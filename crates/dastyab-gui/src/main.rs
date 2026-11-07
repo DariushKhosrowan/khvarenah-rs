@@ -5,6 +5,9 @@
 
 mod app;
 pub mod bridge;
+mod dialogs;
+mod state;
+mod views;
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions::default();

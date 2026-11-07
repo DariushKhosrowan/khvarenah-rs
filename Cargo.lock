@@ -2290,10 +2290,12 @@ dependencies = [
 name = "dastyab-gui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "eframe",
  "egui",
  "dastyab-core",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

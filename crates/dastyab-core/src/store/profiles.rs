@@ -486,6 +486,30 @@ pub fn legacy_dir() -> PathBuf {
     mem_dir().join("legacy")
 }
 
+/// The file that remembers which profile is active, so a restart reopens the
+/// same profile. Kept in the memory root (not inside any profile dir).
+fn active_profile_path() -> PathBuf {
+    mem_dir().join("active_profile")
+}
+
+/// Return the id of the active profile. Defaults to `"default"`.
+pub fn get_active_profile() -> String {
+    let p = active_profile_path();
+    read_opt::<String>(&p).unwrap_or_else(|| "default".to_string())
+}
+
+/// Persist the active profile id so it survives restarts. If `id` is not a
+/// known profile, it falls back to `"default"`.
+pub fn set_active_profile(id: &str) -> Result<(), CFError> {
+    let known = list_profiles().iter().any(|m| m.id == id);
+    let final_id = if known {
+        id.to_string()
+    } else {
+        "default".to_string()
+    };
+    write_json(&active_profile_path(), &final_id)
+}
+
 /// Convenience: current timestamp as ISO-8601-like string.
 pub fn now_iso() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
@@ -516,6 +540,30 @@ mod tests {
             add_token(&id, "cf-main", "secret-token").unwrap();
             let p2 = load_profile(&id);
             assert_eq!(p2.tokens.get("cf-main").unwrap().token, "secret-token");
+        });
+    }
+
+    #[test]
+    fn active_profile_defaults_to_default() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            assert_eq!(get_active_profile(), "default");
+        });
+    }
+
+    #[test]
+    fn active_profile_roundtrip_and_fallback() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let id = create_profile("work", "").unwrap();
+
+            // set to the real profile, read back
+            set_active_profile(&id).unwrap();
+            assert_eq!(get_active_profile(), id);
+
+            // unknown profile falls back to default
+            set_active_profile("does-not-exist").unwrap();
+            assert_eq!(get_active_profile(), "default");
         });
     }
 
