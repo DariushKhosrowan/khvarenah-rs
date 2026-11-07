@@ -4,6 +4,7 @@
 //! is built in a separate module so the file stays navigable.
 
 mod app;
+pub mod bridge;
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions::default();

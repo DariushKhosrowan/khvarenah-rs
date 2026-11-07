@@ -15,6 +15,8 @@ use khvarenah_core::vless::VlessProfile;
 use khvarenah_core::worker::generate_uuid;
 use khvarenah_core::CFError;
 
+use crate::bridge;
+
 // Royal-gold palette
 const GOLD: egui::Color32 = egui::Color32::from_rgb(212, 175, 55);
 const GOLD_DIM: egui::Color32 = egui::Color32::from_rgb(150, 120, 40);
@@ -34,6 +36,11 @@ pub struct KhvarenahApp {
     pub profiles: Vec<String>,
     pub note: String,
     tab: Tab,
+    // async bridge
+    tx: bridge::Tx,
+    rx: bridge::Rx,
+    running: Vec<String>,          // task names currently in flight
+    log_lines: Vec<String>,        // live log pane (capped at 5000)
     // inputs
     pub new_profile_name: String,
     pub token_label: String,
@@ -47,7 +54,6 @@ pub struct KhvarenahApp {
     pub stealth_enabled: bool,
     // results
     pub last_link: String,
-    pub last_scan: String,
     // tools
     pub audit_output: String,
     pub backup_output: String,
@@ -81,6 +87,7 @@ impl KhvarenahApp {
             .collect::<Vec<_>>();
 
         let profile = load_profile("default");
+        let (tx, rx) = bridge::channel();
         Self {
             profile_id: "default".to_string(),
             profiles: if pids.is_empty() {
@@ -89,6 +96,10 @@ impl KhvarenahApp {
                 pids
             },
             note: String::new(),
+            tx,
+            rx,
+            running: Vec::new(),
+            log_lines: Vec::new(),
             new_profile_name: String::new(),
             token_label: "cf-main".to_string(),
             token_value: String::new(),
@@ -103,7 +114,6 @@ impl KhvarenahApp {
             scan_gentle: profile.config.scan_gentle,
             stealth_enabled: profile.config.stealth_enabled,
             last_link: String::new(),
-            last_scan: String::new(),
             audit_output: String::new(),
             backup_output: String::new(),
             export_output: String::new(),
@@ -138,10 +148,50 @@ impl KhvarenahApp {
             self.note = e.brief();
         }
     }
+
+    /// Drain the async bridge, applying every pending event to UI state.
+    fn poll_bridge(&mut self, ctx: &egui::Context) {
+        use bridge::UiEvent;
+        while let Ok(ev) = self.rx.try_recv() {
+            match ev {
+                UiEvent::Done { task, summary } => {
+                    self.running.retain(|t| t != &task);
+                    self.note = format!("✓ {task}: {summary}");
+                    self.push_log(&format!("[done] {task}: {summary}"));
+                }
+                UiEvent::TaskErr { task, error } => {
+                    self.running.retain(|t| t != &task);
+                    self.note = error.brief();
+                    self.push_log(&format!("[err]  {task}: {}", error.explain()));
+                }
+                UiEvent::Log { line, .. } => {
+                    self.push_log(&line);
+                }
+            }
+        }
+        // A live console must repaint every frame — not just on input — so
+        // background events stream in visibly even when the user is idle.
+        if !self.running.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Append a log line, capping the buffer at 5000 entries to keep the
+    /// runaway-scanner OOM risk bounded (report per DeepSeek pass 3.1).
+    fn push_log(&mut self, line: &str) {
+        self.log_lines.push(line.to_string());
+        if self.log_lines.len() > 5000 {
+            let excess = self.log_lines.len() - 5000;
+            self.log_lines.drain(0..excess);
+        }
+    }
 }
 
 impl eframe::App for KhvarenahApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Drain background async work before rendering any frame.
+        self.poll_bridge(ui.ctx());
+
         ui.vertical_centered(|ui| {
             ui.heading(egui::RichText::new("Khvarenah").color(GOLD).size(28.0));
             ui.label(egui::RichText::new("Cloudflare-Workers VLESS VPN console").color(GOLD_DIM));
@@ -236,7 +286,16 @@ impl KhvarenahApp {
         ui.separator();
 
         ui.horizontal(|ui| {
-            if ui.button("Scan ONE clean IP (stops on first)").clicked() {
+            if ui
+                .add_enabled(!self.running.contains(&"scan".to_string()), egui::Button::new(
+                    if self.running.contains(&"scan".to_string()) {
+                        "Scanning…"
+                    } else {
+                        "Scan ONE clean IP (stops on first)"
+                    },
+                ))
+                .clicked()
+            {
                 let pid = self.profile_id.clone();
                 let link = p
                     .history
@@ -252,41 +311,58 @@ impl KhvarenahApp {
                     ports: self.scan_ports.clone(),
                     ..Default::default()
                 };
-                let (note, last_scan) = match link {
-                    Some(link) => match block_on(scan_once(&link, &params)) {
-                        Ok(Some(ep)) => {
-                            let _ = remember_clean_ip(&pid, &ep);
-                            let new_link =
-                                khvarenah_core::scanner::rewrite_vless_with_endpoint(&link, &ep);
-                            let rec = VlessRecord {
-                                id: khvarenah_core::store::new_id(),
-                                ts: khvarenah_core::store::profiles::now_iso(),
-                                epoch: khvarenah_core::store::now_ts(),
-                                uuid: String::new(),
-                                address: ep.clone(),
-                                port: 443,
-                                name: format!("clean-{ep}"),
-                                clean_ip: true,
-                                link: new_link.clone(),
-                                note: "clean IP".into(),
-                            };
-                            let _ = remember_vless(&pid, rec);
-                            self.last_link = new_link;
-                            (format!("✓ Found working IP: {ep}"), "done".to_string())
-                        }
-                        Ok(None) => ("No working clean IP found.".to_string(), "none".to_string()),
-                        Err(e) => (e.brief(), "error".to_string()),
-                    },
-                    None => (
-                        "No deployed config to scan against — deploy first.".to_string(),
-                        "none".to_string(),
-                    ),
-                };
-                self.note = note;
-                self.last_scan = last_scan;
+                match link {
+                    Some(link) => {
+                        self.running.push("scan".to_string());
+                        self.push_log(&format!(
+                            "[scan] starting clean-IP scan (count={}, workers={})",
+                            params.count, params.workers
+                        ));
+                        bridge::spawn("scan", self.tx.clone(), async move {
+                            match scan_once(&link, &params).await {
+                                Ok(Some(ep)) => {
+                                    let new_link = khvarenah_core::scanner::rewrite_vless_with_endpoint(&link, &ep);
+                                    let _ = remember_clean_ip(&pid, &ep);
+                                    let rec = VlessRecord {
+                                        id: khvarenah_core::store::new_id(),
+                                        ts: khvarenah_core::store::profiles::now_iso(),
+                                        epoch: khvarenah_core::store::now_ts(),
+                                        uuid: String::new(),
+                                        address: ep.clone(),
+                                        port: 443,
+                                        name: format!("clean-{ep}"),
+                                        clean_ip: true,
+                                        link: new_link.clone(),
+                                        note: "clean IP".into(),
+                                    };
+                                    let _ = remember_vless(&pid, rec);
+                                    Ok::<String, CFError>(format!(
+                                        "Found working IP: {ep} — link updated in profile."
+                                    ))
+                                }
+                                Ok(None) => Err(CFError::new(
+                                    "No clean IP",
+                                    "No working clean IP was found.",
+                                    "Try a larger scan count, a longer timeout, or a different port.",
+                                )),
+                                Err(e) => Err(e),
+                            }
+                        });
+                    }
+                    None => self.note = "No deployed config to scan against — deploy first.".to_string(),
+                }
             }
 
-            if ui.button("Scan 5 clean IPs").clicked() {
+            if ui
+                .add_enabled(!self.running.contains(&"scan5".to_string()), egui::Button::new(
+                    if self.running.contains(&"scan5".to_string()) {
+                        "Scanning 5…"
+                    } else {
+                        "Scan 5 clean IPs"
+                    },
+                ))
+                .clicked()
+            {
                 let pid = self.profile_id.clone();
                 let link = p
                     .history
@@ -302,18 +378,27 @@ impl KhvarenahApp {
                     ports: self.scan_ports.clone(),
                     ..Default::default()
                 };
-                self.note = match link {
-                    Some(link) => match block_on(scan_many(&link, &params, 5)) {
-                        Ok(res) => {
-                            for ep in &res.endpoints {
-                                let _ = remember_clean_ip(&pid, ep);
+                match link {
+                    Some(link) => {
+                        self.running.push("scan5".to_string());
+                        bridge::spawn("scan5", self.tx.clone(), async move {
+                            match scan_many(&link, &params, 5).await {
+                                Ok(res) => {
+                                    for ep in &res.endpoints {
+                                        let _ = remember_clean_ip(&pid, ep);
+                                    }
+                                    Ok::<String, CFError>(format!(
+                                        "{} — {}",
+                                        res.message,
+                                        res.endpoints.join(", ")
+                                    ))
+                                }
+                                Err(e) => Err(e),
                             }
-                            format!("{} — {}", res.message, res.endpoints.join(", "))
-                        }
-                        Err(e) => e.brief(),
-                    },
-                    None => "No deployed config to scan against.".to_string(),
-                };
+                        });
+                    }
+                    None => self.note = "No deployed config to scan against.".to_string(),
+                }
             }
         });
 
@@ -330,17 +415,46 @@ impl KhvarenahApp {
         ui.add_space(6.0);
         ui.separator();
 
-        if ui.button("Deploy worker & make config").clicked() {
+        if ui
+            .add_enabled(!self.running.contains(&"deploy".to_string()), egui::Button::new(
+                if self.running.contains(&"deploy".to_string()) {
+                    "Deploying…"
+                } else {
+                    "Deploy worker & make config"
+                },
+            ))
+            .clicked()
+        {
             let pid = self.profile_id.clone();
             let token = p.tokens.values().next().map(|t| t.token.clone());
             match token {
-                Some(token) => match block_on(deploy_worker(&token, &pid)) {
-                    Ok((host, link)) => {
-                        self.last_link = link.clone();
-                        self.note = format!("✓ Deployed → {host}");
-                    }
-                    Err(e) => self.note = e.brief(),
-                },
+                Some(token) => {
+                    self.running.push("deploy".to_string());
+                    let tx = self.tx.clone();
+                    bridge::spawn("deploy", tx, async move {
+                        match deploy_worker(&token, &pid).await {
+                            Ok((host, link)) => {
+                                // persist the fresh deployment so it survives
+                                // restarts and shows in profile history
+                                let rec = VlessRecord {
+                                    id: khvarenah_core::store::new_id(),
+                                    ts: khvarenah_core::store::profiles::now_iso(),
+                                    epoch: khvarenah_core::store::now_ts(),
+                                    uuid: String::new(),
+                                    address: host.clone(),
+                                    port: 443,
+                                    name: format!("{host}-edge"),
+                                    clean_ip: false,
+                                    link: link.clone(),
+                                    note: "workers.dev deploy".into(),
+                                };
+                                let _ = remember_vless(&pid, rec);
+                                Ok::<String, CFError>(format!("Deployed → {host}"))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    });
+                }
                 None => self.note = "Add a token first.".to_string(),
             }
         }
@@ -355,6 +469,21 @@ impl KhvarenahApp {
                 "workers.dev"
             };
             ui.label(format!("• {} [{}] {}", r.name, tag, r.ts));
+        }
+
+        // live log pane (the async bridge streams debug lines here)
+        ui.separator();
+        ui.heading(egui::RichText::new("Live log").color(GOLD));
+        if self.log_lines.is_empty() {
+            ui.label(egui::RichText::new("Idle — deploy or scan to see live debug output.").color(GOLD_DIM));
+        } else {
+            let mut joined = self.log_lines.join("\n");
+            ui.add(
+                egui::TextEdit::multiline(&mut joined)
+                    .desired_rows(8)
+                    .font(egui::TextStyle::Monospace)
+                    .interactive(false),
+            );
         }
     }
 
@@ -530,9 +659,3 @@ async fn deploy_worker(token: &str, _pid: &str) -> Result<(String, String), CFEr
     Ok((host, link))
 }
 
-/// Block on a future using a fresh tokio runtime (GUI has no ambient runtime).
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    tokio::runtime::Runtime::new()
-        .expect("failed to create tokio runtime")
-        .block_on(fut)
-}
