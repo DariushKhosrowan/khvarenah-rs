@@ -17,25 +17,53 @@ use dastyab_core::CFError;
 
 use crate::bridge;
 
-// Royal-gold palette
+// Royal-gold palette (dark #0a0705 bg per shell spec)
 const GOLD: egui::Color32 = egui::Color32::from_rgb(212, 175, 55);
 const GOLD_DIM: egui::Color32 = egui::Color32::from_rgb(150, 120, 40);
-const DARK: egui::Color32 = egui::Color32::from_rgb(10, 8, 6);
+const DARK: egui::Color32 = egui::Color32::from_rgb(10, 7, 5); // #0a0705
 const PANEL: egui::Color32 = egui::Color32::from_rgb(24, 20, 14);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(235, 228, 200);
 
-#[derive(Clone, Copy, PartialEq)]
-enum Tab {
-    Deploy,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    DeployScan,
     Profiles,
+    Tokens,
+    CleanIps,
     Tools,
+    Settings,
+}
+
+impl View {
+    /// The six-item sidebar, in order.
+    const ALL: [View; 6] = [
+        View::DeployScan,
+        View::Profiles,
+        View::Tokens,
+        View::CleanIps,
+        View::Tools,
+        View::Settings,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            View::DeployScan => "Deploy & Scan",
+            View::Profiles => "Profiles",
+            View::Tokens => "Tokens",
+            View::CleanIps => "Clean IPs",
+            View::Tools => "Tools",
+            View::Settings => "Settings",
+        }
+    }
 }
 
 pub struct DastYabApp {
     pub profile_id: String,
     pub profiles: Vec<String>,
     pub note: String,
-    tab: Tab,
+    /// The most recent background-task error (if any), shown as a red banner.
+    error_banner: Option<String>,
+    view: View,
     // async bridge
     tx: bridge::Tx,
     rx: bridge::Rx,
@@ -96,6 +124,7 @@ impl DastYabApp {
                 pids
             },
             note: String::new(),
+            error_banner: None,
             tx,
             rx,
             running: Vec::new(),
@@ -117,7 +146,7 @@ impl DastYabApp {
             audit_output: String::new(),
             backup_output: String::new(),
             export_output: String::new(),
-            tab: Tab::Deploy,
+            view: View::DeployScan,
         }
     }
 
@@ -162,6 +191,7 @@ impl DastYabApp {
                 UiEvent::TaskErr { task, error } => {
                     self.running.retain(|t| t != &task);
                     self.note = error.brief();
+                    self.error_banner = Some(error.explain());
                     self.push_log(&format!("[err]  {task}: {}", error.explain()));
                 }
                 UiEvent::Log { line, .. } => {
@@ -221,35 +251,20 @@ impl eframe::App for DastYabApp {
 
         ui.add_space(8.0);
 
-        // Tabs
-        ui.horizontal(|ui| {
-            if ui
-                .selectable_label(self.tab == Tab::Deploy, "Deploy & Scan")
-                .clicked()
-            {
-                self.tab = Tab::Deploy;
-            }
-            if ui
-                .selectable_label(self.tab == Tab::Profiles, "Profiles & Tokens")
-                .clicked()
-            {
-                self.tab = Tab::Profiles;
-            }
-            if ui
-                .selectable_label(self.tab == Tab::Tools, "Tools")
-                .clicked()
-            {
-                self.tab = Tab::Tools;
-            }
-        });
-
-        ui.separator();
-
         let p = load_profile(&self.profile_id);
-        match self.tab {
-            Tab::Deploy => self.deploy_panel(ui, &p),
-            Tab::Profiles => self.profile_panel(ui, &p),
-            Tab::Tools => self.tools_panel(ui, &p),
+        self.render_shell(ui, &p);
+
+        if let Some(err) = &self.error_banner {
+            ui.add_space(8.0);
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(60, 12, 12))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 60, 60)))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(err)
+                            .color(egui::Color32::from_rgb(255, 160, 160)),
+                    );
+                });
         }
 
         if !self.note.is_empty() {
@@ -260,6 +275,48 @@ impl eframe::App for DastYabApp {
 }
 
 impl DastYabApp {
+    /// The app shell: left navigation sidebar + active view, with the active
+    /// view name shown in gold.
+    fn render_shell(&mut self, ui: &mut egui::Ui, p: &dastyab_core::store::profiles::Profile) {
+        ui.horizontal(|ui| {
+            // Left sidebar with the six views.
+            ui.vertical(|ui| {
+                ui.set_width(170.0);
+                ui.label(egui::RichText::new("DASTYAB").color(GOLD).strong().size(16.0));
+                ui.add_space(4.0);
+                for v in View::ALL {
+                    let active = self.view == v;
+                    let text = if active {
+                        egui::RichText::new(v.label()).color(GOLD).strong()
+                    } else {
+                        egui::RichText::new(v.label()).color(TEXT)
+                    };
+                    let resp = ui.selectable_label(active, text);
+                    if resp.clicked() {
+                        self.view = v;
+                    }
+                }
+            });
+
+            ui.separator();
+
+            // Main content area.
+            ui.vertical(|ui| {
+                // active view name in gold
+                ui.heading(egui::RichText::new(self.view.label()).color(GOLD).size(22.0));
+                ui.separator();
+                match self.view {
+                    View::DeployScan => self.deploy_panel(ui, p),
+                    View::Profiles => self.profile_panel(ui, p),
+                    View::Tokens => self.token_panel(ui, p),
+                    View::CleanIps => self.cleanip_panel(ui, p),
+                    View::Tools => self.tools_panel(ui, p),
+                    View::Settings => self.settings_panel(ui, p),
+                }
+            });
+        });
+    }
+
     fn deploy_panel(&mut self, ui: &mut egui::Ui, p: &dastyab_core::store::profiles::Profile) {
         ui.heading(egui::RichText::new("Deploy & Clean-IP").color(GOLD));
 
@@ -531,6 +588,92 @@ impl DastYabApp {
         ui.heading(egui::RichText::new("Clean IPs").color(GOLD));
         for ip in p.clean_ips.iter().take(10) {
             ui.label(format!("• {ip}"));
+        }
+    }
+
+    fn token_panel(&mut self, ui: &mut egui::Ui, _p: &dastyab_core::store::profiles::Profile) {
+        ui.heading(egui::RichText::new("Tokens").color(GOLD));
+        ui.horizontal(|ui| {
+            ui.label("Label:");
+            ui.add(egui::TextEdit::singleline(&mut self.token_label).desired_width(100.0));
+            ui.label("Token:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.token_value)
+                    .desired_width(220.0)
+                    .password(true),
+            );
+            if ui.button("Save token").clicked() {
+                if let Err(e) = add_token(&self.profile_id, &self.token_label, &self.token_value) {
+                    self.note = e.brief();
+                } else {
+                    self.token_value.clear();
+                    self.note = format!(
+                        "Token '{}' saved to profile '{}'.",
+                        self.token_label, self.profile_id
+                    );
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+        let p = load_profile(&self.profile_id);
+        for (label, entry) in &p.tokens {
+            let masked = format!(
+                "{}…{}",
+                &entry.token[..entry.token.len().min(4)],
+                &entry.token[entry.token.len().saturating_sub(4)..]
+            );
+            ui.label(format!("• {label}: {masked}"));
+        }
+        if p.tokens.is_empty() {
+            ui.label(egui::RichText::new("No tokens yet — add one above.").color(GOLD_DIM));
+        }
+    }
+
+    fn cleanip_panel(&mut self, ui: &mut egui::Ui, _p: &dastyab_core::store::profiles::Profile) {
+        ui.heading(egui::RichText::new("Clean IPs").color(GOLD));
+        ui.label(egui::RichText::new(
+            "Verified endpoints saved per profile (smart stop-on-first).",
+        ).color(GOLD_DIM));
+        ui.add_space(6.0);
+        let p = load_profile(&self.profile_id);
+        if p.clean_ips.is_empty() {
+            ui.label(egui::RichText::new("No clean IPs found yet — scan from Deploy & Scan.").color(GOLD_DIM));
+        }
+        for ip in &p.clean_ips {
+            ui.label(format!("• {ip}"));
+        }
+    }
+
+    fn settings_panel(&mut self, ui: &mut egui::Ui, _p: &dastyab_core::store::profiles::Profile) {
+        ui.heading(egui::RichText::new("Settings").color(GOLD));
+        ui.checkbox(&mut self.scan_gentle, "gentle scan");
+        ui.checkbox(&mut self.stealth_enabled, "stealth pacing");
+        ui.add_space(6.0);
+        if ui.button("Save settings").clicked() {
+            self.save_scan_params();
+            self.note = "Settings saved to profile.".to_string();
+        }
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading(egui::RichText::new("Backup / restore").color(GOLD));
+        ui.horizontal(|ui| {
+            if ui.button("Backup this profile").clicked() {
+                match dastyab_core::backup::export_profile_to_file(&self.profile_id, None) {
+                    Ok(path) => self.backup_output = format!("✓ Backed up → {}", path.display()),
+                    Err(e) => self.backup_output = e.explain(),
+                }
+            }
+            if ui.button("List backups").clicked() {
+                self.backup_output = dastyab_core::backup::backup_summary();
+            }
+        });
+        if !self.backup_output.is_empty() {
+            ui.add(
+                egui::TextEdit::multiline(&mut self.backup_output)
+                    .desired_rows(4)
+                    .font(egui::TextStyle::Monospace),
+            );
         }
     }
 
