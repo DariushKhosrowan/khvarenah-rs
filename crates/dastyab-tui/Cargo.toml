@@ -1,0 +1,19 @@
+[package]
+name = "dastyab-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DastYab terminal UI (ratatui)."
+
+[dependencies]
+dastyab-core = { path = "../dastyab-core" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+
+[[bin]]
+name = "dastyab-tui"
+path = "src/main.rs"

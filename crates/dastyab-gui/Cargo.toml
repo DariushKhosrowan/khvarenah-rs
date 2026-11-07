@@ -1,0 +1,20 @@
+[package]
+name = "dastyab-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DastYab desktop GUI (eframe/egui)."
+
+[dependencies]
+dastyab-core = { path = "../dastyab-core" }
+eframe.workspace = true
+egui.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "dastyab-gui"
+path = "src/main.rs"
