@@ -8,21 +8,24 @@
 use eframe::egui;
 use khvarenah_core::scanner::{scan_many, scan_once, ScanParams};
 use khvarenah_core::store::profiles::{
-    add_token, create_profile, list_profiles, load_profile, remember_clean_ip, remember_vless,
-    save_config, ProfileConfig, VlessRecord,
+    add_token, create_profile, delete_profile, list_profiles, load_profile, remember_clean_ip,
+    remember_vless, rename_profile, save_config, set_active_profile, ProfileConfig, VlessRecord,
 };
 use khvarenah_core::vless::VlessProfile;
 use khvarenah_core::worker::generate_uuid;
 use khvarenah_core::CFError;
 
 use crate::bridge;
+use crate::dialogs::{self, Dialog, DialogPayload, DialogResult};
+use crate::state::GuiState;
+use crate::views::{profiles, tokens};
 
 // Royal-gold palette (dark #0a0705 bg per shell spec)
-const GOLD: egui::Color32 = egui::Color32::from_rgb(212, 175, 55);
-const GOLD_DIM: egui::Color32 = egui::Color32::from_rgb(150, 120, 40);
-const DARK: egui::Color32 = egui::Color32::from_rgb(10, 7, 5); // #0a0705
-const PANEL: egui::Color32 = egui::Color32::from_rgb(24, 20, 14);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(235, 228, 200);
+pub const GOLD: egui::Color32 = egui::Color32::from_rgb(212, 175, 55);
+pub const GOLD_DIM: egui::Color32 = egui::Color32::from_rgb(150, 120, 40);
+pub const DARK: egui::Color32 = egui::Color32::from_rgb(10, 7, 5); // #0a0705
+pub const PANEL: egui::Color32 = egui::Color32::from_rgb(24, 20, 14);
+pub const TEXT: egui::Color32 = egui::Color32::from_rgb(235, 228, 200);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -69,10 +72,16 @@ pub struct KhvarenahApp {
     rx: bridge::Rx,
     running: Vec<String>,          // task names currently in flight
     log_lines: Vec<String>,        // live log pane (capped at 5000)
+    // view-model cache (Phase 3.2/3.3)
+    pub state: GuiState,
+    /// Currently open modal dialog (if any).
+    pub dialog: Option<Dialog>,
+    /// The action a dialog submit should take.
+    pub pending_action: Option<PendingDialogAction>,
+    /// Which sidebar profile row is selected (for rename/delete).
+    pub selected_profile: Option<usize>,
     // inputs
     pub new_profile_name: String,
-    pub token_label: String,
-    pub token_value: String,
     // scan params
     pub scan_count: u32,
     pub scan_workers: u32,
@@ -86,6 +95,15 @@ pub struct KhvarenahApp {
     pub audit_output: String,
     pub backup_output: String,
     pub export_output: String,
+}
+
+/// What to do when the open dialog submits.
+#[derive(Debug, Clone)]
+pub enum PendingDialogAction {
+    CreateProfile,
+    RenameProfile(String),
+    DeleteProfile(String),
+    AddToken,
 }
 
 impl KhvarenahApp {
@@ -116,8 +134,10 @@ impl KhvarenahApp {
 
         let profile = load_profile("default");
         let (tx, rx) = bridge::channel();
+        let mut state = GuiState::default();
+        state.reload();
         Self {
-            profile_id: "default".to_string(),
+            profile_id: state.active_profile_id.clone(),
             profiles: if pids.is_empty() {
                 vec!["default".to_string()]
             } else {
@@ -129,9 +149,11 @@ impl KhvarenahApp {
             rx,
             running: Vec::new(),
             log_lines: Vec::new(),
+            state,
+            dialog: None,
+            pending_action: None,
+            selected_profile: None,
             new_profile_name: String::new(),
-            token_label: "cf-main".to_string(),
-            token_value: String::new(),
             scan_count: profile.config.scan_count.max(1),
             scan_workers: profile.config.scan_workers.max(1),
             scan_timeout: profile.config.scan_timeout.max(1),
@@ -187,6 +209,8 @@ impl KhvarenahApp {
                     self.running.retain(|t| t != &task);
                     self.note = format!("✓ {task}: {summary}");
                     self.push_log(&format!("[done] {task}: {summary}"));
+                    // mutating tasks change the store; refresh the view cache
+                    self.state.reload_pending = true;
                 }
                 UiEvent::TaskErr { task, error } => {
                     self.running.retain(|t| t != &task);
@@ -198,6 +222,10 @@ impl KhvarenahApp {
                     self.push_log(&line);
                 }
             }
+        }
+        if self.state.reload_pending {
+            self.state.reload();
+            self.profile_id = self.state.active_profile_id.clone();
         }
         // A live console must repaint every frame — not just on input — so
         // background events stream in visibly even when the user is idle.
@@ -213,6 +241,77 @@ impl KhvarenahApp {
         if self.log_lines.len() > 5000 {
             let excess = self.log_lines.len() - 5000;
             self.log_lines.drain(0..excess);
+        }
+    }
+
+    /// Render the open dialog (if any) and apply its result.
+    fn handle_dialog(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_none() {
+            return;
+        }
+        let mut dlg = self.dialog.take().unwrap();
+        let outcome = dialogs::show(ctx, &mut dlg);
+        match outcome {
+            DialogResult::Open => {
+                self.dialog = Some(dlg);
+            }
+            DialogResult::Cancel => {
+                self.pending_action = None;
+            }
+            DialogResult::Submit(payload) => {
+                let act = self.pending_action.take();
+                match act {
+                    Some(PendingDialogAction::CreateProfile) => {
+                        if let DialogPayload::Text(name) = payload {
+                            match create_profile(&name, "") {
+                                Ok(id) => {
+                                    let _ = set_active_profile(&id);
+                                    self.state.reload_pending = true;
+                                    self.note = format!("Profile '{name}' created & activated.");
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::RenameProfile(id)) => {
+                        if let DialogPayload::Text(newname) = payload {
+                            match rename_profile(&id, &newname) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note =
+                                        format!("Profile renamed to '{newname}'.");
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::DeleteProfile(id)) => {
+                        if let DialogPayload::Confirm = payload {
+                            match delete_profile(&id) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.selected_profile = None;
+                                    self.note = format!("Deleted profile '{id}'.");
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::AddToken) => {
+                        if let DialogPayload::Two(label, token) = payload {
+                            match add_token(&self.profile_id, &label, &token) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note =
+                                        format!("Token '{label}' added to profile.");
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
         }
     }
 }
@@ -253,6 +352,7 @@ impl eframe::App for KhvarenahApp {
 
         let p = load_profile(&self.profile_id);
         self.render_shell(ui, &p);
+        self.handle_dialog(ui.ctx());
 
         if let Some(err) = &self.error_banner {
             ui.add_space(8.0);
@@ -544,89 +644,19 @@ impl KhvarenahApp {
         }
     }
 
-    fn profile_panel(&mut self, ui: &mut egui::Ui, p: &khvarenah_core::store::profiles::Profile) {
-        ui.heading(egui::RichText::new("Tokens").color(GOLD));
-        ui.horizontal(|ui| {
-            ui.label("Label:");
-            ui.add(egui::TextEdit::singleline(&mut self.token_label).desired_width(100.0));
-            ui.label("Token:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.token_value)
-                    .desired_width(200.0)
-                    .password(true),
-            );
-            if ui.button("Save token").clicked() {
-                if let Err(e) = add_token(&self.profile_id, &self.token_label, &self.token_value) {
-                    self.note = e.brief();
-                } else {
-                    self.token_value.clear();
-                    self.note = format!(
-                        "Token '{}' saved to profile '{}'.",
-                        self.token_label, self.profile_id
-                    );
-                }
+    fn profile_panel(&mut self, ui: &mut egui::Ui, _p: &khvarenah_core::store::profiles::Profile) {
+        if let Some(act) = profiles::show(ui, self, self.selected_profile) {
+            if let Some(dlg) = profiles::run_action(self, act) {
+                self.dialog = Some(dlg);
             }
-        });
-
-        ui.add_space(6.0);
-        for (label, entry) in &p.tokens {
-            let masked = format!(
-                "{}…{}",
-                &entry.token[..entry.token.len().min(4)],
-                &entry.token[entry.token.len().saturating_sub(4)..]
-            );
-            ui.label(format!("• {label}: {masked}"));
-        }
-
-        ui.add_space(8.0);
-        ui.heading(egui::RichText::new("Accounts").color(GOLD));
-        for (id, acc) in &p.accounts {
-            ui.label(format!("• {id} — {}", acc.name));
-        }
-
-        ui.add_space(8.0);
-        ui.heading(egui::RichText::new("Clean IPs").color(GOLD));
-        for ip in p.clean_ips.iter().take(10) {
-            ui.label(format!("• {ip}"));
         }
     }
 
     fn token_panel(&mut self, ui: &mut egui::Ui, _p: &khvarenah_core::store::profiles::Profile) {
-        ui.heading(egui::RichText::new("Tokens").color(GOLD));
-        ui.horizontal(|ui| {
-            ui.label("Label:");
-            ui.add(egui::TextEdit::singleline(&mut self.token_label).desired_width(100.0));
-            ui.label("Token:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.token_value)
-                    .desired_width(220.0)
-                    .password(true),
-            );
-            if ui.button("Save token").clicked() {
-                if let Err(e) = add_token(&self.profile_id, &self.token_label, &self.token_value) {
-                    self.note = e.brief();
-                } else {
-                    self.token_value.clear();
-                    self.note = format!(
-                        "Token '{}' saved to profile '{}'.",
-                        self.token_label, self.profile_id
-                    );
-                }
+        if let Some(act) = tokens::show(ui, self) {
+            if let Some(dlg) = tokens::run_action(self, act) {
+                self.dialog = Some(dlg);
             }
-        });
-
-        ui.add_space(6.0);
-        let p = load_profile(&self.profile_id);
-        for (label, entry) in &p.tokens {
-            let masked = format!(
-                "{}…{}",
-                &entry.token[..entry.token.len().min(4)],
-                &entry.token[entry.token.len().saturating_sub(4)..]
-            );
-            ui.label(format!("• {label}: {masked}"));
-        }
-        if p.tokens.is_empty() {
-            ui.label(egui::RichText::new("No tokens yet — add one above.").color(GOLD_DIM));
         }
     }
 
