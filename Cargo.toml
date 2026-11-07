@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/khvarenah-core",
+    "crates/khvarenah-cli",
+    "crates/khvarenah-tui",
+    "crates/khvarenah-gui",
+]
+default-members = [
+    "crates/khvarenah-core",
+    "crates/khvarenah-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Dariush Khosrowan <dariush@khosrowan.ir>"]
+description = "Khvarenah — Cloudflare-Workers VLESS VPN console (Rust)."
+repository = "https://github.com/DariushKhosrowan/khvarenah-rs"
+
+[workspace.dependencies]
+# --- core logic ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+rand = "0.8"
+url = "2"
+percent-encoding = "2"
+base64 = "0.22"
+dirs = "6"
+tempfile = "3"
+sha2 = "0.10"
+flate2 = "1"
+
+# --- async / http ---
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+bytes = "1"
+
+# --- logging / debugging ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# --- CLI ---
+clap = { version = "4", features = ["derive"] }
+
+# --- GUI ---
+eframe = "0.37"
+egui = "0.37"
+qrcode = "0.13"
+
+# --- TUI ---
+ratatui = "0.29"
+crossterm = "0.28"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

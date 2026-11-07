@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <!-- ===================== SEO: Primary ===================== -->
+  <title>Khvarenah — Cloudflare Workers VLESS VPN Console (Rust)</title>
+  <meta name="description" content="Khvarenah (خوَرنه) is a Rust-powered Cloudflare Workers VLESS VPN console: deploy workers, scan clean IPs, and generate v2rayN, sing-box & Clash configs from a single static binary." />
+  <meta name="keywords" content="cloudflare workers, vless, vpn, rust, clean ip, senpaiscanner, v2rayn, sing-box, clash, proxy, cloudflare, iran, khvarenah, khovarenah" />
+  <meta name="author" content="Dariush Khosrowan" />
+  <meta name="robots" content="index, follow" />
+  <meta name="theme-color" content="#0a0806" />
+  <link rel="canonical" href="https://khvarenah.dev/" />
+
+  <!-- ===================== SEO: Open Graph ===================== -->
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Khvarenah — Cloudflare Workers VLESS VPN Console (Rust)" />
+  <meta property="og:description" content="A single static Rust binary to deploy Cloudflare Workers, scan clean IPs, and export v2rayN / sing-box / Clash configs." />
+  <meta property="og:url" content="https://khvarenah.dev/" />
+  <meta property="og:site_name" content="Khvarenah" />
+  <meta property="og:locale" content="en_US" />
+  <meta property="og:image" content="https://khvarenah.dev/og-cover.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="Khvarenah — Cloudflare Workers VLESS VPN Console" />
+
+  <!-- ===================== SEO: Twitter ===================== -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Khvarenah — Cloudflare Workers VLESS VPN Console (Rust)" />
+  <meta name="twitter:description" content="Deploy Cloudflare Workers, scan clean IPs, and export v2rayN / sing-box / Clash configs from one Rust binary." />
+  <meta name="twitter:image" content="https://khvarenah.dev/og-cover.png" />
+
+  <!-- ===================== Structured data (JSON-LD) ===================== -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Khvarenah",
+    "alternateName": "خوَرنه",
+    "operatingSystem": "Linux, macOS, Windows, ARM",
+    "applicationCategory": "NetworkApplication",
+    "description": "Cloudflare Workers VLESS VPN console written in Rust.",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "author": { "@type": "Person", "name": "Dariush Khosrowan" },
+    "programmingLanguage": "Rust",
+    "license": "https://opensource.org/licenses/MIT",
+    "softwareVersion": "0.1.0",
+    "url": "https://khvarenah.dev/"
+  }
+  </script>
+
+  <!-- ===================== Styles ===================== -->
+  <style>
+    :root {
+      --gold: #d4af37;
+      --gold-dim: #96782a;
+      --ink: #0a0806;
+      --panel: #18140e;
+      --text: #ebe4c8;
+      --muted: #b3a986;
+      --radius: 14px;
+      --shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background:
+        radial-gradient(1200px 600px at 80% -10%, rgba(212,175,55,.12), transparent 60%),
+        radial-gradient(900px 500px at 10% 110%, rgba(212,175,55,.08), transparent 55%),
+        var(--ink);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--gold); text-decoration: none; }
+    a:hover { color: #eccf63; }
+
+    /* Header */
+    header {
+      position: sticky; top: 0; z-index: 20;
+      background: rgba(10, 8, 6, 0.8);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid rgba(212,175,55,.15);
+    }
+    .nav {
+      max-width: 1100px; margin: 0 auto; padding: 18px 24px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .brand { font-weight: 800; font-size: 1.15rem; letter-spacing: .5px; }
+    .brand .gold { color: var(--gold); }
+    .nav-links a { margin-left: 22px; color: var(--muted); font-size: .95rem; }
+    .nav-links a:hover { color: var(--gold); }
+
+    main { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+
+    /* Hero */
+    .hero { padding: 80px 0 50px; text-align: center; }
+    .hero .badge {
+      display: inline-block;
+      background: rgba(212,175,55,.12);
+      border: 1px solid rgba(212,175,55,.3);
+      color: var(--gold);
+      padding: 6px 16px; border-radius: 999px;
+      font-size: .85rem; font-weight: 600; margin-bottom: 22px;
+    }
+    .hero h1 { font-size: clamp(2.2rem, 5vw, 3.6rem); line-height: 1.1; font-weight: 800; }
+    .hero h1 .gold { color: var(--gold); }
+    .hero p.lead { max-width: 720px; margin: 22px auto 0; color: var(--muted); font-size: 1.1rem; }
+    .cta { margin-top: 34px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+    .btn {
+      display: inline-block;
+      padding: 13px 26px; border-radius: 999px;
+      font-weight: 700; font-size: .98rem;
+      transition: transform .15s ease, box-shadow .15s ease;
+    }
+    .btn-primary { background: linear-gradient(135deg, #e6c14f, var(--gold)); color: #1a1408; }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: var(--shadow); color: #1a1408; }
+    .btn-ghost { border: 1px solid rgba(212,175,55,.4); color: var(--gold); }
+    .btn-ghost:hover { background: rgba(212,175,55,.08); }
+
+    /* Panels */
+    .card {
+      background: var(--panel);
+      border: 1px solid rgba(212,175,55,.14);
+      border-radius: var(--radius);
+      padding: 30px;
+    }
+    h2 { font-size: 1.7rem; color: var(--gold); margin-bottom: 14px; }
+    h3 { color: var(--gold); margin: 22px 0 8px; }
+    ul, ol { padding-left: 22px; }
+
+    /* Grid */
+    .grid { display: grid; gap: 22px; }
+    .grid-3 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+    .grid-2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+    .feature .icon { font-size: 1.8rem; }
+
+    /* Code */
+    pre {
+      background: #0c0a08;
+      border: 1px solid rgba(212,175,55,.15);
+      border-radius: 10px;
+      padding: 18px;
+      overflow-x: auto;
+      font-size: .9rem;
+      color: #d8cfae;
+      margin: 14px 0;
+    }
+    code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+
+    /* Steps */
+    .steps { counter-reset: step; }
+    .step { position: relative; padding-left: 54px; margin: 20px 0; }
+    .step::before {
+      counter-increment: step;
+      content: counter(step);
+      position: absolute; left: 0; top: 0;
+      width: 36px; height: 36px;
+      background: linear-gradient(135deg, #e6c14f, var(--gold));
+      color: #1a1408; font-weight: 800;
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+    }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid rgba(212,175,55,.15);
+      margin-top: 80px; padding: 34px 24px;
+      text-align: center; color: var(--muted); font-size: .9rem;
+    }
+
+    .section { padding: 50px 0; }
+    .muted { color: var(--muted); }
+    .kbd {
+      background: #0c0a08; border: 1px solid rgba(212,175,55,.25);
+      border-radius: 6px; padding: 2px 8px; font-family: ui-monospace, monospace;
+      font-size: .85em;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ===================== Header ===================== -->
+  <header>
+    <div class="nav">
+      <div class="brand"><span class="gold">◆</span> Khvarenah</div>
+      <nav class="nav-links">
+        <a href="#why">Why Rust</a>
+        <a href="#features">Features</a>
+        <a href="#quickstart">Quick start</a>
+        <a href="https://github.com/DariushKhosrowan/khvarenah-rs">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <!-- ===================== Hero ===================== -->
+    <section class="hero">
+      <span class="badge">✦ Written in Rust — single static binary</span>
+      <h1>Khvarenah <span class="gold">(خوَرنه)</span></h1>
+      <p class="lead">
+        A complete <strong>Cloudflare Workers VLESS VPN console</strong>.
+        Deploy a worker, scan for clean IPs, and export client configs for
+        <strong>v2rayN</strong>, <strong>sing-box</strong>, and
+        <strong>Clash</strong> — all from one fast, safe, static Rust binary.
+      </p>
+      <div class="cta">
+        <a class="btn btn-primary" href="#quickstart">Quick start</a>
+        <a class="btn btn-ghost" href="https://github.com/DariushKhosrowan/khvarenah-rs">View on GitHub</a>
+      </div>
+    </section>
+
+    <!-- ===================== Why Rust ===================== -->
+    <section class="section" id="why">
+      <div class="card">
+        <h2>Why the Rust version?</h2>
+        <p class="muted">
+          This is the Rust rewrite of the classic Python console. It keeps all
+          the same power and adds real engineering advantages.
+        </p>
+        <div class="grid grid-3">
+          <div class="feature"><div class="icon">🚀</div><h3>Single binary</h3><p class="muted">No Python, no pip, no Node. A static executable that runs anywhere.</p></div>
+          <div class="feature"><div class="icon">🛡️</div><h3>Memory-safe</h3><p class="muted">Rust guarantees no null pointers, buffer overflows, or data races.</p></div>
+          <div class="feature"><div class="icon">⚡</div><h3>Fast</h3><p class="muted">Clean-IP scanning and analytics feel instant, even on modest hardware.</p></div>
+          <div class="feature"><div class="icon">🌍</div><h3>Cross-platform</h3><p class="muted">Linux, macOS, Windows, and ARM from one codebase.</p></div>
+          <div class="feature"><div class="icon">📦</div><h3>Type-safe APIs</h3><p class="muted">Every Cloudflare object is a serde model — no loose JSON poking.</p></div>
+          <div class="feature"><div class="icon">📖</div><h3>Fully documented</h3><p class="muted">Architecture maps, module guides, and a design reference included.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== Features ===================== -->
+    <section class="section" id="features">
+      <div class="card">
+        <h2>Expert-grade tooling</h2>
+        <div class="grid grid-2">
+          <ul>
+            <li><strong>Deploy workers</strong> with anti-bot stealth pacing and per-deploy byte humanization.</li>
+            <li><strong>Scan clean IPs</strong> via SenPaiScanner, verified with real health probes.</li>
+            <li><strong>Export configs</strong> for v2rayN, sing-box, and Clash (YAML/JSON).</li>
+            <li><strong>Manage DNS & zones</strong> — list, create, and delete records.</li>
+            <li><strong>Manage worker routes</strong> — map patterns to scripts.</li>
+            <li><strong>Usage analytics</strong> — per-worker request and traffic summaries.</li>
+          </ul>
+          <ul>
+            <li><strong>Security audit</strong> — checks token permissions and flags leaks.</li>
+            <li><strong>Backup & restore</strong> — portable profile bundles.</li>
+            <li><strong>Endpoint diagnostics</strong> — latency & throughput ranking.</li>
+            <li><strong>Self-update</strong> — check & fetch newer releases from GitHub.</li>
+            <li><strong>Deploy presets</strong> — standard / gaming / max-compat.</li>
+            <li><strong>Three frontends</strong> — CLI, TUI, and desktop GUI.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== Quick start ===================== -->
+    <section class="section" id="quickstart">
+      <div class="card">
+        <h2>Quick start</h2>
+        <div class="steps">
+          <div class="step">
+            <h3>Build the release binary</h3>
+            <pre><code>cargo build --release --workspace</code></pre>
+          </div>
+          <div class="step">
+            <h3>Add a Cloudflare API token</h3>
+            <pre><code>khvarenah token add cf-main &lt;YOUR_CF_API_TOKEN&gt;</code></pre>
+            <p class="muted">Stored at <code>0600</code> in <code>~/.khvarenah/</code>.</p>
+          </div>
+          <div class="step">
+            <h3>Verify & deploy a worker</h3>
+            <pre><code>khvarenah verify
+khvarenah deploy --preset standard</code></pre>
+          </div>
+          <div class="step">
+            <h3>Find a clean IP</h3>
+            <pre><code>khvarenah scan</code></pre>
+          </div>
+          <div class="step">
+            <h3>Export client configs</h3>
+            <pre><code>khvarenah export clash    --output clash.yaml
+khvarenah export singbox  --output config.json
+khvarenah export v2rayn  --output xray.json</code></pre>
+          </div>
+        </div>
+        <p class="muted" style="margin-top:20px;">
+          Prefer a dashboard? Run <span class="kbd">khvarenah-tui</span> for a
+          terminal UI or <span class="kbd">khvarenah-gui</span> for the desktop app.
+        </p>
+      </div>
+    </section>
+
+    <!-- ===================== Storage ===================== -->
+    <section class="section">
+      <div class="card">
+        <h2>Storage, built for safety</h2>
+        <p class="muted">
+          All state lives under <code>~/.khvarenah/</code>. Every write is
+          <strong>atomic</strong> (tempfile + fsync + rename), so a crash or
+          kill can never corrupt your tokens or configs.
+        </p>
+        <pre><code>~/.khvarenah/
+├── profiles/
+│   └── default/
+│       ├── profile.json    # metadata
+│       ├── token.json      # API tokens (mode 0600)
+│       ├── accounts.json   # CF accounts
+│       ├── history.json    # generated vless configs
+│       ├── cleanips.json   # scanned clean IPs
+│       └── config.json     # settings
+├── backups/                # exported profile bundles
+└── legacy/                 # migrated pre-0.1 files</code></pre>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Khvarenah — Cloudflare Workers VLESS VPN Console · MIT © Dariush Khosrowan</p>
+    <p style="margin-top:8px;">
+      <a href="https://github.com/DariushKhosrowan/khvarenah-rs">GitHub</a> ·
+      <a href="https://khvarenah.dev/docs/ARCHITECTURE.md">Architecture</a> ·
+      <a href="https://khvarenah.dev/docs/SECURITY.md">Security</a>
+    </p>
+  </footer>
+
+</body>
+</html>
