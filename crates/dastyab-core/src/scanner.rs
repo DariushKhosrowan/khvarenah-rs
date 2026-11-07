@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CFError;
@@ -357,9 +357,9 @@ pub async fn run_scan(
                 }
             }
             // a little jitter so scans read human
-            if rand::thread_rng().gen_range(0.0_f64..1.0) < 0.1 {
+            if rand::rngs::StdRng::from_entropy().gen_range(0.0_f64..1.0) < 0.1 {
                 tokio::time::sleep(std::time::Duration::from_millis(
-                    rand::thread_rng().gen_range(100..600),
+                    rand::rngs::StdRng::from_entropy().gen_range(100..600),
                 ))
                 .await;
             }

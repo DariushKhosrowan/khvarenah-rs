@@ -60,6 +60,17 @@ impl CFError {
         format!("{}: {}", self.title, self.detail)
     }
 
+    /// A canned error for tests and demo flows. Hidden from docs; used by
+    /// the GUI async bridge test and by our own error tests.
+    #[doc(hidden)]
+    pub fn test() -> Self {
+        Self::new(
+            "Test error",
+            "A synthetic error for tests.",
+            "No action needed — this is a test failure.",
+        )
+    }
+
     /// Multi-line form for the GUI / verbose logs.
     pub fn explain(&self) -> String {
         let mut out = format!("{}\n  {}", self.title, self.detail);

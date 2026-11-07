@@ -3,7 +3,7 @@
 //! Port of the Python `stealth.py`. Everything here is configurable; set
 //! `DASTYAB_STEALTH=0` to disable (used by tests/CI).
 
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -19,8 +19,13 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-fn rng() -> rand::rngs::ThreadRng {
-    rand::thread_rng()
+/// A `Send` RNG. The default `rand::thread_rng()` returns a `ThreadRng`
+/// which is `!Send`; holding one across an `.await` (as every stealth pause
+/// does) makes the surrounding future `!Send`, which breaks the bridge
+/// spawning the GUI's async jobs. `StdRng` is seeded from OS entropy, is
+/// `Send`, and is plenty for jitter purposes.
+fn rng() -> rand::rngs::StdRng {
+    rand::rngs::StdRng::from_entropy()
 }
 
 /// Human-shaped pause before an API call.
