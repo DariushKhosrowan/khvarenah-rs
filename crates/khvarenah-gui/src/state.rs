@@ -179,4 +179,45 @@ mod tests {
         st.reload();
         assert!(!st.reload_pending);
     }
+
+    #[test]
+    fn full_profile_crud_flow() {
+        // Mirrors the Phase 3.2/3.3 acceptance checks:
+        // create -> set active -> add token -> reload sees masked token ->
+        // rename -> delete.
+        with_home(|| {
+            use khvarenah_core::store::profiles::{
+                delete_profile, rename_profile, create_profile, set_active_profile,
+            };
+            use khvarenah_core::store::ensure_mem_dir;
+            ensure_mem_dir().unwrap();
+
+            // create
+            let id = create_profile("test-profile", "").unwrap();
+            assert!(!id.is_empty());
+
+            // set active + persist
+            set_active_profile(&id).unwrap();
+            assert_eq!(get_active_profile(), id);
+
+            // add token + reload
+            khvarenah_core::store::profiles::add_token(
+                &id,
+                "primary",
+                "cf_live_token_abcdefgh",
+            )
+            .unwrap();
+            let mut st = GuiState::default();
+            st.reload();
+            assert_eq!(st.active_profile_id, id);
+            assert_eq!(st.tokens.len(), 1);
+            assert_eq!(st.tokens[0].masked, "cf_l…efgh");
+
+            // rename + delete
+            rename_profile(&id, "renamed-profile").unwrap();
+            assert_eq!(load_profile(&id).meta.name, "renamed-profile");
+            delete_profile(&id).unwrap();
+            assert!(!khvarenah_core::store::profiles::profile_dir(&id).exists());
+        });
+    }
 }
