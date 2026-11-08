@@ -261,10 +261,12 @@ pub async fn ensure_singbox(pinned_version: &str) -> Result<PathBuf, CFError> {
         .map_err(|e| CFError::new("Storage error", format!("Cannot create bin dir: {e}"), ""))?;
     #[cfg(target_os = "linux")]
     let asset = format!("sing-box-{pinned_version}-linux-amd64.tar.gz");
-    #[cfg(target_os = "macos")]
-    let asset = format!("sing-box-{pinned_version}-darwin-amd64.tar.gz");
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let asset = format!("sing-box-{pinned_version}-darwin-arm64.tar.gz");
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    let asset = format!("sing-box-{pinned_version}-darwin-amd64.tar.gz");
+    #[cfg(target_os = "windows")]
+    let asset = format!("sing-box-{pinned_version}-windows-amd64.zip");
     let url =
         format!("https://github.com/SagerNet/sing-box/releases/download/v{pinned_version}/{asset}");
     let resp = reqwest::get(&url).await.map_err(|e| {
