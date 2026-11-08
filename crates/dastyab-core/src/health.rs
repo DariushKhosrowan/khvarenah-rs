@@ -2,13 +2,53 @@
 //!
 //! This makes the clean-IP scanner "smart": a candidate endpoint is only
 //! accepted after it passes a real health check.
+//!
+//! It also carries the real-client WebSocket-upgrade gate (DeepSeek plan #1):
+//! a candidate edge only counts as clean if a TLS session completes AND an
+//! RFC 6455 Upgrade to the worker's path returns `101 Switching Protocols`
+//! with actual bytes — not merely that TCP/TLS answers a ping.
 
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 use crate::error::CFError;
+use crate::vless::VlessProfile;
+
+/// Cloudflare alt-ports, ordered by usefulness on censored networks.
+/// 443 is often the most-throttled port (every VPN uses it); the alt ports
+/// are frequently left open because DPI assumes "real HTTPS uses 443".
+pub const ALT_PORTS: &[u16] = &[443, 2053, 2087, 2096, 8443, 2083, 2082, 8880, 2052];
+
+/// A single WebSocket-upgrade probe verdict for one (ip, port).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WsProbe {
+    pub port: u16,
+    /// TLS handshake completed.
+    pub tls_ok: bool,
+    /// HTTP response status of the Upgrade request. `101` is the only accept.
+    pub status: Option<u16>,
+    /// RTT of the TLS handshake in ms.
+    pub rtt_ms: u32,
+    /// Bytes received after the upgrade before close/timeout. 0 = route dead.
+    pub worker_bytes: u32,
+    /// Failure stage if the probe did not pass ("tls" | "ws" | "route").
+    pub failure_stage: Option<String>,
+}
+
+/// Derived target for a WS probe: what to connect to and what to request.
+#[derive(Debug, Clone)]
+pub struct WsTarget {
+    pub sni: String,
+    pub path: String,
+    pub host: String,
+}
 
 /// A measured health result for one endpoint.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -162,9 +202,359 @@ pub async fn check(ip: &str, port: u16, opts: &HealthOptions) -> HealthResult {
     }
 }
 
+/// Derive the SNI / path / Host header for a WS probe from a vless link.
+pub fn derive_ws_target(vless: &VlessProfile) -> WsTarget {
+    let mut p = vless.clone();
+    p.normalize();
+    WsTarget {
+        sni: p.sni.clone().unwrap_or_else(|| p.address.clone()),
+        path: if p.path.is_empty() {
+            "/".to_string()
+        } else {
+            percent_encoding::percent_decode_str(&p.path)
+                .decode_utf8_lossy()
+                .into_owned()
+        },
+        host: p.header_host.clone().unwrap_or_else(|| p.address.clone()),
+    }
+}
+
+/// Lenient TLS verifier: we are fronting a Cloudflare edge and the worker
+/// hostname is not the certificate owner — we intentionally skip cert-pinning.
+/// This mirrors what a real v2ray/xray client does with `allowInsecure`.
+#[derive(Debug)]
+struct LenientVerifier;
+
+impl ServerCertVerifier for LenientVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+/// Connect a TLS stream to `ip:port` using `sni` as the SNI hostname.
+async fn tls_connect(
+    ip: &str,
+    port: u16,
+    sni: &str,
+    timeout_ms: u64,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, CFError> {
+    let addr: SocketAddr = format!("{ip}:{port}")
+        .parse()
+        .map_err(|e| CFError::new("Invalid addr", format!("{e}"), "Bad IP/port."))?;
+    let tcp = tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| CFError::new("Probe timeout", "TCP connect timed out.", ""))?
+    .map_err(|e| CFError::new("Probe error", format!("TCP connect failed: {e}"), ""))?;
+
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| CFError::new("TLS config", format!("{e}"), ""))?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(LenientVerifier))
+    .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from(sni.to_string())
+        .map_err(|_| CFError::new("Invalid SNI", "SNI must be a valid DNS name.", ""))?;
+    let stream = tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        connector.connect(server_name, tcp),
+    )
+    .await
+    .map_err(|_| CFError::new("TLS timeout", "TLS handshake timed out.", ""))?
+    .map_err(|e| CFError::new("TLS error", format!("TLS handshake failed: {e}"), ""))?;
+    Ok(stream)
+}
+
+/// Perform the TLS + RFC 6455 WebSocket upgrade probe.
+///
+/// Sends a minimal handshake request to `sni`'s `path` at `ip:port`, asserts a
+/// `101 Switching Protocols` response line, and counts the bytes received after
+/// the upgrade. Returns the detailed verdict.
+pub async fn probe_ws(
+    ip: &str,
+    port: u16,
+    sni: &str,
+    path: &str,
+    timeout_ms: u64,
+) -> WsProbe {
+    let started = Instant::now();
+    let mut probe = WsProbe {
+        port,
+        tls_ok: false,
+        status: None,
+        rtt_ms: 0,
+        worker_bytes: 0,
+        failure_stage: None,
+    };
+
+    let mut stream = match tls_connect(ip, port, sni, timeout_ms).await {
+        Ok(s) => s,
+        Err(e) => {
+            probe.failure_stage = Some("tls".into());
+            probe.rtt_ms = started.elapsed().as_millis() as u32;
+            let _ = e;
+            return probe;
+        }
+    };
+    probe.tls_ok = true;
+    probe.rtt_ms = started.elapsed().as_millis() as u32;
+
+    // Random 16-byte Sec-WebSocket-Key (base64) per RFC 6455.
+    use base64::Engine as _;
+    use rand::Rng;
+    use rand::SeedableRng as _;
+    let mut key_bytes = [0u8; 16];
+    rand::rngs::StdRng::from_entropy().fill(&mut key_bytes);
+    let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
+
+    let path = if path.is_empty() { "/" } else { path };
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {sni}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+
+    if let Err(e) = tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        stream.write_all(req.as_bytes()),
+    )
+    .await
+    {
+        probe.failure_stage = Some("ws".into());
+        let _ = e;
+        return probe;
+    }
+    if let Err(e) = stream.flush().await {
+        probe.failure_stage = Some("ws".into());
+        let _ = e;
+        return probe;
+    }
+
+    // Read the response, counting body bytes that arrive after the header's
+    // \r\n\r\n terminator (a 101 with zero subsequent bytes = dead route).
+    let mut buf = vec![0u8; 4096];
+    let mut resp = Vec::new();
+    let mut headers_done = false;
+    let mut body_bytes = 0u32;
+    let read_outcome = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        loop {
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if !headers_done {
+                resp.extend_from_slice(&buf[..n]);
+                if let Some(pos) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+                    headers_done = true;
+                    body_bytes += (resp.len() - (pos + 4)) as u32;
+                }
+            } else {
+                body_bytes += n as u32;
+            }
+            if body_bytes >= 1024 {
+                break;
+            }
+        }
+    })
+    .await;
+
+    if !headers_done {
+        // No complete HTTP response arrived.
+        probe.failure_stage = Some("ws".into());
+        return probe;
+    }
+
+    let head_end = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(resp.len())
+        + 4;
+    let head_str = String::from_utf8_lossy(&resp[..head_end]);
+    if head_str.starts_with("HTTP/1.1 101") {
+        probe.status = Some(101);
+        probe.worker_bytes = body_bytes;
+        if probe.worker_bytes == 0 {
+            probe.failure_stage = Some("route".into());
+        } else {
+            let _ = read_outcome;
+        }
+    } else {
+        let status = head_str
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok());
+        probe.status = status;
+        probe.failure_stage = Some("ws".into());
+    }
+
+    probe
+}
+
+/// Sweep `ports` in order, early-exiting on the first `101` hit. Returns
+/// per-port results up to and including the first accepted end.
+async fn probe_ports(
+    ip: &str,
+    sni: &str,
+    path: &str,
+    timeout_ms: u64,
+    ports: &[u16],
+) -> Vec<WsProbe> {
+    let mut results = Vec::new();
+    for &port in ports {
+        let r = probe_ws(ip, port, sni, path, timeout_ms).await;
+        let hit = r.status == Some(101) && r.worker_bytes > 0;
+        results.push(r);
+        if hit {
+            break;
+        }
+    }
+    results
+}
+
+/// Sweep a candidate edge across all `ALT_PORTS`, early-exiting on the first
+/// `101`. Returns per-port results.
+pub async fn probe_all_alt_ports(
+    ip: &str,
+    sni: &str,
+    path: &str,
+    timeout_ms: u64,
+) -> Vec<WsProbe> {
+    probe_ports(ip, sni, path, timeout_ms, ALT_PORTS).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    // --- mock TLS + WebSocket upgrade server ---
+
+    fn mock_cert() -> rcgen::CertifiedKey {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params =
+            rcgen::CertificateParams::new(vec!["mock.test".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        rcgen::CertifiedKey { cert, key_pair: key }
+    }
+
+    /// Spawn a mock TLS server on an ephemeral loopback port.
+    /// `mode` controls the response: "accept" → 101 + payload,
+    /// "200" → 200, "404" → 404, "accept_empty" → 101 without payload.
+    async fn start_mock_server(mode: &str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mode = mode.to_string();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let mode = mode.clone();
+                tokio::spawn(async move {
+                    handle_tls_client(tcp, &mode).await;
+                });
+            }
+        });
+        port
+    }
+
+    async fn handle_tls_client(tcp: tokio::net::TcpStream, mode: &str) {
+        let key = mock_cert();
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            key.key_pair.serialize_der().into(),
+        );
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![key.cert.into()], key_der)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let mut stream = match acceptor.accept(tcp).await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // read request head up to \r\n\r\n
+        let mut buf = vec![0u8; 4096];
+        let mut head = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    head.extend_from_slice(&buf[..n]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                _ => return,
+            }
+        }
+        let response = match mode {
+            "accept" => concat!(
+                "HTTP/1.1 101 Switching Protocols\r\n",
+                "Upgrade: websocket\r\n",
+                "Connection: Upgrade\r\n",
+                "Sec-WebSocket-Accept: abc123\r\n",
+                "\r\n",
+                "worker-payload-bytes"
+            ),
+            "200" => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            "404" => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            "accept_empty" => concat!(
+                "HTTP/1.1 101 Switching Protocols\r\n",
+                "Upgrade: websocket\r\n",
+                "Connection: Upgrade\r\n",
+                "Sec-WebSocket-Accept: abc123\r\n",
+                "\r\n"
+            ),
+            _ => "HTTP/1.1 101 Switching Protocols\r\n\r\nb",
+        };
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    // --- tests ---
 
     #[test]
     fn resolve_parses_ip_port() {
@@ -175,5 +565,81 @@ mod tests {
     #[test]
     fn resolve_rejects_garbage() {
         assert!(resolve("not an ip", 443).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_probe_ws_accepts_101() {
+        let port = start_mock_server("accept").await;
+        let p = probe_ws("127.0.0.1", port, "mock.test", "/ws", 5000).await;
+        assert!(p.tls_ok);
+        assert_eq!(p.status, Some(101));
+        assert!(p.worker_bytes > 0);
+        assert!(p.failure_stage.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_probe_ws_rejects_200_without_upgrade() {
+        let port = start_mock_server("200").await;
+        let p = probe_ws("127.0.0.1", port, "mock.test", "/ws", 5000).await;
+        assert!(p.tls_ok);
+        assert_eq!(p.status, Some(200));
+        assert_eq!(p.failure_stage.as_deref(), Some("ws"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_ws_rejects_404_worker_path() {
+        let port = start_mock_server("404").await;
+        let p = probe_ws("127.0.0.1", port, "mock.test", "/ws", 5000).await;
+        assert_eq!(p.status, Some(404));
+        assert_eq!(p.failure_stage.as_deref(), Some("ws"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_ws_requires_nonzero_worker_bytes() {
+        let port = start_mock_server("accept_empty").await;
+        let p = probe_ws("127.0.0.1", port, "mock.test", "/ws", 5000).await;
+        assert_eq!(p.status, Some(101));
+        assert_eq!(p.worker_bytes, 0);
+        assert_eq!(p.failure_stage.as_deref(), Some("route"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_ws_reports_tls_failure_stage() {
+        // listen then drop -> nothing accepts -> TCP connect fails fast
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let p = probe_ws("127.0.0.1", port, "mock.test", "/ws", 2000).await;
+        assert!(!p.tls_ok);
+        assert_eq!(p.failure_stage.as_deref(), Some("tls"));
+    }
+
+    #[test]
+    fn test_derive_ws_target_from_vless_link() {
+        let link = "vless://8274e874-7470-43ee-8018-4bc3baa709a5@104.17.147.186:443?encryption=none&security=tls&type=ws&sni=amir.dariuskhosrowan.workers.dev&host=amir.dariuskhosrowan.workers.dev&path=%2F&fp=chrome#amir";
+        let profile = VlessProfile::parse(link).unwrap();
+        let t = derive_ws_target(&profile);
+        assert_eq!(t.sni, "amir.dariuskhosrowan.workers.dev");
+        assert_eq!(t.path, "/");
+        assert_eq!(t.host, "amir.dariuskhosrowan.workers.dev");
+    }
+
+    #[tokio::test]
+    async fn test_probe_ports_returns_per_port() {
+        let p200 = start_mock_server("200").await;
+        let p404 = start_mock_server("404").await;
+        let results = probe_ports("127.0.0.1", "mock.test", "/ws", 5000, &[p200, p404]).await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].status, Some(200));
+        assert_eq!(results[1].status, Some(404));
+    }
+
+    #[tokio::test]
+    async fn test_probe_ports_early_exits_on_first_101() {
+        let p101 = start_mock_server("accept").await;
+        let p200 = start_mock_server("200").await;
+        let results = probe_ports("127.0.0.1", "mock.test", "/ws", 5000, &[p101, p200]).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, Some(101));
     }
 }
