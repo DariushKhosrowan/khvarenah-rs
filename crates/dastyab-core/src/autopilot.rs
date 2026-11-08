@@ -1333,24 +1333,37 @@ impl AutopilotEngine {
     }
 
     async fn monitor_cycle_inner(&self) -> Result<CycleSummary, CFError> {
+        use crate::cycle_guard::{mark_stage, CycleStage};
         // Self-heal the user-facing bundle against the ledger before checking
         // the network (never fails the cycle: discovery is still the goal).
+        mark_stage(&self.profile_id, CycleStage::Reconcile)?;
         let _ = crate::cleanip::reconcile_bundle_if_drifted(&self.profile_id);
+        mark_stage(&self.profile_id, CycleStage::Prepare)?;
         let vless = base_vless(&self.profile_id)?;
         let path = crate::health::derive_ws_target(&vless).path;
-        let timeout_ms = (self.params.timeout_s as u64) * 1000;
 
         let mut ledger = read_ledger(&self.profile_id);
         let mut state = crate::store::profiles::protection_state(&self.profile_id);
         let now = store::now_ts() as i64;
         let deep_interval: i64 = 900; // deep E2E check every 15 min
 
-        // ── Tier 1: LIGHT check (WS-gate across alt ports) ──
+        // ── Tier 1: LIGHT check (budgeted parallel WS-gate sweep per endpoint) ──
+        // Each endpoint gets a 15s total budget (3s per port probe) so one stale
+        // endpoint cannot eat the whole monitor budget — the exact live failure
+        // fixed in round 7. A dead endpoint is marked dead and we move on.
+        mark_stage(&self.profile_id, CycleStage::LightCheck)?;
         let mut alive = 0usize;
         for ep in ledger.iter_mut() {
-            let ok = endpoint_live(&ep.ip, &ep.sni, &path, timeout_ms).await;
-            ep.alive = ok;
-            if ok {
+            let res = crate::health::endpoint_live_with_budget(
+                &ep.ip,
+                &ep.sni,
+                &path,
+                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+            ep.alive = res.alive;
+            if res.alive {
                 ep.last_checked = Some(store::now_iso());
                 alive += 1;
             }
@@ -1383,6 +1396,7 @@ impl AutopilotEngine {
 
         if do_deep {
             // ── Tier 2: DEEP check — full discovery through the pipeline ──
+            mark_stage(&self.profile_id, CycleStage::DeepCheck)?;
             state.last_deep_check = now;
             let params = self.params_with_seeds();
             match self.provider.discover(&vless, &params).await {
@@ -1459,6 +1473,7 @@ impl AutopilotEngine {
         }
 
         let _ = crate::cleanip::write_user_bundle(&self.profile_id, &vless, &live);
+        mark_stage(&self.profile_id, CycleStage::BundleWrite)?;
 
         Ok(CycleSummary {
             cycle: 0,
@@ -2912,5 +2927,69 @@ mod tests {
             .await
             .expect("fast monitor guard succeeds");
         assert_eq!(crate::cycle_guard::last_stage(&id), Some(crate::cycle_guard::CycleStage::None));
+    }
+
+    /// The monitor light check uses the budgeted parallel sweep (not the old
+    /// sequential one): with all endpoints dead, the cycle completes quickly and
+    /// leaves the LightCheck→DeepCheck stage markers correctly stepped. We drive
+    /// the monitor with a provider whose discover() returns nothing, and seed a
+    /// ledger of dead endpoints (unreachable loopback) so the light check is
+    /// exercised end-to-end.
+    #[tokio::test]
+    async fn test_monitor_uses_budget_and_stage_marks() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        // Seed a ledger with dead endpoints (closed loopback ports).
+        let dead = vec![
+            CleanEndpoint {
+                ip: "127.0.0.1".into(),
+                port: 1,
+                sni: "amir.dariuskhosrowan.workers.dev".into(),
+                score: 10.0,
+                tcp_ms: 1.0,
+                connect_ms: 1.0,
+                download_kbps: 0.0,
+                verified: true,
+                alive: true,
+                last_checked: None,
+                ts: String::new(),
+            },
+            CleanEndpoint {
+                ip: "127.0.0.1".into(),
+                port: 2,
+                sni: "amir.dariuskhosrowan.workers.dev".into(),
+                score: 5.0,
+                tcp_ms: 1.0,
+                connect_ms: 1.0,
+                download_kbps: 0.0,
+                verified: true,
+                alive: true,
+                last_checked: None,
+                ts: String::new(),
+            },
+        ];
+        write_ledger(&id, &dead).unwrap();
+
+        let provider = Box::new(ScriptedProvider {
+            result: Ok(vec![]), // deep discover finds nothing, either
+        });
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            provider,
+        );
+        let summary = engine
+            .monitor_cycle_guarded(std::time::Duration::from_secs(60))
+            .await
+            .expect("monitor with dead endpoints completes");
+        // All endpoints dead → 0 alive.
+        assert_eq!(summary.alive, 0);
+        // A completed monitor clears the stage marker.
+        assert_eq!(
+            crate::cycle_guard::last_stage(&id),
+            Some(crate::cycle_guard::CycleStage::None)
+        );
     }
 }

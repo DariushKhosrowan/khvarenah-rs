@@ -42,6 +42,12 @@ pub enum CycleStage {
     LedgerWrite,
     /// Writing the user bundle / active configs.
     BundleWrite,
+    /// Monitor tier-1 light check (per-endpoint WS-gate sweep).
+    LightCheck,
+    /// Monitor tier-2 deep discovery pass.
+    DeepCheck,
+    /// Monitor E2E verification step.
+    E2eVerify,
 }
 
 impl CycleStage {
@@ -61,6 +67,9 @@ impl CycleStage {
             CycleStage::E2e => "e2e",
             CycleStage::LedgerWrite => "ledger_write",
             CycleStage::BundleWrite => "bundle_write",
+            CycleStage::LightCheck => "light_check",
+            CycleStage::DeepCheck => "deep_check",
+            CycleStage::E2eVerify => "e2e_verify",
         }
     }
 
@@ -74,6 +83,9 @@ impl CycleStage {
             "e2e" => CycleStage::E2e,
             "ledger_write" => CycleStage::LedgerWrite,
             "bundle_write" => CycleStage::BundleWrite,
+            "light_check" => CycleStage::LightCheck,
+            "deep_check" => CycleStage::DeepCheck,
+            "e2e_verify" => CycleStage::E2eVerify,
             _ => CycleStage::None,
         }
     }
@@ -143,5 +155,27 @@ mod tests {
         mark_stage(&id, CycleStage::LedgerWrite).unwrap();
         clear_stage(&id).unwrap();
         assert_eq!(last_stage(&id), Some(CycleStage::None));
+    }
+
+    #[test]
+    fn test_cycle_stage_roundtrips_through_json() {
+        let _home = rescue_home();
+        let id = make_profile();
+        for stage in [
+            CycleStage::Reconcile,
+            CycleStage::Prepare,
+            CycleStage::BaseVless,
+            CycleStage::Phase1Scan,
+            CycleStage::Phase2Scan,
+            CycleStage::E2e,
+            CycleStage::LedgerWrite,
+            CycleStage::BundleWrite,
+            CycleStage::LightCheck,
+            CycleStage::DeepCheck,
+            CycleStage::E2eVerify,
+        ] {
+            mark_stage(&id, stage).unwrap();
+            assert_eq!(last_stage(&id), Some(stage), "roundtrip {stage:?}");
+        }
     }
 }
