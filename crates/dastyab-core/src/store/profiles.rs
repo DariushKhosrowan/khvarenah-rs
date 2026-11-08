@@ -109,6 +109,15 @@ pub struct ProfileConfig {
     /// UNIX epoch seconds of the last deep (E2E) check.
     #[serde(default)]
     pub last_deep_check: i64,
+    /// UNIX epoch seconds of the last worker redeploy (rate-limit guard).
+    #[serde(default)]
+    pub last_redeploy_ts: i64,
+    /// UNIX epoch seconds of the last rescue-chain attempt (throttling).
+    #[serde(default)]
+    pub last_rescue_attempt_ts: i64,
+    /// Outcome of the most recent rescue chain: "recovered" | "gave_up".
+    #[serde(default)]
+    pub last_rescue_outcome: Option<String>,
 }
 
 fn default_light_interval() -> u64 {
@@ -129,6 +138,9 @@ impl Default for ProfileConfig {
             light_interval_secs: 300,
             failure_streak: 0,
             last_deep_check: 0,
+            last_redeploy_ts: 0,
+            last_rescue_attempt_ts: 0,
+            last_rescue_outcome: None,
         }
     }
 }
@@ -516,6 +528,20 @@ pub fn save_protection_state(id: &str, st: &ProtectionState) -> Result<(), CFErr
     let mut cfg = load_profile(id).config;
     cfg.failure_streak = st.failure_streak;
     cfg.last_deep_check = st.last_deep_check;
+    save_config(id, &cfg)
+}
+
+/// Persist the auto-rescue chain's bookkeeping (rate-limit + outcome).
+pub fn save_rescue_meta(
+    id: &str,
+    last_rescue_attempt_ts: i64,
+    last_redeploy_ts: i64,
+    last_rescue_outcome: Option<String>,
+) -> Result<(), CFError> {
+    let mut cfg = load_profile(id).config;
+    cfg.last_rescue_attempt_ts = last_rescue_attempt_ts;
+    cfg.last_redeploy_ts = last_redeploy_ts;
+    cfg.last_rescue_outcome = last_rescue_outcome;
     save_config(id, &cfg)
 }
 
