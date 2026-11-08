@@ -22,16 +22,20 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: linux-amd64
+            arch: amd64
             deb: true
           - os: ubuntu-24.04-arm
             artifact: linux-arm64
+            arch: arm64
             deb: true
           - os: windows-latest
             artifact: windows-amd64
+            arch: amd64
             exe: true
             zip: true
           - os: macos-latest
             artifact: macos-arm64
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -48,9 +52,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.artifact }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-release-cargo-
+            ${{ runner.os }}-${{ matrix.artifact }}-release-cargo-
 
       - name: Build workspace (release)
         run: cargo build --release --workspace
@@ -82,7 +86,13 @@ jobs:
             cp "target/release/${bin}${EXT}" "dist/${bin}-${BASE}${EXT}"
           done
           if [ "${{ matrix.deb }}" = "true" ]; then
-            cp target/debian/*.deb "dist/dastyab-${BASE}.deb"
+            deb_file=$(ls target/debian/*_${{ matrix.arch }}.deb 2>/dev/null | head -n1)
+            if [ -z "$deb_file" ]; then
+              echo "ERROR: no .deb found for arch ${{ matrix.arch }}"
+              ls -la target/debian/ || true
+              exit 1
+            fi
+            cp "$deb_file" "dist/dastyab-${BASE}.deb"
           fi
           if [ "${{ matrix.zip }}" = "true" ]; then
             python scripts/bundle_windows.py "${{ matrix.artifact }}"
