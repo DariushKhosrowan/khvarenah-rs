@@ -709,4 +709,37 @@ mod tests {
         let out = seeded_candidates(&seeds, &cidrs, 200, 24);
         assert!(!out.contains(&"8.8.8.8".to_string()));
     }
+
+    #[test]
+    fn weighted_sample_by_cidr_proportional_to_block_size() {
+        // Two blocks: a /24 (256 addrs) and a /30 (4 addrs) => the /24
+        // should dominate the sample (~99% of draws land in it). Request far
+        // fewer than the total unique count so we never run out of room.
+        let cidrs = vec![
+            Cidr::parse("10.0.0.0/24").unwrap(),
+            Cidr::parse("10.0.1.0/30").unwrap(),
+        ];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let out = weighted_sample_by_cidr(&cidrs, 200, &mut rng);
+        assert_eq!(out.len(), 200);
+        let in_big = out.iter().filter(|ip| ip.starts_with("10.0.0.")).count();
+        // /24 is 256/(256+4) ≈ 98.5% of the space => expect near-200.
+        assert!(in_big > 190, "got only {in_big}/200 in the /24 block");
+    }
+
+    #[test]
+    fn weighted_sample_by_cidr_produces_unique_ips() {
+        let cidrs = vec![Cidr::parse("104.16.0.0/13").unwrap()];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let out = weighted_sample_by_cidr(&cidrs, 500, &mut rng);
+        assert_eq!(out.len(), 500);
+        let uniq: std::collections::HashSet<_> = out.iter().collect();
+        assert_eq!(uniq.len(), 500);
+    }
+
+    #[test]
+    fn weighted_sample_by_cidr_empty_input_returns_empty() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        assert!(weighted_sample_by_cidr(&[], 10, &mut rng).is_empty());
+    }
 }

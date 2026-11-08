@@ -726,17 +726,24 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
         crate::AutopilotAction::Status => {
             let ledger = dastyab_core::autopilot::read_ledger(profile);
             if ledger.is_empty() {
-                println!("Autopilot ledger is empty — run `.dastyab autopilot on` to start.");
+                println!("Autopilot ledger is empty — run `dastyab autopilot on` to start.");
                 return Ok(());
             }
-            let alive = ledger.iter().filter(|e| e.alive).count();
-            println!("Autopilot status (profile '{profile}'): {} endpoint(s) in ledger, {alive} alive.", ledger.len());
-            for ep in ledger.iter().take(10) {
-                println!(
-                    "  {}:{}  sni={}  score={:.1}  alive={}",
-                    ep.ip, ep.port, ep.sni, ep.score, ep.alive
-                );
-            }
+            let alive: Vec<_> = ledger.iter().filter(|e| e.alive).cloned().collect();
+            let summary = dastyab_core::autopilot::CycleSummary {
+                cycle: 0,
+                alive: alive.len(),
+                replaced: 0,
+                note: format!("monitor: {} alive", alive.len()),
+            };
+            println!("{}", dastyab_core::status::simplify_status(&summary));
+            println!(
+                "  Best IP: {}",
+                dastyab_core::status::pick_best_caption(&alive)
+            );
+            println!("{}", dastyab_core::status::bundle_status(profile));
+            // Collapsible technical detail (only when the user asks).
+            println!("  (detail: {} endpoint(s) in ledger)", ledger.len());
             Ok(())
         }
         crate::AutopilotAction::Check => {
