@@ -173,6 +173,237 @@ fn storage_err(path: &std::path::Path, e: std::io::Error) -> CFError {
     )
 }
 
+/// Pick the ledger's active endpoint: the best-scored verified and alive
+/// endpoint, rendered as `ip:port`. Returns `None` when there is nothing
+/// verified yet (nothing to reconcile against).
+pub fn active_ledger_endpoint(profile_id: &str) -> Option<String> {
+    let ledger = crate::autopilot::read_ledger(profile_id);
+    ledger
+        .iter()
+        .filter(|e| e.verified && e.alive)
+        .max_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|e| format!("{}:{}", e.ip, e.port))
+}
+
+/// Drift state of a user-facing bundle relative to the ledger's active
+/// endpoint. `check_bundle_drift` is pure — it never writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleDrift {
+    InSync,
+    MissingDir,
+    MissingFile {
+        name: &'static str,
+    },
+    EndpointMismatch {
+        bundle_endpoint: String,
+        ledger_endpoint: String,
+    },
+    Unparseable {
+        file: &'static str,
+        reason: String,
+    },
+}
+
+/// Read `active.vless` and extract its `ip:port` endpoint, or `None` on a
+/// missing/unreadable/unparseable file.
+fn active_vless_endpoint(vless_path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(vless_path).ok()?;
+    let content = content.trim();
+    if content.is_empty() {
+        return None;
+    }
+    let (ip, port) = split_endpoint(content);
+    if ip == "unknown" {
+        return None;
+    }
+    Some(format!("{ip}:{port}"))
+}
+
+/// Pure drift check: compare the bundle directory's `active.vless` endpoint to
+/// the ledger's active endpoint. Reports the first drift found.
+pub fn check_bundle_drift(
+    bundle_dir: &std::path::Path,
+    ledger_active_endpoint: &str,
+) -> BundleDrift {
+    if !bundle_dir.is_dir() {
+        return BundleDrift::MissingDir;
+    }
+    for name in ["active.vless", "active.png", "fallbacks.txt", "README.txt"] {
+        if !bundle_dir.join(name).exists() {
+            return BundleDrift::MissingFile { name };
+        }
+    }
+    let vless_path = bundle_dir.join("active.vless");
+    match active_vless_endpoint(&vless_path) {
+        None => BundleDrift::Unparseable {
+            file: "active.vless",
+            reason: "missing, empty, or unparseable".into(),
+        },
+        Some(bundle_ep) if bundle_ep != ledger_active_endpoint => BundleDrift::EndpointMismatch {
+            bundle_endpoint: bundle_ep,
+            ledger_endpoint: ledger_active_endpoint.to_string(),
+        },
+        Some(_) => BundleDrift::InSync,
+    }
+}
+
+/// Outcome of a bundle reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    WasInSync,
+    Rewritten { reason: BundleDrift },
+    Failed { reason: String },
+}
+
+/// Regenerate the bundle from the ledger's active endpoint. If the bundle is
+/// already in sync, this is a no-op (`WasInSync`). The vless template (uuid /
+/// path / security / transport) is taken from the bundle's own `active.vless`
+/// when it parses; otherwise `vless_template` is used. Idempotent.
+pub fn reconcile_bundle(
+    bundle_dir: &std::path::Path,
+    ledger_active_endpoint: &str,
+    vless_template: &VlessProfile,
+) -> Result<ReconcileOutcome, CFError> {
+    // No-op when already in sync.
+    if check_bundle_drift(bundle_dir, ledger_active_endpoint) == BundleDrift::InSync {
+        return Ok(ReconcileOutcome::WasInSync);
+    }
+
+    // Prefer the bundle's own link as the template (preserves uuid/path), so
+    // reconciliation works without a CF token / history.
+    let template = {
+        let raw = std::fs::read_to_string(bundle_dir.join("active.vless")).ok();
+        raw.as_deref()
+            .and_then(|s| VlessProfile::parse(s.trim()).ok())
+            .unwrap_or_else(|| vless_template.clone())
+    };
+
+    let (ip, port) = match ledger_active_endpoint.rsplit_once(':') {
+        Some((ip, port)) => (ip.to_string(), port.parse::<u16>().unwrap_or(443)),
+        None => (ledger_active_endpoint.to_string(), 443),
+    };
+    let mut f = template;
+    f.address = ip;
+    f.port = port;
+    let ep = CleanEndpoint {
+        ip: f.address.clone(),
+        port: f.port,
+        sni: f.address.clone(),
+        score: 100.0,
+        tcp_ms: 0.0,
+        connect_ms: 0.0,
+        download_kbps: 0.0,
+        verified: true,
+        alive: true,
+        last_checked: None,
+        ts: String::new(),
+    };
+    write_user_bundle_into(bundle_dir, &f, std::slice::from_ref(&ep)).map(|_| {
+        ReconcileOutcome::Rewritten {
+            reason: BundleDrift::EndpointMismatch {
+                bundle_endpoint: String::new(),
+                ledger_endpoint: ledger_active_endpoint.to_string(),
+            },
+        }
+    })
+}
+
+/// Convenience wrapper for `write_user_bundle` that writes into an explicit
+/// directory (used by reconciliation so it can target the user-config dir).
+fn write_user_bundle_into(
+    dir: &std::path::Path,
+    vless: &VlessProfile,
+    endpoints: &[CleanEndpoint],
+) -> Result<UserConfigBundle, CFError> {
+    let vless_path = dir.join("active.vless");
+    let qr_path = dir.join("active.png");
+    let fallbacks_path = dir.join("fallbacks.txt");
+    let readme_path = dir.join("README.txt");
+
+    let ranked = ranked_links(vless, endpoints);
+
+    let best = ranked.first().map(|(l, _)| l.clone()).unwrap_or_default();
+    if best.is_empty() {
+        std::fs::write(&vless_path, b"").map_err(|e| storage_err(&vless_path, e))?;
+    } else {
+        std::fs::write(&vless_path, best.as_bytes()).map_err(|e| storage_err(&vless_path, e))?;
+    }
+
+    if best.is_empty() {
+        let _ = std::fs::write(&qr_path, b"");
+    } else {
+        let (png, _side) = crate::qr::render_png(&best, 4, 4)?;
+        std::fs::write(&qr_path, &png).map_err(|e| storage_err(&qr_path, e))?;
+    }
+
+    let mut fb = String::new();
+    for (i, (link, rtt)) in ranked.iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let (ip, port) = split_endpoint(link);
+        fb.push_str(&format!("# {ip}:{port} ({rtt}ms)\n{link}\n"));
+    }
+    if fb.is_empty() {
+        fb.push_str("# No fallbacks yet — run autopilot to discover more clean IPs.\n");
+    }
+    std::fs::write(&fallbacks_path, fb.as_bytes()).map_err(|e| storage_err(&fallbacks_path, e))?;
+
+    let readme = concat!(
+        "Scan active.png with your phone VPN client (v2rayNG, Streisand, etc.)\n",
+        "Or copy the contents of active.vless into your desktop client.\n",
+        "If it stops working, try the next line in fallbacks.txt.\n"
+    );
+    std::fs::write(&readme_path, readme.as_bytes()).map_err(|e| storage_err(&readme_path, e))?;
+
+    Ok(UserConfigBundle {
+        dir: dir.to_path_buf(),
+        vless_path,
+        qr_path,
+        fallbacks_path,
+        readme_path,
+    })
+}
+
+/// Reconcile the user-facing bundle against the ledger at the top of a cycle.
+/// No-op when the ledger has no active endpoint yet (nothing to assert). Never
+/// fails the cycle — errors are downgraded to a `Failed` outcome and logged.
+pub fn reconcile_bundle_if_drifted(profile_id: &str) -> ReconcileOutcome {
+    let Some(ledger_ep) = active_ledger_endpoint(profile_id) else {
+        return ReconcileOutcome::WasInSync;
+    };
+    let dir = match user_config_dir(profile_id) {
+        Ok(d) => d,
+        Err(e) => return ReconcileOutcome::Failed { reason: e.brief() },
+    };
+    let drift = check_bundle_drift(&dir, &ledger_ep);
+    if drift == BundleDrift::InSync {
+        return ReconcileOutcome::WasInSync;
+    }
+    // Template: prefer the bundle's own link (no CF token / history needed);
+    // fall back to the profile's base vless when the bundle has none.
+    let template = std::fs::read_to_string(dir.join("active.vless"))
+        .ok()
+        .and_then(|s| VlessProfile::parse(s.trim()).ok())
+        .or_else(|| crate::autopilot::base_vless(profile_id).ok());
+    let template = match template {
+        Some(t) => t,
+        None => {
+            return ReconcileOutcome::Failed {
+                reason: "no vless template available (bundle empty and no profile history)".into(),
+            }
+        }
+    };
+    match reconcile_bundle(&dir, &ledger_ep, &template) {
+        Ok(outcome) => outcome,
+        Err(e) => ReconcileOutcome::Failed { reason: e.brief() },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +525,164 @@ mod tests {
         let b = write_user_bundle("default", &sample_vless(), &eps).unwrap();
         let readme = std::fs::read_to_string(&b.readme_path).unwrap();
         assert_eq!(readme.lines().count(), 3);
+    }
+
+    // ── Bundle / ledger reconciliation (self-heal) ──
+
+    fn seed_ledger(ip: &str, score: f32) {
+        use crate::autopilot::write_ledger;
+        let eps = vec![sample_endpoint(ip, score, 42)];
+        write_ledger("default", &eps).unwrap();
+    }
+
+    #[test]
+    fn test_check_bundle_drift_in_sync() {
+        with_mem_dir();
+        seed_ledger("104.16.1.1", 7.0);
+        let dir = user_config_dir("default").unwrap();
+        let ledger_ep = active_ledger_endpoint("default").unwrap();
+        write_user_bundle(
+            "default",
+            &sample_vless(),
+            &[sample_endpoint("104.16.1.1", 7.0, 42)],
+        )
+        .unwrap();
+        assert_eq!(check_bundle_drift(&dir, &ledger_ep), BundleDrift::InSync);
+    }
+
+    #[test]
+    fn test_check_bundle_drift_missing_dir() {
+        with_mem_dir();
+        let missing = std::path::Path::new("/nonexistent/khvarenah-configs/default");
+        assert_eq!(
+            check_bundle_drift(missing, "104.16.1.1:443"),
+            BundleDrift::MissingDir
+        );
+    }
+
+    #[test]
+    fn test_check_bundle_drift_missing_file() {
+        with_mem_dir();
+        seed_ledger("104.16.1.1", 7.0);
+        let dir = user_config_dir("default").unwrap();
+        let ledger_ep = active_ledger_endpoint("default").unwrap();
+        write_user_bundle(
+            "default",
+            &sample_vless(),
+            &[sample_endpoint("104.16.1.1", 7.0, 42)],
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(dir.join("active.png"));
+        assert!(matches!(
+            check_bundle_drift(&dir, &ledger_ep),
+            BundleDrift::MissingFile { name: "active.png" }
+        ));
+    }
+
+    #[test]
+    fn test_check_bundle_drift_endpoint_mismatch() {
+        with_mem_dir();
+        seed_ledger("104.16.1.1", 7.0);
+        let dir = user_config_dir("default").unwrap();
+        let ledger_ep = active_ledger_endpoint("default").unwrap();
+        // Bundle written for a DIFFERENT endpoint than the ledger's active one.
+        write_user_bundle(
+            "default",
+            &sample_vless(),
+            &[sample_endpoint("104.16.9.9", 5.0, 42)],
+        )
+        .unwrap();
+        assert!(matches!(
+            check_bundle_drift(&dir, &ledger_ep),
+            BundleDrift::EndpointMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_check_bundle_drift_unparseable_active_vless() {
+        with_mem_dir();
+        seed_ledger("104.16.1.1", 7.0);
+        let dir = user_config_dir("default").unwrap();
+        let ledger_ep = active_ledger_endpoint("default").unwrap();
+        // Build a complete bundle first, then corrupt only active.vless so the
+        // drift check reaches the parse stage (not an earlier MissingFile).
+        write_user_bundle(
+            "default",
+            &sample_vless(),
+            &[sample_endpoint("104.16.1.1", 7.0, 42)],
+        )
+        .unwrap();
+        std::fs::write(dir.join("active.vless"), b"garbage not a vless link").unwrap();
+        assert!(matches!(
+            check_bundle_drift(&dir, &ledger_ep),
+            BundleDrift::Unparseable { .. }
+        ));
+    }
+
+    #[test]
+    fn test_reconcile_rewrites_on_drift() {
+        with_mem_dir();
+        seed_ledger("104.16.1.1", 7.0);
+        let dir = user_config_dir("default").unwrap();
+        let ledger_ep = active_ledger_endpoint("default").unwrap();
+        // Bundle points at the wrong endpoint; reconcile should rewrite it.
+        write_user_bundle(
+            "default",
+            &sample_vless(),
+            &[sample_endpoint("104.16.9.9", 5.0, 42)],
+        )
+        .unwrap();
+        let outcome = reconcile_bundle(&dir, &ledger_ep, &sample_vless()).unwrap();
+        assert!(matches!(outcome, ReconcileOutcome::Rewritten { .. }));
+        // After reconcile, the active.vless must point at the ledger endpoint.
+        assert_eq!(
+            active_vless_endpoint(&dir.join("active.vless")).as_deref(),
+            Some("104.16.1.1:443")
+        );
+    }
+
+    #[test]
+    fn test_reconcile_noop_when_in_sync() {
+        with_mem_dir();
+        seed_ledger("104.16.1.1", 7.0);
+        let dir = user_config_dir("default").unwrap();
+        let ledger_ep = active_ledger_endpoint("default").unwrap();
+        write_user_bundle(
+            "default",
+            &sample_vless(),
+            &[sample_endpoint("104.16.1.1", 7.0, 42)],
+        )
+        .unwrap();
+        let outcome = reconcile_bundle(&dir, &ledger_ep, &sample_vless()).unwrap();
+        assert_eq!(outcome, ReconcileOutcome::WasInSync);
+    }
+
+    #[test]
+    fn test_reconcile_noop_when_no_ledger_endpoint() {
+        with_mem_dir();
+        // No ledger written -> active_ledger_endpoint is None.
+        assert!(active_ledger_endpoint("default").is_none());
+        let outcome = reconcile_bundle_if_drifted("default");
+        assert_eq!(outcome, ReconcileOutcome::WasInSync);
+    }
+
+    #[test]
+    fn test_reconcile_bundle_if_drifted_detects_and_rewrites() {
+        with_mem_dir();
+        seed_ledger("104.16.1.1", 7.0);
+        let dir = user_config_dir("default").unwrap();
+        // Write a drifted bundle directly into the real dir.
+        write_user_bundle_into(
+            &dir,
+            &sample_vless(),
+            &[sample_endpoint("104.16.9.9", 5.0, 42)],
+        )
+        .unwrap();
+        let outcome = reconcile_bundle_if_drifted("default");
+        assert!(matches!(outcome, ReconcileOutcome::Rewritten { .. }));
+        assert_eq!(
+            active_vless_endpoint(&dir.join("active.vless")).as_deref(),
+            Some("104.16.1.1:443")
+        );
     }
 }

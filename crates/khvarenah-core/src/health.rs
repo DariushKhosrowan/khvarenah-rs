@@ -618,13 +618,17 @@ pub async fn probe_with_sni_strategy(
         SniStrategy::GenericCfFirst => {
             // Generic CF SNI first (bypasses `*.workers.dev` SNI blocking);
             // only if it wins zero do we fall back to the worker hostname.
-            let generic_results = probe_ports_sni(ip, generic_cf_sni, host, path, timeout_ms, ALT_PORTS).await;
-            let any_hit = generic_results.iter().any(|r| r.status == Some(101) && r.worker_bytes >= MIN_WORKER_BYTES);
+            let generic_results =
+                probe_ports_sni(ip, generic_cf_sni, host, path, timeout_ms, ALT_PORTS).await;
+            let any_hit = generic_results
+                .iter()
+                .any(|r| r.status == Some(101) && r.worker_bytes >= MIN_WORKER_BYTES);
             if any_hit {
                 return generic_results;
             }
             let mut combined = generic_results;
-            combined.extend(probe_ports_sni(ip, worker_sni, host, path, timeout_ms, ALT_PORTS).await);
+            combined
+                .extend(probe_ports_sni(ip, worker_sni, host, path, timeout_ms, ALT_PORTS).await);
             combined
         }
     }

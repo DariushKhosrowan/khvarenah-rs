@@ -159,13 +159,14 @@ pub fn update_strategy_after_cycle(
 
 /// Resolve the strategy this cycle should use from the persisted profile state.
 pub fn resolve_strategy(profile_id: &str) -> crate::health::SniStrategy {
-    let preferred = crate::store::profiles::preferred_phase2_strategy(profile_id)
-        .and_then(|s| match s.as_str() {
+    let preferred = crate::store::profiles::preferred_phase2_strategy(profile_id).and_then(|s| {
+        match s.as_str() {
             "WorkerOnly" => Some(crate::health::SniStrategy::WorkerOnly),
             "GenericCfFirst" => Some(crate::health::SniStrategy::GenericCfFirst),
             "WorkerThenGenericCf" => Some(crate::health::SniStrategy::WorkerThenGenericCf),
             _ => None,
-        });
+        }
+    });
     let streak = crate::store::profiles::strategy_zero_streak(profile_id);
     select_strategy(preferred, streak)
 }
@@ -308,7 +309,9 @@ async fn discover_native(
     // Local builder for one pipeline round (rebuildable per expansion round).
     // The phase-2 SNI strategy is resolved once per cycle (Copy) and captured
     // by value, so the boxed future does not borrow `params`.
-    let cycle_strategy = params.preferred_strategy.unwrap_or(crate::health::SniStrategy::WorkerOnly);
+    let cycle_strategy = params
+        .preferred_strategy
+        .unwrap_or(crate::health::SniStrategy::WorkerOnly);
     let run_round = |cands: Vec<String>| {
         let phase1: crate::slipscan::Phase1Fn = Box::new(move |ip: &str, fast_fail_ms: u64| {
             let ip = ip.to_string();
@@ -918,6 +921,9 @@ impl AutopilotEngine {
         &self,
         params: &DiscoveryParams,
     ) -> Result<(Vec<CleanEndpoint>, CycleSummary), CFError> {
+        // Self-heal the user-facing bundle against the ledger first (never
+        // fails the cycle: discovery is still the goal).
+        let _ = crate::cleanip::reconcile_bundle_if_drifted(&self.profile_id);
         // Self-learning phase-2 SNI strategy: resolve the persisted preference
         // (rotating on repeated zero-101 streaks) and pin it for this cycle so
         // the phase-2 probe is exclusive about which SNI it tries first.
@@ -1039,6 +1045,9 @@ impl AutopilotEngine {
     /// keeps the highest verified+alive endpoint as the active config.
     /// Returns a per-cycle summary.
     pub async fn monitor_cycle(&self) -> Result<CycleSummary, CFError> {
+        // Self-heal the user-facing bundle against the ledger before checking
+        // the network (never fails the cycle: discovery is still the goal).
+        let _ = crate::cleanip::reconcile_bundle_if_drifted(&self.profile_id);
         let vless = base_vless(&self.profile_id)?;
         let path = crate::health::derive_ws_target(&vless).path;
         let timeout_ms = (self.params.timeout_s as u64) * 1000;
@@ -2316,8 +2325,14 @@ mod tests {
     #[test]
     fn test_rotate_strategy_cycles_between_exclusive_variants() {
         use crate::health::SniStrategy;
-        assert_eq!(rotate_strategy(SniStrategy::WorkerOnly), SniStrategy::GenericCfFirst);
-        assert_eq!(rotate_strategy(SniStrategy::GenericCfFirst), SniStrategy::WorkerOnly);
+        assert_eq!(
+            rotate_strategy(SniStrategy::WorkerOnly),
+            SniStrategy::GenericCfFirst
+        );
+        assert_eq!(
+            rotate_strategy(SniStrategy::GenericCfFirst),
+            SniStrategy::WorkerOnly
+        );
     }
 
     #[test]

@@ -203,6 +203,19 @@ enum Command {
         #[arg(long)]
         tunnel_ip: String,
     },
+    /// Inspect / reconcile the user-facing bundle against the ledger.
+    Bundle {
+        #[command(subcommand)]
+        action: BundleAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum BundleAction {
+    /// Verify the bundle is in sync with the ledger's active endpoint.
+    Verify,
+    /// Reconcile a drifted bundle now (one-shot manual fix).
+    Reconcile,
 }
 
 #[derive(Subcommand)]
