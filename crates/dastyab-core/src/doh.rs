@@ -64,6 +64,7 @@ enum DohBackend {
     Real(reqwest::Client),
     /// Test: a scripted queue of responses (raw DNS wire bytes or errors) plus
     /// a counter of how many POSTs were served.
+    #[cfg_attr(not(test), allow(dead_code))]
     Mock {
         queue: Mutex<Vec<Result<Vec<u8>, CFError>>>,
         calls: std::sync::atomic::AtomicUsize,
@@ -282,6 +283,19 @@ impl DohResolver {
 pub fn is_hijacked_ip(ip: &Ipv4Addr) -> bool {
     let octets = ip.octets();
     octets[0] == 198 && (octets[1] & 0xFE) == 18
+}
+
+/// Cheap network-liveness probe: resolve `cloudflare-dns.com` over the DoH
+/// resolver (which filters hijacked 198.18.x.x answers). Returns true iff a
+/// non-hijacked A record came back. ~50ms. It never touches the CF worker or
+/// the tunnel, so it is safe to call before every daemon cycle — when it
+/// fails we skip the cycle entirely rather than burning rescue/scan budget on
+/// a genuinely-offline network.
+pub async fn probe_network_liveness(resolver: &DohResolver) -> bool {
+    match resolver.resolve("cloudflare-dns.com").await {
+        Ok(ips) => !ips.is_empty() && ips.iter().all(|ip| !is_hijacked_ip(ip)),
+        Err(_) => false,
+    }
 }
 
 /// Build a DNS query (header + QNAME + QTYPE=A + QCLASS=IN) in wire format.
@@ -566,5 +580,28 @@ mod tests {
         let _ = r.resolve("cached.example.com").await.unwrap();
         // After expiry the cache should have been refreshed: 2 POSTs served.
         assert_eq!(r.mock_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_probe_network_liveness_succeeds_on_mock_doh() {
+        let r = mock_resolver();
+        let real = build_dns_response_a(&[Ipv4Addr::new(8, 8, 8, 8)]);
+        set_scripted(&r, vec![Ok(real)]);
+        assert!(probe_network_liveness(&r).await);
+    }
+
+    #[tokio::test]
+    async fn test_probe_network_liveness_fails_on_all_endpoints_down() {
+        let r = mock_resolver();
+        set_scripted(&r, vec![Err(CFError::new("net", "endpoint down", ""))]);
+        assert!(!probe_network_liveness(&r).await);
+    }
+
+    #[tokio::test]
+    async fn test_probe_network_liveness_rejects_hijacked_answer() {
+        let r = mock_resolver();
+        let hijacked = build_dns_response_a(&[Ipv4Addr::new(198, 18, 0, 5)]);
+        set_scripted(&r, vec![Ok(hijacked)]);
+        assert!(!probe_network_liveness(&r).await);
     }
 }

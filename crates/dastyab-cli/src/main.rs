@@ -172,11 +172,16 @@ enum Command {
         action: AutopilotAction,
     },
     /// One-button Protection: persist the monitor flag, run a full discovery
-    /// cycle, export the user bundle, then (optionally) keep monitoring.
-    /// This is the "simple for a normal user" path.
+    /// cycle, export the user bundle, then optionally keep a monitor loop.
     Protection {
         #[command(subcommand)]
         action: ProtectionAction,
+    },
+    /// Persistent protection daemon (unattended monitor with network-liveness
+    /// probe, exponential backoff, and daemon.log).
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
     },
     /// End-to-end harness: verify token → deploy worker → discover clean IPs
     /// → write the user bundle, then print the manual verification block.
@@ -339,6 +344,26 @@ pub enum ProtectionAction {
         #[arg(long)]
         stdin: bool,
     },
+}
+
+/// Persistent daemon subcommands (unattended protection monitor).
+#[derive(Subcommand)]
+pub enum DaemonAction {
+    /// Start the daemon process (foreground or daemonized).
+    Start {
+        /// Run in the foreground (recommended under systemd).
+        #[arg(long)]
+        foreground: bool,
+        /// Initial cycle interval in seconds (default 300).
+        #[arg(long, default_value_t = 300)]
+        interval_s: u64,
+    },
+    /// Stop the daemon (writes the stop file; the loop exits on next tick).
+    Stop,
+    /// Show daemon status: PID, uptime, last cycle, streak, interval, network.
+    Status,
+    /// Write the systemd user unit and print the enable --now command.
+    InstallSystemd,
 }
 
 #[tokio::main]

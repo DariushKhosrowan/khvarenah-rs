@@ -14,7 +14,7 @@ use dastyab_core::worker::{
 };
 use dastyab_core::{CFError, BRAND, VERSION};
 
-use crate::{BackupAction, Command, DnsAction, ProtectionAction, RoutesAction};
+use crate::{BackupAction, Command, DaemonAction, DnsAction, ProtectionAction, RoutesAction};
 /// Run a command. `profile` is the active profile id.
 pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
     match cmd {
@@ -119,6 +119,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         } => cmd_discover(&profile, sample, workers, refresh).await,
         Command::Autopilot { action } => cmd_autopilot(&profile, action).await,
         Command::Protection { action } => cmd_protection(&profile, action).await,
+        Command::Daemon { action } => cmd_daemon(&profile, action).await,
         Command::E2e {
             skip_worker_deploy,
             worker,
@@ -934,6 +935,158 @@ async fn cmd_protection(profile: &str, action: ProtectionAction) -> Result<(), C
                 let (_, summary) = engine.run_cycle().await?;
                 println!("{}", summary.note);
             }
+            Ok(())
+        }
+    }
+}
+
+/// Run the daemon loop forever (or until the stop file appears).
+async fn daemon_loop(cfg: dastyab_core::daemon::DaemonConfig) -> Result<(), CFError> {
+    use dastyab_core::daemon::*;
+    use std::time::Duration;
+
+    let pid = std::process::id();
+    acquire_pid_file(&cfg.pid_file, pid)?;
+    daemon_log_append(
+        &cfg.log_path,
+        &log_line(
+            "INFO",
+            &format!(
+                "daemon start profile={} pid={pid} interval={}",
+                cfg.profile, cfg.initial_interval_secs
+            ),
+        ),
+    );
+
+    let mut state = load_daemon_state(&cfg.profile);
+    state.pid = pid;
+    state.started_at = dastyab_core::store::now_ts() as i64;
+    save_daemon_state(&cfg.profile, &state)?;
+
+    let probe = RealNetworkProbe(dastyab_core::doh::DohResolver::new());
+    let cycle = RealCycleRunner;
+    let mut interval = cfg.initial_interval_secs;
+
+    loop {
+        // Stop request?
+        if cfg.stop_file.exists() {
+            daemon_log_append(&cfg.log_path, &log_line("INFO", "daemon stop requested"));
+            cleanup_daemon(&cfg.pid_file, &cfg.stop_file);
+            return Ok(());
+        }
+
+        let sleep = daemon_tick(&cfg.profile, &mut state, &probe, &cycle, &mut |line| {
+            daemon_log_append(&cfg.log_path, line)
+        })
+        .await;
+        save_daemon_state(&cfg.profile, &state)?;
+        // Persist the current backoff interval into state.
+        if sleep != 0 && sleep != interval {
+            interval = sleep;
+        }
+        tokio::time::sleep(Duration::from_secs(sleep)).await;
+    }
+}
+
+/// CLI handler for the persistent daemon.
+async fn cmd_daemon(profile: &str, action: DaemonAction) -> Result<(), CFError> {
+    use dastyab_core::daemon::*;
+    match action {
+        DaemonAction::Start {
+            foreground,
+            interval_s,
+        } => {
+            let mut cfg = DaemonConfig::new(profile);
+            cfg.initial_interval_secs = interval_s.max(60);
+            cfg.foreground = foreground;
+            cfg.max_interval_secs = DEFAULT_MAX_INTERVAL_SECS;
+
+            if !foreground && is_daemon_running(&cfg.pid_file) {
+                return Err(CFError::new(
+                    "Daemon",
+                    "Already running.",
+                    "Use `daemon status` or `daemon stop` first.",
+                ));
+            }
+
+            if foreground {
+                // Run in the foreground (recommended under systemd).
+                return daemon_loop(cfg).await;
+            }
+
+            // Daemonize: re-exec ourselves in the background with --foreground
+            // and return immediately (the parent must not block on the
+            // long-running daemon). stdio is detached so the daemon survives
+            // the shell/terminal closing.
+            let exe = std::env::current_exe()
+                .map_err(|e| CFError::new("Daemon", e.to_string(), "Cannot locate the binary."))?;
+            std::process::Command::new(exe)
+                .arg("daemon")
+                .arg("start")
+                .arg("--profile")
+                .arg(profile)
+                .arg("--foreground")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| {
+                    CFError::new(
+                        "Daemon",
+                        e.to_string(),
+                        "Cannot spawn the background daemon.",
+                    )
+                })?;
+            // The child holds the pid file; once it has written "daemon start"
+            // to its own log it is live. Give it a moment to acquire the pid
+            // file so a tight `start && status` sequence sees it running.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(())
+        }
+        DaemonAction::Stop => {
+            let cfg = DaemonConfig::new(profile);
+            // Write stop file; the loop cleans up on next tick.
+            dastyab_core::store::write_json(&cfg.stop_file, &true)?;
+            println!("Stop requested. The daemon will exit on its next tick.");
+            Ok(())
+        }
+        DaemonAction::Status => {
+            let cfg = DaemonConfig::new(profile);
+            let state = load_daemon_state(profile);
+            let running = is_daemon_running(&cfg.pid_file);
+            println!("Daemon (profile '{profile}'):");
+            println!("  running: {}", if running { "yes" } else { "no" });
+            println!("  pid: {}", state.pid);
+            if state.started_at > 0 {
+                let up = (dastyab_core::store::now_ts() as i64) - state.started_at;
+                println!("  uptime: {up}s");
+            }
+            println!("  last cycle ts: {}", state.last_cycle_ts);
+            println!("  last success ts: {}", state.last_success_ts);
+            println!("  failure streak: {}", state.failure_streak);
+            println!("  current interval: {}s", state.current_interval_secs);
+            println!("  network was down: {}", state.network_was_down);
+            Ok(())
+        }
+        DaemonAction::InstallSystemd => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
+            let unit_dir = std::path::PathBuf::from(&home).join(".config/systemd/user");
+            std::fs::create_dir_all(&unit_dir).map_err(|e| {
+                CFError::new(
+                    "Daemon",
+                    e.to_string(),
+                    "Cannot create ~/.config/systemd/user.",
+                )
+            })?;
+            let unit = unit_dir.join("dastyab-daemon.service");
+            let bin = std::env::current_exe()
+                .map_err(|e| CFError::new("Daemon", e.to_string(), "Cannot locate the binary."))?;
+            let contents = dastyab_core::daemon::systemd_unit(&bin, profile);
+            std::fs::write(&unit, contents).map_err(|e| {
+                CFError::new("Daemon", e.to_string(), "Cannot write the systemd unit.")
+            })?;
+            println!("Wrote {}.", unit.display());
+            println!("Enable with: systemctl --user enable --now dastyab-daemon.service");
             Ok(())
         }
     }
