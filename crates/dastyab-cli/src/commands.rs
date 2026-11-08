@@ -1244,6 +1244,10 @@ async fn daemon_loop(cfg: dastyab_core::daemon::DaemonConfig) -> Result<(), CFEr
     let probe = RealNetworkProbe(dastyab_core::doh::DohResolver::new());
     let cycle = RealCycleRunner;
     let mut interval = cfg.initial_interval_secs;
+    // The profile the daemon is currently driving. Cross-worker failover may
+    // rotate the ACTIVE profile (store marker) when the rescue chain gives up;
+    // we must follow it so the daemon actually switches to the backup worker.
+    let mut active_profile: String = cfg.profile.clone();
 
     loop {
         // Stop request?
@@ -1253,11 +1257,35 @@ async fn daemon_loop(cfg: dastyab_core::daemon::DaemonConfig) -> Result<(), CFEr
             return Ok(());
         }
 
-        let sleep = daemon_tick(&cfg.profile, &mut state, &probe, &cycle, &mut |line| {
+        // Cross-worker failover: follow the active profile marker. When the
+        // store's active profile changes (e.g. rescue rotated to a backup
+        // worker), adopt it — but only if it is a real, known profile.
+        let store_active = dastyab_core::store::profiles::get_active_profile();
+        if store_active != active_profile {
+            let known = dastyab_core::store::profiles::list_profiles()
+                .iter()
+                .any(|m| m.id == store_active);
+            if known {
+                daemon_log_append(
+                    &cfg.log_path,
+                    &log_line(
+                        "INFO",
+                        &format!("failover: switching profile {} -> {}", active_profile, store_active),
+                    ),
+                );
+                active_profile = store_active.clone();
+                state = load_daemon_state(&active_profile);
+                state.pid = pid;
+                state.started_at = dastyab_core::store::now_ts() as i64;
+                interval = cfg.initial_interval_secs;
+            }
+        }
+
+        let sleep = daemon_tick(&active_profile, &mut state, &probe, &cycle, &mut |line| {
             daemon_log_append(&cfg.log_path, line)
         })
         .await;
-        save_daemon_state(&cfg.profile, &state)?;
+        save_daemon_state(&active_profile, &state)?;
         // Persist the current backoff interval into state.
         if sleep != 0 && sleep != interval {
             interval = sleep;

@@ -1820,6 +1820,48 @@ pub fn should_rescue(failure: &WorkerHealth) -> bool {
     )
 }
 
+/// Whether the daemon should fail over to a different profile's worker.
+///
+/// Failover is the LAST resort after the rescue chain has given up on the
+/// current profile's worker. We only fail over when (a) the worker is genuinely
+/// unrecoverable (`should_rescue` true) AND (b) the rescue chain already ran
+/// and gave up — otherwise we would bounce profiles over a transient blip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailoverDecision {
+    /// Keep the current profile; no failover needed.
+    Stay,
+    /// Fail over to a specific profile id.
+    FailoverTo(String),
+    /// No other eligible profile exists (all failed or only one profile).
+    NoAlternative,
+}
+
+pub fn should_failover(failure: &WorkerHealth, rescue_gave_up: bool) -> bool {
+    should_rescue(failure) && rescue_gave_up
+}
+
+/// Decide the failover target given the current profile and the rescue outcome.
+/// Pure and fully unit-testable — no I/O.
+pub fn decide_failover(
+    current_profile: &str,
+    failure: &WorkerHealth,
+    rescue_gave_up: bool,
+    other_profiles: &[String],
+) -> FailoverDecision {
+    if !should_failover(failure, rescue_gave_up) {
+        return FailoverDecision::Stay;
+    }
+    let eligible: Vec<&str> = other_profiles
+        .iter()
+        .map(String::as_str)
+        .filter(|id| *id != current_profile)
+        .collect();
+    match eligible.first() {
+        Some(target) => FailoverDecision::FailoverTo((*target).to_string()),
+        None => FailoverDecision::NoAlternative,
+    }
+}
+
 /// Plan the ordered rescue actions for a given profile state. Pure and fully
 /// unit-testable. Order is strict: fallback pool → ledger reseed → manual seeds
 /// → redeploy worker. Each step is only included if its precondition is met
@@ -2199,7 +2241,10 @@ pub async fn rescue_from_failure(
         crate::store::profiles::save_rescue_meta(profile_id, now, now, Some("gave_up".into()))?;
     }
 
-    // Step 5 — GiveUp.
+    // Step 5 — GiveUp. The current profile's worker is unrecoverable: every
+    // rescue step is exhausted. Mark this profile failed and fail over to a
+    // different profile whose worker may still be alive (cross-worker
+    // failover). If no alternative exists, we stay and surface the diagnosis.
     chain.gave_up = true;
     chain.attempts.push(RescueAttempt {
         action: RescueAction::GiveUp,
@@ -2208,6 +2253,35 @@ pub async fn rescue_from_failure(
             reason: "all rescue steps exhausted".into(),
         },
     });
+    let _ = crate::store::profiles::mark_profile_failed(
+        profile_id,
+        "worker unrecoverable: all rescue steps exhausted",
+    );
+    let next = crate::store::profiles::select_next_profile(profile_id);
+    if let Some(target) = next {
+        match crate::store::profiles::rotate_active_profile(&target) {
+            Ok(prev) => {
+                chain.attempts.push(RescueAttempt {
+                    action: RescueAction::GiveUp,
+                    attempted_at: now,
+                    outcome: RescueOutcome::Skipped {
+                        reason: format!(
+                            "failed over to profile {target} (previous active: {prev})"
+                        ),
+                    },
+                });
+            }
+            Err(e) => {
+                chain.attempts.push(RescueAttempt {
+                    action: RescueAction::GiveUp,
+                    attempted_at: now,
+                    outcome: RescueOutcome::Failed {
+                        reason: format!("failover to {target} failed: {}", e.brief()),
+                    },
+                });
+            }
+        }
+    }
     crate::store::profiles::save_rescue_meta(
         profile_id,
         now,
@@ -2514,6 +2588,58 @@ mod tests {
         // Manual seeds still attempted when ledger empty.
         let plan = plan_rescue(true, true, false, true);
         assert_eq!(plan, vec![RescueAction::ReseedFromManualSeeds]);
+    }
+
+    #[test]
+    fn test_should_failover_false_when_worker_alive() {
+        // An alive worker never triggers failover, even if rescue "gave up"
+        // (which it wouldn't — alive workers don't enter rescue).
+        assert!(!should_failover(&WorkerHealth::Alive, true));
+        assert!(should_failover(&WorkerHealth::NotFound, true));
+        assert!(should_failover(&WorkerHealth::Suspended { code: 9109 }, true));
+        assert!(should_failover(&WorkerHealth::Unreachable, true));
+        // Rescue must have actually given up — never fail over pre-rescue.
+        assert!(!should_failover(&WorkerHealth::NotFound, false));
+    }
+
+    #[test]
+    fn test_should_failover_when_worker_dead_and_rescue_failed() {
+        // The canonical case: worker dead + rescue exhausted → failover fires.
+        assert!(should_failover(&WorkerHealth::NotFound, true));
+        assert!(should_failover(&WorkerHealth::Unreachable, true));
+        assert!(should_failover(&WorkerHealth::Suspended { code: 9109 }, true));
+        // Alive worker never fails over.
+        assert!(!should_failover(&WorkerHealth::Alive, true));
+    }
+
+    #[test]
+    fn test_decide_failover_picks_eligible_profile() {
+        let decision = decide_failover(
+            "a",
+            &WorkerHealth::NotFound,
+            true,
+            &["a".to_string(), "b".to_string()],
+        );
+        assert_eq!(decision, FailoverDecision::FailoverTo("b".to_string()));
+        // Current profile is filtered out.
+        let decision = decide_failover(
+            "a",
+            &WorkerHealth::NotFound,
+            true,
+            &["a".to_string()],
+        );
+        assert_eq!(decision, FailoverDecision::NoAlternative);
+    }
+
+    #[test]
+    fn test_decide_failover_stays_when_not_giveup() {
+        let decision = decide_failover(
+            "a",
+            &WorkerHealth::NotFound,
+            false, // rescue did NOT give up
+            &["b".to_string()],
+        );
+        assert_eq!(decision, FailoverDecision::Stay);
     }
 
     #[test]
