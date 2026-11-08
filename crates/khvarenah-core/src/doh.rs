@@ -20,7 +20,7 @@
 use crate::error::CFError;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// A DoH endpoint. `host` is the SNI/Host we present; `ip` is the literal
@@ -34,11 +34,26 @@ pub struct DohEndpoint {
 /// Default endpoints. Cloudflare first (fastest), then direct 1.1.1.1,
 /// then Google. All are well-known literal IPs.
 pub const DEFAULT_ENDPOINTS: &[DohEndpoint] = &[
-    DohEndpoint { host: "cloudflare-dns.com", ip: Ipv4Addr::new(104, 16, 132, 229) },
-    DohEndpoint { host: "cloudflare-dns.com", ip: Ipv4Addr::new(104, 16, 133, 229) },
-    DohEndpoint { host: "1.1.1.1", ip: Ipv4Addr::new(1, 1, 1, 1) },
-    DohEndpoint { host: "dns.google", ip: Ipv4Addr::new(8, 8, 8, 8) },
-    DohEndpoint { host: "dns.google", ip: Ipv4Addr::new(8, 8, 4, 4) },
+    DohEndpoint {
+        host: "cloudflare-dns.com",
+        ip: Ipv4Addr::new(104, 16, 132, 229),
+    },
+    DohEndpoint {
+        host: "cloudflare-dns.com",
+        ip: Ipv4Addr::new(104, 16, 133, 229),
+    },
+    DohEndpoint {
+        host: "1.1.1.1",
+        ip: Ipv4Addr::new(1, 1, 1, 1),
+    },
+    DohEndpoint {
+        host: "dns.google",
+        ip: Ipv4Addr::new(8, 8, 8, 8),
+    },
+    DohEndpoint {
+        host: "dns.google",
+        ip: Ipv4Addr::new(8, 8, 4, 4),
+    },
 ];
 
 /// The HTTP backend. `Real` is the production reqwest client (with `.resolve()`
@@ -73,12 +88,20 @@ fn build_real_client(endpoints: &[DohEndpoint]) -> Result<reqwest::Client, CFErr
         })
 }
 
-/// Minimal DNS-over-HTTPS resolver with an in-memory TTL cache.
+/// Consecutive failures on one endpoint before it is temporarily blacklisted.
+pub const ENDPOINT_BLACKLIST_THRESHOLD: u32 = 3;
+/// Number of successful resolutions needed to clear a blacklist.
+pub const ENDPOINT_BLACKLIST_RESET: u32 = 1;
+
+/// Minimal DNS-over-HTTPS resolver with an in-memory TTL cache and per-endpoint
+/// blacklisting (a poisoned or flaky endpoint is retried less often).
 pub struct DohResolver {
     endpoints: Vec<DohEndpoint>,
     backend: DohBackend,
     cache: Mutex<HashMap<String, (Vec<Ipv4Addr>, Instant)>>,
     ttl: Duration,
+    /// Consecutive failures per endpoint index.
+    endpoint_fails: Mutex<Vec<u32>>,
 }
 
 impl Default for DohResolver {
@@ -91,13 +114,14 @@ impl DohResolver {
     /// Build a resolver with the default endpoints and the real reqwest
     /// transport (endpoint hostnames pinned to literal IPs).
     pub fn new() -> Self {
-        let client = build_real_client(DEFAULT_ENDPOINTS)
-            .expect("default DoH client build should succeed");
+        let client =
+            build_real_client(DEFAULT_ENDPOINTS).expect("default DoH client build should succeed");
         Self {
             endpoints: DEFAULT_ENDPOINTS.to_vec(),
             backend: DohBackend::Real(client),
             cache: Mutex::new(HashMap::new()),
             ttl: Duration::from_secs(300),
+            endpoint_fails: Mutex::new(vec![0; DEFAULT_ENDPOINTS.len()]),
         }
     }
 
@@ -112,6 +136,7 @@ impl DohResolver {
             },
             cache: Mutex::new(HashMap::new()),
             ttl: Duration::from_secs(300),
+            endpoint_fails: Mutex::new(vec![0; DEFAULT_ENDPOINTS.len()]),
         }
     }
 
@@ -132,7 +157,10 @@ impl DohResolver {
 
     /// Seed the cache with a known answer (used by tests).
     pub fn seed_cache(&self, host: String, ips: Vec<Ipv4Addr>) {
-        self.cache.lock().unwrap().insert(host, (ips, Instant::now()));
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(host, (ips, Instant::now()));
     }
 
     async fn post(&self, url: &str, query: &[u8]) -> Result<Vec<u8>, CFError> {
@@ -159,9 +187,10 @@ impl DohResolver {
                         "Try again or use another endpoint.",
                     ));
                 }
-                let bytes = resp.bytes().await.map_err(|e| {
-                    CFError::new("DoH read", format!("{e}"), "Retry.")
-                })?;
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| CFError::new("DoH read", format!("{e}"), "Retry."))?;
                 Ok(bytes.to_vec())
             }
             DohBackend::Mock { queue, calls } => {
@@ -190,11 +219,17 @@ impl DohResolver {
         let query = build_dns_query_a(&host, rand::random::<u16>());
 
         let mut last_err = None;
-        for endpoint in &self.endpoints {
+        for (i, endpoint) in self.endpoints.iter().enumerate() {
+            // Skip temporarily-blacklisted endpoints (too many recent failures).
+            if self.endpoint_fails.lock().unwrap()[i] >= ENDPOINT_BLACKLIST_THRESHOLD {
+                continue;
+            }
+
             let url = format!("https://{}/dns-query", endpoint.host);
             let bytes = match self.post(&url, &query).await {
                 Ok(b) => b,
                 Err(e) => {
+                    self.endpoint_fails.lock().unwrap()[i] += 1;
                     last_err = Some(e);
                     continue;
                 }
@@ -203,6 +238,7 @@ impl DohResolver {
             let parsed = match parse_dns_response_a(&bytes) {
                 Ok(ips) => ips,
                 Err(e) => {
+                    self.endpoint_fails.lock().unwrap()[i] += 1;
                     last_err = Some(e);
                     continue;
                 }
@@ -210,11 +246,20 @@ impl DohResolver {
 
             // Filter hijack signature. If a valid answer came back but all
             // addresses are 198.18.x.x, treat the resolution as hijacked.
-            let real: Vec<Ipv4Addr> = parsed.into_iter().filter(|ip| !is_hijacked_ip(ip)).collect();
+            let real: Vec<Ipv4Addr> = parsed
+                .into_iter()
+                .filter(|ip| !is_hijacked_ip(ip))
+                .collect();
             if !real.is_empty() {
-                self.cache.lock().unwrap().insert(host.clone(), (real.clone(), Instant::now()));
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .insert(host.clone(), (real.clone(), Instant::now()));
+                // Reset this endpoint's failure count on success.
+                self.endpoint_fails.lock().unwrap()[i] = 0;
                 return Ok(real);
             }
+            self.endpoint_fails.lock().unwrap()[i] += 1;
             last_err = Some(CFError::new(
                 "DNS hijacked",
                 format!("DoH response for {host} contained only 198.18.x.x addresses."),
@@ -223,7 +268,11 @@ impl DohResolver {
         }
 
         Err(last_err.unwrap_or_else(|| {
-            CFError::new("DoH resolution failed", format!("No endpoint could resolve {host}."), "Check connectivity.")
+            CFError::new(
+                "DoH resolution failed",
+                format!("No endpoint could resolve {host}."),
+                "Check connectivity.",
+            )
         }))
     }
 }
@@ -271,7 +320,11 @@ fn skip_name(bytes: &[u8], mut pos: usize) -> Result<usize, CFError> {
     let mut start = pos;
     loop {
         if pos >= bytes.len() {
-            return Err(CFError::new("DoH parse", "Name ran past end of message.", ""));
+            return Err(CFError::new(
+                "DoH parse",
+                "Name ran past end of message.",
+                "",
+            ));
         }
         let len = bytes[pos];
         if len & 0xC0 == 0xC0 {
@@ -405,10 +458,7 @@ mod tests {
 
     #[test]
     fn test_parse_dns_response_a_extracts_multiple() {
-        let r = build_dns_response_a(&[
-            Ipv4Addr::new(1, 2, 3, 4),
-            Ipv4Addr::new(198, 18, 0, 5),
-        ]);
+        let r = build_dns_response_a(&[Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(198, 18, 0, 5)]);
         let ips = parse_dns_response_a(&r).unwrap();
         assert_eq!(ips.len(), 2);
         assert_eq!(ips[0], Ipv4Addr::new(1, 2, 3, 4));
@@ -450,9 +500,15 @@ mod tests {
         let client = build_real_client(DEFAULT_ENDPOINTS).expect("client should build");
         // If the client built successfully with resolve() pins for all endpoints,
         // the bootstrap pitfall is resolved.
-        assert!(client.get("https://cloudflare-dns.com/dns-query").build().is_ok());
+        assert!(client
+            .get("https://cloudflare-dns.com/dns-query")
+            .build()
+            .is_ok());
         for ep in DEFAULT_ENDPOINTS {
-            assert!(!is_hijacked_ip(&ep.ip), "endpoints themselves must not be hijacked");
+            assert!(
+                !is_hijacked_ip(&ep.ip),
+                "endpoints themselves must not be hijacked"
+            );
         }
     }
 
@@ -480,7 +536,10 @@ mod tests {
     async fn test_doh_resolve_falls_back_to_second_endpoint() {
         let r = mock_resolver();
         let real = build_dns_response_a(&[Ipv4Addr::new(1, 1, 1, 1)]);
-        set_scripted(&r, vec![Err(CFError::new("net", "first down", "")), Ok(real)]);
+        set_scripted(
+            &r,
+            vec![Err(CFError::new("net", "first down", "")), Ok(real)],
+        );
         let ips = r.resolve("worker.example.com").await.unwrap();
         assert_eq!(ips, vec![Ipv4Addr::new(1, 1, 1, 1)]);
     }
