@@ -731,43 +731,89 @@ impl AutopilotEngine {
         }
     }
 
-    /// The monitor loop: re-validate active endpoints, chase better clean IPs
-    /// on a cadence, and always keep the *highest-score alive* endpoint as the
-    /// active config. Swap in fresh clean IPs when the current one dies.
+    /// The monitor loop (DeepSeek two-tier plan). Tier 1 is a cheap **light**
+    /// check: the real-client WS-gate on every ledger endpoint. Two
+    /// consecutive light-failures of the active endpoint *escalate* to Tier 2,
+    /// a **deep** full discovery + E2E pass (also run on a 15-min schedule).
+    /// A deep-check failure is what actually triggers a swap. Best-score-wins
+    /// keeps the highest verified+alive endpoint as the active config.
     /// Returns a per-cycle summary.
     pub async fn monitor_cycle(&self) -> Result<CycleSummary, CFError> {
         let vless = base_vless(&self.profile_id)?;
-        let mut ledger = read_ledger(&self.profile_id);
-        let mut alive = 0;
-        let mut replaced = 0;
-
-        let timeout_ms = (self.params.timeout_s as u64) * 1000;
         let path = crate::health::derive_ws_target(&vless).path;
+        let timeout_ms = (self.params.timeout_s as u64) * 1000;
 
-        // Re-validate every ledger endpoint's liveness.
+        let mut ledger = read_ledger(&self.profile_id);
+        let mut state = crate::store::profiles::protection_state(&self.profile_id);
+        let now = store::now_ts() as i64;
+        let deep_interval: i64 = 900; // deep E2E check every 15 min
+
+        // ── Tier 1: LIGHT check (WS-gate across alt ports) ──
+        let mut alive = 0usize;
         for ep in ledger.iter_mut() {
             let ok = endpoint_live(&ep.ip, &ep.sni, &path, timeout_ms).await;
+            ep.alive = ok;
             if ok {
-                ep.alive = true;
                 ep.last_checked = Some(store::now_iso());
                 alive += 1;
-            } else {
-                ep.alive = false;
             }
         }
 
-        // Re-discover when (a) something died, or (b) we have fewer than
-        // the target number of alive endpoints — we *chase* better clean IPs
-        // aggressively so the active config always has the freshest, fastest
-        // front.
-        let alive_count = ledger.iter().filter(|e| e.alive).count();
-        let want = self.params.top_n.max(1);
-        let need_more = alive_count < want;
-        if need_more {
+        // The active endpoint is the best verified one (highest score).
+        ledger.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let active_alive = ledger
+            .iter()
+            .find(|e| e.verified)
+            .map(|e| e.alive)
+            .unwrap_or(false);
+
+        // Streak: 2 consecutive light failures of the active escalate to deep.
+        if active_alive {
+            state.failure_streak = 0;
+        } else {
+            state.failure_streak = state.failure_streak.saturating_add(1);
+        }
+        let deep_due = (now - state.last_deep_check) >= deep_interval;
+        let escalated = state.failure_streak >= 2 && !active_alive;
+        let do_deep = deep_due || escalated;
+
+        let mut replaced = 0;
+        let mut did_rediscover = false;
+
+        if do_deep {
+            // ── Tier 2: DEEP check — full discovery through the pipeline ──
+            state.last_deep_check = now;
+            let params = self.params_with_seeds();
+            match self.provider.discover(&vless, &params).await {
+                Ok(fresh) => {
+                    for ep in fresh {
+                        if let Some(slot) = ledger.iter_mut().find(|l| l.ip == ep.ip) {
+                            *slot = ep.clone();
+                        } else {
+                            ledger.push(ep.clone());
+                            replaced += 1;
+                        }
+                    }
+                    did_rediscover = true;
+                    // A successful deep pass resets the streak.
+                    if ledger.iter().any(|e| e.alive) {
+                        state.failure_streak = 0;
+                    }
+                }
+                Err(_) => {
+                    // Deep check failed; keep the streak so escalation retries.
+                }
+            }
+        } else if alive == 0 {
+            // Nothing alive but no escalation due yet — still chase fresh ones
+            // so a dead ledger doesn't sit empty.
             let params = self.params_with_seeds();
             if let Ok(fresh) = self.provider.discover(&vless, &params).await {
                 for ep in fresh {
-                    // Record new IPs and update scores of known IPs.
                     if let Some(slot) = ledger.iter_mut().find(|l| l.ip == ep.ip) {
                         *slot = ep.clone();
                     } else {
@@ -775,11 +821,16 @@ impl AutopilotEngine {
                         replaced += 1;
                     }
                 }
+                did_rediscover = true;
             }
         }
 
-        // Best-score wins: pick the highest-score *alive* endpoint as active.
-        ledger.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // Best-score wins: pick the highest verified+alive endpoint as active.
+        ledger.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let best_ip = ledger
             .iter()
             .find(|e| e.verified && e.alive)
@@ -789,9 +840,10 @@ impl AutopilotEngine {
             write_active_configs(&self.profile_id, &vless, best_ep)?;
         }
 
-        // Trim ledger, persist, refresh the user bundle.
+        // Trim ledger, persist state, refresh the user bundle.
         ledger.truncate(64);
         write_ledger(&self.profile_id, &ledger)?;
+        crate::store::profiles::save_protection_state(&self.profile_id, &state)?;
 
         let live: Vec<CleanEndpoint> = ledger
             .iter()
@@ -805,9 +857,10 @@ impl AutopilotEngine {
             alive: live.len(),
             replaced,
             note: format!(
-                "monitor: {alive} alive · {} clean · best {}",
+                "monitor: {alive} alive · {} clean · best {} · deep={did_rediscover} streak={}",
                 live.len(),
-                best_ip.as_deref().unwrap_or("-")
+                best_ip.as_deref().unwrap_or("-"),
+                state.failure_streak
             ),
         })
     }
