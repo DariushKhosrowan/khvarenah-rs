@@ -699,9 +699,22 @@ async fn cmd_discover(profile: &str, sample: u32, workers: u32, refresh: bool) -
         );
     }
     println!("{}", summary.note);
-    let dir = khvarenah_core::autopilot::active_configs_dir(profile);
-    println!("Active configs written to {}", dir.display());
+    // Surface the user-facing bundle (QR + one-line active config).
+    if let Ok(bundle) = khvarenah_core::cleanip::write_user_bundle(profile, &base_vless_for(profile), &found) {
+        println!();
+        println!("✓ Protection active. Config: {}", bundle.dir.display());
+        println!("  → active.png   (scan with your phone)");
+        println!("  → active.vless (paste into your desktop client)");
+        println!("  → 3 fallbacks saved in fallbacks.txt");
+        if let Some(best) = found.first() {
+            println!("  Best endpoint: {}:{} ({:.0}ms)", best.ip, best.port, best.tcp_ms);
+        }
+    }
     Ok(())
+}
+
+fn base_vless_for(profile: &str) -> khvarenah_core::VlessProfile {
+    khvarenah_core::autopilot::base_vless(profile).unwrap_or_default()
 }
 
 async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<(), CFError> {
