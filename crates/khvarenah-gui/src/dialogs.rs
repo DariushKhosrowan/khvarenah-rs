@@ -31,6 +31,12 @@ pub enum Dialog {
         draft_b: String,
         mask_b: bool,
     },
+    /// A multi-line text area (e.g. pasting known-good IPs, one per line).
+    TextArea {
+        title: String,
+        placeholder: String,
+        draft: String,
+    },
 }
 
 /// The outcome of a dialog after one frame of rendering.
@@ -60,6 +66,7 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog) -> DialogResult {
         Dialog::Confirm { title, body, .. } => (title.clone(), body.clone()),
         Dialog::Text { title, .. } => (title.clone(), String::new()),
         Dialog::Two { title, .. } => (title.clone(), String::new()),
+        Dialog::TextArea { title, .. } => (title.clone(), String::new()),
     };
 
     let mut result = DialogResult::Open;
@@ -139,6 +146,25 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog) -> DialogResult {
                     }
                 });
             }
+            Dialog::TextArea { placeholder, draft, .. } => {
+                ui.add(
+                    egui::TextEdit::multiline(draft)
+                        .hint_text(placeholder.as_str())
+                        .desired_rows(8)
+                        .desired_width(360.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Import").clicked() {
+                        let value = draft.clone();
+                        result = DialogResult::Submit(DialogPayload::Text(value));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            }
         }
     });
 
@@ -181,5 +207,15 @@ pub fn prompt_two(
         draft_a: String::new(),
         draft_b: String::new(),
         mask_b,
+    }
+}
+
+/// A convenience constructor for a multi-line text-area prompt (e.g. pasting
+/// known-good IPs, one per line).
+pub fn prompt_text_area(title: impl Into<String>, placeholder: impl Into<String>) -> Dialog {
+    Dialog::TextArea {
+        title: title.into(),
+        placeholder: placeholder.into(),
+        draft: String::new(),
     }
 }

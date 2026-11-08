@@ -214,6 +214,15 @@ async fn discover_native(
     // Diagnostics are persisted so a zero result can be explained in plain
     // language. E2E only runs when we can reach a direct-IP echo service;
     // otherwise the pipeline degrades to the WS-gate alone.
+    // NOTE (honest disclosure): the direct-IP source (api.ipify.org) sits
+    // *outside* the worker's egress path, so a user who is already tunneled
+    // through their own worker will see "tunnel IP ≈ direct IP" and the E2E
+    // gate will (correctly for that state) reject candidates as IpUnchanged.
+    // That is a false negative specific to already-connected users, not a
+    // broken worker. Multi-source direct-IP lookup is future work; for now the
+    // recommendation when Protection is active is to trust the WS-gate result
+    // and only treat persistent E2E failures as worker problems after stopping
+    // Protection.
     let vless_link = vless.share_link();
     let direct_ip = crate::e2e::fetch_direct_ip(params.timeout_s.clamp(3, 20) as u64)
         .await
@@ -448,10 +457,21 @@ impl AutopilotEngine {
     /// scanner (feature #2), so it doesn't start from zero each cycle.
     fn params_with_seeds(&self) -> DiscoveryParams {
         let mut p = self.params.clone();
-        p.seed_ips = crate::cf::ips::load_seed_endpoints(&self.profile_id, 6)
+        // Auto-pilot ledger's last-known-good endpoints first.
+        let mut seeds: Vec<String> = crate::cf::ips::load_seed_endpoints(&self.profile_id, 6)
             .iter()
             .filter_map(|s| s.split(':').next().map(|ip| ip.to_string()))
             .collect();
+        // Then the user's manually imported "known-good IPs" — these are the
+        // highest-value seeds (NetworkBlocked fast path). Bare IPs only.
+        for s in crate::cf::ips::load_manual_seeds(&self.profile_id) {
+            if let Some(ip) = s.split(':').next() {
+                if !seeds.iter().any(|e| e == ip) {
+                    seeds.push(ip.to_string());
+                }
+            }
+        }
+        p.seed_ips = seeds;
         p
     }
 

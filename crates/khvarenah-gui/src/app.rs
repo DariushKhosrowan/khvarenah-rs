@@ -111,6 +111,7 @@ pub enum PendingDialogAction {
     RenameProfile(String),
     DeleteProfile(String),
     AddToken,
+    ImportSeeds,
 }
 
 impl KhvarenahApp {
@@ -421,6 +422,21 @@ impl KhvarenahApp {
                                     self.state.reload_pending = true;
                                     self.note =
                                         format!("Token '{label}' added to profile.");
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::ImportSeeds) => {
+                        if let DialogPayload::Text(raw) = payload {
+                            match khvarenah_core::cf::ips::import_manual_seeds(
+                                &self.profile_id,
+                                &raw,
+                            ) {
+                                Ok(n) => {
+                                    self.note = format!(
+                                        "Imported {n} known-good IP(s) — next scan will use them as seeds."
+                                    );
                                 }
                                 Err(e) => self.note = e.brief(),
                             }
@@ -853,6 +869,15 @@ impl KhvarenahApp {
                         ));
                     }
                 }
+            }
+            // Import known-good IPs (the NetworkBlocked fast path).
+            ui.add_space(8.0);
+            if ui.button("📥 Import known-good IPs").clicked() {
+                self.pending_action = Some(PendingDialogAction::ImportSeeds);
+                self.dialog = Some(dialogs::prompt_text_area(
+                    "Import known-good IPs",
+                    "One IP per line — e.g.\n104.16.1.1\n104.16.2.1:2053  # fast",
+                ));
             }
         }
     }

@@ -805,6 +805,20 @@ async fn cmd_protection(profile: &str, action: ProtectionAction) -> Result<(), C
             }
             Ok(())
         }
+        ProtectionAction::SeedsImport { raw, stdin } => {
+            let input = if stdin {
+                use std::io::Read;
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s)
+                    .map_err(|e| CFError::new("Seeds", format!("stdin read: {e}"), ""))?;
+                s
+            } else {
+                raw.clone().unwrap_or_default()
+            };
+            let n = khvarenah_core::cf::ips::import_manual_seeds(profile, &input)?;
+            println!("Imported {n} known-good IP(s). Next scan will use them as seeds.");
+            Ok(())
+        }
         ProtectionAction::Off => {
             khvarenah_core::store::profiles::set_protection(profile, false)?;
             println!("Protection OFF (monitor will not auto-resume).");

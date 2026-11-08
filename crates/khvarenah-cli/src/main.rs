@@ -318,6 +318,16 @@ pub enum ProtectionAction {
     /// Show whether protection is enabled + the latest explanation of a zero
     /// result (if any).
     Status,
+    /// Import "known-good IPs" (one per line, `ip` or `ip:port`, `#` comments
+    /// allowed) so the next scan seeds from them — the NetworkBlocked fast path.
+    SeedsImport {
+        /// Raw text/IPs to import (argument or stdin).
+        #[arg()]
+        raw: Option<String>,
+        /// Read from stdin instead of the argument.
+        #[arg(long)]
+        stdin: bool,
+    },
 }
 
 #[tokio::main]
