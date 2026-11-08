@@ -41,6 +41,7 @@ pub mod blackout;
 pub mod cf;
 pub mod cleanip;
 pub mod connectivity;
+pub mod cycle_guard;
 pub mod daemon;
 pub mod diagnose;
 pub mod diagnostics;

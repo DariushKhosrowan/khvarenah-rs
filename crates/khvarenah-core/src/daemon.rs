@@ -228,7 +228,7 @@ pub fn log_line(tag: &str, body: &str) -> String {
 /// `profile` is the profile the daemon should manage.
 pub fn systemd_unit(binary: &Path, profile: &str) -> String {
     format!(
-        "[Unit]\nDescription=Khvarenah protection daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={} daemon start --profile {} --foreground\nRestart=on-failure\nRestartSec=30\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Khvarenah protection daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={} daemon start --profile {} --foreground\nRestart=always\nRestartSec=30\nRuntimeMaxSec=1800\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=default.target\n",
         binary.display(),
         profile
     )
@@ -274,7 +274,12 @@ impl CycleRunner for RealCycleRunner {
                 params,
                 std::time::Duration::from_secs(DEFAULT_INITIAL_INTERVAL_SECS),
             );
-            engine.monitor_cycle().await.map(|_| ())
+            engine
+                .monitor_cycle_guarded(std::time::Duration::from_secs(
+                    crate::cycle_guard::MONITOR_TIMEOUT_SECS,
+                ))
+                .await
+                .map(|_| ())
         })
     }
 }
@@ -455,7 +460,8 @@ mod tests {
         assert!(unit.contains(
             "ExecStart=/home/me/.local/bin/khvarenah daemon start --profile default --foreground"
         ));
-        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("Restart=always"));
+        assert!(unit.contains("RuntimeMaxSec=1800"));
         assert!(unit.contains("RestartSec=30"));
         assert!(unit.contains("WantedBy=default.target"));
         // Must NOT auto-run systemctl (privilege escalation is user's call).

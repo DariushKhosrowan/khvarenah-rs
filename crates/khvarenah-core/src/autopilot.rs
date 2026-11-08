@@ -336,6 +336,7 @@ pub fn compose_beacon(
     b.last_rescue_ts = (cfg.last_rescue_attempt_ts > 0).then_some(cfg.last_rescue_attempt_ts);
 
     b.last_error = last_error;
+    b.last_stage = crate::cycle_guard::last_stage(profile_id).map(|s| format!("{s:?}"));
     b
 }
 
@@ -1106,6 +1107,9 @@ impl AutopilotEngine {
             last_error,
         );
         let _ = crate::health_beacon::write_beacon(&self.profile_id, &beacon);
+        if result.is_ok() {
+            let _ = crate::cycle_guard::clear_stage(&self.profile_id);
+        }
         result
     }
 
@@ -1113,18 +1117,25 @@ impl AutopilotEngine {
         &self,
         params: &DiscoveryParams,
     ) -> Result<(Vec<CleanEndpoint>, CycleSummary), CFError> {
+        use crate::cycle_guard::{mark_stage, CycleStage};
+        // Stage markers let a guarded (timed-out) cycle report where it hung.
+        mark_stage(&self.profile_id, CycleStage::Reconcile)?;
         // Self-heal the user-facing bundle against the ledger first (never
         // fails the cycle: discovery is still the goal).
         let _ = crate::cleanip::reconcile_bundle_if_drifted(&self.profile_id);
         // Self-learning phase-2 SNI strategy (v2 rolling-window): resolve the
         // persisted strategy state and pin its current strategy for this cycle
         // so the phase-2 probe is exclusive about which SNI it tries first.
+        mark_stage(&self.profile_id, CycleStage::Prepare)?;
         let mut strategy = resolve_strategy_v2(&self.profile_id);
         let mut used_params = params.clone();
         used_params.preferred_strategy = Some(strategy.current);
 
+        mark_stage(&self.profile_id, CycleStage::BaseVless)?;
         let vless = base_vless(&self.profile_id)?;
+        mark_stage(&self.profile_id, CycleStage::Phase1Scan)?;
         let found = self.provider.discover(&vless, &used_params).await?;
+        mark_stage(&self.profile_id, CycleStage::Phase2Scan)?;
 
         // Learn from this discovery cycle: any verified (accepted-101)
         // endpoint means the strategy won. Record the outcome in the rolling
@@ -1253,7 +1264,72 @@ impl AutopilotEngine {
             last_error,
         );
         let _ = crate::health_beacon::write_beacon(&self.profile_id, &beacon);
+        if result.is_ok() {
+            let _ = crate::cycle_guard::clear_stage(&self.profile_id);
+        }
         result
+    }
+
+    /// Run a full discovery cycle inside a hard timeout. Used by the daemon
+    /// and the CLI so a blocked network path (censored-network hang) cannot
+    /// stall the process forever. On timeout, writes an abort beacon naming the
+    /// stage the cycle was stuck in (from the cycle_guard marker) and returns a
+    /// timed-out error instead of hanging. The caller (daemon/CLI) then either
+    /// rescues or retries on its normal schedule.
+    pub async fn run_cycle_guarded(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(Vec<CleanEndpoint>, CycleSummary), CFError> {
+        match tokio::time::timeout(timeout, self.run_cycle()).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                let stage = crate::cycle_guard::last_stage(&self.profile_id);
+                let _ = crate::health_beacon::write_beacon_on_abort(
+                    &self.profile_id,
+                    crate::health_beacon::CycleKind::Discovery,
+                    "CycleTimeout",
+                );
+                Err(CFError::new(
+                    "Cycle timeout",
+                    format!(
+                        "discovery exceeded {}s and was aborted (stuck in {:?})",
+                        timeout.as_secs(),
+                        stage
+                    ),
+                    "The network path may be blocked; the next cycle retries automatically.",
+                ))
+            }
+        }
+    }
+
+    /// Run a monitor cycle inside a hard timeout (the light WS-gate check is
+    /// fast; a deep E2E pass must still fit inside it). Mirrors
+    /// [`run_cycle_guarded`]: aborts on timeout, writes an abort beacon naming
+    /// the stuck stage, and returns a timed-out error.
+    pub async fn monitor_cycle_guarded(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<CycleSummary, CFError> {
+        match tokio::time::timeout(timeout, self.monitor_cycle()).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                let stage = crate::cycle_guard::last_stage(&self.profile_id);
+                let _ = crate::health_beacon::write_beacon_on_abort(
+                    &self.profile_id,
+                    crate::health_beacon::CycleKind::Monitor,
+                    "CycleTimeout",
+                );
+                Err(CFError::new(
+                    "Cycle timeout",
+                    format!(
+                        "monitor exceeded {}s and was aborted (stuck in {:?})",
+                        timeout.as_secs(),
+                        stage
+                    ),
+                    "The network path may be blocked; the next cycle retries automatically.",
+                ))
+            }
+        }
     }
 
     async fn monitor_cycle_inner(&self) -> Result<CycleSummary, CFError> {
@@ -2713,5 +2789,128 @@ mod tests {
         );
         assert!(beacon.last_error.is_some(), "last_error expected");
         assert!(beacon.written_at > 0);
+    }
+
+    // ── Guarded cycle wrappers (round 5: hard timeout + stage markers) ──
+
+    /// A provider that hangs forever on discover (simulates a censored-network
+    /// blocked socket). Used to prove `run_cycle_guarded` aborts via timeout.
+    struct HangingProvider;
+
+    impl EndpointProvider for HangingProvider {
+        fn discover<'a>(
+            &'a self,
+            _vless: &'a VlessProfile,
+            _params: &'a DiscoveryParams,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<CleanEndpoint>, CFError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                // Loop forever; the guarded wrapper's timeout must abort us.
+                let mut i = 0u64;
+                loop {
+                    i = i.wrapping_add(1);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    if i > 1_000_000_000 {
+                        panic!("guard did not abort a hanging cycle");
+                    }
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_guarded_cycle_returns_summary_when_fast() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        let provider = Box::new(ScriptedProvider {
+            result: Ok(vec![CleanEndpoint {
+                ip: "1.2.3.4".into(),
+                port: 443,
+                sni: "amir.dariuskhosrowan.workers.dev".into(),
+                score: 99.0,
+                tcp_ms: 5.0,
+                connect_ms: 8.0,
+                download_kbps: 900.0,
+                verified: true,
+                alive: true,
+                last_checked: None,
+                ts: String::new(),
+            }]),
+        });
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            provider,
+        );
+        let (found, _summary) = engine
+            .run_cycle_guarded(std::time::Duration::from_secs(30))
+            .await
+            .expect("fast guarded cycle succeeds");
+        assert!(!found.is_empty());
+        // A successful guarded cycle clears the stage marker.
+        assert_eq!(crate::cycle_guard::last_stage(&id), Some(crate::cycle_guard::CycleStage::None));
+    }
+
+    #[tokio::test]
+    async fn test_guarded_cycle_times_out_at_last_stage() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        // Seed a stage marker so the abort beacon can report where it hung.
+        crate::cycle_guard::mark_stage(&id, crate::cycle_guard::CycleStage::Phase1Scan).unwrap();
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(HangingProvider),
+        );
+        // Hanging provider: short timeout to force abort fast.
+        let err = engine
+            .run_cycle_guarded(std::time::Duration::from_millis(300))
+            .await
+            .expect_err("hanging cycle must be aborted by the guard");
+        assert!(err.brief().contains("Cycle timeout"), "got {}", err.brief());
+        // The abort beacon must record the timeout and the stuck stage.
+        let beacon = crate::health_beacon::read_beacon(&id)
+            .unwrap()
+            .expect("abort beacon written on timeout");
+        assert_eq!(beacon.last_error.as_deref(), Some("CycleTimeout"));
+        assert_eq!(beacon.last_stage.as_deref(), Some("Phase1Scan"));
+    }
+
+    #[tokio::test]
+    async fn test_guarded_monitor_clears_stage_on_success() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        crate::cycle_guard::mark_stage(&id, crate::cycle_guard::CycleStage::Phase2Scan).unwrap();
+        let provider = Box::new(ScriptedProvider {
+            result: Ok(vec![CleanEndpoint {
+                ip: "1.2.3.4".into(),
+                port: 443,
+                sni: "amir.dariuskhosrowan.workers.dev".into(),
+                score: 99.0,
+                tcp_ms: 5.0,
+                connect_ms: 8.0,
+                download_kbps: 900.0,
+                verified: true,
+                alive: true,
+                last_checked: None,
+                ts: String::new(),
+            }]),
+        });
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            provider,
+        );
+        let _summary = engine
+            .monitor_cycle_guarded(std::time::Duration::from_secs(30))
+            .await
+            .expect("fast monitor guard succeeds");
+        assert_eq!(crate::cycle_guard::last_stage(&id), Some(crate::cycle_guard::CycleStage::None));
     }
 }
