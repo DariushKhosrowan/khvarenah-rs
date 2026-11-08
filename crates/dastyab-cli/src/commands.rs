@@ -1713,6 +1713,41 @@ async fn cmd_sni_spoof(profile: &str, action: crate::SniSpoofAction) -> Result<(
                 ))
             }
         }
+        crate::SniSpoofAction::WsScan {
+            ip,
+            port,
+            path,
+            timeout_ms,
+        } => {
+            let ip = ip.unwrap_or_else(|| "1.1.1.1".to_string());
+            // Probe the worker's own hostname (if known) then the generic CF edge.
+            let worker_host = dastyab_core::autopilot::base_vless(profile)
+                .ok()
+                .map(|v| v.address);
+            let mut targets: Vec<(String, String)> = Vec::new(); // (sni, label)
+            if let Some(w) = &worker_host {
+                targets.push((w.clone(), "worker".to_string()));
+            }
+            targets.push(("www.cloudflare.com".to_string(), "cf".to_string()));
+            targets.push(("workers.dev".to_string(), "workers".to_string()));
+
+            println!(
+                "WS-upgrade probe → {ip}:{port}{path} (timeout {timeout_ms}ms)…"
+            );
+            for (sni, label) in &targets {
+                let r = dastyab_core::sni_spoof::ws_probe::probe_ws_upgrade(
+                    sni, &ip, port, &path, timeout_ms,
+                )
+                .await;
+                let verdict = dastyab_core::sni_spoof::ws_probe::verdict_line(&r);
+                println!("  [{label}] {sni} → {verdict}  ({}ms)", r.elapsed_ms);
+            }
+            println!();
+            println!("Verdict: see per-target lines above. Any 'http=' line means the");
+            println!("WS upgrade reached the edge (worker-path issue). A 'TLS ok, but reset");
+            println!("after upgrade' line means DPI blocks the WS upgrade.");
+            Ok(())
+        }
     }
 }
 

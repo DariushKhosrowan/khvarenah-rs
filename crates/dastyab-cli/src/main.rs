@@ -260,6 +260,22 @@ pub enum SniSpoofAction {
     Show,
     /// Remove the persisted allowlist (forces a re-scan).
     Clear,
+    /// WS-upgrade diagnostic: does a WS upgrade reach the CF edge, or is it
+    /// intercepted by DPI? Distinguishes DPI-blocks-upgrade from dead worker.
+    WsScan {
+        /// Edge IP to target (default: a known Cloudflare anycast edge).
+        #[arg(long)]
+        ip: Option<String>,
+        /// TCP port (default 443).
+        #[arg(long, default_value_t = 443)]
+        port: u16,
+        /// WS path to probe (default /).
+        #[arg(long, default_value = "/")]
+        path: String,
+        /// Per-probe timeout ms (default 5000).
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+    },
 }
 
 #[derive(Subcommand)]
