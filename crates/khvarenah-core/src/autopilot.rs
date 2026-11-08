@@ -81,6 +81,10 @@ pub struct DiscoveryParams {
     /// neighbourhoods around these first instead of sampling uniformly.
     /// `seed_ips` are bare IPv4 strings (no port).
     pub seed_ips: Vec<String>,
+    /// Skip the step-0 worker-health gate. Used by the rescue chain, which is
+    /// invoked precisely BECAUSE the worker failed the gate — re-running it
+    /// would loop back into rescue forever.
+    pub skip_step0: bool,
 }
 
 impl Default for DiscoveryParams {
@@ -93,6 +97,7 @@ impl Default for DiscoveryParams {
             force_refresh_ranges: false,
             retry_on_fail: true,
             seed_ips: Vec::new(),
+            skip_step0: false,
         }
     }
 }
@@ -154,29 +159,33 @@ async fn discover_native(
     // Step 0 — worker-health gate (DeepSeek plan #1). If the worker is dead,
     // suspended, or path-mismatched, no scanner can find clean IPs: short-
     // circuit with a plain-language diagnosis instead of wasting a scan.
+    // Skipped when `skip_step0` is set (rescue chain: we got here precisely
+    // because the gate failed, so re-running it would loop forever).
     let cidrs = load_ranges(params.force_refresh_ranges).await?;
-    match crate::autopilot::step0_gate(&sni, timeout_s as u64, &cidrs).await {
-        crate::autopilot::WorkerHealth::Alive => {}
-        other => {
-            let cause = match other {
-                crate::autopilot::WorkerHealth::Suspended { .. }
-                | crate::autopilot::WorkerHealth::NotFound => {
-                    crate::diagnose::PlainCause::WorkerDead
-                }
-                crate::autopilot::WorkerHealth::PathMismatch => {
-                    crate::diagnose::PlainCause::WorkerPathMismatch
-                }
-                crate::autopilot::WorkerHealth::Unreachable => {
-                    crate::diagnose::PlainCause::NetworkBlocked
-                }
-                crate::autopilot::WorkerHealth::Alive => unreachable!(),
-            };
-            let msg = crate::diagnose::plain_message(cause, crate::diagnose::Locale::En);
-            return Err(CFError::new(
-                "Worker offline",
-                msg,
-                "Check the Workers dashboard or try another network.",
-            ));
+    if !params.skip_step0 {
+        match crate::autopilot::step0_gate(&sni, timeout_s as u64, &cidrs).await {
+            crate::autopilot::WorkerHealth::Alive => {}
+            other => {
+                let cause = match other {
+                    crate::autopilot::WorkerHealth::Suspended { .. }
+                    | crate::autopilot::WorkerHealth::NotFound => {
+                        crate::diagnose::PlainCause::WorkerDead
+                    }
+                    crate::autopilot::WorkerHealth::PathMismatch => {
+                        crate::diagnose::PlainCause::WorkerPathMismatch
+                    }
+                    crate::autopilot::WorkerHealth::Unreachable => {
+                        crate::diagnose::PlainCause::NetworkBlocked
+                    }
+                    crate::autopilot::WorkerHealth::Alive => unreachable!(),
+                };
+                let msg = crate::diagnose::plain_message(cause, crate::diagnose::Locale::En);
+                return Err(CFError::new(
+                    "Worker offline",
+                    msg,
+                    "Check the Workers dashboard or try another network.",
+                ));
+            }
         }
     }
 
@@ -802,9 +811,17 @@ impl AutopilotEngine {
     /// Run one full discovery+validation cycle, persist the ledger, and
     /// write active configs. Returns the validated endpoints and a summary.
     pub async fn run_cycle(&self) -> Result<(Vec<CleanEndpoint>, CycleSummary), CFError> {
+        self.run_cycle_with_params(&self.params_with_seeds()).await
+    }
+
+    /// Like [`run_cycle`], but with an explicit discovery parameter set (used
+    /// by the rescue chain to inject seed sources / skip the step-0 gate).
+    async fn run_cycle_with_params(
+        &self,
+        params: &DiscoveryParams,
+    ) -> Result<(Vec<CleanEndpoint>, CycleSummary), CFError> {
         let vless = base_vless(&self.profile_id)?;
-        let params = self.params_with_seeds();
-        let found = self.provider.discover(&vless, &params).await?;
+        let found = self.provider.discover(&vless, params).await?;
 
         let mut ledger = read_ledger(&self.profile_id);
         let mut replaced = 0;
@@ -1021,6 +1038,17 @@ impl AutopilotEngine {
             .filter(|e| e.verified && e.alive)
             .cloned()
             .collect();
+
+        // Auto-rescue (Feature C): if nothing is alive, probe the worker and
+        // run the rescue chain so the app *fights* the failure instead of just
+        // reporting it. Only recoverable failures (NotFound/Suspended/
+        // Unreachable) enter the chain — the E2E-while-tunneled false negative
+        // (worker Alive) is deliberately excluded.
+        let mut rescued = false;
+        if live.is_empty() {
+            rescued = self.rescue_if_needed().await;
+        }
+
         let _ = crate::cleanip::write_user_bundle(&self.profile_id, &vless, &live);
 
         Ok(CycleSummary {
@@ -1028,13 +1056,569 @@ impl AutopilotEngine {
             alive: live.len(),
             replaced,
             note: format!(
-                "monitor: {alive} alive · {} clean · best {} · deep={did_rediscover} streak={}",
+                "monitor: {alive} alive · {} clean · best {} · deep={did_rediscover} streak={}{}",
                 live.len(),
                 best_ip.as_deref().unwrap_or("-"),
-                state.failure_streak
+                state.failure_streak,
+                if rescued { " · auto-rescued" } else { "" }
             ),
         })
     }
+
+    /// If every endpoint is dead, probe the worker health and, when it is a
+    /// recoverable failure, run the rescue chain. Returns true if a rescue
+    /// attempt ran (recovered or not). This is the automated call site that
+    /// makes the monitor "fight failure" without any manual step.
+    async fn rescue_if_needed(&self) -> bool {
+        let vless = match base_vless(&self.profile_id) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let ws = crate::health::derive_ws_target(&vless);
+        // Probe health via the worker's SNI. Passing an empty CIDR slice means
+        // the gate uses its embedded/default range fallback (we only care about
+        // the worker-health verdict here, not scanning).
+        let cidrs: &[crate::cf::ips::Cidr] = &[];
+        let health =
+            crate::autopilot::step0_gate(&ws.sni, self.params.timeout_s.max(3) as u64, cidrs).await;
+        if !should_rescue(&health) {
+            return false;
+        }
+        let peer = RealRescuePeer {
+            engine: self,
+            profile_id: &self.profile_id,
+        };
+        match rescue_from_failure(&self.profile_id, &peer, health).await {
+            Ok(chain) => {
+                if chain.gave_up {
+                    // Surface the plain-language diagnosis + recommended action.
+                    let cause = match chain.initial_failure {
+                        WorkerHealth::Suspended { .. } | WorkerHealth::NotFound => {
+                            crate::diagnose::PlainCause::WorkerDead
+                        }
+                        WorkerHealth::Unreachable => crate::diagnose::PlainCause::NetworkBlocked,
+                        _ => crate::diagnose::PlainCause::WorkerDead,
+                    };
+                    let msg = crate::diagnose::plain_message(cause, crate::diagnose::Locale::En);
+                    eprintln!("[khvarenah] rescue gave up: {msg}");
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-rescue chain (Feature C — "fights failure", not just "reports it")
+// ---------------------------------------------------------------------------
+
+/// The discrete recovery actions the rescue chain can attempt, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RescueAction {
+    /// Cheapest: reuse a verified ledger endpoint that isn't the active one.
+    TryFallbackPool,
+    /// Full discovery seeded from the ledger's last-known-good endpoints.
+    ReseedFromLedger,
+    /// Full discovery seeded only from the user's manual seeds.
+    ReseedFromManualSeeds,
+    /// Nuclear: re-deploy the worker (rate-limited to 1/hour).
+    RedeployWorker,
+    /// Every step failed; surface the plain-language diagnosis.
+    GiveUp,
+}
+
+/// Outcome of one rescue attempt.
+#[derive(Debug, Clone)]
+pub enum RescueOutcome {
+    /// The step recovered a working endpoint.
+    Success { endpoint: String, rtt_ms: u32 },
+    /// The step ran but did not recover anything.
+    Failed { reason: String },
+    /// The step was not attempted (e.g. no manual seeds, rate-limited).
+    Skipped { reason: String },
+}
+
+/// One step in a rescue chain.
+#[derive(Debug, Clone)]
+pub struct RescueAttempt {
+    pub action: RescueAction,
+    pub attempted_at: i64,
+    pub outcome: RescueOutcome,
+}
+
+/// The full outcome of a rescue chain.
+#[derive(Debug, Clone)]
+pub struct RescueChain {
+    pub attempts: Vec<RescueAttempt>,
+    /// The cycle summary from whichever step recovered (if any).
+    pub final_state: Option<CycleSummary>,
+    pub gave_up: bool,
+    pub initial_failure: WorkerHealth,
+    pub completed_at: i64,
+}
+
+/// Rescue only fires on failures that a rescue can actually fix. The
+/// E2E-while-tunneled false negative (`E2eIpUnchanged`) is deliberately NOT
+/// rescuable — the direct-IP echo equals tunnel egress for an already-tunneled
+/// user, so rescuing would spin an infinite scan loop.
+pub fn should_rescue(failure: &WorkerHealth) -> bool {
+    matches!(
+        failure,
+        WorkerHealth::NotFound | WorkerHealth::Suspended { .. } | WorkerHealth::Unreachable
+    )
+}
+
+/// Plan the ordered rescue actions for a given profile state. Pure and fully
+/// unit-testable. Order is strict: fallback pool → ledger reseed → manual seeds
+/// → redeploy worker. Each step is only included if its precondition is met
+/// (e.g. skip fallback when the ledger is empty; skip redeploy when rate-limited
+/// or no token). Returns the actions to try in order.
+pub fn plan_rescue(
+    ledger_empty: bool,
+    manual_seeds_exist: bool,
+    has_token: bool,
+    redeploy_rate_limited: bool,
+) -> Vec<RescueAction> {
+    let mut plan = Vec::new();
+    if !ledger_empty {
+        plan.push(RescueAction::TryFallbackPool);
+        plan.push(RescueAction::ReseedFromLedger);
+    }
+    if manual_seeds_exist {
+        plan.push(RescueAction::ReseedFromManualSeeds);
+    }
+    if has_token && !redeploy_rate_limited {
+        plan.push(RescueAction::RedeployWorker);
+    }
+    plan
+}
+
+/// The future returned by a rescue `run_cycle` call.
+type CycleFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(Vec<CleanEndpoint>, CycleSummary), CFError>> + Send + 'a>>;
+
+/// Peer abstraction for the rescue chain's side-effecting operations. Splitting
+/// these out makes the four-step sequencing fully unit-testable with no live
+/// worker, CF token, or network (mirrors the `SingboxSpawner` pattern).
+pub trait RescuePeer: Send + Sync {
+    /// Probe whether one ledger endpoint is alive (fallback pool pick).
+    fn endpoint_alive(
+        &self,
+        ip: &str,
+        sni: &str,
+        path: &str,
+        timeout_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+
+    /// Run one discovery cycle with the given params (reseed steps).
+    fn run_cycle(&self, params: &DiscoveryParams) -> CycleFuture<'_>;
+
+    /// Redeploy the worker. Returns Ok(()) on success.
+    fn redeploy_worker(&self) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>>;
+}
+
+/// The production peer, backed by a real engine + CF client.
+pub struct RealRescuePeer<'a> {
+    pub engine: &'a AutopilotEngine,
+    pub profile_id: &'a str,
+}
+
+impl<'a> RescuePeer for RealRescuePeer<'a> {
+    fn endpoint_alive(
+        &self,
+        ip: &str,
+        sni: &str,
+        path: &str,
+        timeout_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let ip = ip.to_string();
+        let sni = sni.to_string();
+        let path = path.to_string();
+        Box::pin(async move { endpoint_live(&ip, &sni, &path, timeout_ms).await })
+    }
+
+    fn run_cycle(
+        &self,
+        params: &DiscoveryParams,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(Vec<CleanEndpoint>, CycleSummary), CFError>> + Send + '_>,
+    > {
+        let params = params.clone();
+        let engine = self.engine;
+        Box::pin(async move { engine.run_cycle_with_params(&params).await })
+    }
+
+    fn redeploy_worker(&self) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>> {
+        let profile_id = self.profile_id.to_string();
+        Box::pin(async move { redeploy_worker_core(&profile_id).await })
+    }
+}
+
+/// Redeploy this profile's worker using the active token + built-in preset
+/// worker JS. Rate-limiting is handled by the caller (via `last_redeploy_ts`).
+async fn redeploy_worker_core(profile_id: &str) -> Result<(), CFError> {
+    let label = match crate::store::profiles::get_active_token(profile_id)? {
+        Some(l) => l,
+        None => {
+            return Err(CFError::new(
+                "Redeploy",
+                "No active token for this profile.",
+                "Set an active token before enabling auto-redeploy.",
+            ))
+        }
+    };
+    let token = match crate::store::profiles::get_token(profile_id, &label)? {
+        Some(t) => t,
+        None => {
+            return Err(CFError::new(
+                "Redeploy",
+                format!("Token '{label}' not found."),
+                "Re-add the token.",
+            ))
+        }
+    };
+
+    let p = crate::store::profiles::load_profile(profile_id);
+    let client = crate::cf::Client::new(&token);
+
+    // Account id: active_account, else first accessible.
+    let acc_id = if !p.config.active_account.is_empty() {
+        p.config.active_account.clone()
+    } else {
+        let accs = client.list_accounts().await?;
+        accs.first().map(|a| a.id.clone()).ok_or_else(|| {
+            CFError::new(
+                "No account",
+                "No CF account accessible.",
+                "Check token permissions.",
+            )
+        })?
+    };
+
+    let worker_name = crate::worker::worker_name_from_account(Some(&p.config.active_account));
+    let js = crate::presets::fallback_worker_js().into_bytes();
+    client
+        .deploy_script(&acc_id, &worker_name, js, "2026-07-01", 2)
+        .await?;
+    Ok(())
+}
+
+/// Run the full four-step rescue chain. Returns the detailed chain; the caller
+/// decides what to surface (a `final_state` means we recovered).
+pub async fn rescue_from_failure(
+    profile_id: &str,
+    peer: &dyn RescuePeer,
+    initial_failure: WorkerHealth,
+) -> Result<RescueChain, CFError> {
+    let now = crate::store::now_ts() as i64;
+    let mut chain = RescueChain {
+        attempts: Vec::new(),
+        final_state: None,
+        gave_up: false,
+        initial_failure: initial_failure.clone(),
+        completed_at: now,
+    };
+
+    // Loop guard: only recoverable failures enter the chain. In particular the
+    // E2E-while-tunneled false negative (worker Alive + IpUnchanged) must never
+    // rescue, or every scan for an already-tunneled user would spin forever.
+    if !should_rescue(&initial_failure) {
+        return Ok(chain);
+    }
+
+    // Throttle: at most one rescue chain per 5 minutes.
+    let cfg = crate::store::profiles::load_profile(profile_id).config;
+    if now - cfg.last_rescue_attempt_ts < 300 {
+        chain.gave_up = true;
+        chain.attempts.push(RescueAttempt {
+            action: RescueAction::GiveUp,
+            attempted_at: now,
+            outcome: RescueOutcome::Skipped {
+                reason: "rescues throttled (5 min window)".into(),
+            },
+        });
+        return Ok(chain);
+    }
+
+    // Step 1 — TryFallbackPool (cheapest: no re-scan).
+    let fallback_ep = pick_fallback_endpoint(profile_id, peer).await;
+    if let Some((ep, rtt)) = fallback_ep {
+        let ep_key = ep.clone();
+        chain.attempts.push(RescueAttempt {
+            action: RescueAction::TryFallbackPool,
+            attempted_at: now,
+            outcome: RescueOutcome::Success {
+                endpoint: ep,
+                rtt_ms: rtt,
+            },
+        });
+        // Fallback is already in the ledger; write it as active.
+        if let Some(best) = ledger_endpoint(profile_id, &ep_key) {
+            let vless = base_vless(profile_id)?;
+            write_active_configs(profile_id, &vless, &best)?;
+        }
+        let summary = CycleSummary {
+            cycle: 0,
+            alive: 1,
+            replaced: 0,
+            note: format!("rescued via fallback pool → {ep_key}"),
+        };
+        chain.final_state = Some(summary);
+        crate::store::profiles::save_rescue_meta(
+            profile_id,
+            now,
+            cfg.last_redeploy_ts,
+            Some("recovered".into()),
+        )?;
+        return Ok(chain);
+    }
+    chain.attempts.push(RescueAttempt {
+        action: RescueAction::TryFallbackPool,
+        attempted_at: now,
+        outcome: RescueOutcome::Failed {
+            reason: "no live fallback".into(),
+        },
+    });
+
+    // Step 2 — ReseedFromLedger (skip step-0 gate: we already know it failed).
+    let mut params = peer_params(&cfg);
+    params.skip_step0 = true;
+    match peer.run_cycle(&params).await {
+        Ok((found, summary)) if !found.is_empty() => {
+            chain.attempts.push(RescueAttempt {
+                action: RescueAction::ReseedFromLedger,
+                attempted_at: now,
+                outcome: RescueOutcome::Success {
+                    endpoint: found[0].ip.clone(),
+                    rtt_ms: found[0].connect_ms.max(0.0) as u32,
+                },
+            });
+            chain.final_state = Some(summary);
+            crate::store::profiles::save_rescue_meta(
+                profile_id,
+                now,
+                cfg.last_redeploy_ts,
+                Some("recovered".into()),
+            )?;
+            return Ok(chain);
+        }
+        Ok((_, summary)) => {
+            chain.attempts.push(RescueAttempt {
+                action: RescueAction::ReseedFromLedger,
+                attempted_at: now,
+                outcome: RescueOutcome::Failed {
+                    reason: format!("reseed found nothing ({})", summary.note),
+                },
+            });
+        }
+        Err(e) => {
+            chain.attempts.push(RescueAttempt {
+                action: RescueAction::ReseedFromLedger,
+                attempted_at: now,
+                outcome: RescueOutcome::Failed {
+                    reason: format!("reseed error: {}", e.brief()),
+                },
+            });
+        }
+    }
+
+    // Step 3 — ReseedFromManualSeeds.
+    let manual = crate::cf::ips::load_manual_seeds(profile_id);
+    if manual.is_empty() {
+        chain.attempts.push(RescueAttempt {
+            action: RescueAction::ReseedFromManualSeeds,
+            attempted_at: now,
+            outcome: RescueOutcome::Skipped {
+                reason: "no manual seeds imported".into(),
+            },
+        });
+    } else {
+        let mut mparams = peer_params(&cfg);
+        mparams.skip_step0 = true;
+        mparams.seed_ips = manual;
+        match peer.run_cycle(&mparams).await {
+            Ok((found, summary)) if !found.is_empty() => {
+                chain.attempts.push(RescueAttempt {
+                    action: RescueAction::ReseedFromManualSeeds,
+                    attempted_at: now,
+                    outcome: RescueOutcome::Success {
+                        endpoint: found[0].ip.clone(),
+                        rtt_ms: found[0].connect_ms.max(0.0) as u32,
+                    },
+                });
+                chain.final_state = Some(summary);
+                crate::store::profiles::save_rescue_meta(
+                    profile_id,
+                    now,
+                    cfg.last_redeploy_ts,
+                    Some("recovered".into()),
+                )?;
+                return Ok(chain);
+            }
+            Ok((_, summary)) => {
+                chain.attempts.push(RescueAttempt {
+                    action: RescueAction::ReseedFromManualSeeds,
+                    attempted_at: now,
+                    outcome: RescueOutcome::Failed {
+                        reason: format!("manual reseed found nothing ({})", summary.note),
+                    },
+                });
+            }
+            Err(e) => {
+                chain.attempts.push(RescueAttempt {
+                    action: RescueAction::ReseedFromManualSeeds,
+                    attempted_at: now,
+                    outcome: RescueOutcome::Failed {
+                        reason: format!("manual reseed error: {}", e.brief()),
+                    },
+                });
+            }
+        }
+    }
+
+    // Step 4 — RedeployWorker (nuclear; rate-limited to 1/hour).
+    let redeploy_allowed = cfg.last_redeploy_ts == 0 || (now - cfg.last_redeploy_ts) >= 3600;
+    if !redeploy_allowed {
+        chain.attempts.push(RescueAttempt {
+            action: RescueAction::RedeployWorker,
+            attempted_at: now,
+            outcome: RescueOutcome::Skipped {
+                reason: "redeploy rate-limited (1/hour)".into(),
+            },
+        });
+    } else {
+        match peer.redeploy_worker().await {
+            Ok(()) => {
+                // After redeploy, run one fresh full cycle (gate re-enabled).
+                let fresh = peer_params(&cfg);
+                match peer.run_cycle(&fresh).await {
+                    Ok((found, summary)) if !found.is_empty() => {
+                        chain.attempts.push(RescueAttempt {
+                            action: RescueAction::RedeployWorker,
+                            attempted_at: now,
+                            outcome: RescueOutcome::Success {
+                                endpoint: found[0].ip.clone(),
+                                rtt_ms: found[0].connect_ms.max(0.0) as u32,
+                            },
+                        });
+                        chain.final_state = Some(summary);
+                        crate::store::profiles::save_rescue_meta(
+                            profile_id,
+                            now,
+                            now,
+                            Some("recovered".into()),
+                        )?;
+                        return Ok(chain);
+                    }
+                    Ok((_, summary)) => {
+                        chain.attempts.push(RescueAttempt {
+                            action: RescueAction::RedeployWorker,
+                            attempted_at: now,
+                            outcome: RescueOutcome::Failed {
+                                reason: format!(
+                                    "post-redeploy cycle found nothing ({})",
+                                    summary.note
+                                ),
+                            },
+                        });
+                    }
+                    Err(e) => {
+                        chain.attempts.push(RescueAttempt {
+                            action: RescueAction::RedeployWorker,
+                            attempted_at: now,
+                            outcome: RescueOutcome::Failed {
+                                reason: format!("post-redeploy cycle error: {}", e.brief()),
+                            },
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                chain.attempts.push(RescueAttempt {
+                    action: RescueAction::RedeployWorker,
+                    attempted_at: now,
+                    outcome: RescueOutcome::Failed {
+                        reason: format!("redeploy error: {}", e.brief()),
+                    },
+                });
+            }
+        }
+        // Record the redeploy attempt timestamp regardless of outcome.
+        crate::store::profiles::save_rescue_meta(profile_id, now, now, Some("gave_up".into()))?;
+    }
+
+    // Step 5 — GiveUp.
+    chain.gave_up = true;
+    chain.attempts.push(RescueAttempt {
+        action: RescueAction::GiveUp,
+        attempted_at: now,
+        outcome: RescueOutcome::Failed {
+            reason: "all rescue steps exhausted".into(),
+        },
+    });
+    crate::store::profiles::save_rescue_meta(
+        profile_id,
+        now,
+        cfg.last_redeploy_ts,
+        Some("gave_up".into()),
+    )?;
+    Ok(chain)
+}
+
+/// Build discovery params from the profile config (seeds come from the ledger).
+fn peer_params(cfg: &crate::store::profiles::ProfileConfig) -> DiscoveryParams {
+    DiscoveryParams {
+        timeout_s: cfg.scan_timeout.max(3),
+        sample: cfg.scan_count.max(500),
+        workers: cfg.scan_workers.max(8) as usize,
+        top_n: 3,
+        ..Default::default()
+    }
+}
+
+/// Pick the best verified-but-not-active endpoint that is currently alive.
+/// Returns Some((endpoint "ip:port", rtt_ms)) from the fallback pool. This
+/// mirrors the "fallback pool" idea in clean-configs.txt: ranked alternates
+/// from the ledger.
+async fn pick_fallback_endpoint(profile_id: &str, peer: &dyn RescuePeer) -> Option<(String, u32)> {
+    let ledger = read_ledger(profile_id);
+    let vless = base_vless(profile_id).ok()?;
+    let ws = crate::health::derive_ws_target(&vless);
+    let timeout_ms = 5000;
+
+    // Rank by score; skip the currently-active best (we are actively failing
+    // on it). Find the first verified endpoint that is alive.
+    let mut ranked: Vec<&CleanEndpoint> = ledger.iter().filter(|e| e.verified).collect();
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // The active one is the highest-scoring verified endpoint; skip it.
+    let active_ip = ranked.first().map(|e| e.ip.clone());
+    for ep in ranked {
+        if Some(&ep.ip) == active_ip.as_ref() {
+            continue;
+        }
+        if peer
+            .endpoint_alive(&ep.ip, &ep.sni, &ws.path, timeout_ms)
+            .await
+        {
+            let rtt = ep.connect_ms.max(0.0) as u32;
+            return Some((format!("{}:{}", ep.ip, ep.port), rtt));
+        }
+    }
+    None
+}
+
+/// Look up a full ledger endpoint by its `ip:port` string.
+fn ledger_endpoint(profile_id: &str, key: &str) -> Option<CleanEndpoint> {
+    let ledger = read_ledger(profile_id);
+    ledger
+        .into_iter()
+        .find(|e| format!("{}:{}", e.ip, e.port).eq_ignore_ascii_case(key))
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,6 +1628,7 @@ impl AutopilotEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn sample_vless() -> VlessProfile {
         VlessProfile {
@@ -1216,5 +1801,344 @@ mod tests {
         // returns an Option (either Some real IP or None).
         let resolver = crate::doh::DohResolver::new();
         let _ = resolve_worker_host("example.com", Some(&resolver)).await;
+    }
+
+    // ── Auto-rescue chain (Feature C) ──
+
+    /// Isolated profile home for store-backed tests.
+    fn rescue_home() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(tmp.path().join(".khvarenah"));
+        tmp
+    }
+
+    fn make_profile() -> String {
+        crate::store::profiles::create_profile("rl", "").unwrap()
+    }
+
+    #[test]
+    fn should_rescue_only_fires_on_recoverable_failures() {
+        assert!(!should_rescue(&WorkerHealth::Alive));
+        assert!(!should_rescue(&WorkerHealth::PathMismatch));
+        assert!(should_rescue(&WorkerHealth::NotFound));
+        assert!(should_rescue(&WorkerHealth::Unreachable));
+        assert!(should_rescue(&WorkerHealth::Suspended { code: 9109 }));
+    }
+
+    /// The loop guard: a healthy worker that reports E2E IpUnchanged (the known
+    /// already-tunneled false negative) must NOT trigger rescue — rescuing would
+    /// spin an infinite re-scan loop.
+    #[tokio::test]
+    async fn test_rescue_does_not_trigger_on_e2e_ip_unchanged() {
+        let _home = rescue_home();
+        let id = make_profile();
+        let peer = FakeRescuePeer::default();
+        // Worker is Alive; E2E IpUnchanged is a *post-worker* failure stage,
+        // so the worker health reaching the rescue gate is Alive.
+        let chain = rescue_from_failure(&id, &peer, WorkerHealth::Alive)
+            .await
+            .unwrap();
+        assert!(chain.attempts.is_empty(), "no rescue steps should run");
+        assert!(!chain.gave_up);
+        assert!(!peer.run_cycle_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_plan_rescue_orders_steps_correctly() {
+        // Fallback before reseed; manual seeds when present; redeploy last.
+        let plan = plan_rescue(false, true, true, false);
+        assert_eq!(plan[0], RescueAction::TryFallbackPool);
+        assert_eq!(plan[1], RescueAction::ReseedFromLedger);
+        assert_eq!(plan[2], RescueAction::ReseedFromManualSeeds);
+        assert_eq!(plan[3], RescueAction::RedeployWorker);
+
+        // Empty ledger skips fallback+reseed.
+        let plan = plan_rescue(true, false, true, false);
+        assert_eq!(plan, vec![RescueAction::RedeployWorker]);
+
+        // No token + rate-limited redeploy → nothing to try.
+        let plan = plan_rescue(true, false, false, true);
+        assert!(plan.is_empty());
+
+        // Manual seeds still attempted when ledger empty.
+        let plan = plan_rescue(true, true, false, true);
+        assert_eq!(plan, vec![RescueAction::ReseedFromManualSeeds]);
+    }
+
+    #[test]
+    fn test_rescue_skips_fallback_when_ledger_empty() {
+        let _home = rescue_home();
+        let id = make_profile();
+        // No ledger written → empty → fallback+reseed skipped.
+        assert!(read_ledger(&id).is_empty());
+        let plan = plan_rescue(read_ledger(&id).is_empty(), false, false, true);
+        assert!(plan.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rescue_gives_up_after_all_steps_fail() {
+        let _home = rescue_home();
+        let id = make_profile();
+        // Seed a ledger (so fallback+reseed are attempted), manual seeds,
+        // and a token label so redeploy is tried too.
+        let ep = sample_clean_endpoint("1.1.1.1", 443, true);
+        write_ledger(&id, &[ep]);
+        crate::cf::ips::import_manual_seeds(&id, "8.8.8.8").unwrap();
+        crate::store::profiles::add_token(&id, "tok", "x").unwrap();
+        crate::store::profiles::set_active_token(&id, "tok").unwrap();
+
+        // Peer: nothing alive, no cycle results, redeploy fails.
+        let peer = FakeRescuePeer {
+            alive: false,
+            cycle_result: None,
+            redeploy_ok: false,
+            ..Default::default()
+        };
+        let chain = rescue_from_failure(&id, &peer, WorkerHealth::NotFound)
+            .await
+            .unwrap();
+        assert!(chain.gave_up);
+        assert!(chain.final_state.is_none());
+        assert!(chain
+            .attempts
+            .iter()
+            .any(|a| a.action == RescueAction::GiveUp));
+    }
+
+    #[tokio::test]
+    async fn test_rescue_returns_first_success_and_stops() {
+        let _home = rescue_home();
+        let id = make_profile();
+        let ep = sample_clean_endpoint("1.1.1.1", 443, true);
+        write_ledger(&id, &[ep]);
+
+        // Fallback pool has no alive alternate, but the reseed cycle returns
+        // verified endpoints → recovery on the 2nd step.
+        let peer = FakeRescuePeer {
+            alive: false,
+            cycle_result: Some(vec![sample_clean_endpoint("104.16.0.1", 443, true)]),
+            redeploy_ok: false,
+            ..Default::default()
+        };
+        let chain = rescue_from_failure(&id, &peer, WorkerHealth::Unreachable)
+            .await
+            .unwrap();
+        assert!(!chain.gave_up);
+        assert!(chain.final_state.is_some());
+        assert_eq!(chain.attempts.len(), 2);
+        assert_eq!(chain.attempts[1].action, RescueAction::ReseedFromLedger);
+        assert!(matches!(
+            chain.attempts[1].outcome,
+            RescueOutcome::Success { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rescue_uses_manual_seeds_when_fallback_and_reseed_fail() {
+        let _home = rescue_home();
+        let id = make_profile();
+        let ep = sample_clean_endpoint("1.1.1.1", 443, true);
+        write_ledger(&id, &[ep]);
+        crate::cf::ips::import_manual_seeds(&id, "8.8.8.8").unwrap();
+
+        // Fallback dead, ledger reseed empty, manual reseed succeeds.
+        let peer = FakeRescuePeer {
+            alive: false,
+            cycle_result: None,
+            manual_cycle_result: Some(vec![sample_clean_endpoint("8.8.8.8", 443, true)]),
+            redeploy_ok: false,
+            ..Default::default()
+        };
+        let chain = rescue_from_failure(&id, &peer, WorkerHealth::NotFound)
+            .await
+            .unwrap();
+        assert!(!chain.gave_up);
+        assert_eq!(chain.attempts.len(), 3);
+        assert_eq!(
+            chain.attempts[2].action,
+            RescueAction::ReseedFromManualSeeds
+        );
+        assert!(matches!(
+            chain.attempts[2].outcome,
+            RescueOutcome::Success { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rescue_redeploys_when_seed_sources_exhausted() {
+        let _home = rescue_home();
+        let id = make_profile();
+        let ep = sample_clean_endpoint("1.1.1.1", 443, true);
+        write_ledger(&id, &[ep]);
+        crate::cf::ips::import_manual_seeds(&id, "8.8.8.8").unwrap();
+        crate::store::profiles::add_token(&id, "tok", "x").unwrap();
+        crate::store::profiles::set_active_token(&id, "tok").unwrap();
+
+        let peer = FakeRescuePeer {
+            alive: false,
+            cycle_result: None,
+            manual_cycle_result: None,
+            redeploy_ok: true,
+            // After redeploy (4th call) succeed.
+            post_redeploy_result: Some(vec![sample_clean_endpoint("104.16.0.9", 443, true)]),
+            ..Default::default()
+        };
+        let chain = rescue_from_failure(&id, &peer, WorkerHealth::Suspended { code: 9109 })
+            .await
+            .unwrap();
+        assert!(!chain.gave_up);
+        assert!(chain
+            .attempts
+            .iter()
+            .any(|a| a.action == RescueAction::RedeployWorker));
+        assert!(chain
+            .attempts
+            .iter()
+            .any(|a| matches!(a.outcome, RescueOutcome::Success { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_rescue_refuses_redeploy_within_one_hour() {
+        let _home = rescue_home();
+        let id = make_profile();
+        let ep = sample_clean_endpoint("1.1.1.1", 443, true);
+        write_ledger(&id, &[ep]);
+        crate::store::profiles::add_token(&id, "tok", "x").unwrap();
+        crate::store::profiles::set_active_token(&id, "tok").unwrap();
+
+        // Force last_redeploy_ts to now so the rate-limit (1/hour) applies.
+        let now = crate::store::now_ts() as i64;
+        crate::store::profiles::save_rescue_meta(&id, 0, now, None).unwrap();
+
+        let peer = FakeRescuePeer::default();
+        let chain = rescue_from_failure(&id, &peer, WorkerHealth::NotFound)
+            .await
+            .unwrap();
+        // Redeploy step is skipped (Skipped), not attempted.
+        let redeploy = chain
+            .attempts
+            .iter()
+            .find(|a| a.action == RescueAction::RedeployWorker);
+        assert!(redeploy.is_some());
+        assert!(matches!(
+            redeploy.unwrap().outcome,
+            RescueOutcome::Skipped { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_profile_config_migrates_without_rescue_fields() {
+        let _home = rescue_home();
+        let id = make_profile();
+        // Simulate an older config: write a config JSON without the new fields.
+        let cfg_path = crate::store::profiles::profile_dir(&id).join("config.json");
+        let old_cfg = serde_json::json!({
+            "active_account": "acc-1",
+            "stealth_enabled": true,
+            "protection_enabled": false,
+            "light_interval_secs": 300,
+            "failure_streak": 0,
+            "last_deep_check": 0,
+        });
+        crate::store::write_json(&cfg_path, &old_cfg).unwrap();
+
+        let p = crate::store::profiles::load_profile(&id);
+        // New fields default cleanly (migration-safe).
+        assert_eq!(p.config.last_redeploy_ts, 0);
+        assert_eq!(p.config.last_rescue_attempt_ts, 0);
+        assert!(p.config.last_rescue_outcome.is_none());
+    }
+
+    /// A scripted peer for the rescue chain (no network).
+    #[derive(Default)]
+    struct FakeRescuePeer {
+        alive: bool,
+        cycle_result: Option<Vec<CleanEndpoint>>,
+        manual_cycle_result: Option<Vec<CleanEndpoint>>,
+        redeploy_ok: bool,
+        post_redeploy_result: Option<Vec<CleanEndpoint>>,
+        run_cycle_called: std::sync::atomic::AtomicBool,
+        cycle_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeRescuePeer {
+        fn next_cycle(&self) -> Option<Vec<CleanEndpoint>> {
+            let n = self.cycle_calls.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => self.cycle_result.clone(),         // ledger reseed
+                1 => self.manual_cycle_result.clone(),  // manual reseed
+                _ => self.post_redeploy_result.clone(), // post-redeploy
+            }
+        }
+    }
+
+    impl RescuePeer for FakeRescuePeer {
+        fn endpoint_alive(
+            &self,
+            _ip: &str,
+            _sni: &str,
+            _path: &str,
+            _timeout_ms: u64,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+            let alive = self.alive;
+            Box::pin(async move { alive })
+        }
+
+        fn run_cycle(
+            &self,
+            _params: &DiscoveryParams,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(Vec<CleanEndpoint>, CycleSummary), CFError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.run_cycle_called.store(true, Ordering::SeqCst);
+            let result = self.next_cycle();
+            Box::pin(async move {
+                match result {
+                    Some(eps) => Ok((
+                        eps.clone(),
+                        CycleSummary {
+                            cycle: 0,
+                            alive: eps.len(),
+                            replaced: 0,
+                            note: "fake".into(),
+                        },
+                    )),
+                    None => Err(CFError::new("Fake", "no endpoints", "")),
+                }
+            })
+        }
+
+        fn redeploy_worker(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>> {
+            let ok = self.redeploy_ok;
+            Box::pin(async move {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(CFError::new("Fake", "redeploy failed", ""))
+                }
+            })
+        }
+    }
+
+    fn sample_clean_endpoint(ip: &str, port: u16, verified: bool) -> CleanEndpoint {
+        CleanEndpoint {
+            ip: ip.into(),
+            port,
+            sni: "user.workers.dev".into(),
+            score: 50.0,
+            tcp_ms: 10.0,
+            connect_ms: 20.0,
+            download_kbps: 500.0,
+            verified,
+            alive: false,
+            last_checked: None,
+            ts: String::new(),
+        }
     }
 }
