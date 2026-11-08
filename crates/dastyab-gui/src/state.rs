@@ -6,7 +6,7 @@
 //! active profile, its tokens, and the full profile list.
 
 use dastyab_core::store::profiles::{
-    get_active_profile, list_profiles, load_profile,
+    get_active_profile, get_active_token, list_profiles, load_profile,
 };
 
 /// One row in the profile sidebar.
@@ -34,6 +34,8 @@ pub struct GuiState {
     pub profiles: Vec<ProfileSummary>,
     pub active_profile_id: String,
     pub tokens: Vec<TokenSummary>,
+    /// Label of the profile's active token (for deploy/scan + stroke).
+    pub active_token_label: Option<String>,
     /// Set when a background mutation completes; the next frame calls reload.
     pub reload_pending: bool,
 }
@@ -70,6 +72,8 @@ impl GuiState {
                 added_at: relative_time(&e.ts),
             })
             .collect();
+
+        self.active_token_label = get_active_token(&active).unwrap_or(None);
 
         self.reload_pending = false;
     }
@@ -154,13 +158,15 @@ mod tests {
             use dastyab_core::store::ensure_mem_dir;
             ensure_mem_dir().unwrap();
             let id = create_profile("work", "").unwrap();
-            set_active_profile(&id).unwrap();
+            // add token + reload
             add_token(&id, "cf-main", "a-very-long-secret-value-here").unwrap();
+            set_active_token(&id, "cf-main").unwrap();
 
             let mut st = GuiState::default();
             st.reload();
 
             assert_eq!(st.active_profile_id, id);
+            assert_eq!(st.active_token_label.as_deref(), Some("cf-main"));
             assert!(st.profiles.iter().any(|p| p.is_active && p.id == id));
             let p = st.profiles.iter().find(|p| p.id == id).unwrap();
             assert_eq!(p.token_count, 1);

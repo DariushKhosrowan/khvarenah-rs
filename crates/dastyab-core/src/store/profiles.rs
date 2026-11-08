@@ -363,6 +363,55 @@ pub fn remove_token(id: &str, label: &str) -> Result<(), CFError> {
     save_profile(&p)
 }
 
+/// Path of the file that records the active token label for a profile.
+fn active_token_path(id: &str) -> PathBuf {
+    profile_dir(id).join("active_token")
+}
+
+/// Return the label of the profile's active token.
+///
+/// Returns `Ok(None)` when there is no active-token file, or when the label
+/// no longer exists in `tokens.json` (the token was probably deleted). It
+/// never errors for a missing/stale marker — that is an expected state.
+pub fn get_active_token(profile_id: &str) -> Result<Option<String>, CFError> {
+    let label = match read_opt::<String>(&active_token_path(profile_id)) {
+        Some(l) if !l.trim().is_empty() => l.trim().to_string(),
+        _ => return Ok(None),
+    };
+    let p = load_profile(profile_id);
+    if p.tokens.contains_key(&label) {
+        Ok(Some(label))
+    } else {
+        // stale marker — the token was removed. Log a warning and clear it.
+        eprintln!("[dastyab] warn: active token '{label}' no longer exists in profile '{profile_id}'");
+        let _ = write_json(&active_token_path(profile_id), &String::new());
+        Ok(None)
+    }
+}
+
+/// Persist the active token label for a profile.
+pub fn set_active_token(profile_id: &str, label: &str) -> Result<(), CFError> {
+    let p = load_profile(profile_id);
+    if !p.tokens.contains_key(label) {
+        return Err(CFError::new(
+            "Storage error",
+            format!("Token '{label}' does not exist in this profile."),
+            "Save the token first, then select it as active.",
+        ));
+    }
+    write_json(&active_token_path(profile_id), &label.trim().to_string())
+}
+
+/// Clear the active token marker for a profile.
+pub fn clear_active_token(profile_id: &str) -> Result<(), CFError> {
+    write_json(&active_token_path(profile_id), &String::new())
+}
+
+/// Look up a token's plaintext by label (used by verify + deploy).
+pub fn get_token(id: &str, label: &str) -> Result<Option<String>, CFError> {
+    Ok(load_profile(id).tokens.get(label).map(|e| e.token.clone()))
+}
+
 /// Add a remembered account.
 pub fn remember_account(
     id: &str,
@@ -564,6 +613,62 @@ mod tests {
             // unknown profile falls back to default
             set_active_profile("does-not-exist").unwrap();
             assert_eq!(get_active_profile(), "default");
+        });
+    }
+
+    #[test]
+    fn get_active_token_returns_none_when_file_missing() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let id = create_profile("work", "").unwrap();
+            // fresh profile, no active-token file
+            assert_eq!(get_active_token(&id).unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn get_active_token_returns_none_when_label_no_longer_exists() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let id = create_profile("work", "").unwrap();
+            // write a stale marker pointing at a token that doesn't exist
+            fs::create_dir_all(profile_dir(&id)).unwrap();
+            write_json(&profile_dir(&id).join("active_token"), &"deleted-token".to_string())
+                .unwrap();
+            assert_eq!(get_active_token(&id).unwrap(), None);
+            // a second read also returns None (marker stays cleared/no-op)
+            assert_eq!(get_active_token(&id).unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn active_token_roundtrip_and_clear() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let id = create_profile("work", "").unwrap();
+            add_token(&id, "primary", "tok1").unwrap();
+
+            // unknown label -> error
+            assert!(set_active_token(&id, "nope").is_err());
+
+            // set + read back
+            set_active_token(&id, "primary").unwrap();
+            assert_eq!(get_active_token(&id).unwrap().as_deref(), Some("primary"));
+
+            // clear
+            clear_active_token(&id).unwrap();
+            assert_eq!(get_active_token(&id).unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn get_token_by_label() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let id = create_profile("work", "").unwrap();
+            add_token(&id, "primary", "tok-secret").unwrap();
+            assert_eq!(get_token(&id, "primary").unwrap().as_deref(), Some("tok-secret"));
+            assert_eq!(get_token(&id, "missing").unwrap(), None);
         });
     }
 
