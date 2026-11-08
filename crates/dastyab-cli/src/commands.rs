@@ -811,7 +811,22 @@ async fn cmd_e2e(
     let worker_name = worker
         .map(|w| safe_worker_name(&w))
         .unwrap_or_else(|| default_worker_name_for(&p));
-    let acc_id = resolve_account_id(&p, &client, None)?;
+    let acc_id = if p.config.active_account.is_empty() {
+        client
+            .list_accounts()
+            .await?
+            .first()
+            .map(|a| a.id.clone())
+            .ok_or_else(|| {
+                CFError::new(
+                    "No account",
+                    "No CF account accessible.",
+                    "Check token permissions.",
+                )
+            })?
+    } else {
+        p.config.active_account.clone()
+    };
     let scripts = client.list_scripts(&acc_id).await?;
     if !scripts.iter().any(|s| s.name == worker_name) {
         return Err(CFError::new(
