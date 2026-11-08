@@ -344,6 +344,7 @@ pub enum WorkerHealth {
 pub async fn probe_worker_health(
     worker_host: &str,
     connect_ip: Option<std::net::Ipv4Addr>,
+    resolver: Option<&crate::doh::DohResolver>,
     timeout_s: u64,
 ) -> WorkerHealth {
     let timeout_ms = timeout_s.max(1) * 1000;
@@ -351,10 +352,10 @@ pub async fn probe_worker_health(
     let connect_addr = match connect_ip {
         Some(ip) => ip.to_string(),
         None => {
-            // Prefer DoH (immune to system-DNS hijack), then fall back to system
-            // DNS with hijack rejection. DoH already filters 198.18.x.x.
-            let doh = crate::doh::DohResolver::new();
-            match resolve_worker_host(worker_host, Some(&doh)).await {
+            // Prefer the supplied DoH resolver (immune to system-DNS hijack),
+            // then fall back to system DNS with hijack rejection. DoH already
+            // filters 198.18.x.x.
+            match resolve_worker_host(worker_host, resolver).await {
                 Some(ip) => ip.to_string(),
                 None => return WorkerHealth::Unreachable,
             }
@@ -549,9 +550,10 @@ pub async fn step0_gate(
     timeout_s: u64,
     cidrs: &[crate::cf::ips::Cidr],
 ) -> WorkerHealth {
-    // Fast path: try resolving through system DNS (rejecting hijacked answers).
+    // Fast path: try DoH first, then system DNS (rejecting hijacked answers).
+    let doh = crate::doh::DohResolver::new();
     if matches!(
-        probe_worker_health(worker_host, None, timeout_s).await,
+        probe_worker_health(worker_host, None, Some(&doh), timeout_s).await,
         WorkerHealth::Alive
     ) {
         return WorkerHealth::Alive;
