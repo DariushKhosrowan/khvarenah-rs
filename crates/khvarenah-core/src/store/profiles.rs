@@ -118,6 +118,18 @@ pub struct ProfileConfig {
     /// Outcome of the most recent rescue chain: "recovered" | "gave_up".
     #[serde(default)]
     pub last_rescue_outcome: Option<String>,
+    /// Self-learning phase-2 SNI strategy. `None` = not yet learned (auto →
+    /// WorkerOnly). Stored as the enum's name so it survives serde and can be
+    /// spawned across crate boundaries.
+    #[serde(default)]
+    pub preferred_phase2_strategy: Option<String>,
+    /// Consecutive phase-2 cycles that yielded zero accepted `101`s under the
+    /// preferred strategy (the "zero streak"). At 3 the app rotates strategy.
+    #[serde(default)]
+    pub strategy_zero_streak: u32,
+    /// UNIX epoch seconds the strategy was last (re)learned / rotated.
+    #[serde(default)]
+    pub strategy_last_updated_ts: i64,
 }
 
 fn default_light_interval() -> u64 {
@@ -141,6 +153,9 @@ impl Default for ProfileConfig {
             last_redeploy_ts: 0,
             last_rescue_attempt_ts: 0,
             last_rescue_outcome: None,
+            preferred_phase2_strategy: None,
+            strategy_zero_streak: 0,
+            strategy_last_updated_ts: 0,
         }
     }
 }
@@ -500,6 +515,35 @@ pub fn protection_enabled(id: &str) -> bool {
 pub fn set_protection(id: &str, enabled: bool) -> Result<(), CFError> {
     let mut cfg = load_profile(id).config;
     cfg.protection_enabled = enabled;
+    save_config(id, &cfg)
+}
+
+/// Read the persisted self-learning phase-2 SNI strategy. Returns `None`
+/// before the first cycle learns one (the engine auto-defaults to WorkerOnly).
+pub fn preferred_phase2_strategy(id: &str) -> Option<String> {
+    load_profile(id).config.preferred_phase2_strategy.clone()
+}
+
+/// Read the consecutive zero-101 streak (rotation trigger at 3).
+pub fn strategy_zero_streak(id: &str) -> u32 {
+    load_profile(id).config.strategy_zero_streak
+}
+
+/// Read the epoch timestamp of the last strategy (re)learn / rotation.
+pub fn strategy_last_updated_ts(id: &str) -> i64 {
+    load_profile(id).config.strategy_last_updated_ts
+}
+
+/// Persist the learned strategy + zero-streak + timestamp in one atomic save.
+pub fn commit_strategy_state(
+    id: &str,
+    preferred: Option<String>,
+    zero_streak: u32,
+) -> Result<(), CFError> {
+    let mut cfg = load_profile(id).config;
+    cfg.preferred_phase2_strategy = preferred;
+    cfg.strategy_zero_streak = zero_streak;
+    cfg.strategy_last_updated_ts = crate::store::now_ts() as i64;
     save_config(id, &cfg)
 }
 

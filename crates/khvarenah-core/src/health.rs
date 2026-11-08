@@ -507,15 +507,18 @@ pub async fn probe_ws(ip: &str, port: u16, sni: &str, path: &str, timeout_ms: u6
     probe_ws_ex(ip, port, sni, sni, path, timeout_ms).await
 }
 
-/// SNI strategies for the phase-2 probe (DeepSeek resurrection spec): try the
-/// worker hostname first; if DPI blocks that SNI, fall back to a benign generic
-/// Cloudflare domain while keeping the worker hostname as the Host header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// SNI strategies for the phase-2 probe: which SNI the probe offers in the
+/// TLS handshake and how it falls back. This is the self-learning knob the
+/// autopilot rotates when a strategy yields zero accepted `101`s for 3 cycles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SniStrategy {
     /// Use only the worker hostname for both SNI and Host.
     WorkerOnly,
     /// Try the worker hostname first, then a generic CF domain SNI.
     WorkerThenGenericCf,
+    /// Try the generic CF SNI first (bypasses `*.workers.dev` SNI blocking),
+    /// falling back to the worker hostname only if generic wins zero.
+    GenericCfFirst,
 }
 
 /// Sweep `ports` with a fixed (tls_sni, host) pair, early-exiting on the first
@@ -611,6 +614,18 @@ pub async fn probe_with_sni_strategy(
         }
         SniStrategy::WorkerThenGenericCf => {
             probe_all_alt_ports_sni(ip, worker_sni, generic_cf_sni, host, path, timeout_ms).await
+        }
+        SniStrategy::GenericCfFirst => {
+            // Generic CF SNI first (bypasses `*.workers.dev` SNI blocking);
+            // only if it wins zero do we fall back to the worker hostname.
+            let generic_results = probe_ports_sni(ip, generic_cf_sni, host, path, timeout_ms, ALT_PORTS).await;
+            let any_hit = generic_results.iter().any(|r| r.status == Some(101) && r.worker_bytes >= MIN_WORKER_BYTES);
+            if any_hit {
+                return generic_results;
+            }
+            let mut combined = generic_results;
+            combined.extend(probe_ports_sni(ip, worker_sni, host, path, timeout_ms, ALT_PORTS).await);
+            combined
         }
     }
 }
