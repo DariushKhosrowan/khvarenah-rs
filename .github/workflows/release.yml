@@ -85,7 +85,7 @@ jobs:
             cp target/debian/*.deb "dist/khvarenah-${BASE}.deb"
           fi
           if [ "${{ matrix.zip }}" = "true" ]; then
-            (cd target/release && zip -r -X "../../dist/khvarenah-${BASE}-portable.zip" khvarenah.exe khvarenah-tui.exe khvarenah-gui.exe >/dev/null)
+            python scripts/bundle_windows.py "${{ matrix.artifact }}"
           fi
           ls -la dist/
 
