@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use crate::error::CFError;
 use crate::store;
 use crate::store::profiles;
+use crate::bootstrap_diagnose::DiagnosisResult;
 
 /// Where the token came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,7 +234,11 @@ pub async fn ensure_worker(
 }
 
 /// Write the systemd user unit if absent. Returns whether it was just written.
-pub fn ensure_daemon_installed(binary_path: &Path, profile_id: &str) -> Result<DaemonInstallOutcome, CFError> {
+pub fn ensure_daemon_installed(
+    binary_path: &Path,
+    profile_id: &str,
+    auto_enable: bool,
+) -> Result<DaemonInstallOutcome, CFError> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
     let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir).map_err(|e| {
@@ -244,17 +249,43 @@ pub fn ensure_daemon_installed(binary_path: &Path, profile_id: &str) -> Result<D
         )
     })?;
     let unit = unit_dir.join("dastyab-daemon.service");
-    if unit.exists() {
-        return Ok(DaemonInstallOutcome::AlreadyInstalled);
+    let outcome = if unit.exists() {
+        DaemonInstallOutcome::AlreadyInstalled
+    } else {
+        let contents = crate::daemon::systemd_unit(binary_path, profile_id);
+        std::fs::write(&unit, contents).map_err(|e| {
+            CFError::new("Daemon", e.to_string(), "Cannot write the systemd unit.")
+        })?;
+        DaemonInstallOutcome::Installed
+    };
+    if auto_enable {
+        // Best-effort start/enable. On failure we still return OK if the unit
+        // exists — the caller decides whether that is fatal (diagnosis).
+        let _ = systemctl_user(
+            if outcome == DaemonInstallOutcome::Installed {
+                "enable --now"
+            } else {
+                "start"
+            },
+            &unit,
+        );
     }
-    let contents = crate::daemon::systemd_unit(binary_path, profile_id);
-    std::fs::write(&unit, contents).map_err(|e| {
-        CFError::new("Daemon", e.to_string(), "Cannot write the systemd unit.")
-    })?;
-    Ok(DaemonInstallOutcome::Installed)
+    Ok(outcome)
 }
 
-/// The one-command orchestrator.
+/// Run a `systemctl --user` command. Returns the command's stdout/status.
+fn systemctl_user(action: &str, unit: &Path) -> std::io::Result<std::process::Output> {
+    let unit_name = unit.file_name().and_then(|s| s.to_str()).unwrap_or("dastyab-daemon.service");
+    std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(action.split_whitespace())
+        .arg(unit_name)
+        .output()
+}
+
+/// The one-command orchestrator (legacy API — returns a rich `BootstrapResult`,
+/// always `Ok` on success, never a scriptable exit code). Kept for back-compat;
+/// new callers should use [`up_with_diagnosis`].
 pub async fn up(profile_id_override: Option<&str>) -> Result<BootstrapResult, CFError> {
     let started = std::time::Instant::now();
 
@@ -283,7 +314,6 @@ pub async fn up(profile_id_override: Option<&str>) -> Result<BootstrapResult, CF
     // 3 — ensure token is stored + active
     match &detected.source {
         TokenSource::ExistingProfile(_) => {
-            // Already in a profile; just ensure an active token is set.
             if profiles::get_active_token(&profile_id)?.is_none() {
                 let p = profiles::load_profile(&profile_id);
                 if let Some(l) = p.tokens.keys().next() {
@@ -292,12 +322,8 @@ pub async fn up(profile_id_override: Option<&str>) -> Result<BootstrapResult, CF
             }
         }
         _ => {
-            // Store the token on the profile if not already present.
             let p = profiles::load_profile(&profile_id);
-            let existing = p
-                .tokens
-                .values()
-                .find(|e| e.token == detected.token);
+            let existing = p.tokens.values().find(|e| e.token == detected.token);
             if existing.is_none() {
                 profiles::add_token(&profile_id, "default", &detected.token)?;
                 profiles::set_active_token(&profile_id, "default")?;
@@ -331,7 +357,7 @@ pub async fn up(profile_id_override: Option<&str>) -> Result<BootstrapResult, CF
 
     // 7 — daemon unit
     let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("dastyab"));
-    let daemon_outcome = ensure_daemon_installed(&bin, &profile_id)?;
+    let daemon_outcome = ensure_daemon_installed(&bin, &profile_id, false)?;
 
     Ok(BootstrapResult {
         profile_id,
@@ -342,6 +368,232 @@ pub async fn up(profile_id_override: Option<&str>) -> Result<BootstrapResult, CF
         daemon_outcome,
         duration_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// The fail-fast `dastyab up` cascade. Either produces a working bundle (and
+/// returns the success [`DiagnosisResult`]), or returns a [`DiagnosisResult`]
+/// with `ok: false`, a scriptable exit code, one plain-language sentence, and
+/// one recommended action. This is the honest "zero manual steps" contract —
+/// it never prints "✓" when discovery found no working endpoint.
+///
+/// Stage budgets (total ≤ 300s): token 10s, worker 30s, discovery 240s,
+/// bundle 10s, daemon 10s.
+pub async fn up_with_diagnosis(profile_id_override: Option<&str>) -> DiagnosisResult {
+    use crate::bootstrap_diagnose as diag;
+    use crate::bootstrap_diagnose::UpFailure;
+
+    let started = std::time::Instant::now();
+    let elapsed = |s: &std::time::Instant| s.elapsed().as_millis() as u64;
+
+    // 1 — token (budget: immediate)
+    let detected = detect_token();
+    if detected.source == TokenSource::None {
+        return diag::diagnose(&UpFailure::NoTokenFound, elapsed(&started));
+    }
+    let token_budget = std::time::Instant::now();
+
+    // 2 — resolve profile
+    let profile_id = match profile_id_override {
+        Some(id) => id.to_string(),
+        None => match &detected.source {
+            TokenSource::ExistingProfile(id) => id.clone(),
+            _ => "default".to_string(),
+        },
+    };
+    if !profiles::list_profiles().iter().any(|m| m.id == profile_id)
+        && profiles::create_profile(&profile_id, "auto-created by dastyab up").is_err()
+    {
+        return diag::diagnose(
+            &UpFailure::DaemonStartFailed {
+                reason: "could not create profile".into(),
+            },
+            elapsed(&started),
+        );
+    }
+
+    // 3 — ensure token is stored + active (part of token stage)
+    let token_store_ok = match &detected.source {
+        TokenSource::ExistingProfile(_) => {
+            match profiles::get_active_token(&profile_id) {
+                Ok(Some(_)) => true,
+                _ => {
+                    let p = profiles::load_profile(&profile_id);
+                    if let Some(l) = p.tokens.keys().next() {
+                        profiles::set_active_token(&profile_id, l).is_ok()
+                    } else {
+                        false
+                    }
+                }
+            }
+        }
+        _ => {
+            let p = profiles::load_profile(&profile_id);
+            let existing = p.tokens.values().find(|e| e.token == detected.token);
+            if existing.is_some() {
+                true
+            } else {
+                profiles::add_token(&profile_id, "default", &detected.token).is_ok()
+                    && profiles::set_active_token(&profile_id, "default").is_ok()
+            }
+        }
+    };
+    if !token_store_ok {
+        return diag::diagnose(&UpFailure::NoTokenFound, elapsed(&started));
+    }
+
+    // 4 — verify token + resolve account (token stage, ≤10s)
+    if token_budget.elapsed() > std::time::Duration::from_secs(10) {
+        return diag::diagnose(
+            &UpFailure::TokenInvalid {
+                cf_error: "timeout".into(),
+            },
+            elapsed(&started),
+        );
+    }
+    let (account_id, _) = match resolve_token_and_account(&detected.token).await {
+        Ok(x) => x,
+        Err(e) => {
+            return diag::diagnose(
+                &UpFailure::TokenInvalid {
+                    cf_error: e.to_string(),
+                },
+                elapsed(&started),
+            );
+        }
+    };
+
+    // 5 — ensure worker (worker stage, ≤30s)
+    let worker_budget = std::time::Instant::now();
+    if worker_budget.elapsed() > std::time::Duration::from_secs(30) {
+        return diag::diagnose(
+            &UpFailure::WorkerUnreachable {
+                worker_health: "timeout".into(),
+            },
+            elapsed(&started),
+        );
+    }
+    let _worker = match ensure_worker(&profile_id, &detected.token, &account_id).await {
+        Ok(w) => w,
+        Err(e) => {
+            return diag::diagnose(
+                &UpFailure::WorkerDeployFailed {
+                    cf_error: e.to_string(),
+                },
+                elapsed(&started),
+            );
+        }
+    };
+
+    // 6 — discovery (discovery stage, ≤240s) — guarded cycle writes diagnostics
+    let sample_target: u32 = 2000;
+    let params = crate::autopilot::DiscoveryParams {
+        sample: 2000,
+        workers: 64,
+        ..Default::default()
+    };
+    let engine = crate::autopilot::AutopilotEngine::new(
+        profile_id.clone(),
+        params,
+        std::time::Duration::from_secs(300),
+    );
+    let disc_result = engine
+        .run_cycle_guarded(std::time::Duration::from_secs(240))
+        .await;
+    // Load last persisted diagnostics to classify a zero result.
+    let diag_state = profiles::load_last_diagnostics(&profile_id);
+
+    let verified = match &disc_result {
+        Ok((verified, _)) => verified.clone(),
+        Err(_) => {
+            // Timeout / abort — the timeout itself is a diagnosis.
+            return diag::timeout_diagnosis(elapsed(&started));
+        }
+    };
+
+    let phase1_pass = diag_state.as_ref().map(|d| d.phase1_pass).unwrap_or(0);
+    let phase2_pass = diag_state.as_ref().map(|d| d.phase2_pass).unwrap_or(0);
+    let e2e_pass = diag_state.as_ref().map(|d| d.e2e_pass).unwrap_or(0);
+
+    if verified.is_empty() {
+        if phase1_pass == 0 {
+            return diag::diagnose(
+                &UpFailure::DiscoveryNoCandidates {
+                    phase1_pass,
+                    phase1_total: sample_target,
+                },
+                elapsed(&started),
+            );
+        }
+        if phase2_pass == 0 {
+            let hist = diag_state
+                .as_ref()
+                .map(|d| diag::ws_histogram_top(&d.ws_failure_histogram))
+                .unwrap_or_else(|| "Unknown".into());
+            return diag::diagnose(
+                &UpFailure::DiscoveryCandidatesButNoWs { ws_histogram_top: hist },
+                elapsed(&started),
+            );
+        }
+        // phase2 passed but verified empty → E2E gate failed.
+        let e2e_stage = diag_state
+            .as_ref()
+            .and_then(|d| {
+                d.e2e_fail_by_stage
+                    .iter()
+                    .max_by_key(|(_, &c)| c)
+                    .map(|(k, _)| format!("{k:?}"))
+            })
+            .unwrap_or_else(|| "Unknown".into());
+        return diag::diagnose(
+            &UpFailure::DiscoveryNoE2e {
+                phase2_pass,
+                e2e_pass,
+                e2e_failure_stage: e2e_stage,
+            },
+            elapsed(&started),
+        );
+    }
+
+    // 7 — write bundle (bundle stage, ≤10s)
+    let vless = match crate::autopilot::base_vless(&profile_id) {
+        Ok(v) => v,
+        Err(_) => {
+            return diag::diagnose(
+                &UpFailure::BundleWriteFailed {
+                    path: crate::cleanip::user_config_dir(&profile_id)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "~/dastyab-configs".into()),
+                    reason: "no base vless config".into(),
+                },
+                elapsed(&started),
+            );
+        }
+    };
+    if let Err(e) = crate::cleanip::write_user_bundle(&profile_id, &vless, &verified) {
+        return diag::diagnose(
+            &UpFailure::BundleWriteFailed {
+                path: crate::cleanip::user_config_dir(&profile_id)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "~/dastyab-configs".into()),
+                reason: e.to_string(),
+            },
+            elapsed(&started),
+        );
+    }
+
+    // 8 — daemon auto-enable (daemon stage, ≤10s)
+    let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("dastyab"));
+    match ensure_daemon_installed(&bin, &profile_id, true) {
+        Ok(_) => {}
+        Err(e) => {
+            return diag::diagnose(
+                &UpFailure::DaemonStartFailed { reason: e.to_string() },
+                elapsed(&started),
+            );
+        }
+    }
+
+    diag::success_result(elapsed(&started))
 }
 
 #[cfg(test)]
@@ -451,10 +703,10 @@ mod tests {
             std::env::set_var("HOME", &tmp);
         }
         let bin = PathBuf::from("/tmp/fake-dastyab");
-        let outcome = ensure_daemon_installed(&bin, "default").unwrap();
+        let outcome = ensure_daemon_installed(&bin, "default", false).unwrap();
         assert_eq!(outcome, DaemonInstallOutcome::Installed);
         // Second call → already installed.
-        let outcome2 = ensure_daemon_installed(&bin, "default").unwrap();
+        let outcome2 = ensure_daemon_installed(&bin, "default", false).unwrap();
         assert_eq!(outcome2, DaemonInstallOutcome::AlreadyInstalled);
         let _ = std::fs::remove_dir_all(&tmp);
     }

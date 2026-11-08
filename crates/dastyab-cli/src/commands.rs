@@ -1596,21 +1596,27 @@ fn cmd_verify(direct_ip: &str, tunnel_ip: &str) -> Result<(), CFError> {
 }
 
 async fn cmd_up(profile_override: Option<String>) -> Result<(), CFError> {
-    let result = dastyab_core::bootstrap::up(profile_override.as_deref()).await?;
-    println!("✓ Protection bootstrap complete.");
-    println!("  profile:  {}", result.profile_id);
-    println!("  worker:   {}", result.worker_host);
-    println!("  bundle:   {}", result.bundle_dir.display());
-    match result.daemon_outcome {
-        dastyab_core::bootstrap::DaemonInstallOutcome::Installed => println!(
-            "  daemon:   systemd unit written — enable with: systemctl --user enable --now dastyab-daemon.service"
-        ),
-        dastyab_core::bootstrap::DaemonInstallOutcome::AlreadyInstalled => {
-            println!("  daemon:   systemd unit already installed")
-        }
+    let diag = dastyab_core::bootstrap::up_with_diagnosis(profile_override.as_deref()).await;
+    let mins = diag.elapsed_ms as f64 / 60000.0;
+    if diag.ok {
+        let bundle = dastyab_core::cleanip::user_config_dir("default")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "~/dastyab-configs/default/".to_string());
+        println!("✓ Protection active in {mins:.0}m {:.0}s", (diag.elapsed_ms % 60000) as f64 / 1000.0);
+        println!("  Bundle: {bundle}");
+        println!("  → active.png   (scan with your phone)");
+        println!("  → active.vless (paste into your desktop client)");
+        println!("  Daemon: running (systemd user service)");
+        println!("  Best endpoint: see fallbacks.txt / active.vless");
+        std::process::exit(0);
     }
-    println!("  done in:  {} ms", result.duration_ms);
-    Ok(())
+    // Failure — print the honest one-line diagnosis + exit scriptably.
+    eprintln!("✗ Setup could not complete (failed at stage: {})", diag.stage_reached);
+    eprintln!("  {}", diag.plain_message);
+    eprintln!("  Recommended: {}", diag.recommended_action);
+    let code = diag.failure.as_ref().map(|f| f.exit_code()).unwrap_or(1);
+    eprintln!("  Exit code: {code}");
+    std::process::exit(code);
 }
 
 /// `dastyab beacon …` — remote push notifications.
