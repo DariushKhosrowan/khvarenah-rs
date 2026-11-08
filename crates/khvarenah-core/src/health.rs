@@ -312,7 +312,7 @@ impl ServerCertVerifier for LenientVerifier {
 /// Build a lenient rustls ClientConfig for a given browser fingerprint profile.
 /// The verifier is intentionally lenient because we front a Cloudflare edge and
 /// the worker hostname is not the certificate owner (`allowInsecure`).
-fn lenient_client_config(
+pub(crate) fn lenient_client_config(
     profile: crate::probe_jitter::ClientHelloProfile,
 ) -> Result<rustls::ClientConfig, CFError> {
     let provider = crate::probe_jitter::provider_for_profile(profile);
