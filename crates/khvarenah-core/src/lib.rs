@@ -39,6 +39,7 @@ pub mod autopilot;
 pub mod backup;
 pub mod blackout;
 pub mod bootstrap;
+pub mod bootstrap_diagnose;
 pub mod cf;
 pub mod cleanip;
 pub mod connectivity;
