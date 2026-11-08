@@ -20,16 +20,14 @@
 //!      configs. Controlled by a single ON/OFF watch channel.
 
 use std::future::Future;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cf::ips::{load_ranges, sample_candidates};
+use crate::cf::ips::load_ranges;
 use crate::error::CFError;
-use crate::health::{check, HealthOptions};
 use crate::store;
 use crate::scanner::{run_scan, ScanParams, ScanResult};
 use crate::vless::VlessProfile;
@@ -77,6 +75,10 @@ pub struct DiscoveryParams {
     /// Re-validate a candidate "dead" once after a short delay before giving
     /// up (E2E cold-start protection).
     pub retry_on_fail: bool,
+    /// Known-good IP seeds (from the autopilot ledger). The scanner expands
+    /// neighbourhoods around these first instead of sampling uniformly.
+    /// `seed_ips` are bare IPv4 strings (no port).
+    pub seed_ips: Vec<String>,
 }
 
 impl Default for DiscoveryParams {
@@ -88,6 +90,7 @@ impl Default for DiscoveryParams {
             top_n: 3,
             force_refresh_ranges: false,
             retry_on_fail: true,
+            seed_ips: Vec::new(),
         }
     }
 }
@@ -122,75 +125,110 @@ impl EndpointProvider for NativeCfProvider {
     }
 }
 
-/// Probe one candidate IP against a worker host. Returns a scored probe.
-async fn probe_candidate(
+/// Probe one candidate IP against a worker host using the real-client gate:
+/// fast TCP reachability, then TLS + RFC 6455 WebSocket upgrade across the
+/// Cloudflare alt-port set. Only an accepted (101 + bytes) endpoint becomes a
+/// `CleanEndpoint`, and only if it clears the multi-dimension quality score.
+async fn probe_endpoint(
     ip: &str,
-    port: u16,
     sni: &str,
-    timeout_s: u32,
+    path: &str,
+    timeout_ms: u64,
 ) -> Result<CleanEndpoint, CFError> {
-    let opts = HealthOptions {
-        timeout: Duration::from_secs(timeout_s as u64),
-        // Enough to measure throughput without scraping the edge.
-        download_bytes: 16 * 1024,
-        tls: true,
-    };
-    let h = check(ip, port, &opts).await;
-    if !h.ok {
-        // Non-fatal: just not a candidate.
+    // SlipNet-style fast-fail: drop unreachable IPs before paying for TLS/WS.
+    let fast = crate::health::probe_fast(ip, 443, timeout_ms).await;
+    if !fast.passed && fast.rtt_ms == 0 {
         return Err(CFError::new(
             "Probe failed",
-            format!("TCP/TLS probe failed for {ip}:{port}"),
+            format!("TCP unreachable {ip}"),
             "",
         ));
     }
-    // Composite score: favour low latency and decent throughput.
-    let latency = h.tcp_ms.max(0.001);
-    let throughput = h.download_kbps.max(1.0);
-    let score = (1000.0 / latency) + (throughput / 100.0);
+
+    // Deep real-client gate: TLS + WS upgrade across all alt ports.
+    let probes = crate::health::probe_all_alt_ports(ip, sni, path, timeout_ms).await;
+    let accepted = probes
+        .iter()
+        .find(|p| p.status == Some(101) && p.worker_bytes > 0);
+    let Some(accepted) = accepted else {
+        return Err(CFError::new(
+            "Probe failed",
+            format!("No WebSocket accept on {ip}"),
+            "",
+        ));
+    };
+
+    let full = crate::health::FullProbe {
+        tcp_ms: accepted.rtt_ms,
+        tls_ok: accepted.tls_ok,
+        ws_ok: true,
+        latency_under_1500: accepted.rtt_ms <= crate::health::FAST_FAIL_MS as u32,
+        throughput_floor: accepted.worker_bytes >= 1,
+        alt_port_ok: accepted.port != 443,
+    };
+    if !crate::health::is_acceptable(&full) {
+        return Err(CFError::new(
+            "Probe failed",
+            format!("Quality score too low for {ip}"),
+            "",
+        ));
+    }
+    let qs = crate::health::quality_score(&full);
     Ok(CleanEndpoint {
         ip: ip.to_string(),
-        port,
+        port: accepted.port,
         sni: sni.to_string(),
-        score,
-        tcp_ms: h.tcp_ms,
-        connect_ms: h.connect_ms,
-        download_kbps: h.download_kbps,
-        verified: false,
+        score: qs as f32,
+        tcp_ms: accepted.rtt_ms as f32,
+        connect_ms: accepted.rtt_ms as f32,
+        download_kbps: accepted.worker_bytes as f32,
+        verified: true,
         alive: true,
-        last_checked: None,
+        last_checked: Some(store::now_iso()),
         ts: store::now_iso(),
     })
 }
 
-/// The native discovery pipeline:
-/// ranges → sample → concurrent probe → rank → validate the top candidates.
+/// The native discovery pipeline: neighbourhood-aware candidate generation
+/// (seeds + /24 expansion + uniform sample) → concurrent probes → rank by
+/// quality score → top_n. Each accepted endpoint has already passed the real
+/// client TLS+WS upgrade gate, so `verified` is set at probe time.
 async fn discover_native(
     vless: &VlessProfile,
     params: &DiscoveryParams,
 ) -> Result<Vec<CleanEndpoint>, CFError> {
     let cidrs = load_ranges(params.force_refresh_ranges).await?;
-    let candidates = sample_candidates(&cidrs, params.sample);
-    if candidates.is_empty() {
+
+    // Fix for "can't find clean IPs": expand around known-good seeds (/24
+    // neighbours first) instead of sampling ~1.5M edges uniformly.
+    let candidate_ips = crate::cf::ips::seeded_candidates(
+        &params.seed_ips,
+        &cidrs,
+        params.sample as usize,
+        24,
+    );
+    if candidate_ips.is_empty() {
         return Err(CFError::new(
             "No candidates",
-            "The Cloudflare range list produced no sample IPs.",
+            "The Cloudflare range list produced no candidate IPs.",
             "Check network connectivity and retry.",
         ));
     }
 
-    let sni = vless.sni.clone().unwrap_or_else(|| vless.address.clone());
+    let target = crate::health::derive_ws_target(vless);
+    let sni = target.sni.clone();
+    let path = target.path.clone();
+    let timeout_ms = (params.timeout_s as u64) * 1000;
 
-    // Parallel probes bounded by a semaphore (worker pool).
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(params.workers.max(1)));
     let mut handles = Vec::new();
-    for ip in candidates {
+    for ip in candidate_ips {
         let permit = sem.clone().acquire_owned().await.unwrap();
         let sni = sni.clone();
-        let timeout = params.timeout_s;
+        let path = path.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            probe_candidate(&ip.to_string(), 443, &sni, timeout).await
+            probe_endpoint(&ip, &sni, &path, timeout_ms).await
         }));
     }
 
@@ -201,67 +239,18 @@ async fn discover_native(
         }
     }
 
-    // Rank by score, take the top_n for validation.
     pool.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    let top: Vec<CleanEndpoint> = pool.into_iter().take(params.top_n.max(1)).collect();
-    if top.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Validate each top candidate through the real front check. Keep those
-    // that genuinely route the worker host.
-    let mut validated = Vec::new();
-    for ep in top {
-        let mut ok = validate_front(&ep.ip, ep.port, &sni, params.timeout_s).await;
-        if !ok && params.retry_on_fail {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            ok = validate_front(&ep.ip, ep.port, &sni, params.timeout_s).await;
-        }
-        if ok {
-            let mut v = ep.clone();
-            v.verified = true;
-            v.last_checked = Some(store::now_iso());
-            validated.push(v);
-        }
-    }
-
-    Ok(validated)
+    Ok(pool.into_iter().take(params.top_n.max(1)).collect())
 }
 
-/// Validate that candidate_ip:port actually fronts `sni` (the worker host).
-///
-/// We pin the worker hostname to the candidate IP via reqwest `.resolve`, so
-/// TLS uses SNI = `sni` and the Host header = `sni`, while the TCP connection
-/// goes to the candidate IP. Then `GET https://<sni>/cdn-cgi/trace`. A
-/// successful Cloudflare trace body proves the front works for this worker.
-async fn validate_front(ip: &str, port: u16, sni: &str, timeout_s: u32) -> bool {
-    let addr = match format!("{ip}:{port}").parse::<SocketAddr>() {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_s as u64))
-        .resolve(sni, addr)
-        .user_agent("khvarenah-autopilot")
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let url = format!("https://{sni}/cdn-cgi/trace");
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-    if !resp.status().is_success() {
-        return false;
-    }
-    let body = match resp.text().await {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    // A CF trace body contains `fl=` (front line) and `ip=`/`warp=` etc.
-    body.contains("fl=") && body.contains("ip=") || body.contains("h=") && body.contains("ts=")
+/// Check whether an endpoint is still alive using the real-client WS gate:
+/// TLS + RFC 6455 upgrade across the alt-port set, accepting only a 101 with
+/// actual bytes. This is the monitor's "is it still tunnelling?" test.
+async fn endpoint_live(ip: &str, sni: &str, path: &str, timeout_ms: u64) -> bool {
+    let probes = crate::health::probe_all_alt_ports(ip, sni, path, timeout_ms).await;
+    probes
+        .iter()
+        .any(|p| p.status == Some(101) && p.worker_bytes > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -431,11 +420,24 @@ impl AutopilotEngine {
         }
     }
 
+    /// A discovery-param copy seeded from the ledger's last-known-good
+    /// endpoints. `seed_ips` become the neighbourhood anchor points for the
+    /// scanner (feature #2), so it doesn't start from zero each cycle.
+    fn params_with_seeds(&self) -> DiscoveryParams {
+        let mut p = self.params.clone();
+        p.seed_ips = crate::cf::ips::load_seed_endpoints(&self.profile_id, 6)
+            .iter()
+            .filter_map(|s| s.split(':').next().map(|ip| ip.to_string()))
+            .collect();
+        p
+    }
+
     /// Run one full discovery+validation cycle, persist the ledger, and
     /// write active configs. Returns the validated endpoints and a summary.
     pub async fn run_cycle(&self) -> Result<(Vec<CleanEndpoint>, CycleSummary), CFError> {
         let vless = base_vless(&self.profile_id)?;
-        let found = self.provider.discover(&vless, &self.params).await?;
+        let params = self.params_with_seeds();
+        let found = self.provider.discover(&vless, &params).await?;
 
         let mut ledger = read_ledger(&self.profile_id);
         let mut replaced = 0;
@@ -529,8 +531,11 @@ impl AutopilotEngine {
         let mut alive = 0;
         let mut replaced = 0;
 
+        let timeout_ms = (self.params.timeout_s as u64) * 1000;
+        let path = crate::health::derive_ws_target(&vless).path;
+
         for ep in ledger.iter_mut() {
-            let ok = validate_front(&ep.ip, ep.port, &ep.sni, self.params.timeout_s).await;
+            let ok = endpoint_live(&ep.ip, &ep.sni, &path, timeout_ms).await;
             if ok {
                 ep.alive = true;
                 ep.last_checked = Some(store::now_iso());
@@ -540,11 +545,13 @@ impl AutopilotEngine {
             }
         }
 
-        // If any active endpoint died, run a targeted discovery to find one
-        // replacement (not a full re-scan) and swap it in.
+        // If any active endpoint died, run a targeted discovery (seeded from
+        // the remaining known-good endpoints) to find a replacement and swap
+        // it in — the config is regenerated with the fresh clean IP.
         let any_dead = ledger.iter().any(|e| !e.alive);
         if any_dead {
-            if let Ok(mut fresh) = self.provider.discover(&vless, &self.params).await {
+            let params = self.params_with_seeds();
+            if let Ok(mut fresh) = self.provider.discover(&vless, &params).await {
                 fresh.retain(|e| !ledger.iter().any(|l| l.ip == e.ip));
                 if let Some(replacement) = fresh.into_iter().find(|e| e.verified) {
                     ledger.push(replacement.clone());

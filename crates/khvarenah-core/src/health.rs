@@ -462,6 +462,87 @@ pub async fn probe_all_alt_ports(
     probe_ports(ip, sni, path, timeout_ms, ALT_PORTS).await
 }
 
+/// The TCP fast-fail probe (SlipNet style). A tunnel with RTT above this
+/// threshold is unusable even if it connects, so we drop it before any TLS/WS
+/// work.
+pub const FAST_FAIL_MS: u64 = 1500;
+
+#[derive(Debug, Clone)]
+pub struct FastProbe {
+    pub rtt_ms: u32,
+    pub passed: bool,
+}
+
+/// TCP-only hard-capped probe. `passed` = false if rtt > FAST_FAIL_MS or the
+/// connect failed/timed out.
+pub async fn probe_fast(ip: &str, port: u16, timeout_ms: u64) -> FastProbe {
+    let started = Instant::now();
+    let addr: SocketAddr = match format!("{ip}:{port}").parse() {
+        Ok(a) => a,
+        Err(_) => {
+            return FastProbe {
+                rtt_ms: 0,
+                passed: false,
+            }
+        }
+    };
+    let res = tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        TcpStream::connect(addr),
+    )
+    .await;
+    let rtt_ms = started.elapsed().as_millis() as u32;
+    let ok = matches!(res, Ok(Ok(_)));
+    FastProbe {
+        rtt_ms,
+        passed: ok && rtt_ms <= (FAST_FAIL_MS as u32),
+    }
+}
+
+/// The full probe evidence used by the quality score.
+#[derive(Debug, Clone)]
+pub struct FullProbe {
+    pub tcp_ms: u32,
+    pub tls_ok: bool,
+    pub ws_ok: bool,
+    pub latency_under_1500: bool,
+    pub throughput_floor: bool,
+    pub alt_port_ok: bool,
+}
+
+/// 7-dimension quality score.
+/// Dimensions: tcp_ok(1) + tls_ok(1) + ws_ok(2) + latency_under_1500(1) +
+/// throughput_floor(1) + alt_port_ok(1) = max 7.
+pub fn quality_score(p: &FullProbe) -> u8 {
+    let mut s = 0u8;
+    if p.tcp_ms > 0 {
+        s += 1;
+    }
+    if p.tls_ok {
+        s += 1;
+    }
+    if p.ws_ok {
+        s += 2;
+    }
+    if p.latency_under_1500 {
+        s += 1;
+    }
+    if p.throughput_floor {
+        s += 1;
+    }
+    if p.alt_port_ok {
+        s += 1;
+    }
+    s
+}
+
+/// Minimum accepted score. Below this the endpoint is rejected.
+pub const ACCEPT_THRESHOLD: u8 = 5;
+
+pub fn is_acceptable(p: &FullProbe) -> bool {
+    quality_score(p) >= ACCEPT_THRESHOLD
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +722,79 @@ mod tests {
         let results = probe_ports("127.0.0.1", "mock.test", "/ws", 5000, &[p101, p200]).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, Some(101));
+    }
+
+    #[test]
+    fn test_quality_score_all_seven_dimensions() {
+        let p = FullProbe {
+            tcp_ms: 100,
+            tls_ok: true,
+            ws_ok: true,
+            latency_under_1500: true,
+            throughput_floor: true,
+            alt_port_ok: true,
+        };
+        assert_eq!(quality_score(&p), 7);
+    }
+
+    #[test]
+    fn test_quality_score_ws_failure_critical() {
+        let p = FullProbe {
+            tcp_ms: 100,
+            tls_ok: true,
+            ws_ok: false,
+            latency_under_1500: true,
+            throughput_floor: true,
+            alt_port_ok: false,
+        };
+        assert_eq!(quality_score(&p), 4);
+        assert!(!is_acceptable(&p));
+    }
+
+    #[test]
+    fn test_quality_score_rejects_below_threshold() {
+        let p = FullProbe {
+            tcp_ms: 100,
+            tls_ok: true,
+            ws_ok: false,
+            latency_under_1500: true,
+            throughput_floor: false,
+            alt_port_ok: false,
+        };
+        assert_eq!(quality_score(&p), 3);
+        assert!(!is_acceptable(&p));
+    }
+
+    #[test]
+    fn test_quality_score_alt_port_bonus() {
+        let p = FullProbe {
+            tcp_ms: 100,
+            tls_ok: true,
+            ws_ok: true,
+            latency_under_1500: true,
+            throughput_floor: true,
+            alt_port_ok: false,
+        };
+        assert_eq!(quality_score(&p), 6);
+        let p2 = FullProbe { alt_port_ok: true, ..p };
+        assert_eq!(quality_score(&p2), 7);
+    }
+
+    #[test]
+    fn test_is_acceptable_at_threshold_boundary() {
+        let mut p = FullProbe {
+            tcp_ms: 100,
+            tls_ok: true,
+            ws_ok: true,
+            latency_under_1500: true,
+            throughput_floor: true,
+            alt_port_ok: false,
+        };
+        assert_eq!(quality_score(&p), 6);
+        assert!(is_acceptable(&p));
+        p.ws_ok = false;
+        p.throughput_floor = false;
+        assert_eq!(quality_score(&p), 3);
+        assert!(!is_acceptable(&p));
     }
 }
