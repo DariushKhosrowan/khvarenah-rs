@@ -30,6 +30,7 @@
 //! ```
 
 pub mod analytics;
+pub mod autopilot;
 pub mod backup;
 pub mod cf;
 pub mod diagnostics;
