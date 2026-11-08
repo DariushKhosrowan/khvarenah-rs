@@ -102,6 +102,13 @@ pub struct KhvarenahApp {
     pub audit_output: String,
     pub backup_output: String,
     pub export_output: String,
+    // remote notifications config
+    pub beacon_enabled: bool,
+    pub beacon_channel: String,
+    pub beacon_token: String,
+    pub beacon_target: String,
+    pub beacon_rate_limit: i64,
+    pub beacon_note: String,
 }
 
 /// What to do when the open dialog submits.
@@ -191,6 +198,39 @@ impl KhvarenahApp {
             audit_output: String::new(),
             backup_output: String::new(),
             export_output: String::new(),
+            beacon_enabled: profile.config.beacon.as_ref().map(|b| b.enabled).unwrap_or(false),
+            beacon_channel: profile
+                .config
+                .beacon
+                .as_ref()
+                .map(|b| match b.kind {
+                    khvarenah_core::remote_beacon::BeaconKind::Telegram => {
+                        "Telegram".to_string()
+                    }
+                    khvarenah_core::remote_beacon::BeaconKind::GenericWebhook => {
+                        "Webhook".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "Telegram".to_string()),
+            beacon_token: profile
+                .config
+                .beacon
+                .as_ref()
+                .map(|b| b.token.clone())
+                .unwrap_or_default(),
+            beacon_target: profile
+                .config
+                .beacon
+                .as_ref()
+                .map(|b| b.chat_id_or_url.clone())
+                .unwrap_or_default(),
+            beacon_rate_limit: profile
+                .config
+                .beacon
+                .as_ref()
+                .map(|b| b.rate_limit_secs)
+                .unwrap_or(900),
+            beacon_note: String::new(),
             view: View::DeployScan,
         };
         app.refresh_diagnostics();
@@ -237,6 +277,71 @@ impl KhvarenahApp {
         if let Err(e) = save_config(&self.profile_id, &cfg) {
             self.note = e.brief();
         }
+    }
+
+    /// Persist the notification config. Loads the current profile config so we
+    /// preserve every other field (beacon is stored on `ProfileConfig`).
+    fn save_beacon(&mut self) {
+        let kind = if self.beacon_channel == "Webhook" {
+            khvarenah_core::remote_beacon::BeaconKind::GenericWebhook
+        } else {
+            khvarenah_core::remote_beacon::BeaconKind::Telegram
+        };
+        let mut p = khvarenah_core::store::profiles::load_profile(&self.profile_id);
+        p.config.beacon = Some(khvarenah_core::remote_beacon::BeaconConfig {
+            enabled: self.beacon_enabled,
+            kind,
+            token: self.beacon_token.clone(),
+            chat_id_or_url: self.beacon_target.clone(),
+            rate_limit_secs: self.beacon_rate_limit.max(1),
+        });
+        match khvarenah_core::store::profiles::save_profile(&p) {
+            Ok(()) => self.beacon_note = "Notifications saved.".to_string(),
+            Err(e) => self.beacon_note = format!("Save failed: {}", e.brief()),
+        }
+    }
+
+    /// Send a test message with the current on-screen config (does not save).
+    fn send_beacon_test(&mut self) {
+        let kind = if self.beacon_channel == "Webhook" {
+            khvarenah_core::remote_beacon::BeaconKind::GenericWebhook
+        } else {
+            khvarenah_core::remote_beacon::BeaconKind::Telegram
+        };
+        let cfg = khvarenah_core::remote_beacon::BeaconConfig {
+            enabled: true,
+            kind,
+            token: self.beacon_token.clone(),
+            chat_id_or_url: self.beacon_target.clone(),
+            rate_limit_secs: self.beacon_rate_limit.max(1),
+        };
+        if cfg.chat_id_or_url.is_empty() {
+            self.beacon_note = "Set a chat ID / webhook URL first.".to_string();
+            return;
+        }
+        let msg = "✅ Khvarenah test notification — protection is working.";
+        let tx = self.tx.clone();
+        bridge::spawn("beacon-test", tx.clone(), async move {
+            match khvarenah_core::remote_beacon::send(&cfg, msg).await {
+                Ok(()) => {
+                    let _ = tx.send(crate::bridge::UiEvent::Log {
+                        task: "beacon-test".to_string(),
+                        line: "[beacon] test message sent".to_string(),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(crate::bridge::UiEvent::TaskErr {
+                        task: "beacon-test".to_string(),
+                        error: CFError::new(
+                            "Beacon test",
+                            e.brief(),
+                            "Check the channel config.",
+                        ),
+                    });
+                }
+            }
+            Ok::<String, CFError>("beacon-test done".to_string())
+        });
     }
 
     /// Start autopilot: spawn a background engine loop on the global tokio
@@ -936,6 +1041,44 @@ impl KhvarenahApp {
                     .desired_rows(4)
                     .font(egui::TextStyle::Monospace),
             );
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading(egui::RichText::new("Notifications").color(GOLD));
+        ui.checkbox(&mut self.beacon_enabled, "Enable push notifications (Telegram / webhook)");
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("beacon_ch")
+                .selected_text(&self.beacon_channel)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.beacon_channel, "Telegram".to_string(), "Telegram");
+                    ui.selectable_value(&mut self.beacon_channel, "Webhook".to_string(), "Webhook");
+                });
+            ui.label("channel");
+        });
+        if self.beacon_channel == "Telegram" {
+            ui.label("Bot token:");
+            ui.add(egui::TextEdit::singleline(&mut self.beacon_token).password(true).desired_width(260.0));
+            ui.label("Chat ID:");
+            ui.add(egui::TextEdit::singleline(&mut self.beacon_target).desired_width(260.0));
+        } else {
+            ui.label("Webhook URL:");
+            ui.add(egui::TextEdit::singleline(&mut self.beacon_target).desired_width(260.0));
+        }
+        ui.horizontal(|ui| {
+            ui.label("Rate limit (s/event):");
+            ui.add(egui::DragValue::new(&mut self.beacon_rate_limit).range(1..=86400));
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Save notifications").clicked() {
+                self.save_beacon();
+            }
+            if ui.button("Send test").clicked() {
+                self.send_beacon_test();
+            }
+        });
+        if !self.beacon_note.is_empty() {
+            ui.colored_label(GOLD, &self.beacon_note);
         }
     }
 
