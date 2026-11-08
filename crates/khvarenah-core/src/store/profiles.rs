@@ -144,6 +144,10 @@ pub struct ProfileConfig {
     /// UNIX epoch seconds of the last rotation.
     #[serde(default)]
     pub strategy_last_rotated_ts: i64,
+    /// Remote push-notification config (Telegram or webhook). `None` =
+    /// disabled (default). Kept as an `Option` so old configs migrate cleanly.
+    #[serde(default)]
+    pub beacon: Option<crate::remote_beacon::BeaconConfig>,
 }
 
 fn default_light_interval() -> u64 {
@@ -174,6 +178,7 @@ impl Default for ProfileConfig {
             strategy_recent_outcomes: Vec::new(),
             strategy_cycles_since_rotation: 0,
             strategy_last_rotated_ts: 0,
+            beacon: None,
         }
     }
 }

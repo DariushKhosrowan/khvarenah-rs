@@ -15,6 +15,7 @@ use khvarenah_core::worker::{
 use khvarenah_core::{CFError, BRAND, VERSION};
 
 use crate::{BackupAction, Command, DaemonAction, DnsAction, ProtectionAction, RoutesAction};
+use khvarenah_core::remote_beacon::BeaconConfig;
 /// Run a command. `profile` is the active profile id.
 pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
     match cmd {
@@ -130,6 +131,8 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             tunnel_ip,
         } => cmd_verify(&direct_ip, &tunnel_ip),
         Command::Bundle { action } => cmd_bundle(&profile, action),
+        Command::Up { profile: profile_override } => cmd_up(profile_override).await,
+        Command::Beacon { action } => cmd_beacon(&profile, action).await,
     }
 }
 
@@ -1248,6 +1251,15 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
     // rotate the ACTIVE profile (store marker) when the rescue chain gives up;
     // we must follow it so the daemon actually switches to the backup worker.
     let mut active_profile: String = cfg.profile.clone();
+    let mut last_rescue_outcome: Option<String> = None;
+
+    // Remote push on startup (best-effort — never fail the loop).
+    let _ = khvarenah_core::remote_beacon::maybe_emit(
+        &active_profile,
+        &khvarenah_core::remote_beacon::BeaconEvent::ProtectionStarted,
+        khvarenah_core::diagnose::Locale::En,
+    )
+    .await;
 
     loop {
         // Stop request?
@@ -1273,6 +1285,18 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
                         &format!("failover: switching profile {} -> {}", active_profile, store_active),
                     ),
                 );
+                // Notify on failover (rate-limited by event class).
+                let from = active_profile.clone();
+                let to_clone = store_active.clone();
+                let _ = khvarenah_core::remote_beacon::maybe_emit(
+                    &store_active,
+                    &khvarenah_core::remote_beacon::BeaconEvent::FailoverSwitched {
+                        from,
+                        to: to_clone,
+                    },
+                    khvarenah_core::diagnose::Locale::En,
+                )
+                .await;
                 active_profile = store_active.clone();
                 state = load_daemon_state(&active_profile);
                 state.pid = pid;
@@ -1286,6 +1310,20 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
         })
         .await;
         save_daemon_state(&active_profile, &state)?;
+        // Worker-dead + rescue-gave-up → notify (rate-limited). Track the
+        // persisted rescue outcome to avoid re-notifying every cycle.
+        let current_rescue = khvarenah_core::store::profiles::load_profile(&active_profile)
+            .config
+            .last_rescue_outcome;
+        if current_rescue.as_deref() == Some("gave_up") && last_rescue_outcome.as_deref() != Some("gave_up") {
+            let _ = khvarenah_core::remote_beacon::maybe_emit(
+                &active_profile,
+                &khvarenah_core::remote_beacon::BeaconEvent::WorkerDeadGiveUp,
+                khvarenah_core::diagnose::Locale::En,
+            )
+            .await;
+        }
+        last_rescue_outcome = current_rescue;
         // Persist the current backoff interval into state.
         if sleep != 0 && sleep != interval {
             interval = sleep;
@@ -1557,7 +1595,124 @@ fn cmd_verify(direct_ip: &str, tunnel_ip: &str) -> Result<(), CFError> {
     Ok(())
 }
 
+async fn cmd_up(profile_override: Option<String>) -> Result<(), CFError> {
+    let result = khvarenah_core::bootstrap::up(profile_override.as_deref()).await?;
+    println!("✓ Protection bootstrap complete.");
+    println!("  profile:  {}", result.profile_id);
+    println!("  worker:   {}", result.worker_host);
+    println!("  bundle:   {}", result.bundle_dir.display());
+    match result.daemon_outcome {
+        khvarenah_core::bootstrap::DaemonInstallOutcome::Installed => println!(
+            "  daemon:   systemd unit written — enable with: systemctl --user enable --now khvarenah-daemon.service"
+        ),
+        khvarenah_core::bootstrap::DaemonInstallOutcome::AlreadyInstalled => {
+            println!("  daemon:   systemd unit already installed")
+        }
+    }
+    println!("  done in:  {} ms", result.duration_ms);
+    Ok(())
+}
+
+/// `khvarenah beacon …` — remote push notifications.
+async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CFError> {
+    use khvarenah_core::remote_beacon::BeaconKind;
+    match action {
+        crate::BeaconAction::Status => {
+            let cfg = khvarenah_core::remote_beacon::load_config(profile);
+            println!("Notification config (profile {profile}):");
+            println!("  enabled:      {}", cfg.enabled);
+            println!(
+                "  channel:      {}",
+                match cfg.kind {
+                    BeaconKind::Telegram => "Telegram",
+                    BeaconKind::GenericWebhook => "Webhook",
+                }
+            );
+            if !cfg.token.is_empty() {
+                println!("  telegram token: [set]");
+            } else {
+                println!("  telegram token: [unset]");
+            }
+            println!("  target:       {}", cfg.chat_id_or_url);
+            println!("  rate limit:   {}s/event class", cfg.rate_limit_secs);
+            println!("  ---");
+            println!("  configure:   khvarenah beacon telegram <token> <chat-id>");
+            println!("               khvarenah beacon webhook <url>");
+            println!("  enable:      khvarenah beacon enable");
+            Ok(())
+        }
+        crate::BeaconAction::Enable => {
+            let mut cfg = khvarenah_core::remote_beacon::load_config(profile);
+            if cfg.chat_id_or_url.is_empty() {
+                return Err(CFError::new(
+                    "Beacon",
+                    "No channel configured.",
+                    "Run `khvarenah beacon telegram|webhook …` first.",
+                ));
+            }
+            cfg.enabled = true;
+            save_beacon(profile, &cfg)?;
+            println!("Notifications ENABLED for profile {profile}.");
+            Ok(())
+        }
+        crate::BeaconAction::Disable => {
+            let mut cfg = khvarenah_core::remote_beacon::load_config(profile);
+            cfg.enabled = false;
+            save_beacon(profile, &cfg)?;
+            println!("Notifications disabled for profile {profile}.");
+            Ok(())
+        }
+        crate::BeaconAction::Telegram { token, chat_id } => {
+            let mut cfg = khvarenah_core::remote_beacon::load_config(profile);
+            cfg.kind = BeaconKind::Telegram;
+            cfg.token = token;
+            cfg.chat_id_or_url = chat_id;
+            save_beacon(profile, &cfg)?;
+            println!("Telegram channel configured (notifications still disabled — run `beacon enable`).");
+            Ok(())
+        }
+        crate::BeaconAction::Webhook { url } => {
+            let mut cfg = khvarenah_core::remote_beacon::load_config(profile);
+            cfg.kind = BeaconKind::GenericWebhook;
+            cfg.token.clear();
+            cfg.chat_id_or_url = url;
+            save_beacon(profile, &cfg)?;
+            println!("Webhook channel configured (notifications still disabled — run `beacon enable`).");
+            Ok(())
+        }
+        crate::BeaconAction::RateLimit { secs } => {
+            let mut cfg = khvarenah_core::remote_beacon::load_config(profile);
+            cfg.rate_limit_secs = secs.max(1);
+            save_beacon(profile, &cfg)?;
+            println!("Rate limit set to {}s/event class.", cfg.rate_limit_secs);
+            Ok(())
+        }
+        crate::BeaconAction::Test => {
+            let cfg = khvarenah_core::remote_beacon::load_config(profile);
+            if cfg.chat_id_or_url.is_empty() {
+                return Err(CFError::new(
+                    "Beacon",
+                    "No channel configured.",
+                    "Run `khvarenah beacon telegram|webhook …` first.",
+                ));
+            }
+            let msg = "✅ Khvarenah test notification — protection is working.";
+            khvarenah_core::remote_beacon::send(&cfg, msg).await?;
+            println!("Test message sent.");
+            Ok(())
+        }
+    }
+}
+
+fn save_beacon(profile: &str, cfg: &BeaconConfig) -> Result<(), CFError> {
+    let mut p = load_profile(profile);
+    p.config.beacon = Some(cfg.clone());
+    khvarenah_core::store::profiles::save_profile(&p)
+}
+
 #[cfg(test)]
+
+
 mod tests {
     use super::*;
 
