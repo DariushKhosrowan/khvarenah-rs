@@ -12,7 +12,7 @@ in Rust for speed, safety, and a single static binary.**
 | **Language** | Rust (edition 2021) |
 | **Workspace** | `khvarenah-core` · `khvarenah-cli` · `khvarenah-tui` · `khvarenah-gui` |
 | **License** | MIT |
-| **Latest release** | `v0.1.0` |
+| **Latest release** | `v0.1.1` |
 | **Rust version** | 1.99+ (stable) |
 | **Zero runtime deps (CLI)** | single static binary, no Python, no Node |
 
@@ -61,27 +61,48 @@ tested, and ready to extend.
 
 ## Quick start
 
-```bash
-# 1. Build (release, optimized)
-cargo build --release
+### Install (one command)
 
-# 2. Add a Cloudflare token (stored 0600 in ~/.khvarenah/)
+The CLI ships as a single static Rust binary — no Python, no Node, no runtime
+deps. Install the latest release with one line:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DariushKhosrowan/khvarenah-rs/main/scripts/install.sh | sh
+```
+
+This detects your OS/CPU, downloads the matching binary from the latest GitHub
+release, verifies its SHA-256 checksum, installs it to `~/.local/bin`, and
+adds that directory to your `PATH`. Then open a new terminal and confirm:
+
+```bash
+khvarenah --version
+```
+
+> **Windows?** Grab the portable `.zip` from the [releases page](https://github.com/DariushKhosrowan/khvarenah-rs/releases).
+> **Prefer a package?** A `.deb` installer is published with every release too.
+> **Build from source?** `cargo build --release` and run
+> `target/release/khvarenah` (or `cargo install khvarenah-cli`).
+
+After installing:
+
+```bash
+# 1. Add a Cloudflare token (stored 0600 in ~/.khvarenah/)
 khvarenah token add cf-main <YOUR_CF_API_TOKEN>
 
-# 3. Verify the token and list your accounts
+# 2. Verify the token and list your accounts
 khvarenah verify
 khvarenah accounts
 
-# 4. Create a profile (optional, defaults to "default")
+# 3. Create a profile (optional, defaults to "default")
 khvarenah profile-create work --description "my setup"
 
-# 5. Deploy a worker & get a vless share link
+# 4. Deploy a worker & get a vless share link
 khvarenah deploy --preset standard
 
-# 6. Find a clean IP (stops on the first working one)
+# 5. Find a clean IP (stops on the first working one)
 khvarenah scan
 
-# 7. Export client configs
+# 6. Export client configs
 khvarenah export clash    --output clash.yaml
 khvarenah export singbox  --output config.json
 khvarenah export v2rayn  --output xray.json
