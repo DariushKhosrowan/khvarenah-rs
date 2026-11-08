@@ -345,6 +345,172 @@ pub fn summarize(cidrs: &[Cidr]) -> String {
     )
 }
 
+/// Enumerate up to `limit` sibling addresses in the same `/prefix_len` block as
+/// `ip` (network and broadcast addresses excluded). Returns an empty vec for an
+/// invalid IP or an out-of-range prefix. This is the clustering primitive: CF
+/// anycast groups clean endpoints tightly, so a working /24 has working
+/// siblings — expand around a known-good seed rather than sample the whole RFC.
+pub fn neighbors_of(ip: &str, prefix_len: u8, limit: usize) -> Vec<String> {
+    if prefix_len > 30 || limit == 0 {
+        return Vec::new();
+    }
+    let addr: Ipv4Addr = match ip.trim().parse() {
+        Ok(a) => a,
+        Err(_) => return Vec::new(),
+    };
+    let base_u32 = u32::from(addr) & (u32::MAX << (32 - prefix_len as u32));
+    let host_count = 1u32 << (32 - prefix_len as u32);
+    if host_count <= 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for i in 0..host_count {
+        if out.len() >= limit {
+            break;
+        }
+        let candidate = base_u32 | i;
+        // exclude network (i == 0) and broadcast (i == host_count-1)
+        if i == 0 || i == host_count - 1 {
+            continue;
+        }
+        out.push(Ipv4Addr::from(candidate).to_string());
+    }
+    out
+}
+
+/// Build a candidate list: seeds first, then their `/prefix_len` neighbors,
+/// deduplicated, padded with a uniform sample until `n` entries. Seeds and
+/// their neighborhoods come before the uniform sample so the scanner tries the
+/// most promising addresses first.
+pub fn seeded_candidates(
+    seeds: &[String],
+    ranges: &[Cidr],
+    n: usize,
+    prefix_len: u8,
+) -> Vec<String> {
+    let n = n.max(1);
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut add = |ip: &str, out: &mut Vec<String>| {
+        if seen.insert(ip.to_string()) {
+            out.push(ip.to_string());
+        }
+    };
+
+    // 1) seeds that still fall inside the current ranges (from a retired range
+    //    is garbage — drop it and let uniform sampling take over).
+    let live: Vec<&str> = seeds
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| {
+            s.parse::<Ipv4Addr>()
+                .map(|ip| ranges.iter().any(|c| c.contains(ip)))
+                .unwrap_or(false)
+        })
+        .collect();
+    for s in live.iter() {
+        add(s, &mut out);
+    }
+
+    // 2) neighbors of every live seed.
+    for s in live.iter() {
+        for nb in neighbors_of(s, prefix_len, 254) {
+            add(&nb, &mut out);
+            if out.len() >= n {
+                return out;
+            }
+        }
+    }
+
+    // 3) pad with the uniform sample when under budget.
+    if out.len() < n {
+        let sample = sample_candidates(ranges, (n - out.len()) as u32);
+        for ip in sample {
+            add(&ip.to_string(), &mut out);
+            if out.len() >= n {
+                break;
+            }
+        }
+    }
+
+    out.truncate(n);
+    out
+}
+
+/// Read prior successful endpoints from the autopilot ledger for a profile.
+/// Returns the last `max` verified endpoints from the past 7 days, as
+/// "ip:port" strings (the seeds for [`seeded_candidates`]).
+pub fn load_seed_endpoints(profile_id: &str, max: usize) -> Vec<String> {
+    let ledger = crate::store::profiles::profile_dir(profile_id)
+        .join("autopilot")
+        .join("endpoints.json");
+    let Ok(text) = std::fs::read_to_string(&ledger) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let seven_days = 7 * 24 * 3600i64;
+    let mut out = Vec::new();
+    for entry in arr {
+        let verified = entry
+            .get("verified")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !verified {
+            continue;
+        }
+        // Only trust seeds added recently.
+        let ts = entry.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+        let age = if !ts.is_empty() {
+            // ts is ISO-8601; approximate by using last_checked when present,
+            // else fall back to accepting it.
+            match entry.get("last_checked").and_then(|v| v.as_str()) {
+                Some(lc) if !lc.is_empty() => {
+                    // parse "YYYY-MM-DDTHH:MM:SS..." via chrono if available
+                    match chrono::DateTime::parse_from_rfc3339(lc) {
+                        Ok(dt) => now.saturating_sub(dt.timestamp()),
+                        Err(_) => 0,
+                    }
+                }
+                _ => {
+                    // no timestamp — accept only if the record has a recent-ish
+                    // ts (best-effort: skip stale format entirely)
+                    if ts.len() >= 10 {
+                        0
+                    } else {
+                        seven_days + 1
+                    }
+                }
+            }
+        } else {
+            seven_days + 1
+        };
+        if age <= seven_days {
+            let ip = entry.get("ip").and_then(|v| v.as_str()).unwrap_or("");
+            let port = entry
+                .get("port")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(443);
+            if !ip.is_empty() {
+                out.push(format!("{ip}:{port}"));
+            }
+        }
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +575,67 @@ mod tests {
         let ips = sample_candidates(&cidrs, 100);
         assert!(!ips.is_empty());
         assert!(ips.len() <= 100);
+    }
+
+    #[test]
+    fn neighbors_of_254_siblings_for_slash_24() {
+        let nbs = neighbors_of("104.16.1.1", 24, 254);
+        assert_eq!(nbs.len(), 254);
+        assert!(nbs.contains(&"104.16.1.1".to_string()));
+    }
+
+    #[test]
+    fn neighbors_of_excludes_network_and_broadcast() {
+        let nbs = neighbors_of("104.16.1.0", 24, 1000);
+        assert!(!nbs.contains(&"104.16.1.0".to_string()));
+        // /24 has 256 addresses; network .0 and broadcast .255 excluded -> 254
+        assert_eq!(nbs.len(), 254);
+    }
+
+    #[test]
+    fn neighbors_of_respects_limit() {
+        let nbs = neighbors_of("104.16.1.1", 24, 10);
+        assert_eq!(nbs.len(), 10);
+    }
+
+    #[test]
+    fn neighbors_of_invalid_ip_returns_empty() {
+        assert!(neighbors_of("not-an-ip", 24, 10).is_empty());
+        assert!(neighbors_of("104.16.1.1", 31, 10).is_empty());
+    }
+
+    #[test]
+    fn seeded_candidates_seeds_first() {
+        let cidrs = vec![Cidr::parse("104.16.0.0/13").unwrap()];
+        let seeds = vec!["104.16.1.1".to_string(), "104.16.2.2".to_string()];
+        let out = seeded_candidates(&seeds, &cidrs, 20, 24);
+        assert_eq!(out[0], "104.16.1.1");
+        assert_eq!(out[1], "104.16.2.2");
+    }
+
+    #[test]
+    fn seeded_candidates_deduplicates_overlap() {
+        let cidrs = vec![Cidr::parse("104.16.0.0/13").unwrap()];
+        let seeds = vec!["104.16.1.1".to_string(), "104.16.1.1".to_string()];
+        let out = seeded_candidates(&seeds, &cidrs, 20, 24);
+        let uniq: std::collections::HashSet<_> = out.iter().collect();
+        assert_eq!(uniq.len(), out.len());
+    }
+
+    #[test]
+    fn seeded_candidates_pads_with_uniform_when_under_budget() {
+        let cidrs = vec![Cidr::parse("104.16.0.0/13").unwrap()];
+        let seeds: Vec<String> = vec![];
+        let out = seeded_candidates(&seeds, &cidrs, 500, 24);
+        assert_eq!(out.len(), 500);
+    }
+
+    #[test]
+    fn seeded_candidates_drops_retired_range_seeds() {
+        // seed lies outside the only range -> should be excluded entirely
+        let cidrs = vec![Cidr::parse("104.16.0.0/13").unwrap()];
+        let seeds = vec!["8.8.8.8".to_string()];
+        let out = seeded_candidates(&seeds, &cidrs, 200, 24);
+        assert!(!out.contains(&"8.8.8.8".to_string()));
     }
 }
