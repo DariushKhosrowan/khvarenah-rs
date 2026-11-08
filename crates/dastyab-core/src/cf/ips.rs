@@ -154,22 +154,37 @@ pub fn read_cache() -> Option<CachedRanges> {
 
 /// Atomically persist a cache.
 pub fn write_cache(cache: &CachedRanges) -> Result<(), CFError> {
-    store::atomic_write(&cache_path(), &serde_json::to_vec_pretty(cache).map_err(|e| {
-        CFError::new("Storage error", format!("Cannot serialize ranges: {e}"), "Internal error.")
-    })?)
+    store::atomic_write(
+        &cache_path(),
+        &serde_json::to_vec_pretty(cache).map_err(|e| {
+            CFError::new(
+                "Storage error",
+                format!("Cannot serialize ranges: {e}"),
+                "Internal error.",
+            )
+        })?,
+    )
 }
 
 /// Parse the JSON API response body into IPv4 CIDR list.
 fn parse_api_json(body: &str) -> Result<Vec<Cidr>, CFError> {
     let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
-        CFError::new("Parse error", format!("Invalid CF IP JSON: {e}"), "CF API shape changed?")
+        CFError::new(
+            "Parse error",
+            format!("Invalid CF IP JSON: {e}"),
+            "CF API shape changed?",
+        )
     })?;
     let list = v
         .get("result")
         .and_then(|r| r.get("ipv4_cidrs"))
         .and_then(|r| r.as_array())
         .ok_or_else(|| {
-            CFError::new("Parse error", "No ipv4_cidrs in CF response.", "CF API shape changed?")
+            CFError::new(
+                "Parse error",
+                "No ipv4_cidrs in CF response.",
+                "CF API shape changed?",
+            )
         })?;
     let mut out = Vec::new();
     for item in list {
@@ -341,7 +356,9 @@ pub fn summarize(cidrs: &[Cidr]) -> String {
         "{} IPv4 block(s), ~{} addresses (source: {})",
         cidrs.len(),
         total,
-        read_cache().map(|c| c.source).unwrap_or_else(|| "not cached".into())
+        read_cache()
+            .map(|c| c.source)
+            .unwrap_or_else(|| "not cached".into())
     )
 }
 
@@ -496,7 +513,11 @@ pub fn weighted_sample_by_cidr(cidrs: &[Cidr], n: usize, rng: &mut impl Rng) -> 
 
 /// Expand /prefix_len neighbourhoods around known-good clean endpoints.
 /// Returns sibling IPs (network/broadcast excluded), best seeds first.
-pub fn expand_around(clean: &[crate::autopilot::CleanEndpoint], prefix_len: u8, per_seed: usize) -> Vec<String> {
+pub fn expand_around(
+    clean: &[crate::autopilot::CleanEndpoint],
+    prefix_len: u8,
+    per_seed: usize,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for ep in clean {
@@ -567,10 +588,7 @@ pub fn load_seed_endpoints(profile_id: &str, max: usize) -> Vec<String> {
         };
         if age <= seven_days {
             let ip = entry.get("ip").and_then(|v| v.as_str()).unwrap_or("");
-            let port = entry
-                .get("port")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(443);
+            let port = entry.get("port").and_then(|v| v.as_u64()).unwrap_or(443);
             if !ip.is_empty() {
                 out.push(format!("{ip}:{port}"));
             }
@@ -591,8 +609,8 @@ pub fn manual_seeds_path(profile_id: &str) -> PathBuf {
 /// - `1.2.3.4`
 /// - `1.2.3.4:443`
 /// - `1.2.3.4:443  # comment` (and Python-style `#` comments on their own line)
-/// Anything that isn't a valid IPv4 (optionally with a 1-65535 port) is
-/// skipped. Returns the count of accepted seeds and the parsed list.
+///   Anything that isn't a valid IPv4 (optionally with a 1-65535 port) is
+///   skipped. Returns the count of accepted seeds and the parsed list.
 pub fn parse_seeds(raw: &str) -> (usize, Vec<String>) {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -648,7 +666,11 @@ pub fn import_manual_seeds(profile_id: &str, raw: &str) -> Result<usize, CFError
     let path = manual_seeds_path(profile_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            CFError::new("Storage error", format!("Cannot create profile dir: {e}"), "")
+            CFError::new(
+                "Storage error",
+                format!("Cannot create profile dir: {e}"),
+                "",
+            )
         })?;
     }
     // Persist as JSON so it round-trips exactly (the plain-text pitfall).

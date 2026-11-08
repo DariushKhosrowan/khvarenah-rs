@@ -107,15 +107,20 @@ pub fn show(
 
     ui.add_space(4.0);
     ui.label(
-        egui::RichText::new("Select a profile to manage it. Tokens, configs and clean IPs live per-profile.")
-            .color(GOLD_DIM),
+        egui::RichText::new(
+            "Select a profile to manage it. Tokens, configs and clean IPs live per-profile.",
+        )
+        .color(GOLD_DIM),
     );
 
     action
 }
 
 /// Run an action that requires a dialog. Returns the dialog to open, if any.
-pub fn run_action(app: &mut DastYabApp, action: ProfilesAction) -> Option<crate::dialogs::Dialog> {
+pub fn run_action(
+    app: &mut DastYabApp,
+    action: ProfilesAction,
+) -> Option<crate::dialogs::Dialog> {
     use crate::app::PendingDialogAction;
     match action {
         ProfilesAction::Switch(id) => {

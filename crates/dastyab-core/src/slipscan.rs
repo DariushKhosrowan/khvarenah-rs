@@ -24,12 +24,12 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::autopilot::CleanEndpoint;
 use crate::e2e::E2eFailureStage;
@@ -79,7 +79,11 @@ pub type Phase1Fn =
     Box<dyn Fn(&str, u64) -> Pin<Box<dyn Future<Output = FastProbe> + Send>> + Send + Sync>;
 
 /// Phase-2 probe: deep WS-upgrade gate across alt ports.
-pub type Phase2Fn = Box<dyn Fn(&str, &str, &str, u64) -> Pin<Box<dyn Future<Output = Vec<WsProbe>> + Send>> + Send + Sync>;
+pub type Phase2Fn = Box<
+    dyn Fn(&str, &str, &str, u64) -> Pin<Box<dyn Future<Output = Vec<WsProbe>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Scoring function for a verified endpoint. Higher is better.
 pub fn score_ep(fast: &FastProbe, ws: &WsProbe) -> f32 {
@@ -159,7 +163,9 @@ pub async fn two_phase_scan(
             let handle = tokio::spawn(async move {
                 let _permit = permit;
                 let probes = phase2_fn(&ip, &sni, &path, phase2_params.ws_timeout_ms).await;
-                let accepted = probes.iter().find(|p| p.status == Some(101) && p.worker_bytes > 0);
+                let accepted = probes
+                    .iter()
+                    .find(|p| p.status == Some(101) && p.worker_bytes > 0);
                 if let Some(ws) = accepted {
                     let score = score_ep(&fast, ws);
                     let ep = CleanEndpoint {
@@ -225,7 +231,11 @@ pub async fn two_phase_scan(
     let _ = _phase2.await;
 
     let mut out = results.lock().unwrap().clone();
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out.truncate(target_n);
     if let Some(tx) = &progress_tx {
         let _ = tx.send(ScanProgress {
@@ -357,6 +367,7 @@ pub fn gate_by_score(candidates: &[CleanEndpoint], threshold: u8) -> Vec<CleanEn
 /// drains and no new probes spawn. Diagnostics count every stage so "why zero?"
 /// is answerable. When `direct_ip` is `None`, E2E is skipped and phase-2-gated
 /// candidates are promoted directly (graceful degradation).
+#[allow(clippy::too_many_arguments)]
 pub async fn pipeline_scan(
     candidates: Vec<String>,
     sni: &str,
@@ -390,8 +401,7 @@ pub async fn pipeline_scan(
     let phase2_pass = Arc::new(AtomicUsize::new(0));
     let gated = Arc::new(AtomicUsize::new(0));
     let e2e_pass_c = Arc::new(AtomicUsize::new(0));
-    let e2e_fail: Arc<Mutex<HashMap<E2eFailureStage, u32>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let e2e_fail: Arc<Mutex<HashMap<E2eFailureStage, u32>>> = Arc::new(Mutex::new(HashMap::new()));
     let results: Arc<Mutex<Vec<CleanEndpoint>>> = Arc::new(Mutex::new(Vec::new()));
     let candidates = Arc::new(candidates);
     let phase1 = Arc::new(phase1);
@@ -491,12 +501,9 @@ pub async fn pipeline_scan(
                 handles.push(tokio::spawn(async move {
                     let _permit = permit;
                     let probes = phase2_fn(&ip, &sni, &path, params2.ws_timeout_ms).await;
-                    let accepted = probes
-                        .iter()
-                        .find(|p| {
-                            p.status == Some(101)
-                                && p.worker_bytes >= crate::health::MIN_WORKER_BYTES
-                        });
+                    let accepted = probes.iter().find(|p| {
+                        p.status == Some(101) && p.worker_bytes >= crate::health::MIN_WORKER_BYTES
+                    });
                     if let Some(ws) = accepted {
                         phase2_pass_c.fetch_add(1, Ordering::Relaxed);
                         let gate = phase2_score(&fast, ws);
@@ -641,7 +648,10 @@ mod tests {
                 if n < first_n_alive {
                     fast_passed(20)
                 } else {
-                    FastProbe { rtt_ms: 0, passed: false }
+                    FastProbe {
+                        rtt_ms: 0,
+                        passed: false,
+                    }
                 }
             };
             Box::pin(async move { out })
@@ -666,7 +676,7 @@ mod tests {
     async fn two_phase_streams_survivors_to_phase2() {
         let candidates: Vec<String> = (0..40).map(|i| format!("candidate-{i}")).collect();
         let p1 = phase1_ok(20); // first 20 alive
-        let p2 = phase2_ok(4);  // every 4th accepted
+        let p2 = phase2_ok(4); // every 4th accepted
         let params = ScanParams {
             target_n: 3,
             phase1_workers: 50,
@@ -730,7 +740,10 @@ mod tests {
     fn score_prefers_low_rtt_and_bytes() {
         let fast = fast_passed(40);
         let low_rtt = ws_accepted(443, 8192);
-        let high_rtt = WsProbe { rtt_ms: 900, ..ws_accepted(443, 8192) };
+        let high_rtt = WsProbe {
+            rtt_ms: 900,
+            ..ws_accepted(443, 8192)
+        };
         assert!(score_ep(&fast, &low_rtt) > score_ep(&fast, &high_rtt));
         let alt = ws_accepted(2053, 8192);
         assert!(score_ep(&fast, &alt) > score_ep(&fast, &low_rtt));

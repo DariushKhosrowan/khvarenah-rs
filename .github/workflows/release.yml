@@ -1,5 +1,9 @@
 name: Release
 
+# Automatic release builder. Triggered by pushing a `v*` tag (e.g. v0.1.0).
+# Builds the full workspace natively on each target runner and publishes a
+# GitHub Release containing .deb installers (Linux), .exe / portable zip
+# (Windows), raw binaries for all platforms, and a SHA256SUMS.txt file.
 on:
   push:
     tags:
@@ -10,53 +14,106 @@ permissions:
 
 jobs:
   build:
-    name: Build release binaries
+    name: build-${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: dastyab-linux-amd64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact: dastyab-linux-arm64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: dastyab-macos-aarch64
+            artifact: linux-amd64
+            deb: true
+          - os: ubuntu-24.04-arm
+            artifact: linux-arm64
+            deb: true
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: dastyab-windows-amd64.exe
-    runs-on: ${{ matrix.os }}
+            artifact: windows-amd64
+            exe: true
+            zip: true
+          - os: macos-latest
+            artifact: macos-arm64
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install target
-        run: rustup target add ${{ matrix.target }}
+      - name: Install Linux system deps (GUI/egui)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev libx11-dev libxkbcommon-x11-dev
 
-      - name: Build CLI
-        run: cargo build --release --target ${{ matrix.target }} -p dastyab-cli
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
 
-      - name: Upload artifact
+      - name: Build workspace (release)
+        run: cargo build --release --workspace
+
+      - name: Fetch cargo-deb
+        if: matrix.deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Build .deb (CLI)
+        if: matrix.deb
+        run: |
+          cargo deb -p dastyab-cli --no-build
+          ls -la target/debian/
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          BASE="${{ matrix.artifact }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            EXT=".exe"
+          else
+            EXT=""
+          fi
+          for bin in dastyab dastyab-tui dastyab-gui; do
+            cp "target/release/${bin}${EXT}" "dist/${bin}-${BASE}${EXT}"
+          done
+          if [ "${{ matrix.deb }}" = "true" ]; then
+            cp target/debian/*.deb "dist/dastyab-${BASE}.deb"
+          fi
+          if [ "${{ matrix.zip }}" = "true" ]; then
+            (cd target/release && zip -r -X "../../dist/dastyab-${BASE}-portable.zip" dastyab.exe dastyab-tui.exe dastyab-gui.exe >/dev/null)
+          fi
+          ls -la dist/
+
+      - name: Upload release assets
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: target/${{ matrix.target }}/release/dastyab*
+          name: dastyab-release-${{ matrix.artifact }}
+          path: dist/**
+          if-no-files-found: error
 
   release:
     name: Create GitHub release
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
+      - name: Download all release assets
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Create release
+      - name: Generate SHA256 checksums
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*

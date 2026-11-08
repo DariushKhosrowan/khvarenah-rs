@@ -27,7 +27,9 @@ pub fn singbox_bin() -> PathBuf {
 
 /// Where a scratch config for one verification run is written.
 fn scratch_cfg() -> PathBuf {
-    crate::store::mem_dir().join("bin").join("e2e-tmp-config.json")
+    crate::store::mem_dir()
+        .join("bin")
+        .join("e2e-tmp-config.json")
 }
 
 /// Failure stage taxonomy for the E2E gate.
@@ -58,7 +60,12 @@ pub struct E2eResult {
 /// Minimal RFC 1928 SOCKS5 client (no auth, CONNECT). Returns the accepted
 /// (raw, already-spliced) TCP stream after the handshake so callers can speak
 /// any protocol through it (HTTP, TLS, whatever).
-async fn socks5_connect(proxy: &str, target: &str, port: u16, timeout: Duration) -> Result<TcpStream, CFError> {
+async fn socks5_connect(
+    proxy: &str,
+    target: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<TcpStream, CFError> {
     let stream = tokio::time::timeout(timeout, TcpStream::connect(proxy))
         .await
         .map_err(|_| CFError::new("E2E", "SOCKS proxy connect timed out", ""))?
@@ -66,9 +73,13 @@ async fn socks5_connect(proxy: &str, target: &str, port: u16, timeout: Duration)
     let mut s = stream;
 
     // Greeting: v5, 1 method, no-auth.
-    s.write_all(&[0x05, 0x01, 0x00]).await.map_err(|e| CFError::new("E2E", format!("SOCKS greet write: {e}"), ""))?;
+    s.write_all(&[0x05, 0x01, 0x00])
+        .await
+        .map_err(|e| CFError::new("E2E", format!("SOCKS greet write: {e}"), ""))?;
     let mut reply = [0u8; 2];
-    s.read_exact(&mut reply).await.map_err(|e| CFError::new("E2E", format!("SOCKS greet read: {e}"), ""))?;
+    s.read_exact(&mut reply)
+        .await
+        .map_err(|e| CFError::new("E2E", format!("SOCKS greet read: {e}"), ""))?;
     if reply[0] != 0x05 || reply[1] != 0x00 {
         return Err(CFError::new("E2E", "SOCKS no-auth not accepted", ""));
     }
@@ -86,33 +97,49 @@ async fn socks5_connect(proxy: &str, target: &str, port: u16, timeout: Duration)
     req.push(host_bytes.len() as u8);
     req.extend_from_slice(host_bytes);
     req.extend_from_slice(&port.to_be_bytes());
-    s.write_all(&req).await.map_err(|e| CFError::new("E2E", format!("SOCKS connect write: {e}"), ""))?;
+    s.write_all(&req)
+        .await
+        .map_err(|e| CFError::new("E2E", format!("SOCKS connect write: {e}"), ""))?;
 
     // Reply: v5, rep, rsv, atyp, addr, port. Read header first 4 bytes then
     // the address (length-prefixed for domain).
     let mut hdr = [0u8; 4];
-    s.read_exact(&mut hdr).await.map_err(|e| CFError::new("E2E", format!("SOCKS reply read: {e}"), ""))?;
+    s.read_exact(&mut hdr)
+        .await
+        .map_err(|e| CFError::new("E2E", format!("SOCKS reply read: {e}"), ""))?;
     if hdr[0] != 0x05 || hdr[1] != 0x00 {
-        return Err(CFError::new("E2E", format!("SOCKS CONNECT rejected (rep={})", hdr[1]), ""));
+        return Err(CFError::new(
+            "E2E",
+            format!("SOCKS CONNECT rejected (rep={})", hdr[1]),
+            "",
+        ));
     }
     let addr_len = match hdr[3] {
         0x01 => 4usize,
         0x04 => 16usize,
         0x03 => {
             let mut l = [0u8; 1];
-            s.read_exact(&mut l).await.map_err(|e| CFError::new("E2E", format!("SOCKS addr len: {e}"), ""))?;
+            s.read_exact(&mut l)
+                .await
+                .map_err(|e| CFError::new("E2E", format!("SOCKS addr len: {e}"), ""))?;
             l[0] as usize
         }
         other => return Err(CFError::new("E2E", format!("SOCKS bad ATYP {other}"), "")),
     };
     let mut rest = vec![0u8; addr_len + 2];
-    s.read_exact(&mut rest).await.map_err(|e| CFError::new("E2E", format!("SOCKS addr read: {e}"), ""))?;
+    s.read_exact(&mut rest)
+        .await
+        .map_err(|e| CFError::new("E2E", format!("SOCKS addr read: {e}"), ""))?;
     Ok(s)
 }
 
 /// Fetch the egress IP as seen by an IP-echo service, through an established
 /// stream (this is the stream already spliced through the tunnel).
-async fn fetch_ip_via(stream: &mut TcpStream, host: &str, timeout: Duration) -> Result<String, CFError> {
+async fn fetch_ip_via(
+    stream: &mut TcpStream,
+    host: &str,
+    timeout: Duration,
+) -> Result<String, CFError> {
     let req = format!(
         "GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: dastyab-e2e\r\n\r\n"
     );
@@ -148,9 +175,9 @@ async fn fetch_ip_via(stream: &mut TcpStream, host: &str, timeout: Duration) -> 
         .find(|s| {
             let parts: Vec<&str> = s.split('.').collect();
             parts.len() == 4
-                && parts.iter().all(|p| {
-                    !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit())
-                })
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit()))
         })
         .unwrap_or("");
     if ip.is_empty() {
@@ -184,7 +211,7 @@ pub async fn fetch_direct_ip(timeout_s: u64) -> Result<String, CFError> {
         .map_err(|e| CFError::new("E2E", format!("direct-IP write: {e}"), ""))?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
-    tokio::time::timeout(timeout, async {
+    let _ = tokio::time::timeout(timeout, async {
         loop {
             match stream.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
@@ -205,9 +232,9 @@ pub async fn fetch_direct_ip(timeout_s: u64) -> Result<String, CFError> {
         .find(|s| {
             let parts: Vec<&str> = s.split('.').collect();
             parts.len() == 4
-                && parts.iter().all(|p| {
-                    !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit())
-                })
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit()))
         })
         .unwrap_or("");
     if ip.is_empty() {
@@ -230,20 +257,22 @@ pub async fn ensure_singbox(pinned_version: &str) -> Result<PathBuf, CFError> {
     if bin.exists() {
         return Ok(bin);
     }
-    std::fs::create_dir_all(bin.parent().unwrap()).map_err(|e| {
-        CFError::new("Storage error", format!("Cannot create bin dir: {e}"), "")
-    })?;
+    std::fs::create_dir_all(bin.parent().unwrap())
+        .map_err(|e| CFError::new("Storage error", format!("Cannot create bin dir: {e}"), ""))?;
     #[cfg(target_os = "linux")]
     let asset = format!("sing-box-{pinned_version}-linux-amd64.tar.gz");
     #[cfg(target_os = "macos")]
     let asset = format!("sing-box-{pinned_version}-darwin-amd64.tar.gz");
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let asset = format!("sing-box-{pinned_version}-darwin-arm64.tar.gz");
-    let url = format!(
-        "https://github.com/SagerNet/sing-box/releases/download/v{pinned_version}/{asset}"
-    );
+    let url =
+        format!("https://github.com/SagerNet/sing-box/releases/download/v{pinned_version}/{asset}");
     let resp = reqwest::get(&url).await.map_err(|e| {
-        CFError::new("Download error", format!("Failed to download sing-box: {e}"), "")
+        CFError::new(
+            "Download error",
+            format!("Failed to download sing-box: {e}"),
+            "",
+        )
     })?;
     if !resp.status().is_success() {
         return Err(CFError::new(
@@ -252,15 +281,20 @@ pub async fn ensure_singbox(pinned_version: &str) -> Result<PathBuf, CFError> {
             "",
         ));
     }
-    let body = resp.bytes().await.map_err(|e| CFError::new("Download error", format!("{e}"), ""))?;
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| CFError::new("Download error", format!("{e}"), ""))?;
     let tmp = bin.with_extension("tar.gz");
     std::fs::write(&tmp, &body).map_err(|e| CFError::new("Storage error", format!("{e}"), ""))?;
 
     // Extract the tar.gz in a scratch dir, then move the binary.
     let scratch = crate::store::mem_dir().join("bin").join("singbox-extract");
     let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir_all(&scratch).map_err(|e| CFError::new("Storage error", format!("{e}"), ""))?;
-    let tar = std::fs::File::open(&tmp).map_err(|e| CFError::new("Storage error", format!("{e}"), ""))?;
+    std::fs::create_dir_all(&scratch)
+        .map_err(|e| CFError::new("Storage error", format!("{e}"), ""))?;
+    let tar =
+        std::fs::File::open(&tmp).map_err(|e| CFError::new("Storage error", format!("{e}"), ""))?;
     let mut archive = flate2::read::GzDecoder::new(tar);
     let mut tar_archive = tar::Archive::new(&mut archive);
     tar_archive
@@ -268,7 +302,8 @@ pub async fn ensure_singbox(pinned_version: &str) -> Result<PathBuf, CFError> {
         .map_err(|e| CFError::new("Storage error", format!("extract: {e}"), ""))?;
 
     let found = find_file(&scratch, "sing-box")?;
-    std::fs::copy(&found, &bin).map_err(|e| CFError::new("Storage error", format!("copy: {e}"), ""))?;
+    std::fs::copy(&found, &bin)
+        .map_err(|e| CFError::new("Storage error", format!("copy: {e}"), ""))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -280,7 +315,9 @@ pub async fn ensure_singbox(pinned_version: &str) -> Result<PathBuf, CFError> {
 }
 
 fn find_file(root: &Path, name: &str) -> Result<PathBuf, CFError> {
-    for e in std::fs::read_dir(root).map_err(|e| CFError::new("Storage error", format!("{e}"), ""))? {
+    for e in
+        std::fs::read_dir(root).map_err(|e| CFError::new("Storage error", format!("{e}"), ""))?
+    {
         let e = e.map_err(|e| CFError::new("Storage error", format!("{e}"), ""))?;
         let p = e.path();
         if p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some(name) {
@@ -292,7 +329,11 @@ fn find_file(root: &Path, name: &str) -> Result<PathBuf, CFError> {
             }
         }
     }
-    Err(CFError::new("Storage error", format!("sing-box binary not found under {}", root.display()), ""))
+    Err(CFError::new(
+        "Storage error",
+        format!("sing-box binary not found under {}", root.display()),
+        "",
+    ))
 }
 
 /// Verify one endpoint actually tunnels. Spawns sing-box with the vless config
@@ -407,7 +448,11 @@ pub async fn verify_tunnel(
     cleanup(&mut child).await;
 
     let passed = tunnel_ip != direct_ip && !tunnel_ip.is_empty();
-    let failure_stage = if passed { None } else { Some(E2eFailureStage::IpUnchanged) };
+    let failure_stage = if passed {
+        None
+    } else {
+        Some(E2eFailureStage::IpUnchanged)
+    };
     E2eResult {
         endpoint: base.endpoint,
         passed,
@@ -419,7 +464,11 @@ pub async fn verify_tunnel(
 
 /// Given scanner candidates + E2E results, keep only the ones that actually
 /// tunnel (passed == true), ordered by original order, capped at top_n.
-pub fn select_verified(candidates: &[crate::autopilot::CleanEndpoint], results: &[E2eResult], top_n: usize) -> Vec<crate::autopilot::CleanEndpoint> {
+pub fn select_verified(
+    candidates: &[crate::autopilot::CleanEndpoint],
+    results: &[E2eResult],
+    top_n: usize,
+) -> Vec<crate::autopilot::CleanEndpoint> {
     let passed: std::collections::HashSet<&str> = results
         .iter()
         .filter(|r| r.passed)

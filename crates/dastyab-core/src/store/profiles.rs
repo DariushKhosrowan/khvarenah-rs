@@ -404,7 +404,9 @@ pub fn get_active_token(profile_id: &str) -> Result<Option<String>, CFError> {
         Ok(Some(label))
     } else {
         // stale marker — the token was removed. Log a warning and clear it.
-        eprintln!("[dastyab] warn: active token '{label}' no longer exists in profile '{profile_id}'");
+        eprintln!(
+            "[dastyab] warn: active token '{label}' no longer exists in profile '{profile_id}'"
+        );
         let _ = write_json(&active_token_path(profile_id), &String::new());
         Ok(None)
     }
@@ -519,7 +521,10 @@ pub fn save_protection_state(id: &str, st: &ProtectionState) -> Result<(), CFErr
 
 /// The last parallel-scan diagnostics (so the GUI/CLI can explain a zero
 /// result in plain language). Written by the discovery pipeline each cycle.
-pub fn save_last_diagnostics(id: &str, diag: &crate::slipscan::PipelineDiagnostics) -> Result<(), CFError> {
+pub fn save_last_diagnostics(
+    id: &str,
+    diag: &crate::slipscan::PipelineDiagnostics,
+) -> Result<(), CFError> {
     let p = profile_dir(id).join("last-diagnostics.json");
     write_json(&p, diag)
 }
@@ -707,8 +712,11 @@ mod tests {
             let id = create_profile("work", "").unwrap();
             // write a stale marker pointing at a token that doesn't exist
             fs::create_dir_all(profile_dir(&id)).unwrap();
-            write_json(&profile_dir(&id).join("active_token"), &"deleted-token".to_string())
-                .unwrap();
+            write_json(
+                &profile_dir(&id).join("active_token"),
+                &"deleted-token".to_string(),
+            )
+            .unwrap();
             assert_eq!(get_active_token(&id).unwrap(), None);
             // a second read also returns None (marker stays cleared/no-op)
             assert_eq!(get_active_token(&id).unwrap(), None);
@@ -741,7 +749,10 @@ mod tests {
             ensure_mem_dir().unwrap();
             let id = create_profile("work", "").unwrap();
             add_token(&id, "primary", "tok-secret").unwrap();
-            assert_eq!(get_token(&id, "primary").unwrap().as_deref(), Some("tok-secret"));
+            assert_eq!(
+                get_token(&id, "primary").unwrap().as_deref(),
+                Some("tok-secret")
+            );
             assert_eq!(get_token(&id, "missing").unwrap(), None);
         });
     }

@@ -55,9 +55,7 @@ fn encode_png_gray(pixels: &[u8], width: usize, height: usize) -> Result<Vec<u8>
         ));
     }
     // Signature
-    let mut png = vec![
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-    ];
+    let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
     // IHDR
     let mut ihdr = Vec::with_capacity(13);
@@ -101,7 +99,11 @@ fn push_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
 
 /// Render a QR code to a grayscale PNG with a quiet zone (border).
 /// Returns (png_bytes, side_length_in_pixels).
-pub fn render_png(text: &str, scale: usize, quiet_modules: usize) -> Result<(Vec<u8>, usize), CFError> {
+pub fn render_png(
+    text: &str,
+    scale: usize,
+    quiet_modules: usize,
+) -> Result<(Vec<u8>, usize), CFError> {
     let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| {
         CFError::new(
             "QR error",
@@ -141,11 +143,18 @@ impl Crc32 {
         for i in 0..256u32 {
             let mut c = i;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB88320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             table[i as usize] = c;
         }
-        Self { table, crc: 0xFFFF_FFFF }
+        Self {
+            table,
+            crc: 0xFFFF_FFFF,
+        }
     }
     fn update(&mut self, data: &[u8]) {
         for &b in data {

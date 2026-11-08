@@ -30,8 +30,8 @@ use rand::SeedableRng;
 
 use crate::cf::ips::load_ranges;
 use crate::error::CFError;
-use crate::store;
 use crate::scanner::{run_scan, ScanParams, ScanResult};
+use crate::store;
 use crate::vless::VlessProfile;
 
 // ---------------------------------------------------------------------------
@@ -182,19 +182,14 @@ async fn discover_native(
 
     // Candidate generation: seeds first, then /24 neighbors, then weighted
     // sampling proportional to CIDR block size (SlipNet-style).
-    let seeded = crate::cf::ips::seeded_candidates(
-        &params.seed_ips,
-        &cidrs,
-        params.sample as usize,
-        24,
-    );
+    let seeded =
+        crate::cf::ips::seeded_candidates(&params.seed_ips, &cidrs, params.sample as usize, 24);
     let mut candidate_ips = seeded;
     if candidate_ips.len() < (params.sample as usize) {
         let missing = (params.sample as usize) - candidate_ips.len();
         let mut rng = rand::rngs::StdRng::from_entropy();
         let extra = crate::cf::ips::weighted_sample_by_cidr(&cidrs, missing, &mut rng);
-        let mut seen: std::collections::HashSet<String> =
-            candidate_ips.iter().cloned().collect();
+        let mut seen: std::collections::HashSet<String> = candidate_ips.iter().cloned().collect();
         for ip in extra {
             if seen.insert(ip.clone()) {
                 candidate_ips.push(ip);
@@ -218,35 +213,29 @@ async fn discover_native(
 
     // Local builder for one pipeline round (rebuildable per expansion round).
     let run_round = |cands: Vec<String>| {
-        let phase1: crate::slipscan::Phase1Fn =
-            Box::new(move |ip: &str, fast_fail_ms: u64| {
-                let ip = ip.to_string();
-                Box::pin(async move {
-                    crate::health::probe_fast_any_port(&ip, fast_fail_ms).await
-                })
-            });
-        let phase2: crate::slipscan::Phase2Fn = Box::new(
-            move |ip: &str, sni: &str, path: &str, ws_timeout_ms: u64| {
+        let phase1: crate::slipscan::Phase1Fn = Box::new(move |ip: &str, fast_fail_ms: u64| {
+            let ip = ip.to_string();
+            Box::pin(async move { crate::health::probe_fast_any_port(&ip, fast_fail_ms).await })
+        });
+        let phase2: crate::slipscan::Phase2Fn =
+            Box::new(move |ip: &str, sni: &str, path: &str, ws_timeout_ms: u64| {
                 let ip = ip.to_string();
                 let sni = sni.to_string();
                 let path = path.to_string();
                 Box::pin(async move {
                     crate::health::probe_all_alt_ports(&ip, &sni, &path, ws_timeout_ms).await
                 })
-            },
-        );
-        let e2e: crate::slipscan::E2eFn = Box::new(
-            move |ip: &str, port: u16, vless: &str, timeout_s: u64| {
+            });
+        let e2e: crate::slipscan::E2eFn =
+            Box::new(move |ip: &str, port: u16, vless: &str, timeout_s: u64| {
                 let ip = ip.to_string();
                 let vless = vless.to_string();
                 let bin = crate::e2e::singbox_bin();
                 Box::pin(async move {
                     let _ = crate::e2e::ensure_singbox("1.11.4").await;
-                    crate::e2e::verify_tunnel(&ip, port, &vless, "0.0.0.0", &bin, timeout_s)
-                        .await
+                    crate::e2e::verify_tunnel(&ip, port, &vless, "0.0.0.0", &bin, timeout_s).await
                 })
-            },
-        );
+            });
         let pipeline_params = crate::slipscan::PipelineParams {
             target_n,
             phase1_workers: params.workers.max(1),
@@ -270,8 +259,7 @@ async fn discover_native(
         )
     };
 
-    let mut examined: std::collections::HashSet<String> =
-        candidate_ips.iter().cloned().collect();
+    let mut examined: std::collections::HashSet<String> = candidate_ips.iter().cloned().collect();
 
     let first = run_round(candidate_ips).await?;
     let mut diagnostics = Some(first.diagnostics.clone());
@@ -295,7 +283,9 @@ async fn discover_native(
         }
         let r = run_round(new_cands).await?;
         if let Some(d) = &mut diagnostics {
-            d.examined_total = d.examined_total.saturating_add(r.diagnostics.examined_total);
+            d.examined_total = d
+                .examined_total
+                .saturating_add(r.diagnostics.examined_total);
             d.phase1_pass = d.phase1_pass.saturating_add(r.diagnostics.phase1_pass);
             d.phase2_pass = d.phase2_pass.saturating_add(r.diagnostics.phase2_pass);
             d.score_above_threshold = d
@@ -356,7 +346,7 @@ pub async fn probe_worker_health(
     connect_ip: Option<std::net::Ipv4Addr>,
     timeout_s: u64,
 ) -> WorkerHealth {
-    let timeout_ms = (timeout_s.max(1) as u64) * 1000;
+    let timeout_ms = timeout_s.max(1) * 1000;
 
     let connect_addr = match connect_ip {
         Some(ip) => ip.to_string(),
@@ -366,14 +356,15 @@ pub async fn probe_worker_health(
             // unreachable rather than connecting to garbage.
             let mut found_real = false;
             let mut addr = None;
-            if let Ok(iter) = std::net::ToSocketAddrs::to_socket_addrs(
-                &(worker_host.to_string(), 443u16),
-            ) {
+            if let Ok(iter) =
+                std::net::ToSocketAddrs::to_socket_addrs(&(worker_host.to_string(), 443u16))
+            {
                 for a in iter {
                     if let std::net::SocketAddr::V4(v4) = a {
-                        if !crate::health::is_hijacked_ip(&v4.ip()) {
+                        let ip = v4.ip();
+                        if !crate::health::is_hijacked_ip(ip) {
                             found_real = true;
-                            addr = Some(v4.ip().to_string());
+                            addr = Some(ip.to_string());
                             break;
                         }
                     }
@@ -386,7 +377,7 @@ pub async fn probe_worker_health(
         }
     };
 
-    let mut stream = match crate::health::tls_connect(&connect_addr, 443, worker_host, timeout_ms).await
+    let stream = match crate::health::tls_connect(&connect_addr, 443, worker_host, timeout_ms).await
     {
         Ok(s) => s,
         Err(_) => return WorkerHealth::Unreachable,
@@ -420,29 +411,26 @@ async fn classify_worker_response(
     }
     let mut buf = [0u8; 8192];
     let mut head = Vec::new();
-    let read_res = tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        async {
-            let mut total = 0usize;
-            let mut headers_done = false;
-            while total < 16 * 1024 {
-                match stream.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        head.extend_from_slice(&buf[..n]);
-                        total += n;
-                        if !headers_done && head.windows(4).any(|w| w == b"\r\n\r\n") {
-                            headers_done = true;
-                        }
-                        if headers_done && total >= 512 {
-                            break;
-                        }
+    let read_res = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
+        let mut total = 0usize;
+        let mut headers_done = false;
+        while total < 16 * 1024 {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    head.extend_from_slice(&buf[..n]);
+                    total += n;
+                    if !headers_done && head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        headers_done = true;
                     }
-                    Err(_) => break,
+                    if headers_done && total >= 512 {
+                        break;
+                    }
                 }
+                Err(_) => break,
             }
-        },
-    )
+        }
+    })
     .await;
     if read_res.is_err() {
         return WorkerHealth::Unreachable;
@@ -515,18 +503,17 @@ pub async fn probe_worker_via_ips(
     port: u16,
     timeout_s: u64,
 ) -> WorkerHealthSample {
-    let timeout_ms = (timeout_s.max(1) as u64) * 1000;
+    let timeout_ms = timeout_s.max(1) * 1000;
     let mut out = WorkerHealthSample::default();
     for ip_str in ips {
         out.attempted += 1;
-        let stream =
-            match crate::health::tls_connect(ip_str, port, worker_host, timeout_ms).await {
-                Ok(s) => s,
-                Err(_) => {
-                    out.unreachable += 1;
-                    continue;
-                }
-            };
+        let stream = match crate::health::tls_connect(ip_str, port, worker_host, timeout_ms).await {
+            Ok(s) => s,
+            Err(_) => {
+                out.unreachable += 1;
+                continue;
+            }
+        };
         match classify_worker_response(stream, worker_host, timeout_ms).await {
             WorkerHealth::Alive => {
                 out.alive = true;
@@ -647,7 +634,9 @@ fn split_endpoint(ep: &str) -> (String, u16) {
 
 /// Path to the autopilot ledger for a profile.
 pub fn ledger_path(profile_id: &str) -> PathBuf {
-    store::profiles::profile_dir(profile_id).join("autopilot").join("endpoints.json")
+    store::profiles::profile_dir(profile_id)
+        .join("autopilot")
+        .join("endpoints.json")
 }
 
 /// Read the current ledger.
@@ -657,14 +646,23 @@ pub fn read_ledger(profile_id: &str) -> Vec<CleanEndpoint> {
 
 /// Persist the ledger atomically.
 pub fn write_ledger(profile_id: &str, endpoints: &[CleanEndpoint]) -> Result<(), CFError> {
-    store::atomic_write(&ledger_path(profile_id), &serde_json::to_vec_pretty(endpoints).map_err(|e| {
-        CFError::new("Storage error", format!("Cannot serialize ledger: {e}"), "Internal error.")
-    })?)
+    store::atomic_write(
+        &ledger_path(profile_id),
+        &serde_json::to_vec_pretty(endpoints).map_err(|e| {
+            CFError::new(
+                "Storage error",
+                format!("Cannot serialize ledger: {e}"),
+                "Internal error.",
+            )
+        })?,
+    )
 }
 
 /// Directory where active (fronted) configs are written.
 pub fn active_configs_dir(profile_id: &str) -> PathBuf {
-    store::profiles::profile_dir(profile_id).join("configs").join("active")
+    store::profiles::profile_dir(profile_id)
+        .join("configs")
+        .join("active")
 }
 
 /// Write an active vless share link + all common client formats for an
@@ -676,7 +674,11 @@ pub fn write_active_configs(
 ) -> Result<(), CFError> {
     let dir = active_configs_dir(profile_id);
     std::fs::create_dir_all(&dir).map_err(|e| {
-        CFError::new("Storage error", format!("Cannot create {}: {e}", dir.display()), "Check permissions.")
+        CFError::new(
+            "Storage error",
+            format!("Cannot create {}: {e}", dir.display()),
+            "Check permissions.",
+        )
     })?;
 
     let mut fronted = vless.clone();
@@ -695,7 +697,10 @@ pub fn write_active_configs(
         store::atomic_write(&dir.join("sing-box.json"), sb.as_bytes())?;
     }
     // Clash entry
-    store::atomic_write(&dir.join("clash.yaml"), crate::export::clash_entry(&fronted).as_bytes())?;
+    store::atomic_write(
+        &dir.join("clash.yaml"),
+        crate::export::clash_entry(&fronted).as_bytes(),
+    )?;
 
     Ok(())
 }
@@ -800,7 +805,11 @@ impl AutopilotEngine {
                 }
             }
             // Trim to a sane bound (no unbounded growth).
-            merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            merged.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             merged.truncate(64);
             replaced = merged.len().saturating_sub(ledger.len());
             ledger = merged;
@@ -1144,7 +1153,7 @@ mod tests {
     #[cfg(feature = "dev-mock")]
     #[tokio::test]
     async fn probe_via_ips_marks_alive_against_mock_worker() {
-        use crate::mock_worker::{MockWorkerConfig, run_mock_worker};
+        use crate::mock_worker::{run_mock_worker, MockWorkerConfig};
         let cfg = MockWorkerConfig {
             listen_addr: "127.0.0.1:18443".parse().unwrap(),
             worker_path: "/api".into(),

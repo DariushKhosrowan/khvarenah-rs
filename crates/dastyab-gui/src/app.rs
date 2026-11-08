@@ -70,8 +70,8 @@ pub struct DastYabApp {
     // async bridge
     tx: bridge::Tx,
     rx: bridge::Rx,
-    running: Vec<String>,          // task names currently in flight
-    log_lines: Vec<String>,        // live log pane (capped at 5000)
+    running: Vec<String>,   // task names currently in flight
+    log_lines: Vec<String>, // live log pane (capped at 5000)
     // view-model cache (Phase 3.2/3.3)
     pub state: GuiState,
     /// Currently open modal dialog (if any).
@@ -147,7 +147,8 @@ impl DastYabApp {
 
         // One-button Protection auto-resume: if the user left protection on in
         // a previous session, surface that state so the toggle reflects it.
-        let autopilot_on = dastyab_core::store::profiles::protection_enabled(&state.active_profile_id);
+        let autopilot_on =
+            dastyab_core::store::profiles::protection_enabled(&state.active_profile_id);
         let mut app = Self {
             profile_id: state.active_profile_id.clone(),
             profiles: if pids.is_empty() {
@@ -179,7 +180,8 @@ impl DastYabApp {
             last_link: String::new(),
             autopilot_on,
             autopilot_status: if autopilot_on {
-                "Protection is on — refinding the best clean IP and keeping your configs healthy.".to_string()
+                "Protection is on — refinding the best clean IP and keeping your configs healthy."
+                    .to_string()
             } else {
                 "Autopilot is off. Flip the switch to auto-find the best clean IP, export configs, and keep them healthy.".to_string()
             },
@@ -198,13 +200,14 @@ impl DastYabApp {
     /// Re-read the last pipeline diagnostics and derive the plain-language
     /// "why zero?" explanation for the Clean IPs view.
     fn refresh_diagnostics(&mut self) {
-        use dastyab_core::diagnose::{Locale, diagnose, plain_message};
-        if let Some(diag) = dastyab_core::store::profiles::load_last_diagnostics(&self.profile_id) {
+        use dastyab_core::diagnose::{diagnose, plain_message, Locale};
+        if let Some(diag) = dastyab_core::store::profiles::load_last_diagnostics(&self.profile_id)
+        {
             let probe = dastyab_core::diagnose::WorkerProbe::default();
             let cause = diagnose(&diag, probe);
             self.last_cause = Some(plain_message(cause, Locale::En));
-            self.last_action_label = dastyab_core::diagnose::recommended_action(cause)
-                .label(Locale::En);
+            self.last_action_label =
+                dastyab_core::diagnose::recommended_action(cause).label(Locale::En);
         }
     }
 
@@ -300,9 +303,12 @@ impl DastYabApp {
     fn autopilot_off(&mut self) {
         // Clear the persisted flag (monitor will not auto-resume).
         let _ = dastyab_core::store::profiles::set_protection(&self.profile_id, false);
-        self.autopilot_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.autopilot_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.autopilot_on = false;
-        self.autopilot_status = "Autopilot stopped. The last working clean IP stays in your active configs.".to_string();
+        self.autopilot_status =
+            "Autopilot stopped. The last working clean IP stays in your active configs."
+                .to_string();
         self.running.retain(|t| t != "autopilot");
         self.push_log("[autopilot] OFF");
     }
@@ -396,8 +402,7 @@ impl DastYabApp {
                             match rename_profile(&id, &newname) {
                                 Ok(_) => {
                                     self.state.reload_pending = true;
-                                    self.note =
-                                        format!("Profile renamed to '{newname}'.");
+                                    self.note = format!("Profile renamed to '{newname}'.");
                                 }
                                 Err(e) => self.note = e.brief(),
                             }
@@ -420,8 +425,7 @@ impl DastYabApp {
                             match add_token(&self.profile_id, &label, &token) {
                                 Ok(_) => {
                                     self.state.reload_pending = true;
-                                    self.note =
-                                        format!("Token '{label}' added to profile.");
+                                    self.note = format!("Token '{label}' added to profile.");
                                 }
                                 Err(e) => self.note = e.brief(),
                             }
@@ -500,8 +504,7 @@ impl eframe::App for DastYabApp {
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 60, 60)))
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new(err)
-                            .color(egui::Color32::from_rgb(255, 160, 160)),
+                        egui::RichText::new(err).color(egui::Color32::from_rgb(255, 160, 160)),
                     );
                 });
         }
@@ -521,7 +524,12 @@ impl DastYabApp {
             // Left sidebar with the six views.
             ui.vertical(|ui| {
                 ui.set_width(170.0);
-                ui.label(egui::RichText::new("DASTYAB").color(GOLD).strong().size(16.0));
+                ui.label(
+                    egui::RichText::new("DASTYAB")
+                        .color(GOLD)
+                        .strong()
+                        .size(16.0),
+                );
                 ui.add_space(4.0);
                 for v in View::ALL {
                     let active = self.view == v;
@@ -542,7 +550,11 @@ impl DastYabApp {
             // Main content area.
             ui.vertical(|ui| {
                 // active view name in gold
-                ui.heading(egui::RichText::new(self.view.label()).color(GOLD).size(22.0));
+                ui.heading(
+                    egui::RichText::new(self.view.label())
+                        .color(GOLD)
+                        .size(22.0),
+                );
                 ui.separator();
                 match self.view {
                     View::DeployScan => self.deploy_panel(ui, p),
@@ -568,7 +580,9 @@ impl DastYabApp {
                 ("🛡 PROTECTION: OFF", egui::Color32::from_rgb(220, 120, 90))
             };
             let on = ui
-                .add(egui::Button::new(egui::RichText::new(label).color(color).strong().size(16.0)))
+                .add(egui::Button::new(
+                    egui::RichText::new(label).color(color).strong().size(16.0),
+                ))
                 .clicked();
             if on {
                 // Toggle direction depends on current state.
@@ -578,7 +592,10 @@ impl DastYabApp {
                     self.autopilot_on(ui.ctx());
                 }
             }
-            ui.label(egui::RichText::new("Auto-find clean IP · export configs · keep them healthy").color(GOLD_DIM));
+            ui.label(
+                egui::RichText::new("Auto-find clean IP · export configs · keep them healthy")
+                    .color(GOLD_DIM),
+            );
         });
         ui.add_space(4.0);
         ui.label(egui::RichText::new(&self.autopilot_status).color(TEXT));
@@ -589,7 +606,7 @@ impl DastYabApp {
                     open_folder(&dir);
                 }
                 if ui.button("📋 Copy path").clicked() {
-                    let _ = ui.ctx().copy_text(dir.to_string_lossy().into_owned());
+                    ui.ctx().copy_text(dir.to_string_lossy().into_owned());
                 }
                 ui.label(
                     egui::RichText::new(dir.display().to_string())
@@ -753,13 +770,14 @@ impl DastYabApp {
         ui.separator();
 
         if ui
-            .add_enabled(!self.running.contains(&"deploy".to_string()), egui::Button::new(
-                if self.running.contains(&"deploy".to_string()) {
+            .add_enabled(
+                !self.running.contains(&"deploy".to_string()),
+                egui::Button::new(if self.running.contains(&"deploy".to_string()) {
                     "Deploying…"
                 } else {
                     "Deploy worker & make config"
-                },
-            ))
+                }),
+            )
             .clicked()
         {
             let pid = self.profile_id.clone();
@@ -812,7 +830,10 @@ impl DastYabApp {
         ui.separator();
         ui.heading(egui::RichText::new("Live log").color(GOLD));
         if self.log_lines.is_empty() {
-            ui.label(egui::RichText::new("Idle — deploy or scan to see live debug output.").color(GOLD_DIM));
+            ui.label(
+                egui::RichText::new("Idle — deploy or scan to see live debug output.")
+                    .color(GOLD_DIM),
+            );
         } else {
             let mut joined = self.log_lines.join("\n");
             ui.add(
@@ -842,13 +863,17 @@ impl DastYabApp {
 
     fn cleanip_panel(&mut self, ui: &mut egui::Ui, _p: &dastyab_core::store::profiles::Profile) {
         ui.heading(egui::RichText::new("Clean IPs").color(GOLD));
-        ui.label(egui::RichText::new(
-            "Verified endpoints saved per profile (smart stop-on-first).",
-        ).color(GOLD_DIM));
+        ui.label(
+            egui::RichText::new("Verified endpoints saved per profile (smart stop-on-first).")
+                .color(GOLD_DIM),
+        );
         ui.add_space(6.0);
         let p = load_profile(&self.profile_id);
         if p.clean_ips.is_empty() {
-            ui.label(egui::RichText::new("No clean IPs found yet — scan from Deploy & Scan.").color(GOLD_DIM));
+            ui.label(
+                egui::RichText::new("No clean IPs found yet — scan from Deploy & Scan.")
+                    .color(GOLD_DIM),
+            );
         }
         for ip in &p.clean_ips {
             ui.label(format!("• {ip}"));
@@ -861,13 +886,13 @@ impl DastYabApp {
                 ui.separator();
                 ui.heading(egui::RichText::new("Why no clean IPs?").color(GOLD));
                 ui.label(egui::RichText::new(cause).color(TEXT));
-                if !self.last_action_label.is_empty() {
-                    if ui.button(&self.last_action_label).clicked() {
-                        // One tap to open the Cloudflare dashboard.
-                        let _ = ui.ctx().open_url(egui::output::OpenUrl::new_tab(
-                            "https://dash.cloudflare.com/?to=/:account/workers",
-                        ));
-                    }
+                if !self.last_action_label.is_empty()
+                    && ui.button(&self.last_action_label).clicked()
+                {
+                    // One tap to open the Cloudflare dashboard.
+                    ui.ctx().open_url(egui::output::OpenUrl::new_tab(
+                        "https://dash.cloudflare.com/?to=/:account/workers",
+                    ));
                 }
             }
             // Import known-good IPs (the NetworkBlocked fast path).
@@ -1049,4 +1074,3 @@ fn open_folder(dir: &std::path::Path) {
     };
     let _ = std::process::Command::new(prog).arg(arg).spawn();
 }
-

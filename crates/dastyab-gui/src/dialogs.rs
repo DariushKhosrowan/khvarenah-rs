@@ -77,94 +77,101 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog) -> DialogResult {
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO);
 
-    window.show(ctx, |ui| {
-        match dlg {
-            Dialog::Confirm { body, destructive, .. } => {
-                ui.label(body.clone());
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let confirm_label = if *destructive { "Yes, delete" } else { "Confirm" };
-                    let mut btn = egui::Button::new(confirm_label);
-                    if *destructive {
-                        btn = btn.fill(egui::Color32::from_rgb(120, 20, 20));
-                    }
-                    if ui.add(btn).clicked() {
-                        result = DialogResult::Submit(DialogPayload::Confirm);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            }
-            Dialog::Text { placeholder, draft, .. } => {
-                ui.add(
-                    egui::TextEdit::singleline(draft)
-                        .hint_text(placeholder.as_str())
-                        .desired_width(240.0),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() {
-                        let value = draft.clone();
-                        result = DialogResult::Submit(DialogPayload::Text(value));
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            }
-            Dialog::Two {
-                label_a,
-                label_b,
-                draft_a,
-                draft_b,
-                mask_b,
-                ..
-            } => {
-                ui.horizontal(|ui| {
-                    ui.label(label_a.clone());
-                    ui.add(egui::TextEdit::singleline(draft_a).desired_width(200.0));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(label_b.clone());
-                    let mut edit =
-                        egui::TextEdit::singleline(draft_b).desired_width(220.0);
-                    if *mask_b {
-                        edit = edit.password(true);
-                    }
-                    ui.add(edit);
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() {
-                        let a = draft_a.clone();
-                        let b = draft_b.clone();
-                        result = DialogResult::Submit(DialogPayload::Two(a, b));
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            }
-            Dialog::TextArea { placeholder, draft, .. } => {
-                ui.add(
-                    egui::TextEdit::multiline(draft)
-                        .hint_text(placeholder.as_str())
-                        .desired_rows(8)
-                        .desired_width(360.0)
-                        .font(egui::TextStyle::Monospace),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Import").clicked() {
-                        let value = draft.clone();
-                        result = DialogResult::Submit(DialogPayload::Text(value));
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            }
+    window.show(ctx, |ui| match dlg {
+        Dialog::Confirm {
+            body, destructive, ..
+        } => {
+            ui.label(body.clone());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let confirm_label = if *destructive {
+                    "Yes, delete"
+                } else {
+                    "Confirm"
+                };
+                let mut btn = egui::Button::new(confirm_label);
+                if *destructive {
+                    btn = btn.fill(egui::Color32::from_rgb(120, 20, 20));
+                }
+                if ui.add(btn).clicked() {
+                    result = DialogResult::Submit(DialogPayload::Confirm);
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        }
+        Dialog::Text {
+            placeholder, draft, ..
+        } => {
+            ui.add(
+                egui::TextEdit::singleline(draft)
+                    .hint_text(placeholder.as_str())
+                    .desired_width(240.0),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked() {
+                    let value = draft.clone();
+                    result = DialogResult::Submit(DialogPayload::Text(value));
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        }
+        Dialog::Two {
+            label_a,
+            label_b,
+            draft_a,
+            draft_b,
+            mask_b,
+            ..
+        } => {
+            ui.horizontal(|ui| {
+                ui.label(label_a.clone());
+                ui.add(egui::TextEdit::singleline(draft_a).desired_width(200.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label(label_b.clone());
+                let mut edit = egui::TextEdit::singleline(draft_b).desired_width(220.0);
+                if *mask_b {
+                    edit = edit.password(true);
+                }
+                ui.add(edit);
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked() {
+                    let a = draft_a.clone();
+                    let b = draft_b.clone();
+                    result = DialogResult::Submit(DialogPayload::Two(a, b));
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        }
+        Dialog::TextArea {
+            placeholder, draft, ..
+        } => {
+            ui.add(
+                egui::TextEdit::multiline(draft)
+                    .hint_text(placeholder.as_str())
+                    .desired_rows(8)
+                    .desired_width(360.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Import").clicked() {
+                    let value = draft.clone();
+                    result = DialogResult::Submit(DialogPayload::Text(value));
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
         }
     });
 

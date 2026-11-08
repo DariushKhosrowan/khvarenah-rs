@@ -107,7 +107,16 @@ pub fn randomize_ws_request(rng: &mut impl Rng, base_req: &[u8]) -> Vec<u8> {
             // Randomly flip casing of the header *name* (before the colon).
             if let Some((name, value)) = line.split_once(':') {
                 if rng.gen_bool(0.5) {
-                    let cased: String = name.chars().map(|c| if rng.gen_bool(0.5) { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() }).collect();
+                    let cased: String = name
+                        .chars()
+                        .map(|c| {
+                            if rng.gen_bool(0.5) {
+                                c.to_ascii_uppercase()
+                            } else {
+                                c.to_ascii_lowercase()
+                            }
+                        })
+                        .collect();
                     out.extend_from_slice(cased.as_bytes());
                 } else {
                     out.extend_from_slice(name.as_bytes());
