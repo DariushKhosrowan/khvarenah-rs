@@ -19,3 +19,4 @@
 pub mod candidates;
 pub mod config;
 pub mod scanner;
+pub mod ws_probe;
