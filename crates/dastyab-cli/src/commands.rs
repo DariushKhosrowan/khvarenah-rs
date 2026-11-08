@@ -858,6 +858,26 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                     println!("  (no last-diagnostics file for profile {profile})");
                 }
             }
+            // Self-learning phase-2 SNI strategy status (the autonomy knob).
+            if verbose {
+                let strategy = dastyab_core::autopilot::resolve_strategy(profile);
+                let streak = dastyab_core::store::profiles::strategy_zero_streak(profile);
+                let updated = dastyab_core::store::profiles::strategy_last_updated_ts(profile);
+                let name = match strategy {
+                    dastyab_core::health::SniStrategy::WorkerOnly => "WorkerOnly",
+                    dastyab_core::health::SniStrategy::GenericCfFirst => "GenericCfFirst",
+                    dastyab_core::health::SniStrategy::WorkerThenGenericCf => {
+                        "WorkerThenGenericCf"
+                    }
+                };
+                if streak >= 3 {
+                    println!("  Strategy: {name} (streak={streak}, rotating next cycle)");
+                } else if updated > 0 {
+                    println!("  Strategy: {name} (streak={streak}, updated {updated}s epoch)");
+                } else {
+                    println!("  Strategy: {name} (not yet learned; auto)");
+                }
+            }
             Ok(())
         }
         crate::AutopilotAction::On {

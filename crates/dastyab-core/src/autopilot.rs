@@ -85,6 +85,11 @@ pub struct DiscoveryParams {
     /// invoked precisely BECAUSE the worker failed the gate — re-running it
     /// would loop back into rescue forever.
     pub skip_step0: bool,
+    /// Self-learning phase-2 SNI strategy for this cycle. The engine resolves
+    /// the preferred persisted strategy (with rotation on repeated zero-101
+    /// streaks) and pins it here so the phase-2 probe is exclusive about which
+    /// SNI it tries first. `None` = WorkerOnly (the default).
+    pub preferred_strategy: Option<crate::health::SniStrategy>,
 }
 
 impl Default for DiscoveryParams {
@@ -98,8 +103,88 @@ impl Default for DiscoveryParams {
             retry_on_fail: true,
             seed_ips: Vec::new(),
             skip_step0: false,
+            preferred_strategy: None,
         }
     }
+}
+
+/// Rotate the self-learning phase-2 SNI strategy to the next exclusive variant.
+/// Only `WorkerOnly` and `GenericCfFirst` are rotatable — they are the two
+/// *exclusive* single-first strategies whose zero-101 outcome is measurable.
+/// `WorkerThenGenericCf` is a blend and is never a rotation target (it is kept
+/// only as a backward-compatible default for older configs).
+pub fn rotate_strategy(s: crate::health::SniStrategy) -> crate::health::SniStrategy {
+    match s {
+        crate::health::SniStrategy::WorkerOnly => crate::health::SniStrategy::GenericCfFirst,
+        crate::health::SniStrategy::GenericCfFirst => crate::health::SniStrategy::WorkerOnly,
+        crate::health::SniStrategy::WorkerThenGenericCf => crate::health::SniStrategy::WorkerOnly,
+    }
+}
+
+/// Pure strategy selector. `preferred` is the currently persisted strategy;
+/// `zero_streak` counts consecutive cycles with zero accepted `101`s under it.
+/// - `preferred` == None → WorkerOnly (default, never learned yet).
+/// - `preferred` == Some(p) and zero_streak < 3 → keep p.
+/// - `preferred` == Some(p) and zero_streak >= 3 → rotate away from p.
+pub fn select_strategy(
+    preferred: Option<crate::health::SniStrategy>,
+    zero_streak: u32,
+) -> crate::health::SniStrategy {
+    match preferred {
+        None => crate::health::SniStrategy::WorkerOnly,
+        Some(p) if zero_streak >= 3 => rotate_strategy(p),
+        Some(p) => p,
+    }
+}
+
+/// Pure post-cycle learner. Returns `(new_preferred, new_zero_streak)`.
+/// - `won` == true → the current strategy got ≥1 accepted 101 → lock it in,
+///   reset the streak.
+/// - `won` == false and streak reaches 3 → rotate (the other exclusive
+///   strategy), reset the streak.
+/// - `won` == false and streak < 3 → keep trying the same strategy, increment.
+pub fn update_strategy_after_cycle(
+    current: crate::health::SniStrategy,
+    won: bool,
+    previous_streak: u32,
+) -> (crate::health::SniStrategy, u32) {
+    if won {
+        (current, 0)
+    } else if previous_streak + 1 >= 3 {
+        (rotate_strategy(current), 0)
+    } else {
+        (current, previous_streak + 1)
+    }
+}
+
+/// Resolve the strategy this cycle should use from the persisted profile state.
+pub fn resolve_strategy(profile_id: &str) -> crate::health::SniStrategy {
+    let preferred = crate::store::profiles::preferred_phase2_strategy(profile_id)
+        .and_then(|s| match s.as_str() {
+            "WorkerOnly" => Some(crate::health::SniStrategy::WorkerOnly),
+            "GenericCfFirst" => Some(crate::health::SniStrategy::GenericCfFirst),
+            "WorkerThenGenericCf" => Some(crate::health::SniStrategy::WorkerThenGenericCf),
+            _ => None,
+        });
+    let streak = crate::store::profiles::strategy_zero_streak(profile_id);
+    select_strategy(preferred, streak)
+}
+
+/// Commit the cycle's outcome back to the profile (learn + persist). `won` is
+/// whether the cycle produced ≥1 accepted phase-2 `101` (i.e. clean endpoints).
+pub fn commit_strategy(
+    profile_id: &str,
+    current: crate::health::SniStrategy,
+    won: bool,
+) -> Result<(), CFError> {
+    let prev = crate::store::profiles::strategy_zero_streak(profile_id);
+    let (next, streak) = update_strategy_after_cycle(current, won, prev);
+    let name = match next {
+        crate::health::SniStrategy::WorkerOnly => "WorkerOnly",
+        crate::health::SniStrategy::GenericCfFirst => "GenericCfFirst",
+        crate::health::SniStrategy::WorkerThenGenericCf => "WorkerThenGenericCf",
+    };
+    crate::store::profiles::commit_strategy_state(profile_id, Some(name.to_string()), streak)
 }
 
 /// The `EndpointProvider` contract. Two implementations ship today:
@@ -221,6 +306,9 @@ async fn discover_native(
         .ok();
 
     // Local builder for one pipeline round (rebuildable per expansion round).
+    // The phase-2 SNI strategy is resolved once per cycle (Copy) and captured
+    // by value, so the boxed future does not borrow `params`.
+    let cycle_strategy = params.preferred_strategy.unwrap_or(crate::health::SniStrategy::WorkerOnly);
     let run_round = |cands: Vec<String>| {
         let phase1: crate::slipscan::Phase1Fn = Box::new(move |ip: &str, fast_fail_ms: u64| {
             let ip = ip.to_string();
@@ -231,17 +319,16 @@ async fn discover_native(
                 let ip = ip.to_string();
                 let sni = sni.to_string();
                 let path = path.to_string();
+                let strategy = cycle_strategy;
                 Box::pin(async move {
-                    // SNI-variant fallback: try the worker hostname first; if
-                    // DPI blocks that SNI, retry under a benign generic CF
-                    // domain (still routing the Host header to the worker).
-                    crate::health::probe_all_alt_ports_sni(
+                    crate::health::probe_with_sni_strategy(
                         &ip,
                         &sni,
                         crate::health::GENERIC_CF_SNI,
                         &sni,
                         &path,
                         ws_timeout_ms,
+                        strategy,
                     )
                     .await
                 })
@@ -831,8 +918,22 @@ impl AutopilotEngine {
         &self,
         params: &DiscoveryParams,
     ) -> Result<(Vec<CleanEndpoint>, CycleSummary), CFError> {
+        // Self-learning phase-2 SNI strategy: resolve the persisted preference
+        // (rotating on repeated zero-101 streaks) and pin it for this cycle so
+        // the phase-2 probe is exclusive about which SNI it tries first.
+        let strategy = resolve_strategy(&self.profile_id);
+        let mut used_params = params.clone();
+        used_params.preferred_strategy = Some(strategy);
+
         let vless = base_vless(&self.profile_id)?;
-        let found = self.provider.discover(&vless, params).await?;
+        let found = self.provider.discover(&vless, &used_params).await?;
+
+        // Learn from this cycle: if we got any verified (accepted-101)
+        // endpoint, the strategy won — lock it in and reset the streak.
+        // If not, the streak increments (and rotates at 3). This is the
+        // self-healing loop that makes the app pick the working SNI itself.
+        let won = !found.is_empty();
+        let _ = commit_strategy(&self.profile_id, strategy, won);
 
         let mut ledger = read_ledger(&self.profile_id);
         let mut replaced = 0;
@@ -2151,5 +2252,152 @@ mod tests {
             last_checked: None,
             ts: String::new(),
         }
+    }
+
+    // ── Self-learning phase-2 SNI strategy (autonomy) ──
+
+    #[test]
+    fn test_select_strategy_returns_preferred_when_streak_below_three() {
+        use crate::health::SniStrategy;
+        assert_eq!(
+            select_strategy(Some(SniStrategy::GenericCfFirst), 0),
+            SniStrategy::GenericCfFirst
+        );
+        assert_eq!(
+            select_strategy(Some(SniStrategy::GenericCfFirst), 2),
+            SniStrategy::GenericCfFirst
+        );
+    }
+
+    #[test]
+    fn test_select_strategy_rotates_when_streak_reaches_three() {
+        use crate::health::SniStrategy;
+        assert_eq!(
+            select_strategy(Some(SniStrategy::GenericCfFirst), 3),
+            SniStrategy::WorkerOnly
+        );
+        assert_eq!(
+            select_strategy(Some(SniStrategy::WorkerOnly), 5),
+            SniStrategy::GenericCfFirst
+        );
+    }
+
+    #[test]
+    fn test_select_strategy_defaults_to_worker_only_when_none() {
+        use crate::health::SniStrategy;
+        assert_eq!(select_strategy(None, 0), SniStrategy::WorkerOnly);
+        assert_eq!(select_strategy(None, 9), SniStrategy::WorkerOnly);
+    }
+
+    #[test]
+    fn test_update_strategy_resets_streak_on_any_101() {
+        use crate::health::SniStrategy;
+        let (next, streak) = update_strategy_after_cycle(SniStrategy::WorkerOnly, true, 2);
+        assert_eq!(next, SniStrategy::WorkerOnly);
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn test_update_strategy_increments_streak_when_zero_101() {
+        use crate::health::SniStrategy;
+        let (next, streak) = update_strategy_after_cycle(SniStrategy::WorkerOnly, false, 1);
+        assert_eq!(next, SniStrategy::WorkerOnly);
+        assert_eq!(streak, 2);
+    }
+
+    #[test]
+    fn test_update_strategy_rotates_at_streak_three() {
+        use crate::health::SniStrategy;
+        let (next, streak) = update_strategy_after_cycle(SniStrategy::WorkerOnly, false, 2);
+        assert_eq!(next, SniStrategy::GenericCfFirst);
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn test_rotate_strategy_cycles_between_exclusive_variants() {
+        use crate::health::SniStrategy;
+        assert_eq!(rotate_strategy(SniStrategy::WorkerOnly), SniStrategy::GenericCfFirst);
+        assert_eq!(rotate_strategy(SniStrategy::GenericCfFirst), SniStrategy::WorkerOnly);
+    }
+
+    #[test]
+    fn test_commit_strategy_persists_learned_state() {
+        let _home = rescue_home();
+        let id = make_profile();
+        // Start clean: no preferred strategy, streak 0.
+        assert!(crate::store::profiles::preferred_phase2_strategy(&id).is_none());
+        assert_eq!(crate::store::profiles::strategy_zero_streak(&id), 0);
+
+        // First cycle: WorkerOnly wins → locked in, streak stays 0.
+        commit_strategy(&id, crate::health::SniStrategy::WorkerOnly, true).unwrap();
+        assert_eq!(
+            crate::store::profiles::preferred_phase2_strategy(&id).as_deref(),
+            Some("WorkerOnly")
+        );
+        assert_eq!(crate::store::profiles::strategy_zero_streak(&id), 0);
+        assert!(crate::store::profiles::strategy_last_updated_ts(&id) > 0);
+
+        // Two losing cycles then a third → rotate to GenericCfFirst, streak reset.
+        commit_strategy(&id, crate::health::SniStrategy::WorkerOnly, false).unwrap();
+        commit_strategy(&id, crate::health::SniStrategy::WorkerOnly, false).unwrap();
+        assert_eq!(crate::store::profiles::strategy_zero_streak(&id), 2);
+        commit_strategy(&id, crate::health::SniStrategy::WorkerOnly, false).unwrap();
+        assert_eq!(
+            crate::store::profiles::preferred_phase2_strategy(&id).as_deref(),
+            Some("GenericCfFirst")
+        );
+        assert_eq!(crate::store::profiles::strategy_zero_streak(&id), 0);
+    }
+
+    #[test]
+    fn test_resolve_strategy_reads_persisted_state() {
+        let _home = rescue_home();
+        let id = make_profile();
+        // Unlearned → WorkerOnly.
+        assert_eq!(
+            resolve_strategy(&id),
+            crate::health::SniStrategy::WorkerOnly
+        );
+        // Learn GenericCfFirst, then a losing streak of 3 → rotates.
+        commit_strategy(&id, crate::health::SniStrategy::GenericCfFirst, true).unwrap();
+        assert_eq!(
+            resolve_strategy(&id),
+            crate::health::SniStrategy::GenericCfFirst
+        );
+        commit_strategy(&id, crate::health::SniStrategy::GenericCfFirst, false).unwrap();
+        commit_strategy(&id, crate::health::SniStrategy::GenericCfFirst, false).unwrap();
+        commit_strategy(&id, crate::health::SniStrategy::GenericCfFirst, false).unwrap();
+        assert_eq!(
+            resolve_strategy(&id),
+            crate::health::SniStrategy::WorkerOnly
+        );
+    }
+
+    #[test]
+    fn test_profile_config_migrates_without_strategy_fields() {
+        let _home = rescue_home();
+        let id = make_profile();
+        // Simulate an older config without any strategy fields.
+        let cfg_path = crate::store::profiles::profile_dir(&id).join("config.json");
+        let old_cfg = serde_json::json!({
+            "active_account": "acc-1",
+            "stealth_enabled": true,
+            "protection_enabled": false,
+            "light_interval_secs": 300,
+            "failure_streak": 0,
+            "last_deep_check": 0,
+        });
+        crate::store::write_json(&cfg_path, &old_cfg).unwrap();
+
+        let p = crate::store::profiles::load_profile(&id);
+        assert!(p.config.preferred_phase2_strategy.is_none());
+        assert_eq!(p.config.strategy_zero_streak, 0);
+        assert_eq!(p.config.strategy_last_updated_ts, 0);
+        // And commit still works on the migrated config.
+        commit_strategy(&id, crate::health::SniStrategy::WorkerOnly, true).unwrap();
+        assert_eq!(
+            crate::store::profiles::preferred_phase2_strategy(&id).as_deref(),
+            Some("WorkerOnly")
+        );
     }
 }
