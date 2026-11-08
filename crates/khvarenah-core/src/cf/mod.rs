@@ -77,16 +77,34 @@ pub struct WorkerRoute {
     pub script: String,
 }
 
+/// Result of verifying a Cloudflare API token.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct VerifyResult {
+    /// Token status: `"active"` or `"disabled"`.
+    pub status: String,
+    /// The token id from Cloudflare.
+    pub id: String,
+    /// Optional token expiry (`"YYYY-MM-DDTHH:MM:SSZ"` or similar).
+    pub expires_on: Option<String>,
+}
+
 /// Async Cloudflare client.
 #[derive(Clone)]
 pub struct Client {
     token: String,
     http: reqwest::Client,
     timeout: std::time::Duration,
+    base_url: String,
 }
 
 impl Client {
     pub fn new(token: &str) -> Self {
+        Self::with_base(token, API)
+    }
+
+    /// Test helper / advanced use: point the client at a different base URL
+    /// (e.g. a local mock server).
+    pub fn with_base(token: &str, base_url: &str) -> Self {
         Self {
             token: token.trim().to_string(),
             http: reqwest::Client::builder()
@@ -95,6 +113,7 @@ impl Client {
                 .build()
                 .expect("failed to build HTTP client"),
             timeout: std::time::Duration::from_secs(25),
+            base_url: base_url.to_string(),
         }
     }
 
@@ -111,7 +130,7 @@ impl Client {
         let is_write = matches!(method, "PUT" | "PATCH" | "DELETE" | "POST");
         pre_request_pause(if is_write { "write" } else { "read" }).await;
 
-        let url = format!("{API}{path}");
+        let url = format!("{}{path}", self.base_url);
         let mut req = self
             .http
             .request(
@@ -152,8 +171,8 @@ impl Client {
         }
     }
 
-    /// Verify the token is valid.
-    pub async fn verify_token(&self) -> Result<bool, CFError> {
+    /// Verify the token is valid and return structured details.
+    pub async fn verify_token(&self) -> Result<VerifyResult, CFError> {
         let body = self
             .request(
                 "GET",
@@ -164,10 +183,23 @@ impl Client {
                 None,
             )
             .await?;
-        Ok(body
-            .get("success")
-            .and_then(|s| s.as_bool())
-            .unwrap_or(false))
+        let result = body.get("result").cloned().unwrap_or_default();
+        Ok(VerifyResult {
+            status: result
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            id: result
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            expires_on: result
+                .get("expires_on")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        })
     }
 
     /// List accessible accounts.
@@ -554,5 +586,53 @@ mod tests {
             c.workers_dev_url("a", "name", "sub"),
             "https://name.sub.workers.dev"
         );
+    }
+
+    /// A minimal mock HTTP server that responds to any request with a canned
+    /// status + body. Returns the base URL to point a Client at.
+    fn mock_server(status: u16, body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                // read the request head (blocking) so reqwest gets a response
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn test_verify_token_ok() {
+        let base = mock_server(
+            200,
+            r#"{"success":true,"result":{"id":"tok-123","status":"active"}}"#,
+        );
+        let client = Client::with_base("abc", &base);
+        let res = client.verify_token().await.unwrap();
+        assert_eq!(res.status, "active");
+        assert_eq!(res.id, "tok-123");
+    }
+
+    #[tokio::test]
+    async fn test_verify_token_maps_to_account_deactivated() {
+        // 403 + CF code 9109 -> "Invalid API token" title (KNOWN_CODES)
+        let base = mock_server(
+            403,
+            r#"{"success":false,"errors":[{"code":9109,"message":"Invalid API Token"}]}"#,
+        );
+        let client = Client::with_base("abc", &base);
+        let err = client.verify_token().await.unwrap_err();
+        assert_eq!(err.title, "Invalid API token");
+        assert_eq!(err.code, Some(9109));
+        assert_eq!(err.status, Some(403));
     }
 }

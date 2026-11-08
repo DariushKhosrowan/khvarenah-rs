@@ -150,15 +150,10 @@ async fn verify(profile: String) -> Result<(), CFError> {
     let token = first_token(&load_profile(&profile))?;
     let client = Client::new(&token);
     match client.verify_token().await {
-        Ok(true) => {
-            println!("Token is valid.");
+        Ok(res) => {
+            println!("Token is valid. status={} id={}", res.status, res.id);
             Ok(())
         }
-        Ok(false) => Err(CFError::new(
-            "Token invalid",
-            "Cloudflare did not validate the token.",
-            "Re-enter a fresh token.",
-        )),
         Err(e) => Err(e),
     }
 }
