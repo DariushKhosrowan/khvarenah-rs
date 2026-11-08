@@ -438,6 +438,77 @@ pub fn seeded_candidates(
     out
 }
 
+/// Weighted random sampling over CIDR blocks, proportional to each block's
+/// address count (SlipNet `generateFromRanges`-style cumulative distribution).
+/// Returns `n` unique IPv4 strings. This beats uniform-per-block sampling when
+/// blocks vary wildly in size (e.g. a /13 vs a /24).
+pub fn weighted_sample_by_cidr(cidrs: &[Cidr], n: usize, rng: &mut impl Rng) -> Vec<String> {
+    if cidrs.is_empty() || n == 0 {
+        return Vec::new();
+    }
+    // Build cumulative size distribution over the address space.
+    let mut cumulative: Vec<u64> = Vec::with_capacity(cidrs.len());
+    let mut running: u64 = 0;
+    for c in cidrs {
+        running = running.saturating_add(c.addr_count());
+        cumulative.push(running);
+    }
+    let total = running;
+    if total == 0 {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut attempts = 0usize;
+    let max_attempts = n * 40 + 1024;
+    while out.len() < n && attempts < max_attempts {
+        attempts += 1;
+        // Pick a random position in the flattened space.
+        let pos = rng.gen_range(0u64..total);
+        // Binary-search the owning block.
+        let mut lo = 0usize;
+        let mut hi = cidrs.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if cumulative[mid] <= pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let idx = lo.min(cidrs.len() - 1);
+        let base = if idx == 0 { 0 } else { cumulative[idx - 1] };
+        let offset = pos - base;
+        let host_bits = (32 - cidrs[idx].mask as u32).min(31);
+        let ip = if host_bits == 0 {
+            cidrs[idx].base
+        } else {
+            let base_u32 = u32::from(cidrs[idx].base);
+            let o = (offset & ((1u64 << host_bits) - 1)) as u32;
+            Ipv4Addr::from(base_u32 | o)
+        };
+        if seen.insert(ip) {
+            out.push(ip.to_string());
+        }
+    }
+    out
+}
+
+/// Expand /prefix_len neighbourhoods around known-good clean endpoints.
+/// Returns sibling IPs (network/broadcast excluded), best seeds first.
+pub fn expand_around(clean: &[crate::autopilot::CleanEndpoint], prefix_len: u8, per_seed: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for ep in clean {
+        for nb in neighbors_of(&ep.ip, prefix_len, per_seed.max(1)) {
+            if seen.insert(nb.clone()) {
+                out.push(nb);
+            }
+        }
+    }
+    out
+}
+
 /// Read prior successful endpoints from the autopilot ledger for a profile.
 /// Returns the last `max` verified endpoints from the past 7 days, as
 /// "ip:port" strings (the seeds for [`seeded_candidates`]).
