@@ -215,6 +215,49 @@ enum Command {
         #[command(subcommand)]
         action: BundleAction,
     },
+    /// Zero-touch bootstrap: detect a token, create/use a profile, deploy a
+    /// worker if needed, discover clean IPs, write the user bundle, and
+    /// install the systemd unit — all in one command.
+    Up {
+        /// Profile id to use (default: `default`, or the existing profile that
+        /// supplied the token).
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Remote push notifications (Telegram or webhook).
+    Beacon {
+        #[command(subcommand)]
+        action: BeaconAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BeaconAction {
+    /// Send a test message with the current config (verifies the channel).
+    Test,
+    /// Show current notification config.
+    Status,
+    /// Enable notifications (requires a configured channel).
+    Enable,
+    /// Disable notifications.
+    Disable,
+    /// Configure the Telegram channel.
+    Telegram {
+        #[arg()]
+        token: String,
+        #[arg()]
+        chat_id: String,
+    },
+    /// Configure a generic webhook channel.
+    Webhook {
+        #[arg()]
+        url: String,
+    },
+    /// Set the per-event-class rate limit in seconds (default 900).
+    RateLimit {
+        #[arg()]
+        secs: i64,
+    },
 }
 
 #[derive(Subcommand)]
