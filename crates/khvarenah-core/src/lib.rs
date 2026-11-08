@@ -40,6 +40,7 @@ pub mod backup;
 pub mod cf;
 pub mod cleanip;
 pub mod diagnose;
+pub mod doh;
 pub mod diagnostics;
 pub mod e2e;
 pub mod error;

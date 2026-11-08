@@ -351,29 +351,13 @@ pub async fn probe_worker_health(
     let connect_addr = match connect_ip {
         Some(ip) => ip.to_string(),
         None => {
-            // Resolve the hostname ourselves, rejecting hijacked answers. If
-            // the only addresses are 198.18.x.x (DPI signature) treat it as
-            // unreachable rather than connecting to garbage.
-            let mut found_real = false;
-            let mut addr = None;
-            if let Ok(iter) =
-                std::net::ToSocketAddrs::to_socket_addrs(&(worker_host.to_string(), 443u16))
-            {
-                for a in iter {
-                    if let std::net::SocketAddr::V4(v4) = a {
-                        let ip = v4.ip();
-                        if !crate::health::is_hijacked_ip(ip) {
-                            found_real = true;
-                            addr = Some(ip.to_string());
-                            break;
-                        }
-                    }
-                }
+            // Prefer DoH (immune to system-DNS hijack), then fall back to system
+            // DNS with hijack rejection. DoH already filters 198.18.x.x.
+            let doh = crate::doh::DohResolver::new();
+            match resolve_worker_host(worker_host, Some(&doh)).await {
+                Some(ip) => ip.to_string(),
+                None => return WorkerHealth::Unreachable,
             }
-            if !found_real {
-                return WorkerHealth::Unreachable;
-            }
-            addr.unwrap()
         }
     };
 
@@ -384,6 +368,33 @@ pub async fn probe_worker_health(
     };
 
     classify_worker_response(stream, worker_host, timeout_ms).await
+}
+
+/// Resolve `worker_host` to a usable IPv4 address. When `doh` is provided it is
+/// tried first (it is immune to system-DNS hijack); on failure we fall back to
+/// `std::net::ToSocketAddrs` and reject hijacked 198.18.x.x answers.
+async fn resolve_worker_host(
+    worker_host: &str,
+    doh: Option<&crate::doh::DohResolver>,
+) -> Option<std::net::Ipv4Addr> {
+    if let Some(resolver) = doh {
+        if let Ok(ips) = resolver.resolve(worker_host).await {
+            if let Some(ip) = ips.into_iter().find(|ip| !crate::health::is_hijacked_ip(ip)) {
+                return Some(ip);
+            }
+        }
+    }
+    if let Ok(iter) = std::net::ToSocketAddrs::to_socket_addrs(&(worker_host.to_string(), 443u16)) {
+        for a in iter {
+            if let std::net::SocketAddr::V4(v4) = a {
+                let ip = v4.ip();
+                if !crate::health::is_hijacked_ip(ip) {
+                    return Some(*ip);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Perform the TLS handshake + `GET /cdn-cgi/trace` against `worker_host` via
@@ -1179,5 +1190,26 @@ mod tests {
         let sample = probe_worker_via_ips("mock.workers.dev", &ips, 1, 3).await;
         assert!(!sample.alive);
         assert!(sample.unreachable >= 1);
+    }
+
+    /// When a DoH resolver is provided (cache seeded), resolution must use the
+    /// DoH answer first — never the poisoned system resolver.
+    #[tokio::test]
+    async fn test_probe_worker_health_uses_doh_when_resolver_provided() {
+        let resolver = crate::doh::DohResolver::new();
+        let known = std::net::Ipv4Addr::new(104, 16, 132, 229);
+        resolver
+            .seed_cache("mock.workers.dev".to_string(), vec![known]);
+        let resolved = resolve_worker_host("mock.workers.dev", Some(&resolver)).await;
+        assert_eq!(resolved, Some(known), "DoH cache answer must be preferred");
+    }
+
+    #[tokio::test]
+    async fn resolve_worker_host_falls_back_to_system_when_doh_fails() {
+        // An empty (cacheless) resolver will attempt network; on failure we fall
+        // back to system DNS. We only assert the fallback does not panic and
+        // returns an Option (either Some real IP or None).
+        let resolver = crate::doh::DohResolver::new();
+        let _ = resolve_worker_host("example.com", Some(&resolver)).await;
     }
 }
