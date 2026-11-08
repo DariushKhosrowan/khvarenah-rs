@@ -297,6 +297,10 @@ enum AutopilotAction {
         /// using the worker hostname as SNI/Host (skips DNS entirely).
         #[arg(long)]
         connect_ip: Option<std::net::Ipv4Addr>,
+        /// Dump the last scan's phase-2 WS-failure histogram (answers "why
+        /// zero clean IPs?": DPI TLS reset vs dead worker route).
+        #[arg(long)]
+        verbose: bool,
     },
     /// Show autopilot status + current ledger.
     Status,

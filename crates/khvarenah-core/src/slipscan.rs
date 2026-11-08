@@ -309,6 +309,10 @@ pub struct PipelineDiagnostics {
     pub e2e_pass: u32,
     /// E2E failures broken down by stage.
     pub e2e_fail_by_stage: HashMap<E2eFailureStage, u32>,
+    /// Why phase-2 WS probes failed, bucketed. This is the diagnostic that
+    /// tells Cause A (DPI TLS reset — `TlsAlert` dominant) from Cause B
+    /// (dead worker route — `DeadRoute`/`HttpStatus` 404/421 dominant).
+    pub ws_failure_histogram: HashMap<crate::health::WsFailureReason, u32>,
     /// True when we early-exited at target_n.
     pub cancelled_early: bool,
     /// False when E2E was skipped (no direct IP available).
@@ -403,6 +407,8 @@ pub async fn pipeline_scan(
     let gated = Arc::new(AtomicUsize::new(0));
     let e2e_pass_c = Arc::new(AtomicUsize::new(0));
     let e2e_fail: Arc<Mutex<HashMap<E2eFailureStage, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    let ws_fail: Arc<Mutex<HashMap<crate::health::WsFailureReason, u32>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let results: Arc<Mutex<Vec<CleanEndpoint>>> = Arc::new(Mutex::new(Vec::new()));
     let candidates = Arc::new(candidates);
     let phase1 = Arc::new(phase1);
@@ -507,6 +513,7 @@ pub async fn pipeline_scan(
         let phase2_fn = phase2.clone();
         let phase2_pass_c = phase2_pass.clone();
         let gated_c = gated.clone();
+        let ws_fail_c = ws_fail.clone();
         let done_c = done.clone();
         let sni = sni.to_string();
         let path = path.to_string();
@@ -525,10 +532,21 @@ pub async fn pipeline_scan(
                 let tx2 = tx2.clone();
                 let phase2_pass_c = phase2_pass_c.clone();
                 let gated_c = gated_c.clone();
+                let ws_fail_c = ws_fail_c.clone();
                 let params2 = params;
                 handles.push(tokio::spawn(async move {
                     let _permit = permit;
                     let probes = phase2_fn(&ip, &sni, &path, params2.ws_timeout_ms).await;
+                    // Bucket every failed probe's reason into the histogram.
+                    // Only the first (accepted) probe on the happy path has a
+                    // failure_reason; failed probes always carry one.
+                    let mut fm = ws_fail_c.lock().unwrap();
+                    for p in &probes {
+                        if let Some(reason) = p.failure_reason {
+                            *fm.entry(reason).or_insert(0) += 1;
+                        }
+                    }
+                    drop(fm);
                     let accepted = probes.iter().find(|p| {
                         p.status == Some(101) && p.worker_bytes >= crate::health::MIN_WORKER_BYTES
                     });
@@ -615,6 +633,7 @@ pub async fn pipeline_scan(
             0
         },
         e2e_fail_by_stage: e2e_fail.lock().unwrap().clone(),
+        ws_failure_histogram: ws_fail.lock().unwrap().clone(),
         cancelled_early: done.load(Ordering::Relaxed),
         e2e_enabled,
     };
@@ -655,6 +674,8 @@ mod tests {
             rtt_ms: 30,
             worker_bytes: bytes,
             failure_stage: None,
+            failure_reason: None,
+            sni_used: "mock.workers.dev".to_string(),
         }
     }
 
@@ -666,6 +687,8 @@ mod tests {
             rtt_ms: 30,
             worker_bytes: 0,
             failure_stage: Some("ws".into()),
+            failure_reason: Some(crate::health::WsFailureReason::HttpStatus(404)),
+            sni_used: "mock.workers.dev".to_string(),
         }
     }
 
@@ -1027,20 +1050,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_zero_verified_returns_empty_with_full_diagnostics() {
+    async fn pipeline_populates_ws_failure_histogram() {
         let cands: Vec<String> = (0..20).map(|i| format!("candidate-{i}")).collect();
         let p1 = phase1_ok(usize::MAX);
-        let reject_all: Phase2Fn = Box::new(move |_ip, _sni, _path, _to| {
-            let out = vec![ws_rejected(443)];
+        // 1/3 succeed; 1/3 → HttpStatus(404); 1/3 → DeadRoute (101 < 512B).
+        let p2: Phase2Fn = Box::new(move |ip: &str, _sni, _path, _to| {
+            let n: usize = ip.trim_start_matches("candidate-").parse().unwrap_or(0);
+            let out = match n % 3 {
+                0 => vec![ws_accepted(443, 4096)],
+                1 => vec![ws_rejected(443)],
+                _ => vec![WsProbe {
+                    status: Some(101),
+                    worker_bytes: 100,
+                    failure_reason: Some(crate::health::WsFailureReason::DeadRoute),
+                    ..ws_rejected(443)
+                }],
+            };
             Box::pin(async move { out })
         });
-        let e2e: E2eFn = Box::new(move |_ip, _p, _v, _t| {
+        let e2e: E2eFn = Box::new(move |ip, _port, _vless, _t| {
             let r = crate::e2e::E2eResult {
-                endpoint: String::new(),
-                passed: false,
+                endpoint: format!("{ip}:443"),
+                passed: true,
                 failure_stage: None,
                 verified_at: 0,
-                tunnel_ip: None,
+                tunnel_ip: Some("9.9.9.9".into()),
             };
             Box::pin(async move { r })
         });
@@ -1052,17 +1086,28 @@ mod tests {
             Some("1.1.1.1".into()),
             PipelineParams::default(),
             p1,
-            reject_all,
+            p2,
             e2e,
             None,
             None,
         )
         .await
         .unwrap();
-        assert!(res.verified.is_empty());
-        assert_eq!(res.diagnostics.phase1_pass, 20);
-        assert_eq!(res.diagnostics.phase2_pass, 0);
-        assert_eq!(res.diagnostics.score_above_threshold, 0);
-        assert_eq!(res.diagnostics.examined_total, 20);
+        let h = &res.diagnostics.ws_failure_histogram;
+        let http404 = h
+            .get(&crate::health::WsFailureReason::HttpStatus(404))
+            .copied()
+            .unwrap_or(0);
+        let deadroute = h
+            .get(&crate::health::WsFailureReason::DeadRoute)
+            .copied()
+            .unwrap_or(0);
+        assert!(http404 > 0, "expected 404 buckets in histogram, got {h:?}");
+        assert!(
+            deadroute > 0,
+            "expected DeadRoute buckets in histogram, got {h:?}"
+        );
+        // The histogram should contain every failure bucket (no other reasons).
+        assert_eq!(http404 + deadroute, h.values().sum::<u32>());
     }
 }

@@ -136,6 +136,137 @@ pub fn randomize_ws_request(rng: &mut impl Rng, base_req: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Browser TLS fingerprint profiles. DeepSeek's phase-2 resurrection spec:
+/// the scanner's static rustls ClientHello (identical cipher order, extension
+/// order, ALPN on every probe) is a fingerprintable DPI signature. Real
+/// browsers differ; by rotating through these profiles the wire image of each
+/// probe changes, defeating a static-JA3-style blacklist.
+///
+/// NOTE: rustls does not let us reorder *extensions* or inject GREASE
+/// (requires uTLS-style custom ClientHello). It DOES let us choose cipher
+/// suite order and key-exchange group order via a custom [`CryptoProvider`],
+/// and ALPN via [`ClientConfig::alpn_protocols`]. That is the variation we
+/// apply here — enough to break a static signature, without pulling in a new
+/// crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClientHelloProfile {
+    Chrome120,
+    Firefox121,
+    Safari17,
+    Edge120,
+}
+
+impl ClientHelloProfile {
+    /// All supported profiles, for random selection.
+    pub const ALL: [ClientHelloProfile; 4] = [
+        ClientHelloProfile::Chrome120,
+        ClientHelloProfile::Firefox121,
+        ClientHelloProfile::Safari17,
+        ClientHelloProfile::Edge120,
+    ];
+
+    /// Preferred cipher suite order (highest first). Ordering the first
+    /// entries differently is what breaks the static ClientHello signature.
+    pub fn cipher_order(&self) -> &'static [rustls::CipherSuite] {
+        match self {
+            // Chrome 120: AES-128-GCM first, then Chacha20, then AES-256.
+            ClientHelloProfile::Chrome120 => &[
+                rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+                rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            ],
+            // Firefox 121: AES-128, then AES-256, then Chacha20.
+            ClientHelloProfile::Firefox121 => &[
+                rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+                rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+            ],
+            // Safari 17: Chacha20 first (Apple prefers it), then AES-128.
+            ClientHelloProfile::Safari17 => &[
+                rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+                rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            ],
+            // Edge 120: mirrors Chrome's list but swaps the top two.
+            ClientHelloProfile::Edge120 => &[
+                rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+                rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            ],
+        }
+    }
+
+    /// Preferred key-exchange group order. Different first-group = different
+    /// key-share the client offers, another fingerprint lever.
+    pub fn kx_order(&self) -> &'static [rustls::NamedGroup] {
+        match self {
+            ClientHelloProfile::Chrome120
+            | ClientHelloProfile::Firefox121
+            | ClientHelloProfile::Edge120 => &[
+                rustls::NamedGroup::X25519,
+                rustls::NamedGroup::secp256r1,
+                rustls::NamedGroup::X448,
+            ],
+            // Safari historically leads with P-256.
+            ClientHelloProfile::Safari17 => &[
+                rustls::NamedGroup::secp256r1,
+                rustls::NamedGroup::X25519,
+                rustls::NamedGroup::X448,
+            ],
+        }
+    }
+}
+
+/// Pick a random ClientHello profile from the supported set.
+pub fn pick_client_hello_profile(rng: &mut impl rand::Rng) -> ClientHelloProfile {
+    ClientHelloProfile::ALL[rng.gen_range(0..ClientHelloProfile::ALL.len())]
+}
+
+/// Reorder a provider's cipher suites: preferred order first, then any
+/// remaining suites (kept so the provider stays valid — every suite still has
+/// its key-exchange groups present).
+fn order_cipher_suites(
+    mut suites: Vec<rustls::SupportedCipherSuite>,
+    preferred: &'static [rustls::CipherSuite],
+) -> Vec<rustls::SupportedCipherSuite> {
+    let mut ordered = Vec::with_capacity(suites.len());
+    for want in preferred {
+        if let Some(pos) = suites.iter().position(|s| s.suite().eq(want)) {
+            ordered.push(suites.remove(pos));
+        }
+    }
+    ordered.extend(suites);
+    ordered
+}
+
+/// Reorder a provider's key-exchange groups by the profile's preference.
+fn order_kx_groups(
+    mut groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+    preferred: &'static [rustls::NamedGroup],
+) -> Vec<&'static dyn rustls::crypto::SupportedKxGroup> {
+    let mut ordered = Vec::with_capacity(groups.len());
+    for want in preferred {
+        if let Some(pos) = groups.iter().position(|g| g.name().eq(want)) {
+            ordered.push(groups.remove(pos));
+        }
+    }
+    ordered.extend(groups);
+    ordered
+}
+
+/// Build a custom [`rustls::CryptoProvider`] for the given browser profile.
+/// Takes the default aws-lc-rs provider and reorders its cipher suites and
+/// key-exchange groups to match the profile — the cheap, valid way to vary
+/// the ClientHello without new crates.
+pub fn provider_for_profile(profile: ClientHelloProfile) -> rustls::crypto::CryptoProvider {
+    let base = rustls::crypto::aws_lc_rs::default_provider();
+    rustls::crypto::CryptoProvider {
+        cipher_suites: order_cipher_suites(base.cipher_suites, profile.cipher_order()),
+        kx_groups: order_kx_groups(base.kx_groups, profile.kx_order()),
+        ..base
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +305,42 @@ mod tests {
         // Two randomizations must differ.
         let out2 = randomize_ws_request(&mut rng, base);
         assert_ne!(out, out2);
+    }
+
+    #[test]
+    fn test_chrome_profile_has_chrome_cipher_order() {
+        let p = ClientHelloProfile::Chrome120;
+        let order = p.cipher_order();
+        assert_eq!(order[0], rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+        assert_eq!(
+            order[1],
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        );
+        // Provider must actually respect that order.
+        let prov = provider_for_profile(p);
+        let ids: Vec<_> = prov.cipher_suites.iter().map(|s| s.suite()).collect();
+        assert_eq!(ids[0], rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+    }
+
+    #[test]
+    fn test_firefox_profile_has_firefox_cipher_order() {
+        let p = ClientHelloProfile::Firefox121;
+        let order = p.cipher_order();
+        assert_eq!(order[0], rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+        assert_eq!(order[1], rustls::CipherSuite::TLS13_AES_256_GCM_SHA384);
+        let prov = provider_for_profile(p);
+        let ids: Vec<_> = prov.cipher_suites.iter().map(|s| s.suite()).collect();
+        assert_eq!(ids[1], rustls::CipherSuite::TLS13_AES_256_GCM_SHA384);
+    }
+
+    #[test]
+    fn test_random_profile_varies_across_calls() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        // Over many draws we should see >1 distinct profile.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            seen.insert(pick_client_hello_profile(&mut rng));
+        }
+        assert!(seen.len() > 1, "expected variation in random profile picks");
     }
 }

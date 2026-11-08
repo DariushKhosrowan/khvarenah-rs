@@ -210,6 +210,7 @@ mod tests {
             score_above_threshold: 20,
             e2e_pass: 0,
             e2e_fail_by_stage: HashMap::new(),
+            ws_failure_histogram: HashMap::new(),
             cancelled_early: false,
             e2e_enabled: true,
         }
