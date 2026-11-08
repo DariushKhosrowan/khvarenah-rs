@@ -96,6 +96,10 @@ pub struct ProfileConfig {
     pub scan_ports: String,
     #[serde(default)]
     pub scan_gentle: bool,
+    /// One-button "Protection": persisted so the monitor auto-resumes after an
+    /// app restart (the product's main toggle).
+    #[serde(default)]
+    pub protection_enabled: bool,
 }
 
 impl Default for ProfileConfig {
@@ -108,6 +112,7 @@ impl Default for ProfileConfig {
             scan_timeout: 8,
             scan_ports: "443".to_string(),
             scan_gentle: true,
+            protection_enabled: false,
         }
     }
 }
@@ -454,6 +459,31 @@ pub fn save_config(id: &str, cfg: &ProfileConfig) -> Result<(), CFError> {
     let mut p = load_profile(id);
     p.config = cfg.clone();
     save_profile(&p)
+}
+
+/// Whether the one-button Protection monitor is active for this profile.
+pub fn protection_enabled(id: &str) -> bool {
+    load_profile(id).config.protection_enabled
+}
+
+/// Set the persisted Protection monitor flag (survives app restarts).
+pub fn set_protection(id: &str, enabled: bool) -> Result<(), CFError> {
+    let mut cfg = load_profile(id).config;
+    cfg.protection_enabled = enabled;
+    save_config(id, &cfg)
+}
+
+/// The last parallel-scan diagnostics (so the GUI/CLI can explain a zero
+/// result in plain language). Written by the discovery pipeline each cycle.
+pub fn save_last_diagnostics(id: &str, diag: &crate::slipscan::PipelineDiagnostics) -> Result<(), CFError> {
+    let p = profile_dir(id).join("last-diagnostics.json");
+    write_json(&p, diag)
+}
+
+/// Read the last saved pipeline diagnostics, if any.
+pub fn load_last_diagnostics(id: &str) -> Option<crate::slipscan::PipelineDiagnostics> {
+    let p = profile_dir(id).join("last-diagnostics.json");
+    read_opt::<crate::slipscan::PipelineDiagnostics>(&p)
 }
 
 /// --- Legacy migration ---
