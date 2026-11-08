@@ -284,7 +284,15 @@ enum AutopilotAction {
     Check,
     /// Probe the worker's health directly (step-0 gate): a real TLS+HTTP
     /// check against the deployed worker's hostname, before any scanning.
-    Health,
+    /// Optionally connect via a specific fronting IP (bypasses DNS, which is
+    /// often hijacked on censored networks) while still probing the worker's
+    /// hostname as SNI/Host.
+    Health {
+        /// A Cloudflare IP that fronts the worker; connect to this IP while
+        /// using the worker hostname as SNI/Host (skips DNS entirely).
+        #[arg(long)]
+        connect_ip: Option<std::net::Ipv4Addr>,
+    },
     /// Show autopilot status + current ledger.
     Status,
     /// Turn autopilot off (stop the loop). No-op for CLI (loop is per-run);

@@ -757,12 +757,16 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
             println!("{}", summary.note);
             Ok(())
         }
-        crate::AutopilotAction::Health => {
+        crate::AutopilotAction::Health { connect_ip } => {
             let vless = khvarenah_core::autopilot::base_vless(profile)?;
             let target = khvarenah_core::health::derive_ws_target(&vless);
             let host = target.sni.clone();
-            println!("Probing worker {} …", host);
-            match khvarenah_core::autopilot::probe_worker_health(&host, 10).await {
+            if let Some(ip) = connect_ip {
+                println!("Probing worker {host} via connect-ip {ip} (SNI={host}) …");
+            } else {
+                println!("Probing worker {host} …");
+            }
+            match khvarenah_core::autopilot::probe_worker_health(&host, connect_ip, 10).await {
                 khvarenah_core::autopilot::WorkerHealth::Alive => {
                     println!("Worker HEALTHY (Alive). Scanning will proceed.");
                 }
