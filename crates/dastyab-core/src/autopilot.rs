@@ -154,7 +154,7 @@ async fn discover_native(
     // Step 0 — worker-health gate (DeepSeek plan #1). If the worker is dead,
     // suspended, or path-mismatched, no scanner can find clean IPs: short-
     // circuit with a plain-language diagnosis instead of wasting a scan.
-    match crate::autopilot::probe_worker_health(&sni, timeout_s as u64).await {
+    match crate::autopilot::probe_worker_health(&sni, None, timeout_s as u64).await {
         crate::autopilot::WorkerHealth::Alive => {}
         other => {
             let cause = match other {
@@ -346,11 +346,49 @@ pub enum WorkerHealth {
 /// Step-0 worker-health probe. Does a real TLS handshake + HTTP GET against
 /// the worker's hostname (its own host, not a clean-IP front), then classifies
 /// the response. This is cheap (~300ms) and runs once per scan/cycle.
-pub async fn probe_worker_health(worker_host: &str, timeout_s: u64) -> WorkerHealth {
+///
+/// `connect_ip` lets the caller bypass DNS entirely: when provided, we connect
+/// to that literal IP (which must front the worker) while still sending
+/// `worker_host` as the SNI/Host. This is essential on censored networks
+/// where system DNS is hijacked (e.g. 198.18.x.x in Iran) — the hostname
+/// itself may never resolve to a real address.
+pub async fn probe_worker_health(
+    worker_host: &str,
+    connect_ip: Option<std::net::Ipv4Addr>,
+    timeout_s: u64,
+) -> WorkerHealth {
     let timeout_ms = (timeout_s.max(1) as u64) * 1000;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut stream = match crate::health::tls_connect(worker_host, 443, worker_host, timeout_ms).await
+    let connect_addr = match connect_ip {
+        Some(ip) => ip.to_string(),
+        None => {
+            // Resolve the hostname ourselves, rejecting hijacked answers. If
+            // the only addresses are 198.18.x.x (DPI signature) treat it as
+            // unreachable rather than connecting to garbage.
+            let mut found_real = false;
+            let mut addr = None;
+            if let Ok(iter) = std::net::ToSocketAddrs::to_socket_addrs(
+                &(worker_host.to_string(), 443u16),
+            ) {
+                for a in iter {
+                    if let std::net::SocketAddr::V4(v4) = a {
+                        if !crate::health::is_hijacked_ip(&v4.ip()) {
+                            found_real = true;
+                            addr = Some(v4.ip().to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            if !found_real {
+                return WorkerHealth::Unreachable;
+            }
+            addr.unwrap()
+        }
+    };
+
+    let mut stream = match crate::health::tls_connect(&connect_addr, 443, worker_host, timeout_ms).await
     {
         Ok(s) => s,
         Err(_) => return WorkerHealth::Unreachable,

@@ -565,6 +565,15 @@ pub fn quality_score(p: &FullProbe) -> u8 {
 /// Minimum accepted score. Below this the endpoint is rejected.
 pub const ACCEPT_THRESHOLD: u8 = 5;
 
+/// Signatures of DPI DNS hijack on censored networks. 198.18.0.0/15 is the
+/// RFC 2544 benchmark range, which ISPs in Iran use to poison A-record answers
+/// for blocked domains. If every resolved address for a hostname lands in this
+/// range, the resolution is hijacked and must not be trusted.
+pub fn is_hijacked_ip(ip: &std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 198 && octets[1] == 18
+}
+
 pub fn is_acceptable(p: &FullProbe) -> bool {
     quality_score(p) >= ACCEPT_THRESHOLD
 }
