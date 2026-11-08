@@ -121,71 +121,153 @@ pub fn rotate_strategy(s: crate::health::SniStrategy) -> crate::health::SniStrat
     }
 }
 
-/// Pure strategy selector. `preferred` is the currently persisted strategy;
-/// `zero_streak` counts consecutive cycles with zero accepted `101`s under it.
-/// - `preferred` == None → WorkerOnly (default, never learned yet).
-/// - `preferred` == Some(p) and zero_streak < 3 → keep p.
-/// - `preferred` == Some(p) and zero_streak >= 3 → rotate away from p.
-pub fn select_strategy(
-    preferred: Option<crate::health::SniStrategy>,
-    zero_streak: u32,
-) -> crate::health::SniStrategy {
-    match preferred {
-        None => crate::health::SniStrategy::WorkerOnly,
-        Some(p) if zero_streak >= 3 => rotate_strategy(p),
-        Some(p) => p,
-    }
+/// --- v2 rolling-window strategy (round 3) ---
+///
+/// Replaces the v1 consecutive-zero streak (which never rotated when a strategy
+/// occasionally won — the "sticky success" bug). Tracks a rolling window of
+/// discovery outcomes and adds forced exploration so the app cannot lock onto a
+/// suboptimal strategy.
+///
+/// Rolling window length (number of recent discovery outcomes considered).
+pub const STRATEGY_WINDOW: usize = 10;
+/// Success rate below which the window counts as failure-driven rotation.
+pub const STRATEGY_MIN_SUCCESS_RATE: f32 = 0.30;
+/// Discovery cycles after which rotation is forced even if the strategy is
+/// winning (exploration guarantee — can't lock onto a marginal winner).
+pub const STRATEGY_FORCED_ROTATION_CYCLES: u32 = 20;
+/// Consecutive zero-verified discovery cycles that trigger early rotation
+/// without waiting for the full window.
+pub const STRATEGY_EARLY_DEAD_CYCLES: usize = 3;
+
+/// Roll state for the self-learning phase-2 SNI strategy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrategyState {
+    /// The strategy currently in use.
+    pub current: crate::health::SniStrategy,
+    /// Recent discovery outcomes: true = any accepted 101 (won), false = zero.
+    /// Newest is the last element. Capped at `STRATEGY_WINDOW`.
+    pub recent_outcomes: Vec<bool>,
+    /// Discovery cycles since the last rotation.
+    pub cycles_since_rotation: u32,
 }
 
-/// Pure post-cycle learner. Returns `(new_preferred, new_zero_streak)`.
-/// - `won` == true → the current strategy got ≥1 accepted 101 → lock it in,
-///   reset the streak.
-/// - `won` == false and streak reaches 3 → rotate (the other exclusive
-///   strategy), reset the streak.
-/// - `won` == false and streak < 3 → keep trying the same strategy, increment.
-pub fn update_strategy_after_cycle(
-    current: crate::health::SniStrategy,
-    won: bool,
-    previous_streak: u32,
-) -> (crate::health::SniStrategy, u32) {
-    if won {
-        (current, 0)
-    } else if previous_streak + 1 >= 3 {
-        (rotate_strategy(current), 0)
-    } else {
-        (current, previous_streak + 1)
-    }
-}
-
-/// Resolve the strategy this cycle should use from the persisted profile state.
-pub fn resolve_strategy(profile_id: &str) -> crate::health::SniStrategy {
-    let preferred = crate::store::profiles::preferred_phase2_strategy(profile_id).and_then(|s| {
-        match s.as_str() {
-            "WorkerOnly" => Some(crate::health::SniStrategy::WorkerOnly),
-            "GenericCfFirst" => Some(crate::health::SniStrategy::GenericCfFirst),
-            "WorkerThenGenericCf" => Some(crate::health::SniStrategy::WorkerThenGenericCf),
-            _ => None,
+impl Default for StrategyState {
+    fn default() -> Self {
+        Self {
+            current: crate::health::SniStrategy::WorkerOnly,
+            recent_outcomes: Vec::new(),
+            cycles_since_rotation: 0,
         }
-    });
-    let streak = crate::store::profiles::strategy_zero_streak(profile_id);
-    select_strategy(preferred, streak)
+    }
 }
 
-/// Commit the cycle's outcome back to the profile (learn + persist). `won` is
-/// whether the cycle produced ≥1 accepted phase-2 `101` (i.e. clean endpoints).
-pub fn commit_strategy(
-    profile_id: &str,
-    current: crate::health::SniStrategy,
-    won: bool,
-) -> Result<(), CFError> {
-    let prev = crate::store::profiles::strategy_zero_streak(profile_id);
-    let (next, streak) = update_strategy_after_cycle(current, won, prev);
-    let name = match next {
+/// Push a discovery outcome onto the window, trimming to `STRATEGY_WINDOW` and
+/// incrementing the since-rotation counter.
+pub fn record_cycle_outcome(state: &mut StrategyState, any_101: bool) {
+    state.recent_outcomes.push(any_101);
+    if state.recent_outcomes.len() > STRATEGY_WINDOW {
+        let excess = state.recent_outcomes.len() - STRATEGY_WINDOW;
+        let mut drain = state.recent_outcomes.drain(..excess);
+        drain.next();
+    }
+    state.cycles_since_rotation = state.cycles_since_rotation.saturating_add(1);
+}
+
+/// Success rate over the current window (None when empty).
+pub fn success_rate(state: &StrategyState) -> Option<f32> {
+    if state.recent_outcomes.is_empty() {
+        return None;
+    }
+    let wins = state.recent_outcomes.iter().filter(|&&w| w).count();
+    Some(wins as f32 / state.recent_outcomes.len() as f32)
+}
+
+/// Whether the app should rotate away from the current strategy.
+pub fn should_rotate(state: &StrategyState) -> bool {
+    let n = state.recent_outcomes.len();
+    if n >= STRATEGY_EARLY_DEAD_CYCLES && success_rate(state) == Some(0.0) {
+        // (a) early dead: enough zero outcomes with zero success → rotate fast.
+        return true;
+    }
+    if n >= STRATEGY_WINDOW && success_rate(state) < Some(STRATEGY_MIN_SUCCESS_RATE) {
+        // (b) windowed failure: full window below the success floor.
+        return true;
+    }
+    if state.cycles_since_rotation >= STRATEGY_FORCED_ROTATION_CYCLES {
+        // (c) forced exploration: even a winning strategy gets rotated.
+        return true;
+    }
+    false
+}
+
+/// Rotate to the other exclusive strategy and reset the window + counter.
+pub fn rotate(mut state: StrategyState) -> StrategyState {
+    state.current = rotate_strategy(state.current);
+    state.recent_outcomes.clear();
+    state.cycles_since_rotation = 0;
+    state
+}
+
+fn strategy_from_name(name: &str) -> crate::health::SniStrategy {
+    match name {
+        "GenericCfFirst" => crate::health::SniStrategy::GenericCfFirst,
+        "WorkerThenGenericCf" => crate::health::SniStrategy::WorkerThenGenericCf,
+        _ => crate::health::SniStrategy::WorkerOnly,
+    }
+}
+
+fn strategy_name(s: crate::health::SniStrategy) -> &'static str {
+    match s {
         crate::health::SniStrategy::WorkerOnly => "WorkerOnly",
         crate::health::SniStrategy::GenericCfFirst => "GenericCfFirst",
         crate::health::SniStrategy::WorkerThenGenericCf => "WorkerThenGenericCf",
+    }
+}
+
+/// Resolve the v2 strategy state for a cycle from the persisted profile.
+pub fn resolve_strategy_v2(profile_id: &str) -> StrategyState {
+    let current = crate::store::profiles::strategy_current(profile_id)
+        .map(|s| strategy_from_name(&s))
+        .unwrap_or(crate::health::SniStrategy::WorkerOnly);
+    let outcomes = crate::store::profiles::strategy_recent_outcomes(profile_id)
+        .into_iter()
+        .map(|b| b != 0)
+        .collect();
+    let cycles = crate::store::profiles::strategy_cycles_since_rotation(profile_id);
+    StrategyState {
+        current,
+        recent_outcomes: outcomes,
+        cycles_since_rotation: cycles,
+    }
+}
+
+/// Record a discovery outcome, optionally rotate, and persist. `any_101` is
+/// whether this discovery cycle produced ≥1 accepted phase-2 `101` (i.e. clean
+/// endpoints). Returns whether a rotation happened.
+pub fn commit_strategy_v2(
+    profile_id: &str,
+    state: &mut StrategyState,
+    any_101: bool,
+) -> Result<bool, CFError> {
+    record_cycle_outcome(state, any_101);
+    let mut rotated = false;
+    if should_rotate(state) {
+        *state = rotate(state.clone());
+        rotated = true;
+    }
+    let last_rotated = if rotated {
+        crate::store::now_ts() as i64
+    } else {
+        crate::store::profiles::strategy_last_rotated_ts(profile_id)
     };
-    crate::store::profiles::commit_strategy_state(profile_id, Some(name.to_string()), streak)
+    crate::store::profiles::commit_strategy_state_v2(
+        profile_id,
+        Some(strategy_name(state.current).to_string()),
+        state.recent_outcomes.iter().map(|&w| u8::from(w)).collect(),
+        state.cycles_since_rotation,
+        last_rotated,
+    )?;
+    Ok(rotated)
 }
 
 /// The `EndpointProvider` contract. Two implementations ship today:
@@ -924,22 +1006,22 @@ impl AutopilotEngine {
         // Self-heal the user-facing bundle against the ledger first (never
         // fails the cycle: discovery is still the goal).
         let _ = crate::cleanip::reconcile_bundle_if_drifted(&self.profile_id);
-        // Self-learning phase-2 SNI strategy: resolve the persisted preference
-        // (rotating on repeated zero-101 streaks) and pin it for this cycle so
-        // the phase-2 probe is exclusive about which SNI it tries first.
-        let strategy = resolve_strategy(&self.profile_id);
+        // Self-learning phase-2 SNI strategy (v2 rolling-window): resolve the
+        // persisted strategy state and pin its current strategy for this cycle
+        // so the phase-2 probe is exclusive about which SNI it tries first.
+        let mut strategy = resolve_strategy_v2(&self.profile_id);
         let mut used_params = params.clone();
-        used_params.preferred_strategy = Some(strategy);
+        used_params.preferred_strategy = Some(strategy.current);
 
         let vless = base_vless(&self.profile_id)?;
         let found = self.provider.discover(&vless, &used_params).await?;
 
-        // Learn from this cycle: if we got any verified (accepted-101)
-        // endpoint, the strategy won — lock it in and reset the streak.
-        // If not, the streak increments (and rotates at 3). This is the
-        // self-healing loop that makes the app pick the working SNI itself.
+        // Learn from this discovery cycle: any verified (accepted-101)
+        // endpoint means the strategy won. Record the outcome in the rolling
+        // window and rotate if the window / forced-exploration says so. This is
+        // the self-healing loop that makes the app pick the working SNI itself.
         let won = !found.is_empty();
-        let _ = commit_strategy(&self.profile_id, strategy, won);
+        let _ = commit_strategy_v2(&self.profile_id, &mut strategy, won);
 
         let mut ledger = read_ledger(&self.profile_id);
         let mut replaced = 0;
@@ -2264,135 +2346,115 @@ mod tests {
     }
 
     // ── Self-learning phase-2 SNI strategy (autonomy) ──
+    // ── Self-learning phase-2 SNI strategy v2 (rolling-window) ──
 
     #[test]
-    fn test_select_strategy_returns_preferred_when_streak_below_three() {
-        use crate::health::SniStrategy;
+    fn test_record_cycle_outcome_appends_and_trims_window() {
+        let mut s = StrategyState::default();
+        for i in 0..STRATEGY_WINDOW + 2 {
+            record_cycle_outcome(&mut s, i % 2 == 0);
+        }
+        assert_eq!(s.recent_outcomes.len(), STRATEGY_WINDOW);
+        // Newest outcome is last; the two oldest were trimmed.
         assert_eq!(
-            select_strategy(Some(SniStrategy::GenericCfFirst), 0),
-            SniStrategy::GenericCfFirst
+            *s.recent_outcomes.last().unwrap(),
+            (STRATEGY_WINDOW + 1) % 2 == 0
         );
-        assert_eq!(
-            select_strategy(Some(SniStrategy::GenericCfFirst), 2),
-            SniStrategy::GenericCfFirst
-        );
+        assert_eq!(s.cycles_since_rotation, (STRATEGY_WINDOW + 2) as u32);
     }
 
     #[test]
-    fn test_select_strategy_rotates_when_streak_reaches_three() {
-        use crate::health::SniStrategy;
-        assert_eq!(
-            select_strategy(Some(SniStrategy::GenericCfFirst), 3),
-            SniStrategy::WorkerOnly
-        );
-        assert_eq!(
-            select_strategy(Some(SniStrategy::WorkerOnly), 5),
-            SniStrategy::GenericCfFirst
-        );
+    fn test_success_rate_empty_returns_none() {
+        let s = StrategyState::default();
+        assert_eq!(success_rate(&s), None);
     }
 
     #[test]
-    fn test_select_strategy_defaults_to_worker_only_when_none() {
-        use crate::health::SniStrategy;
-        assert_eq!(select_strategy(None, 0), SniStrategy::WorkerOnly);
-        assert_eq!(select_strategy(None, 9), SniStrategy::WorkerOnly);
+    fn test_should_rotate_early_dead_on_three_zeros() {
+        let mut s = StrategyState::default();
+        record_cycle_outcome(&mut s, false);
+        record_cycle_outcome(&mut s, false);
+        assert!(!should_rotate(&s));
+        record_cycle_outcome(&mut s, false);
+        assert!(should_rotate(&s));
     }
 
     #[test]
-    fn test_update_strategy_resets_streak_on_any_101() {
-        use crate::health::SniStrategy;
-        let (next, streak) = update_strategy_after_cycle(SniStrategy::WorkerOnly, true, 2);
-        assert_eq!(next, SniStrategy::WorkerOnly);
-        assert_eq!(streak, 0);
+    fn test_should_rotate_windowed_when_rate_below_threshold() {
+        let mut s = StrategyState::default();
+        // 2 wins / 10 = 20% < 30% floor -> rotate.
+        record_cycle_outcome(&mut s, true);
+        record_cycle_outcome(&mut s, true);
+        for _ in 0..8 {
+            record_cycle_outcome(&mut s, false);
+        }
+        assert_eq!(s.recent_outcomes.len(), STRATEGY_WINDOW);
+        assert_eq!(success_rate(&s), Some(0.2));
+        assert!(should_rotate(&s));
     }
 
     #[test]
-    fn test_update_strategy_increments_streak_when_zero_101() {
-        use crate::health::SniStrategy;
-        let (next, streak) = update_strategy_after_cycle(SniStrategy::WorkerOnly, false, 1);
-        assert_eq!(next, SniStrategy::WorkerOnly);
-        assert_eq!(streak, 2);
+    fn test_should_rotate_not_when_rate_above_threshold_and_under_forced_cycles() {
+        let mut s = StrategyState::default();
+        // 2 wins / 5 = 40% > 30%, and only 5 cycles < 20 -> no rotation.
+        record_cycle_outcome(&mut s, true);
+        record_cycle_outcome(&mut s, true);
+        record_cycle_outcome(&mut s, false);
+        record_cycle_outcome(&mut s, false);
+        record_cycle_outcome(&mut s, false);
+        assert_eq!(success_rate(&s), Some(0.4));
+        assert!(!should_rotate(&s));
     }
 
     #[test]
-    fn test_update_strategy_rotates_at_streak_three() {
-        use crate::health::SniStrategy;
-        let (next, streak) = update_strategy_after_cycle(SniStrategy::WorkerOnly, false, 2);
-        assert_eq!(next, SniStrategy::GenericCfFirst);
-        assert_eq!(streak, 0);
+    fn test_should_rotate_forced_at_twenty_cycles() {
+        let mut s = StrategyState::default();
+        record_cycle_outcome(&mut s, true);
+        for _ in 0..STRATEGY_FORCED_ROTATION_CYCLES - 1 {
+            record_cycle_outcome(&mut s, true);
+        }
+        assert_eq!(s.cycles_since_rotation, STRATEGY_FORCED_ROTATION_CYCLES);
+        assert!(should_rotate(&s));
     }
 
     #[test]
-    fn test_rotate_strategy_cycles_between_exclusive_variants() {
-        use crate::health::SniStrategy;
-        assert_eq!(
-            rotate_strategy(SniStrategy::WorkerOnly),
-            SniStrategy::GenericCfFirst
-        );
-        assert_eq!(
-            rotate_strategy(SniStrategy::GenericCfFirst),
-            SniStrategy::WorkerOnly
-        );
+    fn test_rotate_flips_strategy_and_clears_state() {
+        let mut s = StrategyState::default();
+        record_cycle_outcome(&mut s, false);
+        record_cycle_outcome(&mut s, false);
+        record_cycle_outcome(&mut s, false);
+        let s = rotate(s);
+        assert_eq!(s.current, crate::health::SniStrategy::GenericCfFirst);
+        assert!(s.recent_outcomes.is_empty());
+        assert_eq!(s.cycles_since_rotation, 0);
     }
 
     #[test]
-    fn test_commit_strategy_persists_learned_state() {
+    fn test_commit_strategy_v2_persists_and_reports_rotation() {
         let _home = rescue_home();
         let id = make_profile();
-        // Start clean: no preferred strategy, streak 0.
-        assert!(crate::store::profiles::preferred_phase2_strategy(&id).is_none());
-        assert_eq!(crate::store::profiles::strategy_zero_streak(&id), 0);
+        let mut state = resolve_strategy_v2(&id);
+        assert_eq!(state.current, crate::health::SniStrategy::WorkerOnly);
+        assert!(state.recent_outcomes.is_empty());
 
-        // First cycle: WorkerOnly wins → locked in, streak stays 0.
-        commit_strategy(&id, crate::health::SniStrategy::WorkerOnly, true).unwrap();
-        assert_eq!(
-            crate::store::profiles::preferred_phase2_strategy(&id).as_deref(),
-            Some("WorkerOnly")
-        );
-        assert_eq!(crate::store::profiles::strategy_zero_streak(&id), 0);
-        assert!(crate::store::profiles::strategy_last_updated_ts(&id) > 0);
+        // Three consecutive zero-verified cycles -> early-dead rotation.
+        assert!(!commit_strategy_v2(&id, &mut state, false).unwrap());
+        assert!(!commit_strategy_v2(&id, &mut state, false).unwrap());
+        let rotated = commit_strategy_v2(&id, &mut state, false).unwrap();
+        assert!(rotated);
 
-        // Two losing cycles then a third → rotate to GenericCfFirst, streak reset.
-        commit_strategy(&id, crate::health::SniStrategy::WorkerOnly, false).unwrap();
-        commit_strategy(&id, crate::health::SniStrategy::WorkerOnly, false).unwrap();
-        assert_eq!(crate::store::profiles::strategy_zero_streak(&id), 2);
-        commit_strategy(&id, crate::health::SniStrategy::WorkerOnly, false).unwrap();
-        assert_eq!(
-            crate::store::profiles::preferred_phase2_strategy(&id).as_deref(),
-            Some("GenericCfFirst")
-        );
-        assert_eq!(crate::store::profiles::strategy_zero_streak(&id), 0);
+        // Persisted state reflects the rotation: flipped strategy, cleared window.
+        let reloaded = resolve_strategy_v2(&id);
+        assert_eq!(reloaded.current, crate::health::SniStrategy::GenericCfFirst);
+        assert!(reloaded.recent_outcomes.is_empty());
+        assert_eq!(reloaded.cycles_since_rotation, 0);
     }
 
     #[test]
-    fn test_resolve_strategy_reads_persisted_state() {
+    fn test_profile_config_migrates_to_v2_fields() {
         let _home = rescue_home();
         let id = make_profile();
-        // Unlearned → WorkerOnly.
-        assert_eq!(
-            resolve_strategy(&id),
-            crate::health::SniStrategy::WorkerOnly
-        );
-        // Learn GenericCfFirst, then a losing streak of 3 → rotates.
-        commit_strategy(&id, crate::health::SniStrategy::GenericCfFirst, true).unwrap();
-        assert_eq!(
-            resolve_strategy(&id),
-            crate::health::SniStrategy::GenericCfFirst
-        );
-        commit_strategy(&id, crate::health::SniStrategy::GenericCfFirst, false).unwrap();
-        commit_strategy(&id, crate::health::SniStrategy::GenericCfFirst, false).unwrap();
-        commit_strategy(&id, crate::health::SniStrategy::GenericCfFirst, false).unwrap();
-        assert_eq!(
-            resolve_strategy(&id),
-            crate::health::SniStrategy::WorkerOnly
-        );
-    }
-
-    #[test]
-    fn test_profile_config_migrates_without_strategy_fields() {
-        let _home = rescue_home();
-        let id = make_profile();
-        // Simulate an older config without any strategy fields.
+        // Simulate an old config without any v2 strategy fields.
         let cfg_path = crate::store::profiles::profile_dir(&id).join("config.json");
         let old_cfg = serde_json::json!({
             "active_account": "acc-1",
@@ -2405,14 +2467,14 @@ mod tests {
         crate::store::write_json(&cfg_path, &old_cfg).unwrap();
 
         let p = crate::store::profiles::load_profile(&id);
-        assert!(p.config.preferred_phase2_strategy.is_none());
-        assert_eq!(p.config.strategy_zero_streak, 0);
-        assert_eq!(p.config.strategy_last_updated_ts, 0);
-        // And commit still works on the migrated config.
-        commit_strategy(&id, crate::health::SniStrategy::WorkerOnly, true).unwrap();
-        assert_eq!(
-            crate::store::profiles::preferred_phase2_strategy(&id).as_deref(),
-            Some("WorkerOnly")
-        );
+        assert!(p.config.strategy_current.is_none());
+        assert!(p.config.strategy_recent_outcomes.is_empty());
+        assert_eq!(p.config.strategy_cycles_since_rotation, 0);
+        assert_eq!(p.config.strategy_last_rotated_ts, 0);
+
+        // v2 resolve on the migrated config defaults to an empty WorkerOnly state.
+        let state = resolve_strategy_v2(&id);
+        assert_eq!(state.current, crate::health::SniStrategy::WorkerOnly);
+        assert!(state.recent_outcomes.is_empty());
     }
 }
