@@ -91,6 +91,10 @@ pub struct KhvarenahApp {
     pub stealth_enabled: bool,
     // results
     pub last_link: String,
+    // autopilot
+    pub autopilot_on: bool,
+    pub autopilot_status: String,
+    pub autopilot_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     // tools
     pub audit_output: String,
     pub backup_output: String,
@@ -165,6 +169,9 @@ impl KhvarenahApp {
             scan_gentle: profile.config.scan_gentle,
             stealth_enabled: profile.config.stealth_enabled,
             last_link: String::new(),
+            autopilot_on: false,
+            autopilot_status: "Autopilot is off. Flip the switch to auto-find the best clean IP, export configs, and keep them healthy.".to_string(),
+            autopilot_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             audit_output: String::new(),
             backup_output: String::new(),
             export_output: String::new(),
@@ -200,6 +207,72 @@ impl KhvarenahApp {
         }
     }
 
+    /// Start autopilot: spawn a background engine loop on the global tokio
+    /// runtime. The loop reports progress via bridge Log events.
+    fn autopilot_on(&mut self, ctx: &egui::Context) {
+        let pid = self.profile_id.clone();
+        let tx = self.tx.clone();
+        let stop = self.autopilot_stop.clone();
+        stop.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        self.running.push("autopilot".to_string());
+        self.autopilot_on = true;
+        self.autopilot_status = "Autopilot starting — discovering the best clean IP…".to_string();
+        self.push_log("[autopilot] ON — starting discovery + monitor loop");
+        ctx.request_repaint();
+
+        bridge::spawn("autopilot", tx.clone(), async move {
+            let params = khvarenah_core::autopilot::DiscoveryParams::default();
+            let interval = std::time::Duration::from_secs(300);
+            let engine = khvarenah_core::autopilot::AutopilotEngine::new(pid, params, interval);
+            // Run a full cycle first (so the UI gets a quick result), then
+            // monitor until `stop` is set.
+            match engine.run_cycle().await {
+                Ok((_, summary)) => {
+                    // report via the return value; the loop below reports each cycle
+                    Ok::<String, CFError>(summary.note)
+                }
+                Err(e) => Err(e),
+            }?;
+            // Monitor loop until stop is requested.
+            loop {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(interval).await;
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                match engine.monitor_cycle().await {
+                    Ok(s) => {
+                        // Emit a log line per cycle (quiet by default).
+                        // We send a Log event so the GUI log pane updates.
+                        let _ = tx.send(bridge::UiEvent::Log {
+                            task: "autopilot".to_string(),
+                            line: format!("[autopilot] {}", s.note),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(bridge::UiEvent::Log {
+                            task: "autopilot".to_string(),
+                            line: format!("[autopilot] error: {}", e.brief()),
+                        });
+                    }
+                }
+            }
+            Ok::<String, CFError>("autopilot stopped".to_string())
+        });
+    }
+
+    /// Stop autopilot (request the background loop to halt).
+    fn autopilot_off(&mut self) {
+        self.autopilot_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.autopilot_on = false;
+        self.autopilot_status = "Autopilot stopped. The last working clean IP stays in your active configs.".to_string();
+        self.running.retain(|t| t != "autopilot");
+        self.push_log("[autopilot] OFF");
+    }
+
     /// Drain the async bridge, applying every pending event to UI state.
     fn poll_bridge(&mut self, ctx: &egui::Context) {
         use bridge::UiEvent;
@@ -207,15 +280,25 @@ impl KhvarenahApp {
             match ev {
                 UiEvent::Done { task, summary } => {
                     self.running.retain(|t| t != &task);
-                    self.note = format!("✓ {task}: {summary}");
+                    if task == "autopilot" {
+                        self.autopilot_status = summary.clone();
+                        self.autopilot_on = true;
+                    } else {
+                        self.note = format!("✓ {task}: {summary}");
+                    }
                     self.push_log(&format!("[done] {task}: {summary}"));
                     // mutating tasks change the store; refresh the view cache
                     self.state.reload_pending = true;
                 }
                 UiEvent::TaskErr { task, error } => {
                     self.running.retain(|t| t != &task);
-                    self.note = error.brief();
-                    self.error_banner = Some(error.explain());
+                    if task == "autopilot" {
+                        self.autopilot_on = false;
+                        self.autopilot_status = format!("Autopilot error: {}", error.brief());
+                    } else {
+                        self.note = error.brief();
+                        self.error_banner = Some(error.explain());
+                    }
                     self.push_log(&format!("[err]  {task}: {}", error.explain()));
                 }
                 UiEvent::Log { line, .. } => {
@@ -419,6 +502,31 @@ impl KhvarenahApp {
 
     fn deploy_panel(&mut self, ui: &mut egui::Ui, p: &khvarenah_core::store::profiles::Profile) {
         ui.heading(egui::RichText::new("Deploy & Clean-IP").color(GOLD));
+
+        // ---- Autopilot toggle (the product) ----
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let (label, color) = if self.autopilot_on {
+                ("AUTOPILOT: ON", egui::Color32::from_rgb(90, 210, 120))
+            } else {
+                ("AUTOPILOT: OFF", egui::Color32::from_rgb(220, 120, 90))
+            };
+            let on = ui
+                .add(egui::Button::new(egui::RichText::new(label).color(color).strong().size(16.0)))
+                .clicked();
+            if on {
+                // Toggle direction depends on current state.
+                if self.autopilot_on {
+                    self.autopilot_off();
+                } else {
+                    self.autopilot_on(ui.ctx());
+                }
+            }
+            ui.label(egui::RichText::new("Auto-find clean IP · export configs · keep them healthy").color(GOLD_DIM));
+        });
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(&self.autopilot_status).color(TEXT));
+        ui.separator();
 
         ui.horizontal(|ui| {
             ui.label("Scan count:");

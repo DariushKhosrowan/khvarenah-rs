@@ -149,6 +149,28 @@ enum Command {
     UpdateCheck,
     /// Download & install a newer release (requires GitHub asset).
     UpdateApply,
+
+    // ---- native clean-IP + autopilot ----
+    /// Show cached Cloudflare IP-range summary (diagnostic).
+    Ranges,
+    /// Run a single native clean-IP discovery cycle (no autopilot).
+    Discover {
+        /// Number of candidate IPs to probe per cycle.
+        #[arg(long, default_value_t = 2000)]
+        sample: u32,
+        /// Worker concurrency.
+        #[arg(long, default_value_t = 64)]
+        workers: u32,
+        /// Force refresh of the CF range list.
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Autopilot: find the best clean IP, export vless configs, and
+    /// continuously monitor + auto-replace dead fronts.
+    Autopilot {
+        #[command(subcommand)]
+        action: AutopilotAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -214,6 +236,30 @@ enum BackupAction {
     },
     /// List existing backups.
     List,
+}
+
+#[derive(Subcommand)]
+enum AutopilotAction {
+    /// Turn autopilot on: discover best clean IP, export configs, then
+    /// monitor and auto-replace dead fronts on an interval.
+    On {
+        /// Monitor interval in seconds (default 300 = 5 min).
+        #[arg(long, default_value_t = 300)]
+        interval_s: u64,
+        /// Candidate IPs per discovery cycle.
+        #[arg(long, default_value_t = 2000)]
+        sample: u32,
+        /// Worker concurrency.
+        #[arg(long, default_value_t = 64)]
+        workers: u32,
+    },
+    /// Run one monitor pass (without enabling the loop).
+    Check,
+    /// Show autopilot status + current ledger.
+    Status,
+    /// Turn autopilot off (stop the loop). No-op for CLI (loop is per-run);
+    /// provided for parity with the GUI toggle.
+    Off,
 }
 
 #[tokio::main]

@@ -110,6 +110,15 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::Presets => presets_cmd(),
         Command::UpdateCheck => update_check().await,
         Command::UpdateApply => update_apply().await,
+
+        // ---- native clean-IP + autopilot ----
+        Command::Ranges => cmd_ranges(),
+        Command::Discover {
+            sample,
+            workers,
+            refresh,
+        } => cmd_discover(&profile, sample, workers, refresh).await,
+        Command::Autopilot { action } => cmd_autopilot(&profile, action).await,
     }
 }
 
@@ -641,4 +650,114 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     tokio::runtime::Runtime::new()
         .expect("failed to create tokio runtime")
         .block_on(fut)
+}
+
+// ---------------------------------------------------------------------------
+// Native clean-IP + autopilot CLI
+// ---------------------------------------------------------------------------
+
+fn cmd_ranges() -> Result<(), CFError> {
+    let cidrs = khvarenah_core::cf::ips::read_cache();
+    match cidrs {
+        Some(c) => {
+            println!("Cached Cloudflare IPv4 ranges (fetched {}):", c.source);
+            println!("{}", khvarenah_core::cf::ips::summarize(&c.ipv4));
+        }
+        None => {
+            println!("No cached Cloudflare ranges yet. Run `khvarenah discover` to fetch.");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_discover(profile: &str, sample: u32, workers: u32, refresh: bool) -> Result<(), CFError> {
+    let params = khvarenah_core::autopilot::DiscoveryParams {
+        sample: sample.max(1),
+        workers: workers.max(1) as usize,
+        force_refresh_ranges: refresh,
+        ..Default::default()
+    };
+    // First make sure we have a base worker config to front.
+    let _ = khvarenah_core::autopilot::base_vless(profile)?;
+    println!("Discovery: {} candidate IPs, {} workers, targeting {} clean endpoint(s)…",
+        params.sample, params.workers, params.top_n);
+
+    let engine = khvarenah_core::autopilot::AutopilotEngine::new(
+        profile,
+        params.clone(),
+        std::time::Duration::from_secs(300),
+    );
+    let (found, summary) = engine.run_cycle().await?;
+    if found.is_empty() {
+        println!("No clean IP found in this cycle. Try a larger --sample, --refresh, or re-deploy a worker.");
+        return Ok(());
+    }
+    for ep in &found {
+        println!(
+            "✓ {}:{} (score {:.1}, tcp {:.0}ms, {:.0} kbps)",
+            ep.ip, ep.port, ep.score, ep.tcp_ms, ep.download_kbps
+        );
+    }
+    println!("{}", summary.note);
+    let dir = khvarenah_core::autopilot::active_configs_dir(profile);
+    println!("Active configs written to {}", dir.display());
+    Ok(())
+}
+
+async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<(), CFError> {
+    match action {
+        crate::AutopilotAction::Status => {
+            let ledger = khvarenah_core::autopilot::read_ledger(profile);
+            if ledger.is_empty() {
+                println!("Autopilot ledger is empty — run `.khvarenah autopilot on` to start.");
+                return Ok(());
+            }
+            let alive = ledger.iter().filter(|e| e.alive).count();
+            println!("Autopilot status (profile '{profile}'): {} endpoint(s) in ledger, {alive} alive.", ledger.len());
+            for ep in ledger.iter().take(10) {
+                println!(
+                    "  {}:{}  sni={}  score={:.1}  alive={}",
+                    ep.ip, ep.port, ep.sni, ep.score, ep.alive
+                );
+            }
+            Ok(())
+        }
+        crate::AutopilotAction::Check => {
+            let engine = khvarenah_core::autopilot::AutopilotEngine::new(
+                profile,
+                khvarenah_core::autopilot::DiscoveryParams::default(),
+                std::time::Duration::from_secs(300),
+            );
+            let summary = engine.monitor_cycle().await?;
+            println!("{}", summary.note);
+            Ok(())
+        }
+        crate::AutopilotAction::On {
+            interval_s,
+            sample,
+            workers,
+        } => {
+            let params = khvarenah_core::autopilot::DiscoveryParams {
+                sample: sample.max(1),
+                workers: workers.max(1) as usize,
+                ..Default::default()
+            };
+            let interval = std::time::Duration::from_secs(interval_s.max(60));
+            println!("Autopilot ON (profile '{profile}'): discovery every {}s, {} candidates, {} workers.",
+                interval.as_secs(), params.sample, params.workers);
+            println!("First cycle: discovering the best clean IP…");
+            let engine = khvarenah_core::autopilot::AutopilotEngine::new(profile, params, interval);
+            engine.run_forever(|summary| {
+                println!(
+                    "[cycle {}] {} (alive: {}, replaced: {})",
+                    summary.cycle, summary.note, summary.alive, summary.replaced
+                );
+            }).await?;
+            Ok(())
+        }
+        crate::AutopilotAction::Off => {
+            println!("Autopilot has no persistent loop in the CLI (it runs per-invocation). Use the GUI toggle for a background loop.");
+            Ok(())
+        }
+    }
 }

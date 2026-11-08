@@ -1,5 +1,7 @@
 //! Cloudflare v4 API client (async, reqwest + rustls).
 
+pub mod ips;
+
 use reqwest::{multipart, StatusCode};
 
 use crate::error::{explain_response, CFError};

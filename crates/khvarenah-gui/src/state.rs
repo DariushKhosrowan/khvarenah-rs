@@ -153,12 +153,13 @@ mod tests {
     fn reload_reflects_active_profile_and_tokens() {
         with_home(|| {
             use khvarenah_core::store::profiles::{
-                add_token, create_profile, set_active_profile,
+                add_token, create_profile, set_active_profile, set_active_token,
             };
             use khvarenah_core::store::ensure_mem_dir;
             ensure_mem_dir().unwrap();
             let id = create_profile("work", "").unwrap();
-            // add token + reload
+            // activate the profile, add token + reload
+            set_active_profile(&id).unwrap();
             add_token(&id, "cf-main", "a-very-long-secret-value-here").unwrap();
             set_active_token(&id, "cf-main").unwrap();
 
