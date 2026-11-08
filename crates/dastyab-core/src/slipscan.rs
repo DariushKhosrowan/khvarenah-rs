@@ -379,6 +379,7 @@ pub async fn pipeline_scan(
     phase2: Phase2Fn,
     e2e: E2eFn,
     progress_tx: Option<mpsc::UnboundedSender<ScanProgress>>,
+    spawner: Option<Arc<dyn crate::e2e::SingboxSpawner>>,
 ) -> Result<PipelineResult, CFError> {
     let started = Instant::now();
     let e2e_enabled = direct_ip.is_some();
@@ -406,7 +407,34 @@ pub async fn pipeline_scan(
     let candidates = Arc::new(candidates);
     let phase1 = Arc::new(phase1);
     let phase2 = Arc::new(phase2);
-    let e2e = Arc::new(e2e);
+    // When a spawner is supplied, route the E2E stage through the real tunnel
+    // verification with that spawner (used by the mock-pipeline integration
+    // tests). Otherwise keep the injected `e2e` closure (unit tests / real run).
+    let e2e = if let Some(spawner) = spawner {
+        let direct = direct_ip.clone().unwrap_or_default();
+        Arc::new(
+            Box::new(move |ip: &str, port: u16, vless: &str, timeout_s: u64| {
+                let ip = ip.to_string();
+                let vless = vless.to_string();
+                let direct = direct.clone();
+                let spawner = spawner.clone();
+                Box::pin(async move {
+                    crate::e2e::verify_tunnel_with(
+                        &ip,
+                        port,
+                        &vless,
+                        &direct,
+                        spawner.as_ref(),
+                        timeout_s,
+                    )
+                    .await
+                })
+                    as std::pin::Pin<Box<dyn Future<Output = crate::e2e::E2eResult> + Send>>
+            }) as E2eFn,
+        )
+    } else {
+        Arc::new(e2e)
+    };
 
     // Phase1 survivors -> phase2; phase2 survivors (gated) -> e2e.
     let (tx1, mut rx1) = mpsc::unbounded_channel::<(usize, FastProbe)>();
@@ -801,6 +829,7 @@ mod tests {
             p2,
             e2e,
             None,
+            None,
         )
         .await
         .unwrap()
@@ -934,6 +963,7 @@ mod tests {
             p2,
             e2e,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -983,6 +1013,7 @@ mod tests {
             p2,
             e2e,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1023,6 +1054,7 @@ mod tests {
             p1,
             reject_all,
             e2e,
+            None,
             None,
         )
         .await

@@ -256,6 +256,7 @@ async fn discover_native(
             phase2,
             e2e,
             None,
+            None,
         )
     };
 
@@ -380,7 +381,10 @@ async fn resolve_worker_host(
 ) -> Option<std::net::Ipv4Addr> {
     if let Some(resolver) = doh {
         if let Ok(ips) = resolver.resolve(worker_host).await {
-            if let Some(ip) = ips.into_iter().find(|ip| !crate::health::is_hijacked_ip(ip)) {
+            if let Some(ip) = ips
+                .into_iter()
+                .find(|ip| !crate::health::is_hijacked_ip(ip))
+            {
                 return Some(ip);
             }
         }
@@ -1200,8 +1204,7 @@ mod tests {
     async fn test_probe_worker_health_uses_doh_when_resolver_provided() {
         let resolver = crate::doh::DohResolver::new();
         let known = std::net::Ipv4Addr::new(104, 16, 132, 229);
-        resolver
-            .seed_cache("mock.workers.dev".to_string(), vec![known]);
+        resolver.seed_cache("mock.workers.dev".to_string(), vec![known]);
         let resolved = resolve_worker_host("mock.workers.dev", Some(&resolver)).await;
         assert_eq!(resolved, Some(known), "DoH cache answer must be preferred");
     }
