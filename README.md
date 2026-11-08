@@ -12,7 +12,7 @@ in Rust for speed, safety, and a single static binary.**
 | **Language** | Rust (edition 2021) |
 | **Workspace** | `dastyab-core` · `dastyab-cli` · `dastyab-tui` · `dastyab-gui` |
 | **License** | MIT |
-| **Latest release** | `v0.1.0` |
+| **Latest release** | `v0.1.1` |
 | **Rust version** | 1.99+ (stable) |
 | **Zero runtime deps (CLI)** | single static binary, no Python, no Node |
 
@@ -61,27 +61,48 @@ tested, and ready to extend.
 
 ## Quick start
 
-```bash
-# 1. Build (release, optimized)
-cargo build --release
+### Install (one command)
 
-# 2. Add a Cloudflare token (stored 0600 in ~/.dastyab/)
+The CLI ships as a single static Rust binary — no Python, no Node, no runtime
+deps. Install the latest release with one line:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DariushKhosrowan/dastyab/main/scripts/install.sh | sh
+```
+
+This detects your OS/CPU, downloads the matching binary from the latest GitHub
+release, verifies its SHA-256 checksum, installs it to `~/.local/bin`, and
+adds that directory to your `PATH`. Then open a new terminal and confirm:
+
+```bash
+dastyab --version
+```
+
+> **Windows?** Grab the portable `.zip` from the [releases page](https://github.com/DariushKhosrowan/dastyab/releases).
+> **Prefer a package?** A `.deb` installer is published with every release too.
+> **Build from source?** `cargo build --release` and run
+> `target/release/dastyab` (or `cargo install dastyab-cli`).
+
+After installing:
+
+```bash
+# 1. Add a Cloudflare token (stored 0600 in ~/.dastyab/)
 dastyab token add cf-main <YOUR_CF_API_TOKEN>
 
-# 3. Verify the token and list your accounts
+# 2. Verify the token and list your accounts
 dastyab verify
 dastyab accounts
 
-# 4. Create a profile (optional, defaults to "default")
+# 3. Create a profile (optional, defaults to "default")
 dastyab profile-create work --description "my setup"
 
-# 5. Deploy a worker & get a vless share link
+# 4. Deploy a worker & get a vless share link
 dastyab deploy --preset standard
 
-# 6. Find a clean IP (stops on the first working one)
+# 5. Find a clean IP (stops on the first working one)
 dastyab scan
 
-# 7. Export client configs
+# 6. Export client configs
 dastyab export clash    --output clash.yaml
 dastyab export singbox  --output config.json
 dastyab export v2rayn  --output xray.json
