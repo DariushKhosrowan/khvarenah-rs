@@ -148,7 +148,7 @@ pub fn randomize_ws_request(rng: &mut impl Rng, base_req: &[u8]) -> Vec<u8> {
 /// and ALPN via [`ClientConfig::alpn_protocols`]. That is the variation we
 /// apply here — enough to break a static signature, without pulling in a new
 /// crate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ClientHelloProfile {
     Chrome120,
     Firefox121,
