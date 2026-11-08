@@ -95,6 +95,9 @@ pub struct KhvarenahApp {
     pub autopilot_on: bool,
     pub autopilot_status: String,
     pub autopilot_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // zero-result diagnostics (plain-language explanation)
+    pub last_cause: Option<String>,
+    pub last_action_label: String,
     // tools
     pub audit_output: String,
     pub backup_output: String,
@@ -140,7 +143,11 @@ impl KhvarenahApp {
         let (tx, rx) = bridge::channel();
         let mut state = GuiState::default();
         state.reload();
-        Self {
+
+        // One-button Protection auto-resume: if the user left protection on in
+        // a previous session, surface that state so the toggle reflects it.
+        let autopilot_on = khvarenah_core::store::profiles::protection_enabled(&state.active_profile_id);
+        let mut app = Self {
             profile_id: state.active_profile_id.clone(),
             profiles: if pids.is_empty() {
                 vec!["default".to_string()]
@@ -169,13 +176,34 @@ impl KhvarenahApp {
             scan_gentle: profile.config.scan_gentle,
             stealth_enabled: profile.config.stealth_enabled,
             last_link: String::new(),
-            autopilot_on: false,
-            autopilot_status: "Autopilot is off. Flip the switch to auto-find the best clean IP, export configs, and keep them healthy.".to_string(),
+            autopilot_on,
+            autopilot_status: if autopilot_on {
+                "Protection is on — refinding the best clean IP and keeping your configs healthy.".to_string()
+            } else {
+                "Autopilot is off. Flip the switch to auto-find the best clean IP, export configs, and keep them healthy.".to_string()
+            },
             autopilot_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_cause: None,
+            last_action_label: String::new(),
             audit_output: String::new(),
             backup_output: String::new(),
             export_output: String::new(),
             view: View::DeployScan,
+        };
+        app.refresh_diagnostics();
+        app
+    }
+
+    /// Re-read the last pipeline diagnostics and derive the plain-language
+    /// "why zero?" explanation for the Clean IPs view.
+    fn refresh_diagnostics(&mut self) {
+        use khvarenah_core::diagnose::{Locale, diagnose, plain_message};
+        if let Some(diag) = khvarenah_core::store::profiles::load_last_diagnostics(&self.profile_id) {
+            let probe = khvarenah_core::diagnose::WorkerProbe::default();
+            let cause = diagnose(&diag, probe);
+            self.last_cause = Some(plain_message(cause, Locale::En));
+            self.last_action_label = khvarenah_core::diagnose::recommended_action(cause)
+                .label(Locale::En);
         }
     }
 
@@ -214,6 +242,9 @@ impl KhvarenahApp {
         let tx = self.tx.clone();
         let stop = self.autopilot_stop.clone();
         stop.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Persist the protection flag so the monitor auto-resumes after restart.
+        let _ = khvarenah_core::store::profiles::set_protection(&pid, true);
 
         self.running.push("autopilot".to_string());
         self.autopilot_on = true;
@@ -266,6 +297,8 @@ impl KhvarenahApp {
 
     /// Stop autopilot (request the background loop to halt).
     fn autopilot_off(&mut self) {
+        // Clear the persisted flag (monitor will not auto-resume).
+        let _ = khvarenah_core::store::profiles::set_protection(&self.profile_id, false);
         self.autopilot_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.autopilot_on = false;
         self.autopilot_status = "Autopilot stopped. The last working clean IP stays in your active configs.".to_string();
@@ -283,6 +316,7 @@ impl KhvarenahApp {
                     if task == "autopilot" {
                         self.autopilot_status = summary.clone();
                         self.autopilot_on = true;
+                        self.refresh_diagnostics();
                     } else {
                         self.note = format!("✓ {task}: {summary}");
                     }
@@ -401,6 +435,12 @@ impl KhvarenahApp {
 
 impl eframe::App for KhvarenahApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Auto-resume the one-button Protection monitor if it was left on in a
+        // previous session (persisted flag) but isn't running yet.
+        if self.autopilot_on && !self.running.iter().any(|t| t == "autopilot") {
+            self.autopilot_on(ui.ctx());
+        }
+
         // Drain background async work before rendering any frame.
         self.poll_bridge(ui.ctx());
 
@@ -507,9 +547,9 @@ impl KhvarenahApp {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let (label, color) = if self.autopilot_on {
-                ("AUTOPILOT: ON", egui::Color32::from_rgb(90, 210, 120))
+                ("🛡 PROTECTION: ON", egui::Color32::from_rgb(90, 210, 120))
             } else {
-                ("AUTOPILOT: OFF", egui::Color32::from_rgb(220, 120, 90))
+                ("🛡 PROTECTION: OFF", egui::Color32::from_rgb(220, 120, 90))
             };
             let on = ui
                 .add(egui::Button::new(egui::RichText::new(label).color(color).strong().size(16.0)))
@@ -796,6 +836,24 @@ impl KhvarenahApp {
         }
         for ip in &p.clean_ips {
             ui.label(format!("• {ip}"));
+        }
+
+        // Zero-result diagnostics: explain "why nothing found" in plain language.
+        if p.clean_ips.is_empty() {
+            if let Some(cause) = &self.last_cause {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.heading(egui::RichText::new("Why no clean IPs?").color(GOLD));
+                ui.label(egui::RichText::new(cause).color(TEXT));
+                if !self.last_action_label.is_empty() {
+                    if ui.button(&self.last_action_label).clicked() {
+                        // One tap to open the Cloudflare dashboard.
+                        let _ = ui.ctx().open_url(egui::output::OpenUrl::new_tab(
+                            "https://dash.cloudflare.com/?to=/:account/workers",
+                        ));
+                    }
+                }
+            }
         }
     }
 

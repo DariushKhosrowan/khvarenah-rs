@@ -35,6 +35,7 @@ pub mod backup;
 pub mod cf;
 pub mod cleanip;
 pub mod diagnostics;
+pub mod diagnose;
 pub mod e2e;
 pub mod error;
 pub mod export;

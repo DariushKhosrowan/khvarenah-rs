@@ -114,8 +114,17 @@ pub trait EndpointProvider: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Rust-native provider: Cloudflare ranges + parallel probes + front check.
-#[derive(Default)]
-pub struct NativeCfProvider;
+pub struct NativeCfProvider {
+    profile_id: String,
+}
+
+impl Default for NativeCfProvider {
+    fn default() -> Self {
+        Self {
+            profile_id: "default".to_string(),
+        }
+    }
+}
 
 impl EndpointProvider for NativeCfProvider {
     fn discover<'a>(
@@ -123,7 +132,7 @@ impl EndpointProvider for NativeCfProvider {
         vless: &'a VlessProfile,
         params: &'a DiscoveryParams,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CleanEndpoint>, CFError>> + Send + 'a>> {
-        Box::pin(discover_native(vless, params))
+        Box::pin(discover_native(vless, params, &self.profile_id))
     }
 }
 
@@ -135,6 +144,7 @@ impl EndpointProvider for NativeCfProvider {
 async fn discover_native(
     vless: &VlessProfile,
     params: &DiscoveryParams,
+    profile_id: &str,
 ) -> Result<Vec<CleanEndpoint>, CFError> {
     let cidrs = load_ranges(params.force_refresh_ranges).await?;
 
@@ -198,18 +208,59 @@ async fn discover_native(
         ws_timeout_ms: timeout_s as u64 * 1000,
     };
 
-    let found = crate::slipscan::two_phase_scan(
-        &candidate_ips,
+    // ── Parallel pipeline (SlipNet orchestration) ──
+    // Phase-1 → phase-2 → a *parallel* E2E worker pool, with score-threshold
+    // gating so we only spend sing-box tunnel budget on strong candidates.
+    // Diagnostics are persisted so a zero result can be explained in plain
+    // language. E2E only runs when we can reach a direct-IP echo service;
+    // otherwise the pipeline degrades to the WS-gate alone.
+    let vless_link = vless.share_link();
+    let direct_ip = crate::e2e::fetch_direct_ip(params.timeout_s.clamp(3, 20) as u64)
+        .await
+        .ok();
+
+    let pipeline_params = crate::slipscan::PipelineParams {
+        target_n: params.top_n.max(1),
+        phase1_workers: params.workers.max(1),
+        phase2_workers: (params.workers / 4).clamp(4, 48),
+        e2e_workers: 4,
+        score_threshold: crate::health::ACCEPT_THRESHOLD,
+        fast_fail_ms: crate::health::FAST_FAIL_MS,
+        ws_timeout_ms: timeout_s as u64 * 1000,
+    };
+
+    let e2e: crate::slipscan::E2eFn = Box::new(move |ip: &str, port: u16, vless: &str, timeout_s: u64| {
+        let ip = ip.to_string();
+        let vless = vless.to_string();
+        let bin = crate::e2e::singbox_bin();
+        Box::pin(async move {
+            // Ensure sing-box is present; if the download fails, the E2E
+            // result reports SingBoxSpawn and the pipeline falls back to the
+            // gate-only path.
+            let _ = crate::e2e::ensure_singbox("1.11.4").await;
+            crate::e2e::verify_tunnel(&ip, port, &vless, "0.0.0.0", &bin, timeout_s).await
+        })
+    });
+
+    let result = crate::slipscan::pipeline_scan(
+        candidate_ips,
         &sni,
         &path,
-        &scan_params,
+        &vless_link,
+        direct_ip,
+        pipeline_params,
         phase1,
         phase2,
+        e2e,
         None,
     )
     .await?;
 
-    Ok(found)
+    // Persist diagnostics so the GUI/CLI can explain a zero result.
+    let _ = crate::store::profiles::save_last_diagnostics(profile_id, &result.diagnostics);
+    let _ = scan_params;
+
+    Ok(result.verified)
 }
 
 /// Check whether an endpoint is still alive using the real-client WS gate:
@@ -381,11 +432,14 @@ pub struct AutopilotEngine {
 
 impl AutopilotEngine {
     pub fn new(profile_id: impl Into<String>, params: DiscoveryParams, interval: Duration) -> Self {
+        let profile_id = profile_id.into();
         Self {
-            profile_id: profile_id.into(),
+            profile_id: profile_id.clone(),
             params,
             interval,
-            provider: Box::new(NativeCfProvider),
+            provider: Box::new(NativeCfProvider {
+                profile_id: profile_id.clone(),
+            }),
         }
     }
 

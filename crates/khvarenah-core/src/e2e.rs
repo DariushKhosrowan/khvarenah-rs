@@ -31,7 +31,7 @@ fn scratch_cfg() -> PathBuf {
 }
 
 /// Failure stage taxonomy for the E2E gate.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum E2eFailureStage {
     /// sing-box binary missing / could not start.
     SingBoxSpawn,
@@ -157,6 +157,66 @@ async fn fetch_ip_via(stream: &mut TcpStream, host: &str, timeout: Duration) -> 
         return Err(CFError::new(
             "E2E",
             format!("no IP found in echo body: {}", &text[..text.len().min(160)]),
+            "",
+        ));
+    }
+    Ok(ip.to_string())
+}
+
+/// Fetch the caller's public egress IP over a plain TCP connection (no tunnel).
+/// This is what E2E compares the tunnel's egress against, so we know whether a
+/// candidate edge actually routed traffic (IP changed) or not.
+pub async fn fetch_direct_ip(timeout_s: u64) -> Result<String, CFError> {
+    const HOST: &str = "api.ipify.org";
+    const PORT: u16 = 80;
+    let addr = format!("{HOST}:{PORT}");
+    let timeout = Duration::from_secs(timeout_s.max(1));
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+        .await
+        .map_err(|_| CFError::new("E2E", "direct-IP fetch timed out", ""))?
+        .map_err(|e| CFError::new("E2E", format!("direct-IP connect: {e}"), ""))?;
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\nUser-Agent: khvarenah-e2e\r\n\r\n"
+    );
+    tokio::time::timeout(timeout, stream.write_all(req.as_bytes()))
+        .await
+        .map_err(|_| CFError::new("E2E", "direct-IP write timed out", ""))?
+        .map_err(|e| CFError::new("E2E", format!("direct-IP write: {e}"), ""))?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    tokio::time::timeout(timeout, async {
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    let text = String::from_utf8_lossy(&buf);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    let ip = body
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .find(|s| {
+            let parts: Vec<&str> = s.split('.').collect();
+            parts.len() == 4
+                && parts.iter().all(|p| {
+                    !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit())
+                })
+        })
+        .unwrap_or("");
+    if ip.is_empty() {
+        return Err(CFError::new(
+            "E2E",
+            format!(
+                "no IP found in direct echo body: {}",
+                &text[..text.len().min(160)]
+            ),
             "",
         ));
     }

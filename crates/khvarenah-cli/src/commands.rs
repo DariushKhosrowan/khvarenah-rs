@@ -14,7 +14,7 @@ use khvarenah_core::worker::{
 };
 use khvarenah_core::{CFError, BRAND, VERSION};
 
-use crate::{BackupAction, Command, DnsAction, RoutesAction};
+use crate::{BackupAction, Command, DnsAction, ProtectionAction, RoutesAction};
 /// Run a command. `profile` is the active profile id.
 pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
     match cmd {
@@ -118,6 +118,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             refresh,
         } => cmd_discover(&profile, sample, workers, refresh).await,
         Command::Autopilot { action } => cmd_autopilot(&profile, action).await,
+        Command::Protection { action } => cmd_protection(&profile, action).await,
         Command::E2e {
             skip_worker_deploy,
             worker,
@@ -781,6 +782,68 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
         }
         crate::AutopilotAction::Off => {
             println!("Autopilot has no persistent loop in the CLI (it runs per-invocation). Use the GUI toggle for a background loop.");
+            Ok(())
+        }
+    }
+}
+
+/// One-button Protection: the "simple for a normal user" path. Persists the
+/// monitor flag (auto-resume after restart), runs a full discovery cycle with
+/// the parallel pipeline, writes the user bundle, and optionally keeps a
+/// foreground monitor loop until Ctrl+C.
+async fn cmd_protection(profile: &str, action: ProtectionAction) -> Result<(), CFError> {
+    match action {
+        ProtectionAction::Status => {
+            let enabled = khvarenah_core::store::profiles::protection_enabled(profile);
+            println!("Protection: {}", if enabled { "ON" } else { "OFF" });
+            // Surface the last plain-language explanation of a zero result, if any.
+            if let Some(diag) = khvarenah_core::store::profiles::load_last_diagnostics(profile) {
+                let probe = khvarenah_core::diagnose::WorkerProbe::default();
+                let cause = khvarenah_core::diagnose::diagnose(&diag, probe);
+                println!("  Last scan: {}", khvarenah_core::diagnose::plain_message(cause, khvarenah_core::diagnose::Locale::En));
+                println!("  Recommended: {}", khvarenah_core::diagnose::recommended_action(cause).label(khvarenah_core::diagnose::Locale::En));
+            }
+            Ok(())
+        }
+        ProtectionAction::Off => {
+            khvarenah_core::store::profiles::set_protection(profile, false)?;
+            println!("Protection OFF (monitor will not auto-resume).");
+            Ok(())
+        }
+        ProtectionAction::On {
+            persist,
+            monitor,
+            interval_s,
+            sample,
+            workers,
+        } => {
+            if persist {
+                khvarenah_core::store::profiles::set_protection(profile, true)?;
+                println!("Protection ON (persisted — will auto-resume after restart).");
+            } else {
+                println!("Protection ON (not persisted).");
+            }
+
+            let params = khvarenah_core::autopilot::DiscoveryParams {
+                sample: sample.max(1),
+                workers: workers.max(1) as usize,
+                ..Default::default()
+            };
+            let interval = std::time::Duration::from_secs(interval_s.max(60));
+            println!("First cycle: discovering the best clean IP…");
+            let engine = khvarenah_core::autopilot::AutopilotEngine::new(profile, params, interval);
+
+            if monitor {
+                engine.run_forever(|summary| {
+                    println!(
+                        "[cycle {}] {} (alive: {}, replaced: {})",
+                        summary.cycle, summary.note, summary.alive, summary.replaced
+                    );
+                }).await?;
+            } else {
+                let (_, summary) = engine.run_cycle().await?;
+                println!("{}", summary.note);
+            }
             Ok(())
         }
     }

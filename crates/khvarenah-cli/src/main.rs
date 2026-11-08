@@ -171,6 +171,13 @@ enum Command {
         #[command(subcommand)]
         action: AutopilotAction,
     },
+    /// One-button Protection: persist the monitor flag, run a full discovery
+    /// cycle, export the user bundle, then (optionally) keep monitoring.
+    /// This is the "simple for a normal user" path.
+    Protection {
+        #[command(subcommand)]
+        action: ProtectionAction,
+    },
     /// End-to-end harness: verify token → deploy worker → discover clean IPs
     /// → write the user bundle, then print the manual verification block.
     E2e {
@@ -280,6 +287,37 @@ enum AutopilotAction {
     /// Turn autopilot off (stop the loop). No-op for CLI (loop is per-run);
     /// provided for parity with the GUI toggle.
     Off,
+}
+
+/// One-button Protection subcommands (the "simple for a normal user" path).
+#[derive(Subcommand)]
+pub enum ProtectionAction {
+    /// Turn protection on: persist the flag, deploy-if-needed, run a full
+    /// discovery cycle, export the user bundle, then optionally keep a
+    /// monitor loop running (bg).
+    On {
+        /// Persist the protection flag (auto-resume after restart).
+        #[arg(long)]
+        persist: bool,
+        /// Keep monitoring in a background loop after the first cycle
+        /// (default true). The loop runs in the foreground until Ctrl+C.
+        #[arg(long, default_value_t = true)]
+        monitor: bool,
+        /// Monitor interval in seconds (default 300 = 5 min).
+        #[arg(long, default_value_t = 300)]
+        interval_s: u64,
+        /// Candidate IPs per discovery cycle.
+        #[arg(long, default_value_t = 2000)]
+        sample: u32,
+        /// Worker concurrency.
+        #[arg(long, default_value_t = 64)]
+        workers: u32,
+    },
+    /// Turn protection off (clear the persisted flag).
+    Off,
+    /// Show whether protection is enabled + the latest explanation of a zero
+    /// result (if any).
+    Status,
 }
 
 #[tokio::main]
