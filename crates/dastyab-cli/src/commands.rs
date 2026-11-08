@@ -128,6 +128,73 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             direct_ip,
             tunnel_ip,
         } => cmd_verify(&direct_ip, &tunnel_ip),
+        Command::Bundle { action } => cmd_bundle(&profile, action),
+    }
+}
+
+fn cmd_bundle(profile: &str, action: crate::BundleAction) -> Result<(), CFError> {
+    match action {
+        crate::BundleAction::Verify => {
+            let ledger_ep = dastyab_core::cleanip::active_ledger_endpoint(profile);
+            match ledger_ep {
+                None => {
+                    println!(
+                        "No verified active endpoint in the ledger yet — nothing to reconcile."
+                    );
+                }
+                Some(ledger_ep) => {
+                    let dir = dastyab_core::cleanip::user_config_dir(profile)?;
+                    let drift = dastyab_core::cleanip::check_bundle_drift(&dir, &ledger_ep);
+                    match drift {
+                        dastyab_core::cleanip::BundleDrift::InSync => {
+                            println!(
+                                "Bundle in-sync with ledger (endpoint={ledger_ep}, files=4/4)"
+                            );
+                        }
+                        dastyab_core::cleanip::BundleDrift::MissingDir => {
+                            println!("Bundle drift: directory missing ({}). Next cycle will recreate it.", dir.display());
+                        }
+                        dastyab_core::cleanip::BundleDrift::MissingFile { name } => {
+                            println!(
+                                "Bundle drift: missing file {name}. Next cycle will recreate it."
+                            );
+                        }
+                        dastyab_core::cleanip::BundleDrift::EndpointMismatch {
+                            bundle_endpoint,
+                            ledger_endpoint,
+                        } => {
+                            println!(
+                                "Bundle drift: active.vless points to {bundle_endpoint} but ledger says {ledger_endpoint}"
+                            );
+                            println!("Next cycle will reconcile automatically, or run `dastyab bundle reconcile`.");
+                        }
+                        dastyab_core::cleanip::BundleDrift::Unparseable { file, reason } => {
+                            println!("Bundle drift: {file} unparseable ({reason}). Next cycle will recreate it.");
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        crate::BundleAction::Reconcile => {
+            let outcome = dastyab_core::cleanip::reconcile_bundle_if_drifted(profile);
+            match outcome {
+                dastyab_core::cleanip::ReconcileOutcome::WasInSync => {
+                    println!("Bundle already in-sync with ledger — no action needed.");
+                }
+                dastyab_core::cleanip::ReconcileOutcome::Rewritten { reason } => {
+                    println!("Bundle rewritten from ledger (reason={reason:?}).");
+                }
+                dastyab_core::cleanip::ReconcileOutcome::Failed { reason } => {
+                    return Err(CFError::new(
+                        "Bundle reconcile",
+                        reason,
+                        "Check permissions and profile config.",
+                    ));
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -773,7 +840,10 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
             println!("{}", summary.note);
             Ok(())
         }
-        crate::AutopilotAction::Health { connect_ip, verbose } => {
+        crate::AutopilotAction::Health {
+            connect_ip,
+            verbose,
+        } => {
             let vless = dastyab_core::autopilot::base_vless(profile)?;
             let target = dastyab_core::health::derive_ws_target(&vless);
             let host = target.sni.clone();
@@ -824,7 +894,8 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
             // (Cause B, rescue territory).
             if verbose {
                 println!("\n--- phase-2 WS-failure histogram (last scan) ---");
-                if let Some(diag) = dastyab_core::store::profiles::load_last_diagnostics(profile) {
+                if let Some(diag) = dastyab_core::store::profiles::load_last_diagnostics(profile)
+                {
                     if diag.ws_failure_histogram.is_empty() {
                         println!("  (empty — no phase-2 probes recorded yet; run a discovery cycle first)");
                     } else {
@@ -840,10 +911,7 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                         let all: u32 = diag.ws_failure_histogram.values().sum();
                         if all > 0 {
                             let pct = tls_alerts as f64 * 100.0 / all as f64;
-                            println!(
-                                "\n  TlsAlert share: {pct:.0}% of {} phase-2 failures",
-                                all
-                            );
+                            println!("\n  TlsAlert share: {pct:.0}% of {} phase-2 failures", all);
                             println!(
                                 "  Verdict: {}",
                                 if pct > 50.0 {
@@ -876,6 +944,27 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                     println!("  Strategy: {name} (streak={streak}, updated {updated}s epoch)");
                 } else {
                     println!("  Strategy: {name} (not yet learned; auto)");
+                }
+                // Bundle sync state (the user's actual handoff).
+                if let Some(ledger_ep) = dastyab_core::cleanip::active_ledger_endpoint(profile) {
+                    let dir = dastyab_core::cleanip::user_config_dir(profile).ok();
+                    let drift = dir
+                        .as_ref()
+                        .map(|d| dastyab_core::cleanip::check_bundle_drift(d, &ledger_ep));
+                    match drift {
+                        Some(dastyab_core::cleanip::BundleDrift::InSync) => {
+                            println!("  Bundle: in-sync (endpoint={ledger_ep})");
+                        }
+                        Some(dastyab_core::cleanip::BundleDrift::EndpointMismatch { .. })
+                        | Some(dastyab_core::cleanip::BundleDrift::MissingDir)
+                        | Some(dastyab_core::cleanip::BundleDrift::MissingFile { .. })
+                        | Some(dastyab_core::cleanip::BundleDrift::Unparseable { .. }) => {
+                            println!("  Bundle: drifted — next cycle will reconcile automatically");
+                        }
+                        None => {
+                            println!("  Bundle: (unreadable)");
+                        }
+                    }
                 }
             }
             Ok(())
