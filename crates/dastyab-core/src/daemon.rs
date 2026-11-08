@@ -110,6 +110,28 @@ pub fn save_daemon_state(profile: &str, st: &DaemonState) -> Result<(), CFError>
     crate::store::write_json(&daemon_state_path(profile), st)
 }
 
+/// Reset the daemon's backoff state: zero `failure_streak` and restore
+/// `current_interval_secs` to the initial value. Used to make a fix testable
+/// in minutes (instead of waiting out a 6-hour backoff). Returns `Some` with
+/// the previous `(streak, interval)` if a state file existed, or `None` if
+/// there was no state to reset (the caller prints "No daemon state to reset").
+pub fn reset_daemon_state(profile: &str) -> Result<Option<(u32, u64)>, CFError> {
+    let path = daemon_state_path(profile);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let old = load_daemon_state(profile);
+    let old_streak = old.failure_streak;
+    let old_interval = old.current_interval_secs;
+    let fresh = DaemonState {
+        failure_streak: 0,
+        current_interval_secs: DEFAULT_INITIAL_INTERVAL_SECS,
+        ..old.clone()
+    };
+    save_daemon_state(profile, &fresh)?;
+    Ok(Some((old_streak, old_interval)))
+}
+
 /// Pure: compute the next backoff interval. Follows the escalation table
 /// 300 → 900 → 3600 → 21600 (5min → 15min → 1h → 6h), capped at `max`.
 pub fn backoff_next(current: u64, max: u64) -> u64 {
@@ -275,9 +297,7 @@ impl CycleRunner for RealCycleRunner {
                 std::time::Duration::from_secs(DEFAULT_INITIAL_INTERVAL_SECS),
             );
             engine
-                .monitor_cycle_guarded(std::time::Duration::from_secs(
-                    crate::cycle_guard::MONITOR_TIMEOUT_SECS,
-                ))
+                .monitor_cycle_guarded(crate::autopilot::MonitorTimeouts::default())
                 .await
                 .map(|_| ())
         })
@@ -659,5 +679,39 @@ mod tests {
         assert_eq!(sleep, DEFAULT_INITIAL_INTERVAL_SECS);
         assert_eq!(state.failure_streak, 0);
         assert_ne!(state.last_success_ts, 0);
+    }
+
+    /// `daemon reset` zeroes the failure streak and restores the initial
+    /// interval so a fix can be observed in minutes instead of hours.
+    #[test]
+    fn test_daemon_reset_backoff_clears_failure_streak() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("rl", "").unwrap();
+        save_daemon_state(
+            &profile,
+            &DaemonState {
+                failure_streak: 3,
+                current_interval_secs: 21600,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let prev = reset_daemon_state(&profile)
+            .unwrap()
+            .expect("state existed");
+        assert_eq!(prev, (3, 21600));
+
+        let st = load_daemon_state(&profile);
+        assert_eq!(st.failure_streak, 0);
+        assert_eq!(st.current_interval_secs, DEFAULT_INITIAL_INTERVAL_SECS);
+    }
+
+    /// `daemon reset` with no state file is a harmless no-op.
+    #[test]
+    fn test_daemon_reset_backoff_noop_when_no_state_file() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("rl", "").unwrap();
+        assert!(reset_daemon_state(&profile).unwrap().is_none());
     }
 }

@@ -93,7 +93,10 @@ impl CycleStage {
 
 /// Mark the current stage. Called at the top of each stage-entering line.
 pub fn mark_stage(profile_id: &str, stage: CycleStage) -> Result<(), CFError> {
-    store::write_json(&CycleStage::marker_path(profile_id), &stage.as_str().to_string())
+    store::write_json(
+        &CycleStage::marker_path(profile_id),
+        &stage.as_str().to_string(),
+    )
 }
 
 /// Read the last-written stage (None when missing).
@@ -108,7 +111,10 @@ pub fn last_stage(profile_id: &str) -> Option<CycleStage> {
 
 /// Clear the stage marker (called on a successful cycle).
 pub fn clear_stage(profile_id: &str) -> Result<(), CFError> {
-    store::write_json(&CycleStage::marker_path(profile_id), &CycleStage::None.as_str().to_string())
+    store::write_json(
+        &CycleStage::marker_path(profile_id),
+        &CycleStage::None.as_str().to_string(),
+    )
 }
 
 #[cfg(test)]

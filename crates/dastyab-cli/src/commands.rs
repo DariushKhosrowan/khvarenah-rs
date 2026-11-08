@@ -926,9 +926,7 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                 std::time::Duration::from_secs(300),
             );
             let summary = engine
-                .monitor_cycle_guarded(std::time::Duration::from_secs(
-                    dastyab_core::cycle_guard::MONITOR_TIMEOUT_SECS,
-                ))
+                .monitor_cycle_guarded(dastyab_core::autopilot::MonitorTimeouts::default())
                 .await?;
             println!("{}", summary.note);
             Ok(())
@@ -1367,6 +1365,21 @@ async fn cmd_daemon(profile: &str, action: DaemonAction) -> Result<(), CFError> 
             })?;
             println!("Wrote {}.", unit.display());
             println!("Enable with: systemctl --user enable --now dastyab-daemon.service");
+            Ok(())
+        }
+        DaemonAction::Reset => {
+            match reset_daemon_state(profile) {
+                Ok(Some((old_streak, old_interval))) => {
+                    println!(
+                        "Daemon backoff reset: next cycle in {}s (was {}s, streak {})",
+                        DEFAULT_INITIAL_INTERVAL_SECS, old_interval, old_streak
+                    );
+                }
+                Ok(None) => {
+                    println!("No daemon state to reset");
+                }
+                Err(e) => return Err(e),
+            }
             Ok(())
         }
     }

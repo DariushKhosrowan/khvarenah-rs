@@ -660,9 +660,7 @@ pub async fn probe_ports_budgeted(
         let sni = sni.to_string();
         let host = host.to_string();
         let path = path.to_string();
-        set.spawn(async move {
-            probe_ws_ex(&ip, port, &sni, &host, &path, per_ms).await
-        });
+        set.spawn(async move { probe_ws_ex(&ip, port, &sni, &host, &path, per_ms).await });
     }
     let attempted = ports.len() as u32;
     let mut completed = 0u32;
