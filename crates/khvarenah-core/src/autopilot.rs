@@ -173,10 +173,11 @@ async fn discover_native(
     let path = target.path.clone();
     let timeout_s = params.timeout_s.max(1);
 
-    // Phase 1: fast TCP liveness (probe_fast).
+    // Phase 1: fast TCP liveness across the alt-port set (early-exits on
+    // the first reachable port — vital when 443 is throttled in Iran).
     let phase1: crate::slipscan::Phase1Fn = Box::new(move |ip: &str, fast_fail_ms: u64| {
         let ip = ip.to_string();
-        Box::pin(async move { crate::health::probe_fast(&ip, 443, fast_fail_ms).await })
+        Box::pin(async move { crate::health::probe_fast_any_port(&ip, fast_fail_ms).await })
     });
 
     // Phase 2: deep WS-upgrade gate across alt ports.
