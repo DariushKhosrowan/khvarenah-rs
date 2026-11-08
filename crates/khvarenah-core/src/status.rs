@@ -30,7 +30,11 @@ pub fn pick_best_caption(endpoints: &[CleanEndpoint]) -> String {
     let best = endpoints
         .iter()
         .filter(|e| e.verified && e.alive)
-        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        .max_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     match best {
         Some(ep) => format!("{} ({}ms)", ep.ip, ep.tcp_ms.round() as u32),
         None => "Searching…".to_string(),
@@ -91,7 +95,12 @@ mod tests {
 
     #[test]
     fn simplify_status_hides_internal_fields() {
-        let s = CycleSummary { cycle: 3, alive: 2, replaced: 1, note: "monitor: 2 alive".into() };
+        let s = CycleSummary {
+            cycle: 3,
+            alive: 2,
+            replaced: 1,
+            note: "monitor: 2 alive".into(),
+        };
         let line = simplify_status(&s);
         assert!(line.contains("✓"));
         assert!(line.contains("2"));
@@ -102,13 +111,23 @@ mod tests {
 
     #[test]
     fn simplify_status_searching_when_zero_alive() {
-        let s = CycleSummary { cycle: 1, alive: 0, replaced: 0, note: "found 0".into() };
+        let s = CycleSummary {
+            cycle: 1,
+            alive: 0,
+            replaced: 0,
+            note: "found 0".into(),
+        };
         assert!(simplify_status(&s).contains("Searching"));
     }
 
     #[test]
     fn simplify_status_error_hint() {
-        let s = CycleSummary { cycle: 1, alive: 0, replaced: 0, note: "monitor error: net".into() };
+        let s = CycleSummary {
+            cycle: 1,
+            alive: 0,
+            replaced: 0,
+            note: "monitor error: net".into(),
+        };
         assert!(simplify_status(&s).contains("retrying"));
     }
 

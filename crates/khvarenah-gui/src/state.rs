@@ -103,8 +103,7 @@ pub fn mask_token(token: &str) -> String {
 /// Format a `%Y-%m-%d %H:%M:%S` timestamp as a short relative string, falling
 /// back to the raw string when it cannot be parsed.
 pub fn relative_time(ts: &str) -> String {
-    let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
-    else {
+    let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") else {
         return ts.to_string();
     };
     let now = chrono::Local::now().naive_local();
@@ -152,10 +151,10 @@ mod tests {
     #[test]
     fn reload_reflects_active_profile_and_tokens() {
         with_home(|| {
+            use khvarenah_core::store::ensure_mem_dir;
             use khvarenah_core::store::profiles::{
                 add_token, create_profile, set_active_profile, set_active_token,
             };
-            use khvarenah_core::store::ensure_mem_dir;
             ensure_mem_dir().unwrap();
             let id = create_profile("work", "").unwrap();
             // activate the profile, add token + reload
@@ -193,10 +192,10 @@ mod tests {
         // create -> set active -> add token -> reload sees masked token ->
         // rename -> delete.
         with_home(|| {
-            use khvarenah_core::store::profiles::{
-                delete_profile, rename_profile, create_profile, set_active_profile,
-            };
             use khvarenah_core::store::ensure_mem_dir;
+            use khvarenah_core::store::profiles::{
+                create_profile, delete_profile, rename_profile, set_active_profile,
+            };
             ensure_mem_dir().unwrap();
 
             // create
@@ -208,12 +207,8 @@ mod tests {
             assert_eq!(get_active_profile(), id);
 
             // add token + reload
-            khvarenah_core::store::profiles::add_token(
-                &id,
-                "primary",
-                "cf_live_token_abcdefgh",
-            )
-            .unwrap();
+            khvarenah_core::store::profiles::add_token(&id, "primary", "cf_live_token_abcdefgh")
+                .unwrap();
             let mut st = GuiState::default();
             st.reload();
             assert_eq!(st.active_profile_id, id);

@@ -35,22 +35,22 @@ pub fn show(ui: &mut egui::Ui, app: &KhvarenahApp) -> Option<TokensAction> {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(&t.label).strong());
-                                ui.label(
-                                    egui::RichText::new(&t.masked)
-                                        .color(TEXT)
-                                        .monospace(),
+                                ui.label(egui::RichText::new(&t.masked).color(TEXT).monospace());
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("Verify").clicked() {
+                                            action = Some(TokensAction::Verify(t.label.clone()));
+                                        }
+                                        if ui.button("Remove").clicked() {
+                                            action = Some(TokensAction::Remove(t.label.clone()));
+                                        }
+                                    },
                                 );
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("Verify").clicked() {
-                                        action = Some(TokensAction::Verify(t.label.clone()));
-                                    }
-                                    if ui.button("Remove").clicked() {
-                                        action = Some(TokensAction::Remove(t.label.clone()));
-                                    }
-                                });
                             });
                             ui.label(
-                                egui::RichText::new(format!("added {}", t.added_at)).color(GOLD_DIM),
+                                egui::RichText::new(format!("added {}", t.added_at))
+                                    .color(GOLD_DIM),
                             );
                         });
                 }

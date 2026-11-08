@@ -109,10 +109,15 @@ pub async fn run_mock_worker(cfg: MockWorkerConfig) -> Result<(), CFError> {
     }
 }
 
-async fn handle_conn(acceptor: TlsAcceptor, tcp: TcpStream, cfg: &MockWorkerConfig) -> Result<(), CFError> {
-    let mut stream = acceptor.accept(tcp).await.map_err(|e| {
-        CFError::new("Mock worker", format!("tls accept: {e}"), "")
-    })?;
+async fn handle_conn(
+    acceptor: TlsAcceptor,
+    tcp: TcpStream,
+    cfg: &MockWorkerConfig,
+) -> Result<(), CFError> {
+    let mut stream = acceptor
+        .accept(tcp)
+        .await
+        .map_err(|e| CFError::new("Mock worker", format!("tls accept: {e}"), ""))?;
 
     // Read the full HTTP request head.
     let mut buf = vec![0u8; 8192];
@@ -120,9 +125,10 @@ async fn handle_conn(acceptor: TlsAcceptor, tcp: TcpStream, cfg: &MockWorkerConf
     let mut n = 0usize;
     // Read until we see the header terminator or the buffer fills.
     while n < 8192 && !head.windows(4).any(|w| w == b"\r\n\r\n") {
-        let r = stream.read(&mut buf).await.map_err(|e| {
-            CFError::new("Mock worker", format!("read: {e}"), "")
-        })?;
+        let r = stream
+            .read(&mut buf)
+            .await
+            .map_err(|e| CFError::new("Mock worker", format!("read: {e}"), ""))?;
         if r == 0 {
             break;
         }
@@ -146,9 +152,10 @@ async fn handle_conn(acceptor: TlsAcceptor, tcp: TcpStream, cfg: &MockWorkerConf
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        stream.write_all(resp.as_bytes()).await.map_err(|e| {
-            CFError::new("Mock worker", format!("write trace: {e}"), "")
-        })?;
+        stream
+            .write_all(resp.as_bytes())
+            .await
+            .map_err(|e| CFError::new("Mock worker", format!("write trace: {e}"), ""))?;
         stream.flush().await.ok();
         return Ok(());
     }
@@ -156,14 +163,16 @@ async fn handle_conn(acceptor: TlsAcceptor, tcp: TcpStream, cfg: &MockWorkerConf
     // WebSocket upgrade on the worker path.
     if path == cfg.worker_path && is_upgrade {
         let resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: mock-accept\r\n\r\n";
-        stream.write_all(resp.as_bytes()).await.map_err(|e| {
-            CFError::new("Mock worker", format!("write upgrade: {e}"), "")
-        })?;
+        stream
+            .write_all(resp.as_bytes())
+            .await
+            .map_err(|e| CFError::new("Mock worker", format!("write upgrade: {e}"), ""))?;
         // Emit the payload (enough to clear MIN_WORKER_BYTES).
         let payload = vec![b'x'; cfg.ws_payload_bytes];
-        stream.write_all(&payload).await.map_err(|e| {
-            CFError::new("Mock worker", format!("write payload: {e}"), "")
-        })?;
+        stream
+            .write_all(&payload)
+            .await
+            .map_err(|e| CFError::new("Mock worker", format!("write payload: {e}"), ""))?;
         stream.flush().await.ok();
         // Keep the connection open briefly so the client can drain it.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -176,9 +185,10 @@ async fn handle_conn(acceptor: TlsAcceptor, tcp: TcpStream, cfg: &MockWorkerConf
         "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(resp.as_bytes()).await.map_err(|e| {
-        CFError::new("Mock worker", format!("write 404: {e}"), "")
-    })?;
+    stream
+        .write_all(resp.as_bytes())
+        .await
+        .map_err(|e| CFError::new("Mock worker", format!("write 404: {e}"), ""))?;
     stream.flush().await.ok();
     Ok(())
 }
@@ -191,10 +201,14 @@ pub async fn run_mock_worker_from_args(
     payload: usize,
 ) -> Result<(), CFError> {
     let cfg = MockWorkerConfig {
-        listen_addr: format!("127.0.0.1:{port}").parse().map_err(|e| {
-            CFError::new("Mock worker", format!("bad port: {e}"), "")
-        })?,
-        worker_path: if path.is_empty() { "/api".to_string() } else { path.to_string() },
+        listen_addr: format!("127.0.0.1:{port}")
+            .parse()
+            .map_err(|e| CFError::new("Mock worker", format!("bad port: {e}"), ""))?,
+        worker_path: if path.is_empty() {
+            "/api".to_string()
+        } else {
+            path.to_string()
+        },
         trace_ip: trace_ip.to_string(),
         ws_payload_bytes: payload,
         ..Default::default()
@@ -241,10 +255,7 @@ mod tests {
 
         // TLS connect + GET /cdn-cgi/trace
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut tls_stream = acceptor
-            .accept(stream)
-            .await
-            .expect("tls handshake");
+        let mut tls_stream = acceptor.accept(stream).await.expect("tls handshake");
         let (mut reader, mut writer) = tokio::io::split(tls_stream);
         writer
             .write_all(b"GET /cdn-cgi/trace HTTP/1.1\r\nHost: mock.workers.dev\r\nConnection: close\r\n\r\n")

@@ -302,8 +302,15 @@ mod tests {
         ] {
             let m = plain_message(cause, Locale::En);
             for forbidden in [
-                "SNI", "sni", "uuid", "UUID", "phase", "WebSocket",
-                "E2E", "101", "WS",
+                "SNI",
+                "sni",
+                "uuid",
+                "UUID",
+                "phase",
+                "WebSocket",
+                "E2E",
+                "101",
+                "WS",
             ] {
                 assert!(
                     !m.contains(forbidden),
@@ -324,11 +331,9 @@ mod tests {
     #[test]
     fn fa_messages_render() {
         assert!(!plain_message(PlainCause::WorkerDead, Locale::Fa).is_empty());
-        assert!(
-            !recommended_action(PlainCause::WorkerDead)
-                .label(Locale::Fa)
-                .is_empty()
-        );
+        assert!(!recommended_action(PlainCause::WorkerDead)
+            .label(Locale::Fa)
+            .is_empty());
     }
 
     #[test]

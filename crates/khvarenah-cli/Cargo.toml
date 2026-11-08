@@ -19,3 +19,33 @@ anyhow.workspace = true
 [[bin]]
 name = "khvarenah"
 path = "src/main.rs"
+
+# --- Debian packaging (.deb) via cargo-deb ---------------------------
+# Used by the CI release workflow to build the Linux installer. The binary is
+# statically linked, so no runtime deps are required beyond libc.
+[package.metadata.deb]
+maintainer = "Dariush Khosrowan <dariush@khosrowan.ir>"
+copyright = "2026, Dariush Khosrowan"
+section = "utils"
+priority = "optional"
+depends = ""
+assets = [
+  ["target/release/khvarenah", "usr/bin/", "755"],
+]
+extended-description = """\
+Khvarenah (خوَرنه) is a Rust-powered Cloudflare Workers VLESS VPN console.
+
+From a single static binary you can deploy edgetunnel VLESS workers to
+Cloudflare Workers, scan for clean/fast Cloudflare IPs (native Rust scanner +
+SlipNet-style two-phase streaming scan), and export client configs for
+v2rayN / v2rayNG, sing-box, and Clash / Clash.Meta in one command.
+
+Features:
+  * Deploy workers with anti-bot stealth pacing and byte-fingerprint humanization
+  * Clean-IP scanning with an E2E tunnel-verification gate
+  * Autopilot / Protection monitor that auto-replaces dead fronts
+  * Generate configs for v2rayN, v2rayNG, sing-box, Clash, Clash.Meta
+  * Manage Cloudflare account: DNS, zones, routes, tokens, analytics
+  * Auditable token storage (0600), atomic profile writes, security audit
+  * Back up / restore entire profiles as portable JSON bundles
+  * MIT-licensed, pure Rust, single static binary"""

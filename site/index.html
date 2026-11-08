@@ -3,6 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <link rel="manifest" href="site.webmanifest" />
 
   <!-- ===================== SEO: Primary ===================== -->
   <title>Khvarenah — Cloudflare Workers VLESS VPN Console (Rust)</title>
@@ -43,10 +45,30 @@
     "description": "Cloudflare Workers VLESS VPN console written in Rust.",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
     "author": { "@type": "Person", "name": "Dariush Khosrowan" },
+    "publisher": { "@type": "Organization", "name": "Dariush Khosrowan" },
     "programmingLanguage": "Rust",
     "license": "https://opensource.org/licenses/MIT",
     "softwareVersion": "0.1.0",
+    "fileSize": "8MB",
+    "downloadUrl": "https://github.com/DariushKhosrowan/khvarenah-rs/releases/latest",
+    "releaseNotes": "https://github.com/DariushKhosrowan/khvarenah-rs/releases",
     "url": "https://khvarenah.dev/"
+  }
+  </script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    "name": "Khvarenah",
+    "alternateName": "خوَرنه",
+    "url": "https://khvarenah.dev/",
+    "description": "The official site for Khvarenah — a Rust-powered Cloudflare Workers VLESS VPN console.",
+    "inLanguage": ["en", "fa"],
+    "publisher": {
+      "@type": "Organization",
+      "name": "Dariush Khosrowan",
+      "url": "https://github.com/DariushKhosrowan"
+    }
   }
   </script>
 
@@ -187,6 +209,7 @@
     <div class="nav">
       <div class="brand"><span class="gold">◆</span> Khvarenah</div>
       <nav class="nav-links">
+        <a href="#download">Download</a>
         <a href="#why">Why Rust</a>
         <a href="#features">Features</a>
         <a href="#quickstart">Quick start</a>
@@ -207,7 +230,8 @@
         <strong>Clash</strong> — all from one fast, safe, static Rust binary.
       </p>
       <div class="cta">
-        <a class="btn btn-primary" href="#quickstart">Quick start</a>
+        <a class="btn btn-primary" href="https://github.com/DariushKhosrowan/khvarenah-rs/releases/latest">⬇ Download</a>
+        <a class="btn btn-ghost" href="#quickstart">Quick start</a>
         <a class="btn btn-ghost" href="https://github.com/DariushKhosrowan/khvarenah-rs">View on GitHub</a>
       </div>
     </section>
@@ -253,6 +277,40 @@
             <li><strong>Three frontends</strong> — CLI, TUI, and desktop GUI.</li>
           </ul>
         </div>
+      </div>
+    </section>
+
+    <!-- ===================== Download ===================== -->
+    <section class="section" id="download">
+      <div class="card">
+        <h2>Download</h2>
+        <p class="muted">
+          Khvarenah ships as native packages and static binaries for Linux,
+          macOS, and Windows. All assets come with a <code>SHA256SUMS.txt</code>
+          checksum file.
+        </p>
+        <div class="grid grid-3">
+          <div class="feature">
+            <div class="icon">🐧</div>
+            <h3>Linux</h3>
+            <p class="muted">Debian/Ubuntu and Debian-based distros:</p>
+            <pre><code>sudo apt install ./khvarenah-linux-amd64.deb</code></pre>
+            <p class="muted" style="margin-top:10px;">Also available as raw <code>khvarenah-linux-amd64</code> and <code>khvarenah-linux-arm64</code> binaries.</p>
+          </div>
+          <div class="feature">
+            <div class="icon">🪟</div>
+            <h3>Windows</h3>
+            <p class="muted">Portable <code>khvarenah-windows-amd64.exe</code> and a full <code>-portable.zip</code> bundle (CLI + TUI + GUI).</p>
+          </div>
+          <div class="feature">
+            <div class="icon">🍎</div>
+            <h3>macOS</h3>
+            <p class="muted">Native <code>khvarenah-macos-arm64</code> binary (Apple Silicon).</p>
+          </div>
+        </div>
+        <p style="margin-top:18px;">
+          <a class="btn btn-primary" href="https://github.com/DariushKhosrowan/khvarenah-rs/releases/latest">View all releases →</a>
+        </p>
       </div>
     </section>
 

@@ -229,7 +229,9 @@ mod tests {
         let dir = user_config_dir("family").unwrap();
         // With a mem override set (tests) the bundle is isolated under the
         // temp base, still keyed by the profile *name* (not its id).
-        assert!(dir.to_string_lossy().starts_with(tmp.path().to_string_lossy().as_ref()));
+        assert!(dir
+            .to_string_lossy()
+            .starts_with(tmp.path().to_string_lossy().as_ref()));
         assert!(dir.to_string_lossy().ends_with("configs/family"));
     }
 
@@ -268,7 +270,10 @@ mod tests {
         let content = std::fs::read_to_string(&b.fallbacks_path).unwrap();
         // best (score 7) is active, so fallbacks start with score 6 (104.16.3.3)
         let first_line = content.lines().next().unwrap_or("");
-        assert!(first_line.contains("104.16.3.3"), "unexpected fallbacks: {content}");
+        assert!(
+            first_line.contains("104.16.3.3"),
+            "unexpected fallbacks: {content}"
+        );
         // and the score-5 one appears after
         assert!(content.contains("104.16.2.2"));
     }

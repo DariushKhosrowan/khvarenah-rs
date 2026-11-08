@@ -123,7 +123,10 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             skip_worker_deploy,
             worker,
         } => cmd_e2e(&profile, skip_worker_deploy, worker).await,
-        Command::VerifyTunnel { direct_ip, tunnel_ip } => cmd_verify(&direct_ip, &tunnel_ip),
+        Command::VerifyTunnel {
+            direct_ip,
+            tunnel_ip,
+        } => cmd_verify(&direct_ip, &tunnel_ip),
     }
 }
 
@@ -675,7 +678,12 @@ fn cmd_ranges() -> Result<(), CFError> {
     Ok(())
 }
 
-async fn cmd_discover(profile: &str, sample: u32, workers: u32, refresh: bool) -> Result<(), CFError> {
+async fn cmd_discover(
+    profile: &str,
+    sample: u32,
+    workers: u32,
+    refresh: bool,
+) -> Result<(), CFError> {
     let params = khvarenah_core::autopilot::DiscoveryParams {
         sample: sample.max(1),
         workers: workers.max(1) as usize,
@@ -684,8 +692,10 @@ async fn cmd_discover(profile: &str, sample: u32, workers: u32, refresh: bool) -
     };
     // First make sure we have a base worker config to front.
     let _ = khvarenah_core::autopilot::base_vless(profile)?;
-    println!("Discovery: {} candidate IPs, {} workers, targeting {} clean endpoint(s)…",
-        params.sample, params.workers, params.top_n);
+    println!(
+        "Discovery: {} candidate IPs, {} workers, targeting {} clean endpoint(s)…",
+        params.sample, params.workers, params.top_n
+    );
 
     let engine = khvarenah_core::autopilot::AutopilotEngine::new(
         profile,
@@ -705,14 +715,19 @@ async fn cmd_discover(profile: &str, sample: u32, workers: u32, refresh: bool) -
     }
     println!("{}", summary.note);
     // Surface the user-facing bundle (QR + one-line active config).
-    if let Ok(bundle) = khvarenah_core::cleanip::write_user_bundle(profile, &base_vless_for(profile), &found) {
+    if let Ok(bundle) =
+        khvarenah_core::cleanip::write_user_bundle(profile, &base_vless_for(profile), &found)
+    {
         println!();
         println!("✓ Protection active. Config: {}", bundle.dir.display());
         println!("  → active.png   (scan with your phone)");
         println!("  → active.vless (paste into your desktop client)");
         println!("  → 3 fallbacks saved in fallbacks.txt");
         if let Some(best) = found.first() {
-            println!("  Best endpoint: {}:{} ({:.0}ms)", best.ip, best.port, best.tcp_ms);
+            println!(
+                "  Best endpoint: {}:{} ({:.0}ms)",
+                best.ip, best.port, best.tcp_ms
+            );
         }
     }
     Ok(())
@@ -815,12 +830,14 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                 interval.as_secs(), params.sample, params.workers);
             println!("First cycle: discovering the best clean IP…");
             let engine = khvarenah_core::autopilot::AutopilotEngine::new(profile, params, interval);
-            engine.run_forever(|summary| {
-                println!(
-                    "[cycle {}] {} (alive: {}, replaced: {})",
-                    summary.cycle, summary.note, summary.alive, summary.replaced
-                );
-            }).await?;
+            engine
+                .run_forever(|summary| {
+                    println!(
+                        "[cycle {}] {} (alive: {}, replaced: {})",
+                        summary.cycle, summary.note, summary.alive, summary.replaced
+                    );
+                })
+                .await?;
             Ok(())
         }
         crate::AutopilotAction::Off => {
@@ -843,8 +860,18 @@ async fn cmd_protection(profile: &str, action: ProtectionAction) -> Result<(), C
             if let Some(diag) = khvarenah_core::store::profiles::load_last_diagnostics(profile) {
                 let probe = khvarenah_core::diagnose::WorkerProbe::default();
                 let cause = khvarenah_core::diagnose::diagnose(&diag, probe);
-                println!("  Last scan: {}", khvarenah_core::diagnose::plain_message(cause, khvarenah_core::diagnose::Locale::En));
-                println!("  Recommended: {}", khvarenah_core::diagnose::recommended_action(cause).label(khvarenah_core::diagnose::Locale::En));
+                println!(
+                    "  Last scan: {}",
+                    khvarenah_core::diagnose::plain_message(
+                        cause,
+                        khvarenah_core::diagnose::Locale::En
+                    )
+                );
+                println!(
+                    "  Recommended: {}",
+                    khvarenah_core::diagnose::recommended_action(cause)
+                        .label(khvarenah_core::diagnose::Locale::En)
+                );
             }
             Ok(())
         }
@@ -852,7 +879,8 @@ async fn cmd_protection(profile: &str, action: ProtectionAction) -> Result<(), C
             let input = if stdin {
                 use std::io::Read;
                 let mut s = String::new();
-                std::io::stdin().read_to_string(&mut s)
+                std::io::stdin()
+                    .read_to_string(&mut s)
                     .map_err(|e| CFError::new("Seeds", format!("stdin read: {e}"), ""))?;
                 s
             } else {
@@ -891,12 +919,14 @@ async fn cmd_protection(profile: &str, action: ProtectionAction) -> Result<(), C
             let engine = khvarenah_core::autopilot::AutopilotEngine::new(profile, params, interval);
 
             if monitor {
-                engine.run_forever(|summary| {
-                    println!(
-                        "[cycle {}] {} (alive: {}, replaced: {})",
-                        summary.cycle, summary.note, summary.alive, summary.replaced
-                    );
-                }).await?;
+                engine
+                    .run_forever(|summary| {
+                        println!(
+                            "[cycle {}] {} (alive: {}, replaced: {})",
+                            summary.cycle, summary.note, summary.alive, summary.replaced
+                        );
+                    })
+                    .await?;
             } else {
                 let (_, summary) = engine.run_cycle().await?;
                 println!("{}", summary.note);
@@ -962,7 +992,10 @@ async fn cmd_e2e(
             "Deploy the worker first (or omit --skip-worker-deploy).",
         ));
     }
-    let host = format!("{worker_name}.{}.workers.dev", client.get_subdomain(&acc_id).await?);
+    let host = format!(
+        "{worker_name}.{}.workers.dev",
+        client.get_subdomain(&acc_id).await?
+    );
     println!("✓ Worker '{worker_name}' exists → {host}");
 
     // 4) Run native discovery.

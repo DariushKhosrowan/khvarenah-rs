@@ -282,13 +282,10 @@ pub async fn tls_connect(
     let addr: SocketAddr = format!("{ip}:{port}")
         .parse()
         .map_err(|e| CFError::new("Invalid addr", format!("{e}"), "Bad IP/port."))?;
-    let tcp = tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        TcpStream::connect(addr),
-    )
-    .await
-    .map_err(|_| CFError::new("Probe timeout", "TCP connect timed out.", ""))?
-    .map_err(|e| CFError::new("Probe error", format!("TCP connect failed: {e}"), ""))?;
+    let tcp = tokio::time::timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr))
+        .await
+        .map_err(|_| CFError::new("Probe timeout", "TCP connect timed out.", ""))?
+        .map_err(|e| CFError::new("Probe error", format!("TCP connect failed: {e}"), ""))?;
 
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -316,13 +313,7 @@ pub async fn tls_connect(
 /// Sends a minimal handshake request to `sni`'s `path` at `ip:port`, asserts a
 /// `101 Switching Protocols` response line, and counts the bytes received after
 /// the upgrade. Returns the detailed verdict.
-pub async fn probe_ws(
-    ip: &str,
-    port: u16,
-    sni: &str,
-    path: &str,
-    timeout_ms: u64,
-) -> WsProbe {
+pub async fn probe_ws(ip: &str, port: u16, sni: &str, path: &str, timeout_ms: u64) -> WsProbe {
     let started = Instant::now();
     let mut probe = WsProbe {
         port,
@@ -363,11 +354,8 @@ pub async fn probe_ws(
     let mut rng = rand::rngs::StdRng::from_entropy();
     let req = crate::probe_jitter::randomize_ws_request(&mut rng, base_req.as_bytes());
 
-    if let Err(e) = tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        stream.write_all(&req),
-    )
-    .await
+    if let Err(e) =
+        tokio::time::timeout(Duration::from_millis(timeout_ms), stream.write_all(&req)).await
     {
         probe.failure_stage = Some("ws".into());
         let _ = e;
@@ -465,12 +453,7 @@ async fn probe_ports(
 
 /// Sweep a candidate edge across all `ALT_PORTS`, early-exiting on the first
 /// `101`. Returns per-port results.
-pub async fn probe_all_alt_ports(
-    ip: &str,
-    sni: &str,
-    path: &str,
-    timeout_ms: u64,
-) -> Vec<WsProbe> {
+pub async fn probe_all_alt_ports(ip: &str, sni: &str, path: &str, timeout_ms: u64) -> Vec<WsProbe> {
     probe_ports(ip, sni, path, timeout_ms, ALT_PORTS).await
 }
 
@@ -498,11 +481,8 @@ pub async fn probe_fast(ip: &str, port: u16, timeout_ms: u64) -> FastProbe {
             }
         }
     };
-    let res = tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        TcpStream::connect(addr),
-    )
-    .await;
+    let res =
+        tokio::time::timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await;
     let rtt_ms = started.elapsed().as_millis() as u32;
     let ok = matches!(res, Ok(Ok(_)));
     FastProbe {
@@ -522,7 +502,10 @@ pub async fn probe_fast_any_port(ip: &str, timeout_ms: u64) -> FastProbe {
             return p;
         }
     }
-    FastProbe { rtt_ms: 0, passed: false }
+    FastProbe {
+        rtt_ms: 0,
+        passed: false,
+    }
 }
 
 /// The full probe evidence used by the quality score.
@@ -587,19 +570,19 @@ mod tests {
 
     fn mock_cert() -> rcgen::CertifiedKey {
         let key = rcgen::KeyPair::generate().unwrap();
-        let params =
-            rcgen::CertificateParams::new(vec!["mock.test".to_string()]).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["mock.test".to_string()]).unwrap();
         let cert = params.self_signed(&key).unwrap();
-        rcgen::CertifiedKey { cert, key_pair: key }
+        rcgen::CertifiedKey {
+            cert,
+            key_pair: key,
+        }
     }
 
     /// Spawn a mock TLS server on an ephemeral loopback port.
     /// `mode` controls the response: "accept" → 101 + payload,
     /// "200" → 200, "404" → 404, "accept_empty" → 101 without payload.
     async fn start_mock_server(mode: &str) -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let mode = mode.to_string();
         tokio::spawn(async move {
@@ -615,9 +598,7 @@ mod tests {
 
     async fn handle_tls_client(tcp: tokio::net::TcpStream, mode: &str) {
         let key = mock_cert();
-        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            key.key_pair.serialize_der().into(),
-        );
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(key.key_pair.serialize_der().into());
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))
@@ -838,7 +819,10 @@ mod tests {
             alt_port_ok: false,
         };
         assert_eq!(quality_score(&p), 6);
-        let p2 = FullProbe { alt_port_ok: true, ..p };
+        let p2 = FullProbe {
+            alt_port_ok: true,
+            ..p
+        };
         assert_eq!(quality_score(&p2), 7);
     }
 

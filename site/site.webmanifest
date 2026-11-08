@@ -1,0 +1,18 @@
+{
+  "name": "Khvarenah",
+  "short_name": "Khvarenah",
+  "description": "Khvarenah (خوَرنه) — a Rust-powered Cloudflare Workers VLESS VPN console. Deploy workers, scan clean IPs, and export v2rayN / sing-box / Clash configs.",
+  "lang": "en",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0806",
+  "theme_color": "#0a0806",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

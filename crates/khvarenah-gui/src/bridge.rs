@@ -45,9 +45,7 @@ use khvarenah_core::CFError;
 /// executor down with it.
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        Runtime::new().expect("failed to create the Khvarenah tokio runtime")
-    })
+    RT.get_or_init(|| Runtime::new().expect("failed to create the Khvarenah tokio runtime"))
 }
 
 /// Channel flavour used by the bridge.
@@ -67,21 +65,12 @@ pub fn channel() -> (Tx, Rx) {
 #[derive(Debug)]
 pub enum UiEvent {
     /// A background job finished successfully, carrying a human summary.
-    Done {
-        task: String,
-        summary: String,
-    },
+    Done { task: String, summary: String },
     /// A background job failed. The error is the structured `CFError`, so
     /// the GUI can show title/detail/fix (matching the Python experience).
-    TaskErr {
-        task: String,
-        error: CFError,
-    },
+    TaskErr { task: String, error: CFError },
     /// Producers can stream progressive log lines into the live log pane.
-    Log {
-        task: String,
-        line: String,
-    },
+    Log { task: String, line: String },
 }
 
 /// Spawn a future onto the global runtime, delivering its outcome to `tx`.
@@ -108,7 +97,10 @@ where
                 });
             }
             Err(e) => {
-                let _ = tx.send(UiEvent::TaskErr { task, error: e.into() });
+                let _ = tx.send(UiEvent::TaskErr {
+                    task,
+                    error: e.into(),
+                });
             }
         }
     })
