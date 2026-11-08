@@ -65,23 +65,37 @@ fetch() { # fetch <url> -> stdout (curl preferred, wget fallback)
 }
 
 # ---- resolve latest release + asset --------------------------------------
+# Latest tag is discovered without the API (no rate limit): the public
+# /releases/latest URL 302-redirects to /releases/tag/<tag>. The asset
+# download URL is then deterministic on the CDN. The API is only used as a
+# fallback when a GITHUB_TOKEN is available.
 resolve_latest() {
   say "Resolving latest release of ${REPO_NAME}..."
   if [ -n "${KHVARENAH_VERSION:-}" ]; then
     tag="$KHVARENAH_VERSION"
     info "Pinned version: $tag"
   else
-    tag="$(fetch "${GITHUB_API}/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    if have curl; then
+      tag="$(curl -fsSI -o /dev/null -w '%{redirect_url}' "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest" 2>/dev/null | sed 's#.*/tag/##' | sed 's#/$##')"
+    elif have wget; then
+      tag="$(wget -S -O /dev/null "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest" 2>&1 | grep -i '^ *Location:' | tail -1 | sed 's#.*/tag/##' | sed 's#/$##')"
+    fi
     [ -n "$tag" ] || die "Could not determine the latest release tag."
     info "Latest release: $tag"
   fi
 
-  base_url="${GITHUB_API}/releases/tags/${tag}"
-  asset_json="$(fetch "$base_url")"
-  # Resolve the CLI asset's API + CDN URLs. Prefer python3 for correct JSON
-  # pairing; fall back to exact-name grep (CDN only) when python3 is absent.
-  if have python3; then
-    urls="$(printf '%s\n' "$asset_json" | python3 -c '
+  # Deterministic CDN asset URL (no API required).
+  cdn_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${tag}/${asset}"
+
+  # Optional API fallback (auth'd only) for restricted networks where the CDN
+  # is blocked and the anonymous API quota is exhausted.
+  api_url=""
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    api_url="$(curl -fsSL \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${tag}" 2>/dev/null \
+      | python3 -c '
 import json,sys
 try:
     rel = json.load(sys.stdin)
@@ -91,16 +105,11 @@ want = sys.argv[1] if len(sys.argv) > 1 else ""
 for a in rel.get("assets", []):
     if a.get("name") == want:
         print(a.get("url", ""))
-        print(a.get("browser_download_url", ""))
         break
 ' "$asset")"
-    api_url="$(printf '%s\n' "$urls" | sed -n '1p')"
-    cdn_url="$(printf '%s\n' "$urls" | sed -n '2p')"
   fi
-  if [ -z "${cdn_url:-}" ]; then
-    cdn_url="$(printf '%s\n' "$asset_json" | grep -o '"browser_download_url": *"[^"]*"' | sed 's/.*"\(.*\)"/\1/' | grep "/${asset}$" | grep -v '\.deb$' | grep -v '\.exe$' | head -n1)"
-  fi
-  [ -n "${api_url:-}" ] || [ -n "$cdn_url" ] || die "No ${asset} asset found in ${tag}."
+
+  [ -n "$api_url" ] || [ -n "$cdn_url" ] || die "No ${asset} asset found in ${tag}."
   url="${api_url:-$cdn_url}"
   info "Asset: ${asset}"
 }
@@ -129,9 +138,17 @@ do_install() {
   case "$url" in
     *api.github.com*)
       if have curl; then
-        curl -fsSL -H "Accept: application/octet-stream" -o "$tmp/$name" "$url"
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+          curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/octet-stream" -o "$tmp/$name" "$url"
+        else
+          curl -fsSL -H "Accept: application/octet-stream" -o "$tmp/$name" "$url"
+        fi
       else
-        wget -q --header="Accept: application/octet-stream" -O "$tmp/$name" "$url"
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+          wget -q --header="Authorization: Bearer ${GITHUB_TOKEN}" --header="Accept: application/octet-stream" -O "$tmp/$name" "$url"
+        else
+          wget -q --header="Accept: application/octet-stream" -O "$tmp/$name" "$url"
+        fi
       fi
       ;;
     *)
