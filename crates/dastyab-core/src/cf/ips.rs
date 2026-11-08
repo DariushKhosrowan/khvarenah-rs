@@ -742,4 +742,31 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         assert!(weighted_sample_by_cidr(&[], 10, &mut rng).is_empty());
     }
+
+    #[test]
+    fn expand_around_generates_neighbors() {
+        let eps = vec![crate::autopilot::CleanEndpoint {
+            ip: "104.16.1.5".into(),
+            port: 443,
+            sni: "worker.workers.dev".into(),
+            score: 7.0,
+            tcp_ms: 20.0,
+            connect_ms: 30.0,
+            download_kbps: 500.0,
+            verified: true,
+            alive: true,
+            last_checked: Some("2026-11-08T00:00:00Z".into()),
+            ts: "2026-11-08T00:00:00Z".into(),
+        }];
+        let out = expand_around(&eps, 24, 10);
+        // All must be /24 siblings within 104.16.1.x (network/broadcast
+        // excluded), unique, and the seed must be present (neighbors_of keeps
+        // the seed; it only drops the network and broadcast addresses).
+        assert!(out.iter().all(|ip| ip.starts_with("104.16.1.")));
+        assert!(!out.contains(&"104.16.1.0".to_string())); // network
+        assert!(!out.contains(&"104.16.1.255".to_string())); // broadcast
+        assert_eq!(out.len(), 10);
+        let uniq: std::collections::HashSet<_> = out.iter().collect();
+        assert_eq!(uniq.len(), out.len());
+    }
 }
