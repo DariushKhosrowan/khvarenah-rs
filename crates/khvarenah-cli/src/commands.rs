@@ -1037,6 +1037,13 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                         "  Beacon: age={age}s cycle_ts={} cycle_kind={kind}",
                         beacon.cycle_ts
                     );
+                    let last_error = beacon.last_error.as_deref().unwrap_or("none");
+                    let last_stage = beacon.last_stage.as_deref().unwrap_or("<cleared>");
+                    let active = beacon.active_endpoint.as_deref().unwrap_or("-");
+                    let elapsed = beacon.cycle_duration_ms;
+                    println!(
+                        "  Last monitor cycle: stage={last_stage} error={last_error} elapsed={elapsed}ms endpoint={active}"
+                    );
                 }
                 let state = khvarenah_core::autopilot::resolve_strategy_v2(profile);
                 let name = match state.current {

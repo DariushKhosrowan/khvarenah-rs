@@ -598,6 +598,190 @@ pub async fn probe_all_alt_ports(ip: &str, sni: &str, path: &str, timeout_ms: u6
     probe_all_alt_ports_sni(ip, sni, sni, sni, path, timeout_ms).await
 }
 
+/// Outcome of a budgeted parallel light-check on one endpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EndpointLiveResult {
+    /// True if any port returned 101 + >= MIN_WORKER_BYTES.
+    pub alive: bool,
+    /// The port that passed (None if not alive).
+    pub responding_port: Option<u16>,
+    /// TLS RTT of the winning probe (None if not alive).
+    pub rtt_ms: Option<u32>,
+    /// Bucketed reason when not alive.
+    pub failure_stage: Option<EndpointFailureStage>,
+    /// Wall-clock time the whole sweep took.
+    pub elapsed_ms: u64,
+    /// Number of probes launched.
+    pub probes_attempted: u32,
+    /// Number of probes that settled before the budget/winner ended the sweep.
+    pub probes_completed: u32,
+}
+
+/// Why a budgeted endpoint check did not find a live port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EndpointFailureStage {
+    /// No port responded to TCP within the budget (all connect failed/timeout).
+    TcpTimeoutAllPorts,
+    /// Ports responded but every TLS handshake was reset (DPI signature).
+    TlsResetAllPorts,
+    /// Ports passed TLS but none returned a 101 WS upgrade.
+    WsUpgradeAllPorts,
+    /// Got 101 but all below MIN_WORKER_BYTES (dead route).
+    WorkerBytesAllPorts,
+    /// The overall budget elapsed before any probe settled.
+    BudgetExceeded,
+}
+
+/// Sweep `ports` **in parallel**, each probe with its own per-probe timeout,
+/// wrapped in an overall `total_budget`. First 101 + MIN_WORKER_BYTES wins and
+/// aborts the remaining in-flight probes (they are dropped, not awaited). If
+/// `total_budget` elapses before any settles → `BudgetExceeded`. If all settle
+/// without a winner, the failure mode is aggregated.
+///
+/// This is what the monitor's tier-1 light check uses. It prevents a single
+/// stale/hanging endpoint from eating the whole monitor budget — the exact live
+/// failure observed in round 6 (`CycleTimeout` at 120s, `last_stage: null`).
+pub async fn probe_ports_budgeted(
+    ip: &str,
+    sni: &str,
+    host: &str,
+    path: &str,
+    ports: &[u16],
+    total_budget: Duration,
+    per_probe_timeout: Duration,
+) -> EndpointLiveResult {
+    let started = Instant::now();
+    let per_ms = per_probe_timeout.as_millis() as u64;
+    let deadline = tokio::time::Instant::now() + total_budget;
+
+    let mut set = tokio::task::JoinSet::new();
+    for &port in ports {
+        let ip = ip.to_string();
+        let sni = sni.to_string();
+        let host = host.to_string();
+        let path = path.to_string();
+        set.spawn(async move {
+            probe_ws_ex(&ip, port, &sni, &host, &path, per_ms).await
+        });
+    }
+    let attempted = ports.len() as u32;
+    let mut completed = 0u32;
+    let mut probes: Vec<WsProbe> = Vec::with_capacity(ports.len());
+
+    while let Ok(Some(res)) = tokio::time::timeout_at(deadline, set.join_next()).await {
+        let probe = match res {
+            Ok(p) => p,
+            Err(_) => continue, // a probe task panicked — ignore, keep going
+        };
+        completed += 1;
+        if probe.status == Some(101) && probe.worker_bytes >= MIN_WORKER_BYTES {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            set.abort_all();
+            return EndpointLiveResult {
+                alive: true,
+                responding_port: Some(probe.port),
+                rtt_ms: Some(probe.rtt_ms),
+                failure_stage: None,
+                elapsed_ms,
+                probes_attempted: attempted,
+                probes_completed: completed,
+            };
+        }
+        probes.push(probe);
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    // If the loop exited because the deadline fired, some probes are still
+    // in flight → BudgetExceeded. If join_next returned None, all settled.
+    let budget_exceeded = !set.is_empty();
+    set.abort_all();
+
+    if budget_exceeded {
+        return EndpointLiveResult {
+            alive: false,
+            responding_port: None,
+            rtt_ms: None,
+            failure_stage: Some(EndpointFailureStage::BudgetExceeded),
+            elapsed_ms,
+            probes_attempted: attempted,
+            probes_completed: completed,
+        };
+    }
+
+    let failure_stage = aggregate_endpoint_failure(&probes);
+    EndpointLiveResult {
+        alive: false,
+        responding_port: None,
+        rtt_ms: None,
+        failure_stage: Some(failure_stage),
+        elapsed_ms,
+        probes_attempted: attempted,
+        probes_completed: completed,
+    }
+}
+
+/// Aggregate the per-probe failure reasons into one `EndpointFailureStage`.
+pub fn aggregate_endpoint_failure(probes: &[WsProbe]) -> EndpointFailureStage {
+    if probes.is_empty() {
+        return EndpointFailureStage::WsUpgradeAllPorts;
+    }
+    let total = probes.len();
+    let tcp = probes
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.failure_reason,
+                Some(WsFailureReason::ConnectFailed)
+                    | Some(WsFailureReason::ConnectTimeout)
+                    | Some(WsFailureReason::TlsTimeout)
+            )
+        })
+        .count();
+    let tls_reset = probes
+        .iter()
+        .filter(|p| p.failure_reason == Some(WsFailureReason::TlsAlert))
+        .count();
+    let worker_bytes = probes
+        .iter()
+        .filter(|p| p.status == Some(101) && p.worker_bytes < MIN_WORKER_BYTES)
+        .count();
+
+    if tcp == total {
+        return EndpointFailureStage::TcpTimeoutAllPorts;
+    }
+    // >80% of responding ports hit a TLS alert → DPI/ClientHello signature.
+    if tls_reset > 0 && tls_reset * 10 >= total * 8 {
+        return EndpointFailureStage::TlsResetAllPorts;
+    }
+    if worker_bytes == total {
+        return EndpointFailureStage::WorkerBytesAllPorts;
+    }
+    EndpointFailureStage::WsUpgradeAllPorts
+}
+
+/// Budgeted version of `endpoint_live` — same SNI/Host semantics (worker SNI
+/// and Host both = `sni`), but the alt-port sweep runs in parallel under a
+/// total budget so one hanging port cannot stall the monitor. Returns a rich
+/// `EndpointLiveResult` instead of a bare bool.
+pub async fn endpoint_live_with_budget(
+    ip: &str,
+    sni: &str,
+    path: &str,
+    total_budget: Duration,
+    per_probe_timeout: Duration,
+) -> EndpointLiveResult {
+    probe_ports_budgeted(
+        ip,
+        sni,
+        sni,
+        path,
+        ALT_PORTS,
+        total_budget,
+        per_probe_timeout,
+    )
+    .await
+}
+
 /// Convenience: try SNI variants according to a [`SniStrategy`].
 pub async fn probe_with_sni_strategy(
     ip: &str,
@@ -1211,5 +1395,166 @@ mod tests {
         assert_eq!(results[1].status, Some(101));
         assert!(results[1].worker_bytes >= MIN_WORKER_BYTES);
         assert_eq!(results[1].sni_used, "generic.cloudflare.com");
+    }
+
+    // ── Budgeted parallel light-check (round 7) ──
+
+    /// Bind a TCP listener that accepts connections but NEVER responds — the
+    /// TLS handshake blocks forever. Simulates a censored/blackholed port.
+    async fn start_hanging_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Wait for a client, then just sit on a blocked read forever
+                    // (never write anything → TLS never progresses).
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let _ = tcp.read(&mut buf).await;
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// The core TDD test: a single hanging endpoint must NOT be able to eat the
+    /// whole monitor budget. With per-probe timeout larger than the total
+    /// budget, the budget MUST fire first → `BudgetExceeded`, and elapsed must
+    /// stay within budget + tolerance.
+    #[tokio::test]
+    async fn test_endpoint_live_with_budget_respects_total_budget() {
+        // Mock all 9 ports to hang.
+        let mut ports = Vec::new();
+        for _ in 0..ALT_PORTS.len() {
+            ports.push(start_hanging_server().await);
+        }
+        let started = Instant::now();
+        let res = probe_ports_budgeted(
+            "127.0.0.1",
+            "worker.test",
+            "worker.test",
+            "/ws",
+            &ports,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        assert!(!res.alive);
+        assert_eq!(
+            res.failure_stage,
+            Some(EndpointFailureStage::BudgetExceeded),
+            "expected BudgetExceeded, got {:?} (elapsed={elapsed_ms}ms)",
+            res.failure_stage
+        );
+        assert!(
+            elapsed_ms <= 5500,
+            "elapsed {elapsed_ms}ms > 5s budget + 500ms tolerance"
+        );
+        assert!(res.elapsed_ms <= 5500, "report elapsed {}", res.elapsed_ms);
+    }
+
+    /// First-101 wins: a responder on one port + hang on the rest → alive with a
+    /// short elapsed (we must not wait for the hanging ports).
+    #[tokio::test]
+    async fn test_endpoint_live_with_budget_returns_alive_on_first_101() {
+        let responder = start_mock_server("accept").await;
+        let mut ports = vec![responder];
+        for _ in 0..2 {
+            ports.push(start_hanging_server().await);
+        }
+        let started = Instant::now();
+        let res = probe_ports_budgeted(
+            "127.0.0.1",
+            "worker.test",
+            "worker.test",
+            "/ws",
+            &ports,
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+        )
+        .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        assert!(res.alive, "alive=false, stage={:?}", res.failure_stage);
+        assert_eq!(res.responding_port, Some(responder));
+        assert!(
+            elapsed_ms < 5000,
+            "should not wait for hanging ports: elapsed={elapsed_ms}ms"
+        );
+    }
+
+    /// All ports respond but all TLS-reset (DPI signature) → aggregated
+    /// `TlsResetAllPorts`.
+    #[tokio::test]
+    async fn test_endpoint_live_with_budget_aggregates_tls_reset_failures() {
+        let mut ports = Vec::new();
+        for _ in 0..3 {
+            ports.push(start_mock_server("reset").await);
+        }
+        let res = probe_ports_budgeted(
+            "127.0.0.1",
+            "worker.test",
+            "worker.test",
+            "/ws",
+            &ports,
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(!res.alive);
+        assert_eq!(
+            res.failure_stage,
+            Some(EndpointFailureStage::TlsResetAllPorts)
+        );
+    }
+
+    /// All ports unreachable (connect refused) → `TcpTimeoutAllPorts`.
+    #[tokio::test]
+    async fn test_endpoint_live_with_budget_aggregates_tcp_timeouts() {
+        // Bind listeners and close them immediately so connect is refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // port now closed → ECONNREFUSED
+        let res = probe_ports_budgeted(
+            "127.0.0.1",
+            "worker.test",
+            "worker.test",
+            "/ws",
+            &[port, port, port],
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(!res.alive);
+        assert_eq!(
+            res.failure_stage,
+            Some(EndpointFailureStage::TcpTimeoutAllPorts)
+        );
+    }
+
+    /// Confirms the parallel sweep actually drops remaining probes once a winner
+    /// is found (they don't delay us).
+    #[tokio::test]
+    async fn test_endpoint_live_with_budget_drops_remaining_probes_after_winner() {
+        let responder = start_mock_server("accept").await;
+        let mut ports = vec![responder];
+        for _ in 0..2 {
+            ports.push(start_hanging_server().await);
+        }
+        let res = probe_ports_budgeted(
+            "127.0.0.1",
+            "worker.test",
+            "worker.test",
+            "/ws",
+            &ports,
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(res.alive);
+        assert!(res.elapsed_ms < 2000, "elapsed {}", res.elapsed_ms);
     }
 }
