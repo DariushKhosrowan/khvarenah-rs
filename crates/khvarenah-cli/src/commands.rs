@@ -15,7 +15,6 @@ use khvarenah_core::worker::{
 use khvarenah_core::{CFError, BRAND, VERSION};
 
 use crate::{BackupAction, Command, DnsAction, RoutesAction};
-
 /// Run a command. `profile` is the active profile id.
 pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
     match cmd {
@@ -119,6 +118,11 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             refresh,
         } => cmd_discover(&profile, sample, workers, refresh).await,
         Command::Autopilot { action } => cmd_autopilot(&profile, action).await,
+        Command::E2e {
+            skip_worker_deploy,
+            worker,
+        } => cmd_e2e(&profile, skip_worker_deploy, worker).await,
+        Command::VerifyTunnel { direct_ip, tunnel_ip } => cmd_verify(&direct_ip, &tunnel_ip),
     }
 }
 
@@ -772,5 +776,149 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
             println!("Autopilot has no persistent loop in the CLI (it runs per-invocation). Use the GUI toggle for a background loop.");
             Ok(())
         }
+    }
+}
+
+/// End-to-end harness: verify the token → (optionally) deploy the worker →
+/// discover clean IPs → write the user bundle → print the manual-verification
+/// block. Does NOT claim success itself; the only proof is the two `ip=`
+/// lines differing after the human runs `verify`.
+async fn cmd_e2e(
+    profile: &str,
+    skip_worker_deploy: bool,
+    worker: Option<String>,
+) -> Result<(), CFError> {
+    // 1) Token must be live.
+    let p = load_profile(profile);
+    let token = first_token(&p)?;
+    let client = khvarenah_core::cf::Client::new(&token);
+    let v = client.verify_token().await?;
+    if v.status != "active" {
+        return Err(CFError::new(
+            "CF token not active",
+            format!("token status = '{}'", v.status),
+            "Check the API token in the profile.",
+        ));
+    }
+    println!("✓ CF token active.");
+
+    // 2) Deploy the worker unless skipped.
+    if !skip_worker_deploy {
+        deploy(profile, None, worker.clone(), None).await?;
+    }
+
+    // 3) Worker must exist.
+    let worker_name = worker
+        .map(|w| safe_worker_name(&w))
+        .unwrap_or_else(|| default_worker_name_for(&p));
+    let acc_id = resolve_account_id(&p, &client, None)?;
+    let scripts = client.list_scripts(&acc_id).await?;
+    if !scripts.iter().any(|s| s.name == worker_name) {
+        return Err(CFError::new(
+            "Worker missing",
+            format!("Worker '{worker_name}' not found on account {acc_id}."),
+            "Deploy the worker first (or omit --skip-worker-deploy).",
+        ));
+    }
+    let host = format!("{worker_name}.{}.workers.dev", client.get_subdomain(&acc_id).await?);
+    println!("✓ Worker '{worker_name}' exists → {host}");
+
+    // 4) Run native discovery.
+    let params = khvarenah_core::autopilot::DiscoveryParams::default();
+    let engine = khvarenah_core::autopilot::AutopilotEngine::new(
+        profile,
+        params,
+        std::time::Duration::from_secs(300),
+    );
+    let (found, summary) = engine.run_cycle().await?;
+    if found.is_empty() {
+        return Err(CFError::new(
+            "No clean IP",
+            "Discovery found no clean IP for this worker.",
+            "Run with a larger sample or re-deploy the worker.",
+        ));
+    }
+    for ep in &found {
+        println!(
+            "✓ {}:{} (score {:.1}, tcp {:.0}ms)",
+            ep.ip, ep.port, ep.score, ep.tcp_ms
+        );
+    }
+    println!("{}", summary.note);
+
+    // 5) Write the user bundle.
+    let bundle = khvarenah_core::cleanip::write_user_bundle(
+        profile,
+        &khvarenah_core::autopilot::base_vless(profile)?,
+        &found,
+    )?;
+    println!();
+    println!("✓ User config bundle: {}", bundle.dir.display());
+    println!("  → active.png (scan with phone) · active.vless (paste into client)");
+
+    // 6) Manual verification block.
+    println!();
+    println!("══════════════════ MANUAL VERIFICATION ══════════════════");
+    println!("1. Direct (no VPN) — run:   curl -s https://ifconfig.me");
+    println!("   (or https://api.ipify.org) → note the IP as DIRECT_IP");
+    println!("2. Connect with the client using active.vless / active.png");
+    println!("3. Through the tunnel — run: curl -s https://ifconfig.me");
+    println!("   → note the IP as TUNNEL_IP");
+    println!("4. Compare:  khvarenah verify --direct-ip DIRECT_IP --tunnel-ip TUNNEL_IP");
+    println!("   PASS = the two IPs differ → the tunnel routes through the Worker.");
+    println!("════════════════════════════════════════════════════════════");
+    Ok(())
+}
+
+fn default_worker_name_for(p: &khvarenah_core::store::profiles::Profile) -> String {
+    // Mirror deploy()'s fallback: first account name, else preset stem.
+    if let Some(first) = p.accounts.iter().next() {
+        worker_name_from_account(Some(&first.1.name))
+    } else {
+        khvarenah_core::worker::default_worker_name()
+    }
+}
+
+/// Compare direct vs tunnel IP. This is the E2E gate.
+fn cmd_verify(direct_ip: &str, tunnel_ip: &str) -> Result<(), CFError> {
+    let d = direct_ip.trim();
+    let t = tunnel_ip.trim();
+    if d.is_empty() || t.is_empty() {
+        return Err(CFError::new(
+            "Missing IP",
+            "Both --direct-ip and --tunnel-ip are required.",
+            "Run the manual verification steps in `khvarenah e2e`.",
+        ));
+    }
+    if d == t {
+        return Err(CFError::new(
+            "E2E FAIL",
+            "direct IP == tunnel IP — the tunnel is NOT routing through the Worker.",
+            "Check the worker route, UUID, and clean-IP config, then retry.",
+        ));
+    }
+    println!("✓ E2E PASS — direct {d} ≠ tunnel {t}. Tunnel routes through the Worker.");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_passes_when_ips_differ() {
+        assert!(cmd_verify("1.2.3.4", "5.6.7.8").is_ok());
+    }
+
+    #[test]
+    fn test_verify_fails_when_ips_match() {
+        assert!(cmd_verify("1.2.3.4", "1.2.3.4").is_err());
+    }
+
+    #[test]
+    fn test_verify_fails_on_empty_ip() {
+        assert!(cmd_verify("", "1.2.3.4").is_err());
+        assert!(cmd_verify("1.2.3.4", "").is_err());
+        assert!(cmd_verify("", "").is_err());
     }
 }

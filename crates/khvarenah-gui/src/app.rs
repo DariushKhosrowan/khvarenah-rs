@@ -526,6 +526,22 @@ impl KhvarenahApp {
         });
         ui.add_space(4.0);
         ui.label(egui::RichText::new(&self.autopilot_status).color(TEXT));
+        // User-facing bundle quick actions.
+        if let Ok(dir) = khvarenah_core::cleanip::user_config_dir(&self.profile_id) {
+            ui.horizontal(|ui| {
+                if ui.button("📂 Open folder").clicked() {
+                    open_folder(&dir);
+                }
+                if ui.button("📋 Copy path").clicked() {
+                    let _ = ui.ctx().copy_text(dir.to_string_lossy().into_owned());
+                }
+                ui.label(
+                    egui::RichText::new(dir.display().to_string())
+                        .small()
+                        .color(GOLD_DIM),
+                );
+            });
+        }
         ui.separator();
 
         ui.horizontal(|ui| {
@@ -938,5 +954,16 @@ async fn deploy_worker(token: &str, _pid: &str) -> Result<(String, String), CFEr
     };
     let link = vless.share_link();
     Ok((host, link))
+}
+
+/// Open a folder in the platform file manager.
+fn open_folder(dir: &std::path::Path) {
+    let dir = dir.to_string_lossy().into_owned();
+    let (prog, arg) = match std::env::consts::OS {
+        "macos" => ("open", dir),
+        "windows" => ("explorer", dir),
+        _ => ("xdg-open", dir),
+    };
+    let _ = std::process::Command::new(prog).arg(arg).spawn();
 }
 

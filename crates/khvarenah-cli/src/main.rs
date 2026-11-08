@@ -171,6 +171,26 @@ enum Command {
         #[command(subcommand)]
         action: AutopilotAction,
     },
+    /// End-to-end harness: verify token → deploy worker → discover clean IPs
+    /// → write the user bundle, then print the manual verification block.
+    E2e {
+        /// Skip the worker-deploy step (assume a worker already exists).
+        #[arg(long)]
+        skip_worker_deploy: bool,
+        /// Worker name to use/deploy (optional).
+        #[arg(long)]
+        worker: Option<String>,
+    },
+    /// Compare the direct (non-tunnel) IP with the tunnel IP to prove the
+    /// VLESS tunnel actually routes through the Worker.
+    VerifyTunnel {
+        /// IP the machine reports without the tunnel.
+        #[arg(long)]
+        direct_ip: String,
+        /// IP the machine reports through the tunnel.
+        #[arg(long)]
+        tunnel_ip: String,
+    },
 }
 
 #[derive(Subcommand)]
