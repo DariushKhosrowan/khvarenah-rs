@@ -229,6 +229,37 @@ enum Command {
         #[command(subcommand)]
         action: BeaconAction,
     },
+    /// SNI allowlist scanner — tests which SNIs DPI allows on this network,
+    /// independent of the Cloudflare account.
+    SniSpoof {
+        #[command(subcommand)]
+        action: SniSpoofAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SniSpoofAction {
+    /// Probe each candidate SNI against a public CF edge and print the allowlist.
+    Scan {
+        /// Edge IP to target (default: use a known Cloudflare anycast edge).
+        #[arg(long)]
+        ip: Option<String>,
+        /// TCP port (default 443).
+        #[arg(long, default_value_t = 443)]
+        port: u16,
+        /// Per-probe timeout ms (default 3000).
+        #[arg(long, default_value_t = 3000)]
+        timeout_ms: u64,
+        /// Concurrency (default 4).
+        #[arg(long, default_value_t = 4)]
+        workers: usize,
+    },
+    /// Show the persisted allowlist.
+    List,
+    /// Pretty-print the last scan JSON.
+    Show,
+    /// Remove the persisted allowlist (forces a re-scan).
+    Clear,
 }
 
 #[derive(Subcommand)]

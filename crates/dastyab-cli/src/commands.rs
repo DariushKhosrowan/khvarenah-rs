@@ -133,6 +133,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::Bundle { action } => cmd_bundle(&profile, action),
         Command::Up { profile: profile_override } => cmd_up(profile_override).await,
         Command::Beacon { action } => cmd_beacon(&profile, action).await,
+        Command::SniSpoof { action } => cmd_sni_spoof(&profile, action).await,
     }
 }
 
@@ -1617,6 +1618,102 @@ async fn cmd_up(profile_override: Option<String>) -> Result<(), CFError> {
     let code = diag.failure.as_ref().map(|f| f.exit_code()).unwrap_or(1);
     eprintln!("  Exit code: {code}");
     std::process::exit(code);
+}
+
+/// `dastyab sni-spoof …` — SNI allowlist scanner.
+async fn cmd_sni_spoof(profile: &str, action: crate::SniSpoofAction) -> Result<(), CFError> {
+    use dastyab_core::sni_spoof as sp;
+    match action {
+        crate::SniSpoofAction::List => {
+            match sp::config::load_allowlist(profile) {
+                Some(list) if !list.is_empty() => {
+                    println!("Allowed SNIs for profile '{profile}':");
+                    for s in &list {
+                        println!("  {s}");
+                    }
+                }
+                _ => {
+                    println!("No allowlist saved yet. Run: dastyab sni-spoof scan");
+                }
+            }
+            Ok(())
+        }
+        crate::SniSpoofAction::Show => {
+            let p = sp::config::allowlist_path(profile)?;
+            if !p.exists() {
+                println!("No scan saved yet. Run: dastyab sni-spoof scan");
+                return Ok(());
+            }
+            let raw = std::fs::read_to_string(&p)
+                .map_err(|e| CFError::new("SniSpoof", e.to_string(), "Cannot read the saved scan."))?;
+            println!("{raw}");
+            Ok(())
+        }
+        crate::SniSpoofAction::Clear => {
+            sp::config::clear_allowlist(profile)?;
+            println!("Allowlist cleared for profile '{profile}'.");
+            Ok(())
+        }
+        crate::SniSpoofAction::Scan {
+            ip,
+            port,
+            timeout_ms,
+            workers,
+        } => {
+            // Default edge: a well-known Cloudflare anycast IP.
+            let ip = ip.unwrap_or_else(|| "1.1.1.1".to_string());
+            let worker_host = dastyab_core::autopilot::base_vless(profile)
+                .ok()
+                .map(|v| v.address);
+            let snis = sp::candidates::candidates_with_worker(worker_host.as_deref());
+            println!(
+                "Probing {} SNIs against {ip}:{port} (timeout {timeout_ms}ms, {workers} workers)…",
+                snis.len()
+            );
+            let results = sp::scanner::scan_snis(&snis, &ip, port, timeout_ms, workers).await;
+            let summary = sp::scanner::summarize(&results);
+
+            // Persist the allowlist.
+            if !summary.allowed.is_empty() {
+                sp::config::persist_allowlist(profile, &summary.allowed)?;
+            }
+
+            println!();
+            println!("=== SNI allowlist scan (profile '{profile}') ===");
+            println!(
+                "  allowed ({}) | blocked ({}) | timeout ({})",
+                summary.allowed.len(),
+                summary.blocked.len(),
+                summary.timeouts.len()
+            );
+            println!();
+            for (sni, r) in &results {
+                let mark = if r.passed {
+                    "✓ ALLOWED".to_string()
+                } else if r.failure == Some(dastyab_core::sni_spoof::scanner::SniTestFailure::Timeout) {
+                    "… TIMEOUT".to_string()
+                } else {
+                    "✗ BLOCKED".to_string()
+                };
+                println!("  {mark}  {sni}  ({}ms)", r.rtt_ms);
+            }
+            println!();
+            if !summary.allowed.is_empty() {
+                println!("Saved {} allowed SNI(s).", summary.allowed.len());
+                println!("Next: dastyab sni-spoof list");
+                Ok(())
+            } else {
+                println!(
+                    "No SNI allowed — DPI may be active at the TLS-fingerprint or network level."
+                );
+                Err(CFError::new(
+                    "SniSpoof",
+                    "All SNIs blocked or timed out.",
+                    "DPI is not passing any SNI — see the round-13 decision.",
+                ))
+            }
+        }
+    }
 }
 
 /// `dastyab beacon …` — remote push notifications.

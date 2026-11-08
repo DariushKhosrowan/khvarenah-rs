@@ -62,6 +62,7 @@ pub mod probe_jitter;
 pub mod qr;
 pub mod scanner;
 pub mod security;
+pub mod sni_spoof;
 pub mod selfupdate;
 pub mod slipscan;
 pub mod status;
