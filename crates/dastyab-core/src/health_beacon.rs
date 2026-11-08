@@ -141,10 +141,25 @@ pub fn write_beacon(profile_id: &str, beacon: &HealthBeacon) -> Result<(), CFErr
 /// cycle was last marked in (from the cycle_guard marker). Fills every other
 /// field `compose_beacon` can derive (worker health, ledger endpoint, bundle
 /// sync, strategy window) so the beacon stays as rich as a normal one.
+/// Write an abort beacon for a cycle (`reason` = timeout/error kind). A
+/// `worker_health_label` records the step-0 worker verdict so an honest
+/// diagnosis survives even on abort (round 9: the beacon must never show
+/// "Skipped" when we actually probed).
 pub fn write_beacon_on_abort(
     profile_id: &str,
     kind: CycleKind,
     reason: &str,
+) -> Result<(), CFError> {
+    write_beacon_on_abort_with_verdict(profile_id, kind, reason, None)
+}
+
+/// Like [`write_beacon_on_abort`], but records the step-0 worker-health
+/// verdict label (Alive / NotFound / …) instead of defaulting to "Skipped".
+pub fn write_beacon_on_abort_with_verdict(
+    profile_id: &str,
+    kind: CycleKind,
+    reason: &str,
+    worker_health_label: Option<&str>,
 ) -> Result<(), CFError> {
     let now = crate::store::now_ts() as i64;
     let beacon = crate::autopilot::compose_beacon(
@@ -152,7 +167,7 @@ pub fn write_beacon_on_abort(
         kind,
         now,
         0,
-        None,
+        worker_health_label,
         None,
         Some(reason.to_string()),
     );
