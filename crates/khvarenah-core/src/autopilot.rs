@@ -1016,6 +1016,35 @@ pub struct CycleSummary {
     pub note: String,
 }
 
+/// Separate hard budgets for the monitor's two phases. The LIGHT tier-1 sweep
+/// gets a short budget (a hanging endpoint should be cut off in two minutes);
+/// the DEEP discovery+E2E pass gets a much larger one (on a censored network a
+/// native pass takes minutes — cutting it at 120s meant no deep pass ever
+/// completed, the round-7 live finding).
+#[derive(Debug, Clone, Copy)]
+pub struct MonitorTimeouts {
+    pub light: std::time::Duration,
+    pub deep: std::time::Duration,
+}
+
+impl Default for MonitorTimeouts {
+    fn default() -> Self {
+        Self {
+            light: std::time::Duration::from_secs(crate::cycle_guard::MONITOR_TIMEOUT_SECS),
+            deep: std::time::Duration::from_secs(crate::cycle_guard::DISCOVERY_TIMEOUT_SECS),
+        }
+    }
+}
+
+/// Outcome of the monitor's LIGHT phase.
+#[derive(Debug, Clone)]
+pub enum LightOutcome {
+    /// At least one endpoint is alive — no deep discovery needed.
+    Alive(CycleSummary),
+    /// No endpoint alive — escalate to the deep discovery phase.
+    NeedDeep,
+}
+
 /// A handle to the running autopilot engine. Controls stop via a watch
 /// channel; progress is streamed through `tx`.
 pub struct AutopilotEngine {
@@ -1250,24 +1279,27 @@ impl AutopilotEngine {
     pub async fn monitor_cycle(&self) -> Result<CycleSummary, CFError> {
         let cycle_ts = crate::store::now_ts() as i64;
         let started = std::time::Instant::now();
-        let result = self.monitor_cycle_inner().await;
+        // Unguarded two-phase monitor (no hard timeouts; used by foreground /
+        // run_forever paths). The daemon path uses monitor_cycle_guarded.
+        let mut summary = match self.monitor_light_phase().await {
+            Ok(LightOutcome::Alive(s)) => s,
+            Ok(LightOutcome::NeedDeep) => self.monitor_deep_phase().await?,
+            Err(e) => return Err(e),
+        };
         let duration_ms = started.elapsed().as_millis() as u64;
-        let last_error = result.as_ref().err().map(|e| e.brief());
-        let active_alive = result.as_ref().ok().map(|s| s.alive > 0);
         let beacon = compose_beacon(
             &self.profile_id,
             crate::health_beacon::CycleKind::Monitor,
             cycle_ts,
             duration_ms,
             None,
-            active_alive,
-            last_error,
+            Some(summary.alive > 0),
+            None,
         );
         let _ = crate::health_beacon::write_beacon(&self.profile_id, &beacon);
-        if result.is_ok() {
-            let _ = crate::cycle_guard::clear_stage(&self.profile_id);
-        }
-        result
+        let _ = crate::cycle_guard::clear_stage(&self.profile_id);
+        summary.cycle = 0;
+        Ok(summary)
     }
 
     /// Run a full discovery cycle inside a hard timeout. Used by the daemon
@@ -1302,40 +1334,119 @@ impl AutopilotEngine {
         }
     }
 
-    /// Run a monitor cycle inside a hard timeout (the light WS-gate check is
-    /// fast; a deep E2E pass must still fit inside it). Mirrors
-    /// [`run_cycle_guarded`]: aborts on timeout, writes an abort beacon naming
-    /// the stuck stage, and returns a timed-out error.
+    /// Run a monitor cycle inside a hard timeout. Two-phase: the LIGHT tier-1
+    /// sweep runs under `timeouts.light` (default 120s); if no endpoint is alive
+    /// it escalates to the DEEP discovery phase under `timeouts.deep` (default
+    /// 600s — a native discovery+E2E pass on a censored network genuinely needs
+    /// minutes). Each phase aborts independently and writes an abort beacon
+    /// naming the exact stuck stage. Returns a timed-out error on either phase
+    /// exceeding its budget.
     pub async fn monitor_cycle_guarded(
         &self,
-        timeout: std::time::Duration,
+        timeouts: MonitorTimeouts,
     ) -> Result<CycleSummary, CFError> {
-        match tokio::time::timeout(timeout, self.monitor_cycle()).await {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                let stage = crate::cycle_guard::last_stage(&self.profile_id);
+        let cycle_start = crate::store::now_ts() as i64;
+        let started = std::time::Instant::now();
+
+        // ── Phase 1: LIGHT ──
+        match tokio::time::timeout(timeouts.light, self.monitor_light_phase()).await {
+            Ok(Ok(LightOutcome::Alive(summary))) => {
+                let _ = crate::cycle_guard::clear_stage(&self.profile_id);
+                self.write_monitor_beacon(cycle_start, started, &summary, None);
+                return Ok(summary);
+            }
+            Ok(Ok(LightOutcome::NeedDeep)) => { /* fall through to deep */ }
+            Ok(Err(e)) => {
                 let _ = crate::health_beacon::write_beacon_on_abort(
                     &self.profile_id,
                     crate::health_beacon::CycleKind::Monitor,
-                    "CycleTimeout",
+                    "Error",
+                );
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                let stage = crate::cycle_guard::last_stage(&self.profile_id)
+                    .unwrap_or(crate::cycle_guard::CycleStage::LightCheck);
+                let _ = crate::health_beacon::write_beacon_on_abort(
+                    &self.profile_id,
+                    crate::health_beacon::CycleKind::Monitor,
+                    "LightPhaseTimeout",
+                );
+                return Err(CFError::new(
+                    "Cycle timeout",
+                    format!(
+                        "monitor light phase exceeded {}s and was aborted (stuck in {:?})",
+                        timeouts.light.as_secs(),
+                        stage
+                    ),
+                    "The network path may be blocked; the next cycle retries automatically.",
+                ));
+            }
+        }
+
+        // ── Phase 2: DEEP ──
+        match tokio::time::timeout(timeouts.deep, self.monitor_deep_phase()).await {
+            Ok(Ok(summary)) => {
+                let _ = crate::cycle_guard::clear_stage(&self.profile_id);
+                self.write_monitor_beacon(cycle_start, started, &summary, None);
+                Ok(summary)
+            }
+            Ok(Err(e)) => {
+                let _ = crate::health_beacon::write_beacon_on_abort(
+                    &self.profile_id,
+                    crate::health_beacon::CycleKind::Monitor,
+                    "Error",
+                );
+                Err(e)
+            }
+            Err(_elapsed) => {
+                let stage = crate::cycle_guard::last_stage(&self.profile_id)
+                    .unwrap_or(crate::cycle_guard::CycleStage::DeepCheck);
+                let _ = crate::health_beacon::write_beacon_on_abort(
+                    &self.profile_id,
+                    crate::health_beacon::CycleKind::Monitor,
+                    "DeepPhaseTimeout",
                 );
                 Err(CFError::new(
                     "Cycle timeout",
                     format!(
-                        "monitor exceeded {}s and was aborted (stuck in {:?})",
-                        timeout.as_secs(),
+                        "monitor deep phase exceeded {}s and was aborted (stuck in {:?})",
+                        timeouts.deep.as_secs(),
                         stage
                     ),
-                    "The network path may be blocked; the next cycle retries automatically.",
+                    "A full discovery pass on this network is slow; the next cycle retries.",
                 ))
             }
         }
     }
 
-    async fn monitor_cycle_inner(&self) -> Result<CycleSummary, CFError> {
+    /// Write a success beacon for a monitor cycle.
+    fn write_monitor_beacon(
+        &self,
+        cycle_start: i64,
+        started: std::time::Instant,
+        summary: &CycleSummary,
+        last_error: Option<String>,
+    ) {
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let beacon = crate::autopilot::compose_beacon(
+            &self.profile_id,
+            crate::health_beacon::CycleKind::Monitor,
+            cycle_start,
+            duration_ms,
+            None,
+            Some(summary.alive > 0),
+            last_error,
+        );
+        let _ = crate::health_beacon::write_beacon(&self.profile_id, &beacon);
+    }
+
+    /// Phase 1 of the monitor: reconcile → prepare → tier-1 light sweep. No
+    /// discovery. Returns `LightOutcome::Alive` if any endpoint is alive
+    /// (best-score wins, bundle refreshed) or `LightOutcome::NeedDeep` to
+    /// escalate. Marks stages Reconcile / Prepare / LightCheck.
+    async fn monitor_light_phase(&self) -> Result<LightOutcome, CFError> {
         use crate::cycle_guard::{mark_stage, CycleStage};
-        // Self-heal the user-facing bundle against the ledger before checking
-        // the network (never fails the cycle: discovery is still the goal).
         mark_stage(&self.profile_id, CycleStage::Reconcile)?;
         let _ = crate::cleanip::reconcile_bundle_if_drifted(&self.profile_id);
         mark_stage(&self.profile_id, CycleStage::Prepare)?;
@@ -1343,16 +1454,8 @@ impl AutopilotEngine {
         let path = crate::health::derive_ws_target(&vless).path;
 
         let mut ledger = read_ledger(&self.profile_id);
-        let mut state = crate::store::profiles::protection_state(&self.profile_id);
-        let now = store::now_ts() as i64;
-        let deep_interval: i64 = 900; // deep E2E check every 15 min
-
-        // ── Tier 1: LIGHT check (budgeted parallel WS-gate sweep per endpoint) ──
-        // Each endpoint gets a 15s total budget (3s per port probe) so one stale
-        // endpoint cannot eat the whole monitor budget — the exact live failure
-        // fixed in round 7. A dead endpoint is marked dead and we move on.
-        mark_stage(&self.profile_id, CycleStage::LightCheck)?;
         let mut alive = 0usize;
+        mark_stage(&self.profile_id, CycleStage::LightCheck)?;
         for ep in ledger.iter_mut() {
             let res = crate::health::endpoint_live_with_budget(
                 &ep.ip,
@@ -1369,61 +1472,62 @@ impl AutopilotEngine {
             }
         }
 
-        // The active endpoint is the best verified one (highest score).
         ledger.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let active_alive = ledger
+        write_ledger(&self.profile_id, &ledger)?;
+
+        let live: Vec<CleanEndpoint> = ledger
             .iter()
-            .find(|e| e.verified)
-            .map(|e| e.alive)
-            .unwrap_or(false);
+            .filter(|e| e.verified && e.alive)
+            .cloned()
+            .collect();
 
-        // Streak: 2 consecutive light failures of the active escalate to deep.
-        if active_alive {
-            state.failure_streak = 0;
-        } else {
-            state.failure_streak = state.failure_streak.saturating_add(1);
+        if live.is_empty() {
+            return Ok(LightOutcome::NeedDeep);
         }
-        let deep_due = (now - state.last_deep_check) >= deep_interval;
-        let escalated = state.failure_streak >= 2 && !active_alive;
-        let do_deep = deep_due || escalated;
 
+        // Best-score wins → write active configs + refresh bundle.
+        if let Some(best) = live.first() {
+            write_active_configs(&self.profile_id, &vless, best)?;
+        }
+        let _ = crate::cleanip::write_user_bundle(&self.profile_id, &vless, &live);
+        mark_stage(&self.profile_id, CycleStage::BundleWrite)?;
+
+        let summary = CycleSummary {
+            cycle: 0,
+            alive: live.len(),
+            replaced: 0,
+            note: format!(
+                "monitor: {alive} alive · {} clean · best {} · light-only",
+                live.len(),
+                live.first().map(|e| e.ip.as_str()).unwrap_or("-")
+            ),
+        };
+        Ok(LightOutcome::Alive(summary))
+    }
+
+    /// Phase 2 of the monitor: deep discovery (assumes phase 1 said NeedDeep).
+    /// Runs a full discovery + E2E pass, merges fresh endpoints, best-score-wins,
+    /// persists, and refreshes the user bundle. Marks stages DeepCheck / (ledger
+    /// merge) / BundleWrite. Returns the cycle summary.
+    async fn monitor_deep_phase(&self) -> Result<CycleSummary, CFError> {
+        use crate::cycle_guard::{mark_stage, CycleStage};
+        mark_stage(&self.profile_id, CycleStage::DeepCheck)?;
+        let vless = base_vless(&self.profile_id)?;
+
+        let mut ledger = read_ledger(&self.profile_id);
+        let mut state = crate::store::profiles::protection_state(&self.profile_id);
+        let now = store::now_ts() as i64;
+        state.last_deep_check = now;
+
+        let params = self.params_with_seeds();
         let mut replaced = 0;
         let mut did_rediscover = false;
-
-        if do_deep {
-            // ── Tier 2: DEEP check — full discovery through the pipeline ──
-            mark_stage(&self.profile_id, CycleStage::DeepCheck)?;
-            state.last_deep_check = now;
-            let params = self.params_with_seeds();
-            match self.provider.discover(&vless, &params).await {
-                Ok(fresh) => {
-                    for ep in fresh {
-                        if let Some(slot) = ledger.iter_mut().find(|l| l.ip == ep.ip) {
-                            *slot = ep.clone();
-                        } else {
-                            ledger.push(ep.clone());
-                            replaced += 1;
-                        }
-                    }
-                    did_rediscover = true;
-                    // A successful deep pass resets the streak.
-                    if ledger.iter().any(|e| e.alive) {
-                        state.failure_streak = 0;
-                    }
-                }
-                Err(_) => {
-                    // Deep check failed; keep the streak so escalation retries.
-                }
-            }
-        } else if alive == 0 {
-            // Nothing alive but no escalation due yet — still chase fresh ones
-            // so a dead ledger doesn't sit empty.
-            let params = self.params_with_seeds();
-            if let Ok(fresh) = self.provider.discover(&vless, &params).await {
+        match self.provider.discover(&vless, &params).await {
+            Ok(fresh) => {
                 for ep in fresh {
                     if let Some(slot) = ledger.iter_mut().find(|l| l.ip == ep.ip) {
                         *slot = ep.clone();
@@ -1433,10 +1537,15 @@ impl AutopilotEngine {
                     }
                 }
                 did_rediscover = true;
+                if ledger.iter().any(|e| e.alive) {
+                    state.failure_streak = 0;
+                }
+            }
+            Err(_) => {
+                state.failure_streak = state.failure_streak.saturating_add(1);
             }
         }
 
-        // Best-score wins: pick the highest verified+alive endpoint as active.
         ledger.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1447,11 +1556,11 @@ impl AutopilotEngine {
             .find(|e| e.verified && e.alive)
             .map(|e| e.ip.clone());
         if let Some(best) = best_ip.as_ref() {
-            let best_ep = ledger.iter().find(|e| e.ip == *best).unwrap();
-            write_active_configs(&self.profile_id, &vless, best_ep)?;
+            if let Some(best_ep) = ledger.iter().find(|e| e.ip == *best) {
+                write_active_configs(&self.profile_id, &vless, best_ep)?;
+            }
         }
 
-        // Trim ledger, persist state, refresh the user bundle.
         ledger.truncate(64);
         write_ledger(&self.profile_id, &ledger)?;
         crate::store::profiles::save_protection_state(&self.profile_id, &state)?;
@@ -1462,11 +1571,6 @@ impl AutopilotEngine {
             .cloned()
             .collect();
 
-        // Auto-rescue (Feature C): if nothing is alive, probe the worker and
-        // run the rescue chain so the app *fights* the failure instead of just
-        // reporting it. Only recoverable failures (NotFound/Suspended/
-        // Unreachable) enter the chain — the E2E-while-tunneled false negative
-        // (worker Alive) is deliberately excluded.
         let mut rescued = false;
         if live.is_empty() {
             rescued = self.rescue_if_needed().await;
@@ -1480,11 +1584,11 @@ impl AutopilotEngine {
             alive: live.len(),
             replaced,
             note: format!(
-                "monitor: {alive} alive · {} clean · best {} · deep={did_rediscover} streak={}{}",
+                "monitor: {} alive · {} clean · best {} · deep={did_rediscover} streak={} rescue={rescued}",
+                live.len(),
                 live.len(),
                 best_ip.as_deref().unwrap_or("-"),
                 state.failure_streak,
-                if rescued { " · auto-rescued" } else { "" }
             ),
         })
     }
@@ -2865,7 +2969,10 @@ mod tests {
             .expect("fast guarded cycle succeeds");
         assert!(!found.is_empty());
         // A successful guarded cycle clears the stage marker.
-        assert_eq!(crate::cycle_guard::last_stage(&id), Some(crate::cycle_guard::CycleStage::None));
+        assert_eq!(
+            crate::cycle_guard::last_stage(&id),
+            Some(crate::cycle_guard::CycleStage::None)
+        );
     }
 
     #[tokio::test]
@@ -2923,10 +3030,13 @@ mod tests {
             provider,
         );
         let _summary = engine
-            .monitor_cycle_guarded(std::time::Duration::from_secs(30))
+            .monitor_cycle_guarded(crate::autopilot::MonitorTimeouts::default())
             .await
             .expect("fast monitor guard succeeds");
-        assert_eq!(crate::cycle_guard::last_stage(&id), Some(crate::cycle_guard::CycleStage::None));
+        assert_eq!(
+            crate::cycle_guard::last_stage(&id),
+            Some(crate::cycle_guard::CycleStage::None)
+        );
     }
 
     /// The monitor light check uses the budgeted parallel sweep (not the old
@@ -2934,7 +3044,8 @@ mod tests {
     /// leaves the LightCheck→DeepCheck stage markers correctly stepped. We drive
     /// the monitor with a provider whose discover() returns nothing, and seed a
     /// ledger of dead endpoints (unreachable loopback) so the light check is
-    /// exercised end-to-end.
+    /// exercised end-to-end. Uses 127.0.0.2 (not 127.0.0.1) so a dev-mock
+    /// worker on 127.0.0.1:<ALT_PORT> never collides when tests run in parallel.
     #[tokio::test]
     async fn test_monitor_uses_budget_and_stage_marks() {
         let _home = rescue_home();
@@ -2943,7 +3054,7 @@ mod tests {
         // Seed a ledger with dead endpoints (closed loopback ports).
         let dead = vec![
             CleanEndpoint {
-                ip: "127.0.0.1".into(),
+                ip: "127.0.0.2".into(),
                 port: 1,
                 sni: "amir.dariuskhosrowan.workers.dev".into(),
                 score: 10.0,
@@ -2956,7 +3067,7 @@ mod tests {
                 ts: String::new(),
             },
             CleanEndpoint {
-                ip: "127.0.0.1".into(),
+                ip: "127.0.0.2".into(),
                 port: 2,
                 sni: "amir.dariuskhosrowan.workers.dev".into(),
                 score: 5.0,
@@ -2981,7 +3092,7 @@ mod tests {
             provider,
         );
         let summary = engine
-            .monitor_cycle_guarded(std::time::Duration::from_secs(60))
+            .monitor_cycle_guarded(crate::autopilot::MonitorTimeouts::default())
             .await
             .expect("monitor with dead endpoints completes");
         // All endpoints dead → 0 alive.
@@ -2991,5 +3102,335 @@ mod tests {
             crate::cycle_guard::last_stage(&id),
             Some(crate::cycle_guard::CycleStage::None)
         );
+    }
+
+    // ── Round 8: two-phase monitor timeout split (light 120s / deep 600s) ──
+
+    /// A scripted provider that sleeps the given virtual duration before
+    /// returning a single verified+alive endpoint. Used to prove the deep
+    /// phase receives its full budget (i.e. it is not cut at the light cap).
+    struct SlowProvider {
+        sleep: std::time::Duration,
+    }
+
+    impl EndpointProvider for SlowProvider {
+        fn discover<'a>(
+            &'a self,
+            _vless: &'a VlessProfile,
+            _params: &'a DiscoveryParams,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<CleanEndpoint>, CFError>> + Send + 'a>>
+        {
+            let d = self.sleep;
+            Box::pin(async move {
+                // Under tokio::time::pause this advances with the virtual clock.
+                tokio::time::sleep(d).await;
+                Ok(vec![CleanEndpoint {
+                    ip: "1.2.3.4".into(),
+                    port: 443,
+                    sni: "amir.dariuskhosrowan.workers.dev".into(),
+                    score: 99.0,
+                    tcp_ms: 5.0,
+                    connect_ms: 8.0,
+                    download_kbps: 900.0,
+                    verified: true,
+                    alive: true,
+                    last_checked: None,
+                    ts: String::new(),
+                }])
+            })
+        }
+    }
+
+    fn dead_loopback_ledger() -> Vec<CleanEndpoint> {
+        // 127.0.0.2 is a distinct loopback address that never hosts a mock
+        // worker (which binds 127.0.0.1:<ALT_PORT>). Using it keeps these
+        // "dead" endpoints dead even when dev-mock tests run in parallel — a
+        // shared 127.0.0.1 would otherwise collide with the mock worker's
+        // ALT_PORT listener during the light-phase sweep.
+        vec![
+            CleanEndpoint {
+                ip: "127.0.0.2".into(),
+                port: 1,
+                sni: "amir.dariuskhosrowan.workers.dev".into(),
+                score: 10.0,
+                tcp_ms: 1.0,
+                connect_ms: 1.0,
+                download_kbps: 0.0,
+                verified: true,
+                alive: false,
+                last_checked: None,
+                ts: String::new(),
+            },
+            CleanEndpoint {
+                ip: "127.0.0.2".into(),
+                port: 2,
+                sni: "amir.dariuskhosrowan.workers.dev".into(),
+                score: 5.0,
+                tcp_ms: 1.0,
+                connect_ms: 1.0,
+                download_kbps: 0.0,
+                verified: true,
+                alive: false,
+                last_checked: None,
+                ts: String::new(),
+            },
+        ]
+    }
+
+    /// The light phase returns `NeedDeep` (no deep discovery) when every
+    /// ledger endpoint fails its liveness probe — there is nothing to swap.
+    #[tokio::test]
+    async fn test_monitor_light_phase_returns_need_deep_when_all_fail() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        write_ledger(&id, &dead_loopback_ledger()).unwrap();
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(ScriptedProvider { result: Ok(vec![]) }),
+        );
+        match engine
+            .monitor_light_phase()
+            .await
+            .expect("light phase runs")
+        {
+            LightOutcome::Alive(_) => panic!("dead endpoints must yield NeedDeep"),
+            LightOutcome::NeedDeep => {}
+        }
+    }
+
+    /// The deep phase runs discovery, merges fresh endpoints, best-score-wins,
+    /// and writes the user bundle. The scripted provider returns one
+    /// verified+alive endpoint so rescue is not triggered.
+    #[tokio::test]
+    async fn test_monitor_deep_phase_runs_discovery_and_writes_bundle() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        write_ledger(&id, &dead_loopback_ledger()).unwrap();
+
+        let provider = Box::new(ScriptedProvider {
+            result: Ok(vec![CleanEndpoint {
+                ip: "1.2.3.4".into(),
+                port: 443,
+                sni: "amir.dariuskhosrowan.workers.dev".into(),
+                score: 99.0,
+                tcp_ms: 5.0,
+                connect_ms: 8.0,
+                download_kbps: 900.0,
+                verified: true,
+                alive: true,
+                last_checked: None,
+                ts: String::new(),
+            }]),
+        });
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            provider,
+        );
+        let summary = engine
+            .monitor_deep_phase()
+            .await
+            .expect("deep phase completes");
+        assert!(
+            summary.alive >= 1,
+            "expected a live endpoint after deep discovery"
+        );
+
+        // The user bundle must be written (active.vless etc.), isolated under
+        // the mem-dir override so parallel tests never touch the real home.
+        let cfg_dir = crate::cleanip::user_config_dir(&id).expect("config dir resolvable");
+        assert!(
+            cfg_dir.join("active.vless").exists(),
+            "active.vless missing in {}",
+            cfg_dir.display()
+        );
+        assert!(cfg_dir.join("fallbacks.txt").exists());
+    }
+
+    /// ACCEPTANCE (the round's deliverable): a slow deep discovery that runs
+    /// longer than the light budget must still complete, because the deep
+    /// phase gets its own (larger) timeout. We inject tiny timeouts (light
+    /// 200ms, deep 5s) and a SlowProvider that sleeps 1s: if the two phases
+    /// shared a single short timeout, the cycle would abort — with the split,
+    /// the deep phase is allowed to finish.
+    #[tokio::test]
+    async fn test_monitor_guarded_deep_gets_600s_budget() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        write_ledger(&id, &dead_loopback_ledger()).unwrap();
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(SlowProvider {
+                sleep: std::time::Duration::from_secs(1),
+            }),
+        );
+        let timeouts = MonitorTimeouts {
+            light: std::time::Duration::from_millis(200),
+            deep: std::time::Duration::from_secs(5),
+        };
+
+        let started = std::time::Instant::now();
+        let summary = engine
+            .monitor_cycle_guarded(timeouts)
+            .await
+            .expect("deep phase must complete within its own 5s budget, not be cut at 200ms");
+        let elapsed = started.elapsed();
+
+        // An endpoint was found by the deep discovery.
+        assert_eq!(summary.alive, 1);
+        // The cycle actually ran the 1s deep probe — proving the deep phase was
+        // allowed to run longer than the 200ms light cap.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "cycle finished too fast ({elapsed:?}) — deep phase likely wasn't exercised"
+        );
+
+        let beacon = crate::health_beacon::read_beacon(&id)
+            .unwrap()
+            .expect("success beacon written");
+        assert!(
+            beacon.last_error.is_none(),
+            "last_error={:?}",
+            beacon.last_error
+        );
+        assert_eq!(beacon.cycle_kind, crate::health_beacon::CycleKind::Monitor);
+    }
+
+    /// A hanging deep discovery aborts at the deep budget and writes an abort
+    /// beacon naming `DeepPhaseTimeout`.
+    #[tokio::test]
+    async fn test_monitor_guarded_deep_timeout_at_600s() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        write_ledger(&id, &dead_loopback_ledger()).unwrap();
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(HangingProvider),
+        );
+        let err = engine
+            .monitor_cycle_guarded(MonitorTimeouts {
+                light: std::time::Duration::from_millis(200),
+                deep: std::time::Duration::from_millis(500),
+            })
+            .await
+            .expect_err("hanging deep phase must be aborted by its own budget");
+
+        assert!(
+            err.brief().contains("deep phase"),
+            "expected deep-phase timeout, got: {}",
+            err.brief()
+        );
+        let beacon = crate::health_beacon::read_beacon(&id)
+            .unwrap()
+            .expect("abort beacon written");
+        assert_eq!(beacon.last_error.as_deref(), Some("DeepPhaseTimeout"));
+    }
+
+    /// When the light phase's probe succeeds, the expensive deep discovery is
+    /// skipped. We simulate a live endpoint by running the real mock worker on
+    /// a loopback ALT port and seeding a ledger pointing at it, so the light
+    /// phase's WS-gate probe genuinely succeeds — proving deep never runs.
+    #[cfg(feature = "dev-mock")]
+    #[tokio::test]
+    async fn test_monitor_guarded_light_success_skips_deep_phase() {
+        use crate::mock_worker::{run_mock_worker, MockWorkerConfig};
+
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+
+        // Start the mock worker on a loopback alt port, at the same WS path
+        // the vless profile uses ("/" from the seeded profile) so the light
+        // phase's WS-gate probe completes.
+        let cfg = MockWorkerConfig {
+            listen_addr: "127.0.0.1:2053".parse().unwrap(),
+            worker_path: "/".into(),
+            ws_payload_bytes: 4096,
+            trace_ip: "198.51.100.1".into(),
+            cert_sni: "mock.workers.dev".into(),
+        };
+        let _handle = tokio::spawn(run_mock_worker(cfg));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Seed a ledger whose endpoint is the live mock worker. The light phase
+        // will probe 127.0.0.1:2053 → TLS (sni mock.workers.dev) → WS upgrade
+        // on /api → 101 + payload → alive.
+        let live = vec![CleanEndpoint {
+            ip: "127.0.0.1".into(),
+            port: 2053,
+            sni: "mock.workers.dev".into(),
+            score: 99.0,
+            tcp_ms: 1.0,
+            connect_ms: 1.0,
+            download_kbps: 1000.0,
+            verified: true,
+            alive: true,
+            last_checked: None,
+            ts: String::new(),
+        }];
+        write_ledger(&id, &live).unwrap();
+
+        // A provider whose discover() is a hard error: if the deep phase is
+        // ever entered, this test fails — proving it was skipped.
+        let provider = Box::new(ScriptedProvider {
+            result: Err(crate::error::CFError::new(
+                "should not run",
+                "deep discover must not be called when light succeeds",
+                "",
+            )),
+        });
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            provider,
+        );
+
+        let summary = engine
+            .monitor_cycle_guarded(crate::autopilot::MonitorTimeouts::default())
+            .await
+            .expect("light-alive monitor succeeds without deep discovery");
+        assert_eq!(summary.alive, 1, "the live mock endpoint must be found");
+    }
+
+    /// Beacon kind: an aborting monitor cycle records `cycle_kind == Monitor`.
+    #[tokio::test]
+    async fn test_monitor_guarded_records_beacon_with_cycle_kind_monitor() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        write_ledger(&id, &dead_loopback_ledger()).unwrap();
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(HangingProvider),
+        );
+        let _ = engine
+            .monitor_cycle_guarded(MonitorTimeouts {
+                light: std::time::Duration::from_millis(200),
+                deep: std::time::Duration::from_millis(500),
+            })
+            .await;
+
+        let beacon = crate::health_beacon::read_beacon(&id)
+            .unwrap()
+            .expect("abort beacon written");
+        assert_eq!(beacon.cycle_kind, crate::health_beacon::CycleKind::Monitor);
     }
 }

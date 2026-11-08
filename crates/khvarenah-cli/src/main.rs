@@ -388,6 +388,9 @@ pub enum DaemonAction {
     Status,
     /// Write the systemd user unit and print the enable --now command.
     InstallSystemd,
+    /// Reset backoff state: zero failure streak and restore the initial interval.
+    /// Use after fixing a network/worker issue so the daemon retries now.
+    Reset,
 }
 
 #[tokio::main]
