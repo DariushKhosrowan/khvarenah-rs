@@ -684,6 +684,23 @@ mod tests {
         assert!(resolve("not an ip", 443).is_err());
     }
 
+    #[test]
+    fn is_hijacked_detects_198_18_range() {
+        use std::net::Ipv4Addr;
+        assert!(is_hijacked_ip(&Ipv4Addr::new(198, 18, 0, 1)));
+        assert!(is_hijacked_ip(&Ipv4Addr::new(198, 18, 7, 152)));
+        assert!(is_hijacked_ip(&Ipv4Addr::new(198, 18, 255, 255)));
+    }
+
+    #[test]
+    fn is_hijacked_rejects_public_ips() {
+        use std::net::Ipv4Addr;
+        assert!(!is_hijacked_ip(&Ipv4Addr::new(104, 16, 132, 229)));
+        assert!(!is_hijacked_ip(&Ipv4Addr::new(188, 114, 96, 3)));
+        assert!(!is_hijacked_ip(&Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(!is_hijacked_ip(&Ipv4Addr::new(127, 0, 0, 1)));
+    }
+
     #[tokio::test]
     async fn test_probe_ws_accepts_101() {
         let port = start_mock_server("accept").await;
