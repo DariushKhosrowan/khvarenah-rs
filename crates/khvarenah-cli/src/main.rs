@@ -183,6 +183,13 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Read the per-cycle health beacon (one-`cat` health check). Exit code
+    /// 0 = fresh, 1 = stale (scriptable for remote checks).
+    Health {
+        /// Emit raw beacon JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
     /// End-to-end harness: verify token → deploy worker → discover clean IPs
     /// → write the user bundle, then print the manual verification block.
     E2e {

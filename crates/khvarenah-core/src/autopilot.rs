@@ -270,6 +270,75 @@ pub fn commit_strategy_v2(
     Ok(rotated)
 }
 
+/// Build a [`crate::health_beacon::HealthBeacon`] from persisted profile state
+/// plus the current cycle's contextual facts. Read-mostly plumbing: every
+/// subsurface value already lives in the store or the cycle's own scope.
+pub fn compose_beacon(
+    profile_id: &str,
+    kind: crate::health_beacon::CycleKind,
+    cycle_ts: i64,
+    duration_ms: u64,
+    worker_health_label: Option<&str>,
+    active_alive: Option<bool>,
+    last_error: Option<String>,
+) -> crate::health_beacon::HealthBeacon {
+    let cfg = crate::store::profiles::load_profile(profile_id).config;
+    let now = crate::store::now_ts() as i64;
+
+    let mut b = crate::health_beacon::HealthBeacon::new(kind, cycle_ts);
+    b.written_at = now;
+    b.cycle_duration_ms = duration_ms;
+    b.protection_enabled = cfg.protection_enabled;
+
+    // Daemon owner (pid + start) if the daemon is running.
+    let dstate = crate::daemon::load_daemon_state(profile_id);
+    if dstate.pid > 0 {
+        b.daemon_pid = Some(dstate.pid);
+        b.daemon_started_at = (dstate.started_at > 0).then_some(dstate.started_at);
+    }
+
+    // Worker health label.
+    b.worker_health =
+        crate::health_beacon::worker_health_label(worker_health_label.unwrap_or("Skipped"));
+
+    // Active ledger endpoint + rtt.
+    if let Some(ep) = crate::cleanip::active_ledger_endpoint(profile_id) {
+        b.active_endpoint = Some(ep);
+        if let Some(active_alive) = active_alive {
+            b.active_alive = active_alive;
+        }
+    }
+
+    // Bundle condition.
+    if let Ok(dir) = crate::cleanip::user_config_dir(profile_id) {
+        b.bundle_dir = Some(dir.display().to_string());
+        if b.active_endpoint.is_some() {
+            let active = b.active_endpoint.clone().unwrap_or_default();
+            b.bundle_in_sync = matches!(
+                crate::cleanip::check_bundle_drift(&dir, &active),
+                crate::cleanip::BundleDrift::InSync
+            );
+        }
+    }
+    b.bundle_last_checked = now;
+
+    // Strategy v2.
+    let st = resolve_strategy_v2(profile_id);
+    b.strategy_current = strategy_name(st.current).to_string();
+    b.strategy_window = st.recent_outcomes.iter().map(|&w| u8::from(w)).collect();
+    b.strategy_rate = success_rate(&st);
+    b.strategy_cycles_since_rotation = st.cycles_since_rotation;
+    b.strategy_last_rotated_ts =
+        (cfg.strategy_last_rotated_ts > 0).then_some(cfg.strategy_last_rotated_ts);
+
+    // Rescue meta.
+    b.last_rescue_outcome = cfg.last_rescue_outcome.clone();
+    b.last_rescue_ts = (cfg.last_rescue_attempt_ts > 0).then_some(cfg.last_rescue_attempt_ts);
+
+    b.last_error = last_error;
+    b
+}
+
 /// The `EndpointProvider` contract. Two implementations ship today:
 /// `NativeCfProvider` (Rust-native discovery) and `SenpaiProvider` (thin
 /// wrapper around the SenPaiScanner binary, kept as a fallback/debug mode).
@@ -968,6 +1037,23 @@ impl AutopilotEngine {
         }
     }
 
+    /// Test-only constructor: inject a scripted provider so cycles can be
+    /// driven without a live network / worker.
+    #[cfg(test)]
+    fn with_provider(
+        profile_id: impl Into<String>,
+        params: DiscoveryParams,
+        interval: Duration,
+        provider: Box<dyn EndpointProvider>,
+    ) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+            params,
+            interval,
+            provider,
+        }
+    }
+
     /// A discovery-param copy seeded from the ledger's last-known-good
     /// endpoints. `seed_ips` become the neighbourhood anchor points for the
     /// scanner (feature #2), so it doesn't start from zero each cycle.
@@ -999,7 +1085,31 @@ impl AutopilotEngine {
 
     /// Like [`run_cycle`], but with an explicit discovery parameter set (used
     /// by the rescue chain to inject seed sources / skip the step-0 gate).
+    /// Writes a health beacon on BOTH success and error paths.
     async fn run_cycle_with_params(
+        &self,
+        params: &DiscoveryParams,
+    ) -> Result<(Vec<CleanEndpoint>, CycleSummary), CFError> {
+        let cycle_ts = crate::store::now_ts() as i64;
+        let started = std::time::Instant::now();
+        let result = self.run_cycle_with_params_inner(params).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let last_error = result.as_ref().err().map(|e| e.brief());
+        let active_alive = result.as_ref().ok().map(|(found, _)| !found.is_empty());
+        let beacon = compose_beacon(
+            &self.profile_id,
+            crate::health_beacon::CycleKind::Discovery,
+            cycle_ts,
+            duration_ms,
+            None,
+            active_alive,
+            last_error,
+        );
+        let _ = crate::health_beacon::write_beacon(&self.profile_id, &beacon);
+        result
+    }
+
+    async fn run_cycle_with_params_inner(
         &self,
         params: &DiscoveryParams,
     ) -> Result<(Vec<CleanEndpoint>, CycleSummary), CFError> {
@@ -1125,8 +1235,28 @@ impl AutopilotEngine {
     /// a **deep** full discovery + E2E pass (also run on a 15-min schedule).
     /// A deep-check failure is what actually triggers a swap. Best-score-wins
     /// keeps the highest verified+alive endpoint as the active config.
-    /// Returns a per-cycle summary.
+    /// Returns a per-cycle summary. Writes a health beacon on BOTH paths.
     pub async fn monitor_cycle(&self) -> Result<CycleSummary, CFError> {
+        let cycle_ts = crate::store::now_ts() as i64;
+        let started = std::time::Instant::now();
+        let result = self.monitor_cycle_inner().await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let last_error = result.as_ref().err().map(|e| e.brief());
+        let active_alive = result.as_ref().ok().map(|s| s.alive > 0);
+        let beacon = compose_beacon(
+            &self.profile_id,
+            crate::health_beacon::CycleKind::Monitor,
+            cycle_ts,
+            duration_ms,
+            None,
+            active_alive,
+            last_error,
+        );
+        let _ = crate::health_beacon::write_beacon(&self.profile_id, &beacon);
+        result
+    }
+
+    async fn monitor_cycle_inner(&self) -> Result<CycleSummary, CFError> {
         // Self-heal the user-facing bundle against the ledger before checking
         // the network (never fails the cycle: discovery is still the goal).
         let _ = crate::cleanip::reconcile_bundle_if_drifted(&self.profile_id);
@@ -2476,5 +2606,112 @@ mod tests {
         let state = resolve_strategy_v2(&id);
         assert_eq!(state.current, crate::health::SniStrategy::WorkerOnly);
         assert!(state.recent_outcomes.is_empty());
+    }
+
+    // ── Health beacon acceptance (round 4) ──
+
+    /// Scripted provider: returns a fixed result on every discover call.
+    struct ScriptedProvider {
+        result: Result<Vec<CleanEndpoint>, CFError>,
+    }
+
+    impl EndpointProvider for ScriptedProvider {
+        fn discover<'a>(
+            &'a self,
+            _vless: &'a VlessProfile,
+            _params: &'a DiscoveryParams,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<CleanEndpoint>, CFError>> + Send + 'a>>
+        {
+            let result = self.result.clone();
+            Box::pin(async move { result })
+        }
+    }
+
+    fn seeded_vless_profile(id: &str) {
+        let rec = crate::store::profiles::VlessRecord {
+            link: "vless://8274e874-7470-43ee-8018-4bc3baa709a5@104.17.147.186:443?encryption=none&security=tls&type=ws&sni=amir.dariuskhosrowan.workers.dev&host=amir.dariuskhosrowan.workers.dev&path=%2F&fp=chrome#amir".to_string(),
+            address: "104.17.147.186".to_string(),
+            port: 443,
+            uuid: "8274e874-7470-43ee-8018-4bc3baa709a5".to_string(),
+            name: "test".to_string(),
+            clean_ip: false,
+            ..Default::default()
+        };
+        crate::store::profiles::remember_vless(id, rec).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_cycle_writes_beacon_on_success() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+
+        // Script a successful discovery: one verified endpoint.
+        let provider = Box::new(ScriptedProvider {
+            result: Ok(vec![CleanEndpoint {
+                ip: "1.2.3.4".into(),
+                port: 443,
+                sni: "amir.dariuskhosrowan.workers.dev".into(),
+                score: 99.0,
+                tcp_ms: 5.0,
+                connect_ms: 8.0,
+                download_kbps: 900.0,
+                verified: true,
+                alive: true,
+                last_checked: None,
+                ts: String::new(),
+            }]),
+        });
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            provider,
+        );
+        let (found, _summary) = engine.run_cycle().await.expect("cycle succeeds");
+        assert!(!found.is_empty());
+
+        let beacon = crate::health_beacon::read_beacon(&id)
+            .unwrap()
+            .expect("beacon written on success");
+        assert_eq!(
+            beacon.cycle_kind,
+            crate::health_beacon::CycleKind::Discovery
+        );
+        assert!(
+            beacon.last_error.is_none(),
+            "last_error={:?}",
+            beacon.last_error
+        );
+        assert_eq!(beacon.active_endpoint.as_deref(), Some("1.2.3.4:443"));
+        // A won discovery records a 1 in the strategy window.
+        assert_eq!(beacon.strategy_window.last(), Some(&1u8));
+        assert!(beacon.written_at > 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_cycle_writes_beacon_on_failure() {
+        let _home = rescue_home();
+        let id = make_profile();
+        // No vless history set up → base_vless errors before discovery. This is
+        // the case that matters most: a failure cycle must still leave a
+        // readable health beacon.
+        let engine = AutopilotEngine::new(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+        );
+        assert!(engine.run_cycle().await.is_err());
+
+        let beacon = crate::health_beacon::read_beacon(&id)
+            .unwrap()
+            .expect("beacon written on failure");
+        assert_eq!(
+            beacon.cycle_kind,
+            crate::health_beacon::CycleKind::Discovery
+        );
+        assert!(beacon.last_error.is_some(), "last_error expected");
+        assert!(beacon.written_at > 0);
     }
 }

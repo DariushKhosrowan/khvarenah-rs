@@ -120,6 +120,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::Autopilot { action } => cmd_autopilot(&profile, action).await,
         Command::Protection { action } => cmd_protection(&profile, action).await,
         Command::Daemon { action } => cmd_daemon(&profile, action).await,
+        Command::Health { json } => cmd_health(&profile, json),
         Command::E2e {
             skip_worker_deploy,
             worker,
@@ -196,6 +197,90 @@ fn cmd_bundle(profile: &str, action: crate::BundleAction) -> Result<(), CFError>
             Ok(())
         }
     }
+}
+
+/// Read and render the per-cycle health beacon. `--json` emits the raw
+/// snapshot; otherwise a human-readable table. Exit code 0 (fresh) / 1
+/// (stale / missing) makes this scriptable for the user's remote check.
+fn cmd_health(profile: &str, json: bool) -> Result<(), CFError> {
+    let beacon = match khvarenah_core::health_beacon::read_beacon(profile)? {
+        Some(b) => b,
+        None => {
+            println!("No health beacon yet for profile '{profile}' — no cycle has run.");
+            println!("Run `khvarenah autopilot` or start the daemon, then re-check.");
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&beacon).unwrap());
+        return Ok(());
+    }
+
+    let now = khvarenah_core::store::now_ts() as i64;
+    let age = khvarenah_core::health_beacon::beacon_age_secs(&beacon, now);
+    // Staleness threshold: 3× the light-monitor interval from the profile
+    // config.
+    let cfg = khvarenah_core::store::profiles::load_profile(profile).config;
+    let interval = cfg.light_interval_secs.max(60) as i64;
+    let stale = khvarenah_core::health_beacon::is_stale(&beacon, now, 3 * interval);
+
+    let kind = match beacon.cycle_kind {
+        khvarenah_core::health_beacon::CycleKind::Discovery => "Discovery",
+        khvarenah_core::health_beacon::CycleKind::Monitor => "Monitor",
+        khvarenah_core::health_beacon::CycleKind::Rescue => "Rescue",
+        khvarenah_core::health_beacon::CycleKind::Manual => "Manual",
+    };
+
+    println!("Health beacon — profile {profile}");
+    println!(
+        "  cycle:        {kind} ts={} dur={}ms",
+        beacon.cycle_ts, beacon.cycle_duration_ms
+    );
+    println!(
+        "  written:      {}s ago ({})",
+        age,
+        if stale { "STALE" } else { "fresh" }
+    );
+    println!(
+        "  protection:   {}",
+        if beacon.protection_enabled {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    println!("  worker:       {}", beacon.worker_health);
+    println!(
+        "  active:       {}",
+        beacon.active_endpoint.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  alive:        {}",
+        if beacon.active_alive { "yes" } else { "no" }
+    );
+    println!(
+        "  bundle:       {}/sync",
+        if beacon.bundle_in_sync { "in" } else { "NOT" }
+    );
+    println!(
+        "  strategy:     {} window={:?} rate={:?} cycles_since_rot={}",
+        beacon.strategy_current,
+        beacon.strategy_window,
+        beacon.strategy_rate,
+        beacon.strategy_cycles_since_rotation
+    );
+    if let Some(outcome) = &beacon.last_rescue_outcome {
+        println!("  last rescue:  {outcome}");
+    }
+    if let Some(err) = &beacon.last_error {
+        println!("  last error:   {err}");
+    }
+
+    if stale {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn cmd_profiles() -> Result<(), CFError> {
@@ -929,6 +1014,22 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
             // Self-learning phase-2 SNI strategy status (the autonomy knob, v2
             // rolling-window).
             if verbose {
+                // Health beacon line (round 4): age + kind, so `autopilot
+                // health --verbose` doubles as a one-line liveness check.
+                if let Ok(Some(beacon)) = khvarenah_core::health_beacon::read_beacon(profile) {
+                    let now = khvarenah_core::store::now_ts() as i64;
+                    let age = khvarenah_core::health_beacon::beacon_age_secs(&beacon, now);
+                    let kind = match beacon.cycle_kind {
+                        khvarenah_core::health_beacon::CycleKind::Discovery => "Discovery",
+                        khvarenah_core::health_beacon::CycleKind::Monitor => "Monitor",
+                        khvarenah_core::health_beacon::CycleKind::Rescue => "Rescue",
+                        khvarenah_core::health_beacon::CycleKind::Manual => "Manual",
+                    };
+                    println!(
+                        "  Beacon: age={age}s cycle_ts={} cycle_kind={kind}",
+                        beacon.cycle_ts
+                    );
+                }
                 let state = khvarenah_core::autopilot::resolve_strategy_v2(profile);
                 let name = match state.current {
                     khvarenah_core::health::SniStrategy::WorkerOnly => "WorkerOnly",
