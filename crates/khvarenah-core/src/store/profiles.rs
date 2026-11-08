@@ -764,6 +764,102 @@ pub fn set_active_profile(id: &str) -> Result<(), CFError> {
     write_json(&active_profile_path(), &final_id)
 }
 
+// ---------------------------------------------------------------------------
+// Cross-worker failover ledger + profile rotation.
+//
+// When a profile's worker is unrecoverable (rescue gave up, the worker is
+// suspended or the path is blocked) the daemon can switch the ACTIVE profile to
+// a different profile whose worker is alive. This removes the last single
+// point of failure — the assumption that the active profile always has a
+// working worker. The ledger below remembers which profiles recently failed so
+// selection skips them, and gets cleared when a profile recovers.
+// ---------------------------------------------------------------------------
+
+/// One failure record in the failover ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailoverEntry {
+    pub profile_id: String,
+    /// UNIX seconds the profile was marked failed.
+    pub marked_at: i64,
+    pub reason: String,
+}
+
+/// The failover ledger: which profiles recently failed and why.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FailoverLedger {
+    pub entries: Vec<FailoverEntry>,
+}
+
+/// How long a profile stays in the "failed" set before it can be tried again.
+/// 24h gives the operator time to fix the worker while keeping the daemon from
+/// bouncing back onto a known-broken profile every cycle.
+pub const FAILOVER_FAIL_WINDOW_SECS: i64 = 86_400;
+
+fn failover_ledger_path() -> PathBuf {
+    mem_dir().join("failover.json")
+}
+
+/// Load the failover ledger (empty on error / first run).
+pub fn load_failover_ledger() -> FailoverLedger {
+    read_or_default::<FailoverLedger>(&failover_ledger_path())
+}
+
+/// Mark a profile as failed (e.g. its worker gave up rescue). Appends a
+/// deduped entry and persists the ledger.
+pub fn mark_profile_failed(profile_id: &str, reason: &str) -> Result<(), CFError> {
+    let mut ledger = load_failover_ledger();
+    let now = now_ts() as i64;
+    ledger.entries.retain(|e| e.profile_id != profile_id);
+    ledger.entries.push(FailoverEntry {
+        profile_id: profile_id.to_string(),
+        marked_at: now,
+        reason: reason.to_string(),
+    });
+    write_json(&failover_ledger_path(), &ledger)
+}
+
+/// Clear a profile's failure marker (e.g. it recovered a working worker).
+pub fn clear_profile_failed(profile_id: &str) -> Result<(), CFError> {
+    let mut ledger = load_failover_ledger();
+    ledger.entries.retain(|e| e.profile_id != profile_id);
+    write_json(&failover_ledger_path(), &ledger)
+}
+
+/// Return the set of profiles marked failed within the last `window_secs`.
+pub fn failed_profiles_within(window_secs: i64) -> Vec<String> {
+    let now = now_ts() as i64;
+    load_failover_ledger()
+        .entries
+        .into_iter()
+        .filter(|e| now - e.marked_at <= window_secs)
+        .map(|e| e.profile_id)
+        .collect()
+}
+
+/// Pick the next profile to fail over to. Round-robin by name over ALL known
+/// profiles, skipping the `current_id` and profiles failed within the fail
+/// window. Returns `None` when there is no other eligible profile.
+pub fn select_next_profile(current_id: &str) -> Option<String> {
+    let failed = failed_profiles_within(FAILOVER_FAIL_WINDOW_SECS);
+    list_profiles()
+        .into_iter()
+        .filter(|m| m.id != current_id && !failed.contains(&m.id))
+        .map(|m| m.id)
+        .next()
+}
+
+/// Atomically switch the active profile to `target_id`, after clearing its
+/// failure marker (we are trusting it now). Returns the previous active id.
+pub fn rotate_active_profile(target_id: &str) -> Result<String, CFError> {
+    let prev = get_active_profile();
+    if prev == target_id {
+        return Ok(prev);
+    }
+    let _ = clear_profile_failed(target_id);
+    set_active_profile(target_id)?;
+    Ok(prev)
+}
+
 /// Convenience: current timestamp as ISO-8601-like string.
 pub fn now_iso() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
@@ -967,4 +1063,97 @@ mod tests {
             assert_eq!(p.config.light_interval_secs, 300);
         });
     }
+
+    #[test]
+    fn mark_and_clear_profile_failed() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let id = create_profile("work", "").unwrap();
+            mark_profile_failed(&id, "worker down").unwrap();
+            let failed = failed_profiles_within(FAILOVER_FAIL_WINDOW_SECS);
+            assert!(failed.contains(&id));
+            clear_profile_failed(&id).unwrap();
+            let failed = failed_profiles_within(FAILOVER_FAIL_WINDOW_SECS);
+            assert!(!failed.contains(&id));
+        });
+    }
+
+    #[test]
+    fn failed_profiles_expire_after_window() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let id = create_profile("work", "").unwrap();
+            // Seed a ledger entry with an old marked_at (outside the fail window).
+            let ledger = FailoverLedger {
+                entries: vec![FailoverEntry {
+                    profile_id: id.clone(),
+                    marked_at: now_ts() as i64 - FAILOVER_FAIL_WINDOW_SECS - 1,
+                    reason: "old".into(),
+                }],
+            };
+            write_json(&failover_ledger_path(), &ledger).unwrap();
+            let failed = failed_profiles_within(FAILOVER_FAIL_WINDOW_SECS);
+            assert!(!failed.contains(&id), "expired entry must not be failed");
+        });
+    }
+
+    #[test]
+    fn select_next_profile_skips_failed() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let a = create_profile("a", "").unwrap();
+            let b = create_profile("b", "").unwrap();
+            mark_profile_failed(&b, "worker down").unwrap();
+            // b is failed, so from a there is no eligible other → none.
+            assert_eq!(select_next_profile(&a), None);
+            // From b, a is eligible.
+            assert_eq!(select_next_profile(&b), Some(a));
+        });
+    }
+
+    #[test]
+    fn select_next_profile_round_robin() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let a = create_profile("a", "").unwrap();
+            let b = create_profile("b", "").unwrap();
+            // list_profiles sorts by name → [a, b].
+            // From a: skips a, picks the first other → b.
+            assert_eq!(select_next_profile(&a), Some(b.clone()));
+            // From b: skips b, picks the first remaining → a.
+            assert_eq!(select_next_profile(&b), Some(a));
+        });
+    }
+
+    #[test]
+    fn select_next_profile_none_when_all_failed() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let a = create_profile("a", "").unwrap();
+            let b = create_profile("b", "").unwrap();
+            mark_profile_failed(&b, "worker down").unwrap();
+            assert_eq!(select_next_profile(&a), None);
+        });
+    }
+
+    #[test]
+    fn rotate_active_profile_atomic_swap() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let a = create_profile("a", "").unwrap();
+            let b = create_profile("b", "").unwrap();
+            set_active_profile(&a).unwrap();
+            // Mark b failed, then fail over TO b: its marker must be cleared
+            // (we are trusting it now) and the active profile must become b.
+            mark_profile_failed(&b, "worker down").unwrap();
+            let prev = rotate_active_profile(&b).unwrap();
+            assert_eq!(prev, a);
+            assert_eq!(get_active_profile(), b);
+            assert!(
+                !failed_profiles_within(FAILOVER_FAIL_WINDOW_SECS).contains(&b),
+                "rotated-to profile's failure marker must be cleared"
+            );
+        });
+    }
+
 }
