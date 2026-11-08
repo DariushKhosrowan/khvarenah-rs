@@ -46,6 +46,7 @@ pub mod scanner;
 pub mod security;
 pub mod selfupdate;
 pub mod slipscan;
+pub mod status;
 pub mod stealth;
 pub mod store;
 pub mod vless;

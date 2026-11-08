@@ -26,6 +26,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use rand::SeedableRng;
+
 use crate::cf::ips::load_ranges;
 use crate::error::CFError;
 use crate::store;
@@ -125,88 +127,39 @@ impl EndpointProvider for NativeCfProvider {
     }
 }
 
-/// Probe one candidate IP against a worker host using the real-client gate:
-/// fast TCP reachability, then TLS + RFC 6455 WebSocket upgrade across the
-/// Cloudflare alt-port set. Only an accepted (101 + bytes) endpoint becomes a
-/// `CleanEndpoint`, and only if it clears the multi-dimension quality score.
-async fn probe_endpoint(
-    ip: &str,
-    sni: &str,
-    path: &str,
-    timeout_ms: u64,
-) -> Result<CleanEndpoint, CFError> {
-    // SlipNet-style fast-fail: drop unreachable IPs before paying for TLS/WS.
-    let fast = crate::health::probe_fast(ip, 443, timeout_ms).await;
-    if !fast.passed && fast.rtt_ms == 0 {
-        return Err(CFError::new(
-            "Probe failed",
-            format!("TCP unreachable {ip}"),
-            "",
-        ));
-    }
-
-    // Deep real-client gate: TLS + WS upgrade across all alt ports.
-    let probes = crate::health::probe_all_alt_ports(ip, sni, path, timeout_ms).await;
-    let accepted = probes
-        .iter()
-        .find(|p| p.status == Some(101) && p.worker_bytes > 0);
-    let Some(accepted) = accepted else {
-        return Err(CFError::new(
-            "Probe failed",
-            format!("No WebSocket accept on {ip}"),
-            "",
-        ));
-    };
-
-    let full = crate::health::FullProbe {
-        tcp_ms: accepted.rtt_ms,
-        tls_ok: accepted.tls_ok,
-        ws_ok: true,
-        latency_under_1500: accepted.rtt_ms <= crate::health::FAST_FAIL_MS as u32,
-        throughput_floor: accepted.worker_bytes >= 1,
-        alt_port_ok: accepted.port != 443,
-    };
-    if !crate::health::is_acceptable(&full) {
-        return Err(CFError::new(
-            "Probe failed",
-            format!("Quality score too low for {ip}"),
-            "",
-        ));
-    }
-    let qs = crate::health::quality_score(&full);
-    Ok(CleanEndpoint {
-        ip: ip.to_string(),
-        port: accepted.port,
-        sni: sni.to_string(),
-        score: qs as f32,
-        tcp_ms: accepted.rtt_ms as f32,
-        connect_ms: accepted.rtt_ms as f32,
-        download_kbps: accepted.worker_bytes as f32,
-        verified: true,
-        alive: true,
-        last_checked: Some(store::now_iso()),
-        ts: store::now_iso(),
-    })
-}
-
 /// The native discovery pipeline: neighbourhood-aware candidate generation
-/// (seeds + /24 expansion + uniform sample) → concurrent probes → rank by
-/// quality score → top_n. Each accepted endpoint has already passed the real
-/// client TLS+WS upgrade gate, so `verified` is set at probe time.
+/// (seeds + /24 expansion + weighted sample) → SlipNet-style two-phase
+/// streaming scan → ranked clean endpoints. Each accepted endpoint has passed
+/// the fast TCP prefilter *and* the real-client TLS+WS upgrade gate, so
+/// `verified` is set at probe time.
 async fn discover_native(
     vless: &VlessProfile,
     params: &DiscoveryParams,
 ) -> Result<Vec<CleanEndpoint>, CFError> {
     let cidrs = load_ranges(params.force_refresh_ranges).await?;
 
-    // Fix for "can't find clean IPs": expand around known-good seeds (/24
-    // neighbours first) instead of sampling ~1.5M edges uniformly.
-    let candidate_ips = crate::cf::ips::seeded_candidates(
+    // Candidate generation: seeds first, then /24 neighbors, then weighted
+    // sampling proportional to CIDR block size (SlipNet-style).
+    let seeded = crate::cf::ips::seeded_candidates(
         &params.seed_ips,
         &cidrs,
         params.sample as usize,
         24,
     );
+    let mut candidate_ips = seeded;
+    if candidate_ips.len() < (params.sample as usize) {
+        let missing = (params.sample as usize) - candidate_ips.len();
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let extra = crate::cf::ips::weighted_sample_by_cidr(&cidrs, missing, &mut rng);
+        let mut seen: std::collections::HashSet<String> =
+            candidate_ips.iter().cloned().collect();
+        for ip in extra {
+            if seen.insert(ip.clone()) {
+                candidate_ips.push(ip);
+            }
+        }
+    }
+    candidate_ips.truncate(params.sample as usize);
     if candidate_ips.is_empty() {
         return Err(CFError::new(
             "No candidates",
@@ -218,29 +171,44 @@ async fn discover_native(
     let target = crate::health::derive_ws_target(vless);
     let sni = target.sni.clone();
     let path = target.path.clone();
-    let timeout_ms = (params.timeout_s as u64) * 1000;
+    let timeout_s = params.timeout_s.max(1);
 
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(params.workers.max(1)));
-    let mut handles = Vec::new();
-    for ip in candidate_ips {
-        let permit = sem.clone().acquire_owned().await.unwrap();
-        let sni = sni.clone();
-        let path = path.clone();
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            probe_endpoint(&ip, &sni, &path, timeout_ms).await
-        }));
-    }
+    // Phase 1: fast TCP liveness (probe_fast).
+    let phase1: crate::slipscan::Phase1Fn = Box::new(move |ip: &str, fast_fail_ms: u64| {
+        let ip = ip.to_string();
+        Box::pin(async move { crate::health::probe_fast(&ip, 443, fast_fail_ms).await })
+    });
 
-    let mut pool: Vec<CleanEndpoint> = Vec::new();
-    for h in handles {
-        if let Ok(Ok(ep)) = h.await {
-            pool.push(ep);
-        }
-    }
+    // Phase 2: deep WS-upgrade gate across alt ports.
+    let phase2: crate::slipscan::Phase2Fn = Box::new(move |ip: &str, sni: &str, path: &str, ws_timeout_ms: u64| {
+        let ip = ip.to_string();
+        let sni = sni.to_string();
+        let path = path.to_string();
+        Box::pin(async move {
+            crate::health::probe_all_alt_ports(&ip, &sni, &path, ws_timeout_ms).await
+        })
+    });
 
-    pool.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(pool.into_iter().take(params.top_n.max(1)).collect())
+    let scan_params = crate::slipscan::ScanParams {
+        target_n: params.top_n.max(1),
+        phase1_workers: params.workers.max(1),
+        phase2_workers: (params.workers / 4).clamp(4, 48),
+        fast_fail_ms: crate::health::FAST_FAIL_MS,
+        ws_timeout_ms: timeout_s as u64 * 1000,
+    };
+
+    let found = crate::slipscan::two_phase_scan(
+        &candidate_ips,
+        &sni,
+        &path,
+        &scan_params,
+        phase1,
+        phase2,
+        None,
+    )
+    .await?;
+
+    Ok(found)
 }
 
 /// Check whether an endpoint is still alive using the real-client WS gate:
@@ -531,8 +499,10 @@ impl AutopilotEngine {
         }
     }
 
-    /// The monitor loop: re-validate active endpoints; swap a dead front for
-    /// a fresh one found via targeted discovery. Returns a per-cycle summary.
+    /// The monitor loop: re-validate active endpoints, chase better clean IPs
+    /// on a cadence, and always keep the *highest-score alive* endpoint as the
+    /// active config. Swap in fresh clean IPs when the current one dies.
+    /// Returns a per-cycle summary.
     pub async fn monitor_cycle(&self) -> Result<CycleSummary, CFError> {
         let vless = base_vless(&self.profile_id)?;
         let mut ledger = read_ledger(&self.profile_id);
@@ -542,6 +512,7 @@ impl AutopilotEngine {
         let timeout_ms = (self.params.timeout_s as u64) * 1000;
         let path = crate::health::derive_ws_target(&vless).path;
 
+        // Re-validate every ledger endpoint's liveness.
         for ep in ledger.iter_mut() {
             let ok = endpoint_live(&ep.ip, &ep.sni, &path, timeout_ms).await;
             if ok {
@@ -553,25 +524,43 @@ impl AutopilotEngine {
             }
         }
 
-        // If any active endpoint died, run a targeted discovery (seeded from
-        // the remaining known-good endpoints) to find a replacement and swap
-        // it in — the config is regenerated with the fresh clean IP.
-        let any_dead = ledger.iter().any(|e| !e.alive);
-        if any_dead {
+        // Re-discover when (a) something died, or (b) we have fewer than
+        // the target number of alive endpoints — we *chase* better clean IPs
+        // aggressively so the active config always has the freshest, fastest
+        // front.
+        let alive_count = ledger.iter().filter(|e| e.alive).count();
+        let want = self.params.top_n.max(1);
+        let need_more = alive_count < want;
+        if need_more {
             let params = self.params_with_seeds();
-            if let Ok(mut fresh) = self.provider.discover(&vless, &params).await {
-                fresh.retain(|e| !ledger.iter().any(|l| l.ip == e.ip));
-                if let Some(replacement) = fresh.into_iter().find(|e| e.verified) {
-                    ledger.push(replacement.clone());
-                    replaced += 1;
-                    write_active_configs(&self.profile_id, &vless, &replacement)?;
+            if let Ok(fresh) = self.provider.discover(&vless, &params).await {
+                for ep in fresh {
+                    // Record new IPs and update scores of known IPs.
+                    if let Some(slot) = ledger.iter_mut().find(|l| l.ip == ep.ip) {
+                        *slot = ep.clone();
+                    } else {
+                        ledger.push(ep.clone());
+                        replaced += 1;
+                    }
                 }
             }
         }
 
+        // Best-score wins: pick the highest-score *alive* endpoint as active.
+        ledger.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let best_ip = ledger
+            .iter()
+            .find(|e| e.verified && e.alive)
+            .map(|e| e.ip.clone());
+        if let Some(best) = best_ip.as_ref() {
+            let best_ep = ledger.iter().find(|e| e.ip == *best).unwrap();
+            write_active_configs(&self.profile_id, &vless, best_ep)?;
+        }
+
+        // Trim ledger, persist, refresh the user bundle.
+        ledger.truncate(64);
         write_ledger(&self.profile_id, &ledger)?;
 
-        // Keep the user-facing bundle current after any swap.
         let live: Vec<CleanEndpoint> = ledger
             .iter()
             .filter(|e| e.verified && e.alive)
@@ -581,9 +570,13 @@ impl AutopilotEngine {
 
         Ok(CycleSummary {
             cycle: 0,
-            alive: ledger.iter().filter(|e| e.alive).count(),
+            alive: live.len(),
             replaced,
-            note: format!("monitor: {alive} alive, {replaced} replaced"),
+            note: format!(
+                "monitor: {alive} alive · {} clean · best {}",
+                live.len(),
+                best_ip.as_deref().unwrap_or("-")
+            ),
         })
     }
 }
