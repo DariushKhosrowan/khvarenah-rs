@@ -493,7 +493,10 @@ pub async fn pipeline_scan(
                     let probes = phase2_fn(&ip, &sni, &path, params2.ws_timeout_ms).await;
                     let accepted = probes
                         .iter()
-                        .find(|p| p.status == Some(101) && p.worker_bytes > 0);
+                        .find(|p| {
+                            p.status == Some(101)
+                                && p.worker_bytes >= crate::health::MIN_WORKER_BYTES
+                        });
                     if let Some(ws) = accepted {
                         phase2_pass_c.fetch_add(1, Ordering::Relaxed);
                         let gate = phase2_score(&fast, ws);

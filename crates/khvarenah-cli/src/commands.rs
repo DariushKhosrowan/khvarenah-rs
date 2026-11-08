@@ -757,6 +757,45 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
             println!("{}", summary.note);
             Ok(())
         }
+        crate::AutopilotAction::Health => {
+            let vless = khvarenah_core::autopilot::base_vless(profile)?;
+            let target = khvarenah_core::health::derive_ws_target(&vless);
+            let host = target.sni.clone();
+            println!("Probing worker {} …", host);
+            match khvarenah_core::autopilot::probe_worker_health(&host, 10).await {
+                khvarenah_core::autopilot::WorkerHealth::Alive => {
+                    println!("Worker HEALTHY (Alive). Scanning will proceed.");
+                }
+                other => {
+                    let cause = match other {
+                        khvarenah_core::autopilot::WorkerHealth::Suspended { .. }
+                        | khvarenah_core::autopilot::WorkerHealth::NotFound => {
+                            khvarenah_core::diagnose::PlainCause::WorkerDead
+                        }
+                        khvarenah_core::autopilot::WorkerHealth::PathMismatch => {
+                            khvarenah_core::diagnose::PlainCause::WorkerPathMismatch
+                        }
+                        khvarenah_core::autopilot::WorkerHealth::Unreachable => {
+                            khvarenah_core::diagnose::PlainCause::NetworkBlocked
+                        }
+                        khvarenah_core::autopilot::WorkerHealth::Alive => unreachable!(),
+                    };
+                    println!(
+                        "Worker NOT healthy: {}",
+                        khvarenah_core::diagnose::plain_message(
+                            cause,
+                            khvarenah_core::diagnose::Locale::En
+                        )
+                    );
+                    println!(
+                        "  Recommended: {}",
+                        khvarenah_core::diagnose::recommended_action(cause)
+                            .label(khvarenah_core::diagnose::Locale::En)
+                    );
+                }
+            }
+            Ok(())
+        }
         crate::AutopilotAction::On {
             interval_s,
             sample,

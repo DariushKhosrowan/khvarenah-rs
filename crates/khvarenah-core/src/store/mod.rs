@@ -52,6 +52,12 @@ pub fn set_mem_dir_override(path: PathBuf) {
     MEM_DIR_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(path));
 }
 
+/// The active base-directory override, if one is set (tests only). Returns
+/// `None` in normal (production) use.
+pub fn mem_override() -> Option<PathBuf> {
+    MEM_DIR_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
 /// The directory holding all profiles.
 pub fn profiles_dir() -> PathBuf {
     mem_dir().join("profiles")

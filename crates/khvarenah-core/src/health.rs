@@ -26,6 +26,11 @@ use crate::vless::VlessProfile;
 /// are frequently left open because DPI assumes "real HTTPS uses 443".
 pub const ALT_PORTS: &[u16] = &[443, 2053, 2087, 2096, 8443, 2083, 2082, 8880, 2052];
 
+/// Minimum worker payload bytes for a WS-upgrade to count as a real route.
+/// A 101 that immediately closes with < this many bytes is a dead route
+/// (edge upgraded but no worker behind it). (DeepSeek plan, Phase 3.)
+pub const MIN_WORKER_BYTES: u32 = 512;
+
 /// A single WebSocket-upgrade probe verdict for one (ip, port).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WsProbe {
@@ -223,7 +228,7 @@ pub fn derive_ws_target(vless: &VlessProfile) -> WsTarget {
 /// hostname is not the certificate owner — we intentionally skip cert-pinning.
 /// This mirrors what a real v2ray/xray client does with `allowInsecure`.
 #[derive(Debug)]
-struct LenientVerifier;
+pub struct LenientVerifier;
 
 impl ServerCertVerifier for LenientVerifier {
     fn verify_server_cert(
@@ -268,7 +273,7 @@ impl ServerCertVerifier for LenientVerifier {
 }
 
 /// Connect a TLS stream to `ip:port` using `sni` as the SNI hostname.
-async fn tls_connect(
+pub async fn tls_connect(
     ip: &str,
     port: u16,
     sni: &str,
@@ -349,13 +354,18 @@ pub async fn probe_ws(
     let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
 
     let path = if path.is_empty() { "/" } else { path };
-    let req = format!(
+    let base_req = format!(
         "GET {path} HTTP/1.1\r\nHost: {sni}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
+    // Anti-DPI: randomize the wire image per probe (shuffle header order +
+    // random header-name casing). A fixed request gets blacklisted within
+    // seconds on censored networks (SlipNet-style).
+    let mut rng = rand::rngs::StdRng::from_entropy();
+    let req = crate::probe_jitter::randomize_ws_request(&mut rng, base_req.as_bytes());
 
     if let Err(e) = tokio::time::timeout(
         Duration::from_millis(timeout_ms),
-        stream.write_all(req.as_bytes()),
+        stream.write_all(&req),
     )
     .await
     {
@@ -413,8 +423,10 @@ pub async fn probe_ws(
     if head_str.starts_with("HTTP/1.1 101") {
         probe.status = Some(101);
         probe.worker_bytes = body_bytes;
-        if probe.worker_bytes == 0 {
-            probe.failure_stage = Some("route".into());
+        if probe.worker_bytes < MIN_WORKER_BYTES {
+            // Edge upgraded but closed before sending a real worker payload:
+            // dead route (no worker behind the edge).
+            probe.failure_stage = Some("Ws_NoRoute".into());
         } else {
             let _ = read_outcome;
         }
@@ -442,7 +454,7 @@ async fn probe_ports(
     let mut results = Vec::new();
     for &port in ports {
         let r = probe_ws(ip, port, sni, path, timeout_ms).await;
-        let hit = r.status == Some(101) && r.worker_bytes > 0;
+        let hit = r.status == Some(101) && r.worker_bytes >= MIN_WORKER_BYTES;
         results.push(r);
         if hit {
             break;
@@ -626,24 +638,25 @@ mod tests {
             }
         }
         let response = match mode {
-            "accept" => concat!(
-                "HTTP/1.1 101 Switching Protocols\r\n",
-                "Upgrade: websocket\r\n",
-                "Connection: Upgrade\r\n",
-                "Sec-WebSocket-Accept: abc123\r\n",
-                "\r\n",
-                "worker-payload-bytes"
-            ),
-            "200" => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-            "404" => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            "accept" => {
+                // Send a payload large enough to pass the MIN_WORKER_BYTES
+                // gate — a real worker sends well over 512 bytes.
+                let payload = "worker-payload-bytes".repeat(40); // ~760 bytes
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: abc123\r\n\r\n{payload}"
+                )
+            }
+            "200" => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+            "404" => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string(),
             "accept_empty" => concat!(
                 "HTTP/1.1 101 Switching Protocols\r\n",
                 "Upgrade: websocket\r\n",
                 "Connection: Upgrade\r\n",
                 "Sec-WebSocket-Accept: abc123\r\n",
                 "\r\n"
-            ),
-            _ => "HTTP/1.1 101 Switching Protocols\r\n\r\nb",
+            )
+            .to_string(),
+            _ => "HTTP/1.1 101 Switching Protocols\r\n\r\nb".to_string(),
         };
         let _ = stream.write_all(response.as_bytes()).await;
         let _ = stream.flush().await;
@@ -695,7 +708,16 @@ mod tests {
         let p = probe_ws("127.0.0.1", port, "mock.test", "/ws", 5000).await;
         assert_eq!(p.status, Some(101));
         assert_eq!(p.worker_bytes, 0);
-        assert_eq!(p.failure_stage.as_deref(), Some("route"));
+        assert_eq!(p.failure_stage.as_deref(), Some("Ws_NoRoute"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_ws_accepts_full_payload() {
+        let port = start_mock_server("accept").await;
+        let p = probe_ws("127.0.0.1", port, "mock.test", "/ws", 5000).await;
+        assert_eq!(p.status, Some(101));
+        assert!(p.worker_bytes >= MIN_WORKER_BYTES, "got {}", p.worker_bytes);
+        assert!(p.failure_stage.is_none());
     }
 
     #[tokio::test]

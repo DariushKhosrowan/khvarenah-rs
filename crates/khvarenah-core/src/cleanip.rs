@@ -41,10 +41,16 @@ pub fn user_config_dir(profile_id: &str) -> Result<PathBuf, CFError> {
     } else {
         name.trim().to_string()
     };
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("khvarenah-configs")
-        .join(&safe);
+    // In tests (mem override set) isolate bundle writes under the temp base so
+    // parallel tests never clobber the real ~/khvarenah-configs/$.
+    let dir = if let Some(base) = store::mem_override() {
+        base.join("configs").join(&safe)
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("khvarenah-configs")
+            .join(&safe)
+    };
     std::fs::create_dir_all(&dir).map_err(|e| {
         CFError::new(
             "Storage error",
@@ -211,18 +217,20 @@ mod tests {
         with_mem_dir();
         let dir = user_config_dir("default").unwrap();
         assert!(dir.exists());
-        assert!(dir.to_string_lossy().contains("khvarenah-configs"));
+        assert!(dir.to_string_lossy().contains("configs"));
         assert!(dir.to_string_lossy().contains("default"));
     }
 
     #[test]
     fn user_config_dir_uses_profile_name_not_id() {
-        crate::store::set_mem_dir_override(
-            tempfile::tempdir().unwrap().path().join(".khvarenah"),
-        );
+        let tmp = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(tmp.path().join(".khvarenah"));
         crate::store::profiles::create_profile("family", "").unwrap();
         let dir = user_config_dir("family").unwrap();
-        assert!(dir.to_string_lossy().ends_with("khvarenah-configs/family"));
+        // With a mem override set (tests) the bundle is isolated under the
+        // temp base, still keyed by the profile *name* (not its id).
+        assert!(dir.to_string_lossy().starts_with(tmp.path().to_string_lossy().as_ref()));
+        assert!(dir.to_string_lossy().ends_with("configs/family"));
     }
 
     #[test]
