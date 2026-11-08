@@ -146,6 +146,39 @@ async fn discover_native(
     params: &DiscoveryParams,
     profile_id: &str,
 ) -> Result<Vec<CleanEndpoint>, CFError> {
+    let target = crate::health::derive_ws_target(vless);
+    let sni = target.sni.clone();
+    let path = target.path.clone();
+    let timeout_s = params.timeout_s.max(1);
+
+    // Step 0 — worker-health gate (DeepSeek plan #1). If the worker is dead,
+    // suspended, or path-mismatched, no scanner can find clean IPs: short-
+    // circuit with a plain-language diagnosis instead of wasting a scan.
+    match crate::autopilot::probe_worker_health(&sni, timeout_s as u64).await {
+        crate::autopilot::WorkerHealth::Alive => {}
+        other => {
+            let cause = match other {
+                crate::autopilot::WorkerHealth::Suspended { .. }
+                | crate::autopilot::WorkerHealth::NotFound => {
+                    crate::diagnose::PlainCause::WorkerDead
+                }
+                crate::autopilot::WorkerHealth::PathMismatch => {
+                    crate::diagnose::PlainCause::WorkerPathMismatch
+                }
+                crate::autopilot::WorkerHealth::Unreachable => {
+                    crate::diagnose::PlainCause::NetworkBlocked
+                }
+                crate::autopilot::WorkerHealth::Alive => unreachable!(),
+            };
+            let msg = crate::diagnose::plain_message(cause, crate::diagnose::Locale::En);
+            return Err(CFError::new(
+                "Worker offline",
+                msg,
+                "Check the Workers dashboard or try another network.",
+            ));
+        }
+    }
+
     let cidrs = load_ranges(params.force_refresh_ranges).await?;
 
     // Candidate generation: seeds first, then /24 neighbors, then weighted
@@ -178,98 +211,222 @@ async fn discover_native(
         ));
     }
 
-    let target = crate::health::derive_ws_target(vless);
-    let sni = target.sni.clone();
-    let path = target.path.clone();
-    let timeout_s = params.timeout_s.max(1);
-
-    // Phase 1: fast TCP liveness across the alt-port set (early-exits on
-    // the first reachable port — vital when 443 is throttled in Iran).
-    let phase1: crate::slipscan::Phase1Fn = Box::new(move |ip: &str, fast_fail_ms: u64| {
-        let ip = ip.to_string();
-        Box::pin(async move { crate::health::probe_fast_any_port(&ip, fast_fail_ms).await })
-    });
-
-    // Phase 2: deep WS-upgrade gate across alt ports.
-    let phase2: crate::slipscan::Phase2Fn = Box::new(move |ip: &str, sni: &str, path: &str, ws_timeout_ms: u64| {
-        let ip = ip.to_string();
-        let sni = sni.to_string();
-        let path = path.to_string();
-        Box::pin(async move {
-            crate::health::probe_all_alt_ports(&ip, &sni, &path, ws_timeout_ms).await
-        })
-    });
-
-    let scan_params = crate::slipscan::ScanParams {
-        target_n: params.top_n.max(1),
-        phase1_workers: params.workers.max(1),
-        phase2_workers: (params.workers / 4).clamp(4, 48),
-        fast_fail_ms: crate::health::FAST_FAIL_MS,
-        ws_timeout_ms: timeout_s as u64 * 1000,
-    };
-
-    // ── Parallel pipeline (SlipNet orchestration) ──
-    // Phase-1 → phase-2 → a *parallel* E2E worker pool, with score-threshold
-    // gating so we only spend sing-box tunnel budget on strong candidates.
-    // Diagnostics are persisted so a zero result can be explained in plain
-    // language. E2E only runs when we can reach a direct-IP echo service;
-    // otherwise the pipeline degrades to the WS-gate alone.
-    // NOTE (honest disclosure): the direct-IP source (api.ipify.org) sits
-    // *outside* the worker's egress path, so a user who is already tunneled
-    // through their own worker will see "tunnel IP ≈ direct IP" and the E2E
-    // gate will (correctly for that state) reject candidates as IpUnchanged.
-    // That is a false negative specific to already-connected users, not a
-    // broken worker. Multi-source direct-IP lookup is future work; for now the
-    // recommendation when Protection is active is to trust the WS-gate result
-    // and only treat persistent E2E failures as worker problems after stopping
-    // Protection.
+    let target_n = params.top_n.max(1);
     let vless_link = vless.share_link();
     let direct_ip = crate::e2e::fetch_direct_ip(params.timeout_s.clamp(3, 20) as u64)
         .await
         .ok();
 
-    let pipeline_params = crate::slipscan::PipelineParams {
-        target_n: params.top_n.max(1),
-        phase1_workers: params.workers.max(1),
-        phase2_workers: (params.workers / 4).clamp(4, 48),
-        e2e_workers: 4,
-        score_threshold: crate::health::ACCEPT_THRESHOLD,
-        fast_fail_ms: crate::health::FAST_FAIL_MS,
-        ws_timeout_ms: timeout_s as u64 * 1000,
+    // Local builder for one pipeline round (rebuildable per expansion round).
+    let run_round = |cands: Vec<String>| {
+        let phase1: crate::slipscan::Phase1Fn =
+            Box::new(move |ip: &str, fast_fail_ms: u64| {
+                let ip = ip.to_string();
+                Box::pin(async move {
+                    crate::health::probe_fast_any_port(&ip, fast_fail_ms).await
+                })
+            });
+        let phase2: crate::slipscan::Phase2Fn = Box::new(
+            move |ip: &str, sni: &str, path: &str, ws_timeout_ms: u64| {
+                let ip = ip.to_string();
+                let sni = sni.to_string();
+                let path = path.to_string();
+                Box::pin(async move {
+                    crate::health::probe_all_alt_ports(&ip, &sni, &path, ws_timeout_ms).await
+                })
+            },
+        );
+        let e2e: crate::slipscan::E2eFn = Box::new(
+            move |ip: &str, port: u16, vless: &str, timeout_s: u64| {
+                let ip = ip.to_string();
+                let vless = vless.to_string();
+                let bin = crate::e2e::singbox_bin();
+                Box::pin(async move {
+                    let _ = crate::e2e::ensure_singbox("1.11.4").await;
+                    crate::e2e::verify_tunnel(&ip, port, &vless, "0.0.0.0", &bin, timeout_s)
+                        .await
+                })
+            },
+        );
+        let pipeline_params = crate::slipscan::PipelineParams {
+            target_n,
+            phase1_workers: params.workers.max(1),
+            phase2_workers: (params.workers / 4).clamp(4, 48),
+            e2e_workers: 4,
+            score_threshold: crate::health::ACCEPT_THRESHOLD,
+            fast_fail_ms: crate::health::FAST_FAIL_MS,
+            ws_timeout_ms: timeout_s as u64 * 1000,
+        };
+        crate::slipscan::pipeline_scan(
+            cands,
+            &sni,
+            &path,
+            &vless_link,
+            direct_ip.clone(),
+            pipeline_params,
+            phase1,
+            phase2,
+            e2e,
+            None,
+        )
     };
 
-    let e2e: crate::slipscan::E2eFn = Box::new(move |ip: &str, port: u16, vless: &str, timeout_s: u64| {
-        let ip = ip.to_string();
-        let vless = vless.to_string();
-        let bin = crate::e2e::singbox_bin();
-        Box::pin(async move {
-            // Ensure sing-box is present; if the download fails, the E2E
-            // result reports SingBoxSpawn and the pipeline falls back to the
-            // gate-only path.
-            let _ = crate::e2e::ensure_singbox("1.11.4").await;
-            crate::e2e::verify_tunnel(&ip, port, &vless, "0.0.0.0", &bin, timeout_s).await
-        })
-    });
+    let mut examined: std::collections::HashSet<String> =
+        candidate_ips.iter().cloned().collect();
 
-    let result = crate::slipscan::pipeline_scan(
-        candidate_ips,
-        &sni,
-        &path,
-        &vless_link,
-        direct_ip,
-        pipeline_params,
-        phase1,
-        phase2,
-        e2e,
-        None,
-    )
-    .await?;
+    let first = run_round(candidate_ips).await?;
+    let mut diagnostics = Some(first.diagnostics.clone());
+    let mut verified = first.verified;
+
+    // Multi-round cluster expansion (SlipNet style): when we find fewer than
+    // target_n clean IPs, expand around the ones we DID find (their /24
+    // siblings) and scan those next. One hit becomes a cluster. Bounded to
+    // avoid runaway scans; only runs while there is still room to improve.
+    let mut round = 0;
+    while verified.len() < target_n && round < 3 && !verified.is_empty() {
+        let expanded = crate::cf::ips::expand_around(&verified, 24, 254);
+        let mut new_cands = Vec::new();
+        for ip in expanded {
+            if examined.insert(ip.clone()) {
+                new_cands.push(ip);
+            }
+        }
+        if new_cands.is_empty() {
+            break;
+        }
+        let r = run_round(new_cands).await?;
+        if let Some(d) = &mut diagnostics {
+            d.examined_total = d.examined_total.saturating_add(r.diagnostics.examined_total);
+            d.phase1_pass = d.phase1_pass.saturating_add(r.diagnostics.phase1_pass);
+            d.phase2_pass = d.phase2_pass.saturating_add(r.diagnostics.phase2_pass);
+            d.score_above_threshold = d
+                .score_above_threshold
+                .saturating_add(r.diagnostics.score_above_threshold);
+            d.e2e_pass = d.e2e_pass.saturating_add(r.diagnostics.e2e_pass);
+        }
+        for ep in r.verified {
+            if !verified.iter().any(|v| v.ip == ep.ip) {
+                verified.push(ep);
+            }
+        }
+        verified.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        verified.truncate(target_n);
+        round += 1;
+    }
 
     // Persist diagnostics so the GUI/CLI can explain a zero result.
-    let _ = crate::store::profiles::save_last_diagnostics(profile_id, &result.diagnostics);
-    let _ = scan_params;
+    if let Some(d) = diagnostics {
+        let _ = crate::store::profiles::save_last_diagnostics(profile_id, &d);
+    }
 
-    Ok(result.verified)
+    Ok(verified)
+}
+
+/// Health state of the worker's route, as observed by a one-shot probe.
+/// Used as a step-0 gate so a scan never runs against a dead/misconfigured
+/// worker (DeepSeek plan #1 — the #1 cause of "zero clean IPs").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerHealth {
+    /// The worker answered a healthy probe (HTTP 200/101 or textual trace).
+    Alive,
+    /// The route responds, but with a status that suggests no worker there.
+    NotFound,
+    /// The account/worker is suspended or errored (e.g. CF 9109).
+    Suspended { code: u16 },
+    /// The worker responds but on a path the app didn't ask for.
+    PathMismatch,
+    /// No TCP/TLS/HTTP response at all (network or worker unreachable).
+    Unreachable,
+}
+
+/// Step-0 worker-health probe. Does a real TLS handshake + HTTP GET against
+/// the worker's hostname (its own host, not a clean-IP front), then classifies
+/// the response. This is cheap (~300ms) and runs once per scan/cycle.
+pub async fn probe_worker_health(worker_host: &str, timeout_s: u64) -> WorkerHealth {
+    let timeout_ms = (timeout_s.max(1) as u64) * 1000;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = match crate::health::tls_connect(worker_host, 443, worker_host, timeout_ms).await
+    {
+        Ok(s) => s,
+        Err(_) => return WorkerHealth::Unreachable,
+    };
+
+    let req = format!(
+        "GET /cdn-cgi/trace HTTP/1.1\r\nHost: {worker_host}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    );
+    if tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        stream.write_all(req.as_bytes()),
+    )
+    .await
+    .is_err()
+        || stream.flush().await.is_err()
+    {
+        return WorkerHealth::Unreachable;
+    }
+    let mut buf = [0u8; 8192];
+    let mut head = Vec::new();
+    let read_res = tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        async {
+            let mut total = 0usize;
+            let mut headers_done = false;
+            while total < 16 * 1024 {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        head.extend_from_slice(&buf[..n]);
+                        total += n;
+                        if !headers_done && head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            headers_done = true;
+                        }
+                        if headers_done && total >= 512 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        },
+    )
+    .await;
+    if read_res.is_err() {
+        return WorkerHealth::Unreachable;
+    }
+    let text = String::from_utf8_lossy(&head);
+    classify_worker_health(&text)
+}
+
+/// Pure classification of a raw HTTP response head into a `WorkerHealth`.
+/// Split out for deterministic unit testing.
+pub fn classify_worker_health(text: &str) -> WorkerHealth {
+    if text.contains("HTTP/1.1 200") || text.contains("HTTP/1.1 101") {
+        return WorkerHealth::Alive;
+    }
+    // Cloudflare account/worker error codes take precedence over generic 4xx
+    // path heuristics: a 403/500 with 9109 (invalid token) or a suspended/
+    // disabled marker is an account-level problem, not a path mismatch.
+    if text.contains("9109") || text.contains("disabled") || text.contains("suspended") {
+        return WorkerHealth::Suspended { code: 9109 };
+    }
+    if text.contains("HTTP/1.1 404")
+        || text.contains("HTTP/1.1 400")
+        || text.contains("HTTP/1.1 426")
+        || text.contains("HTTP/1.1 403")
+    {
+        // 403/404 on the trace route => likely path mismatch or wrong host.
+        return WorkerHealth::PathMismatch;
+    }
+    if text.contains("HTTP/1.1") {
+        WorkerHealth::Suspended { code: 500 }
+    } else {
+        WorkerHealth::Unreachable
+    }
 }
 
 /// Check whether an endpoint is still alive using the real-client WS gate:
@@ -279,7 +436,7 @@ async fn endpoint_live(ip: &str, sni: &str, path: &str, timeout_ms: u64) -> bool
     let probes = crate::health::probe_all_alt_ports(ip, sni, path, timeout_ms).await;
     probes
         .iter()
-        .any(|p| p.status == Some(101) && p.worker_bytes > 0)
+        .any(|p| p.status == Some(101) && p.worker_bytes >= crate::health::MIN_WORKER_BYTES)
 }
 
 // ---------------------------------------------------------------------------
@@ -744,5 +901,45 @@ mod tests {
         assert_eq!(p.sample, 2000);
         assert_eq!(p.workers, 64);
         assert_eq!(p.top_n, 3);
+    }
+
+    #[test]
+    fn classify_health_alive_on_200() {
+        assert!(matches!(
+            classify_worker_health("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nfl=000"),
+            WorkerHealth::Alive
+        ));
+    }
+
+    #[test]
+    fn classify_health_alive_on_101() {
+        assert!(matches!(
+            classify_worker_health("HTTP/1.1 101 Switching Protocols\r\n\r\n"),
+            WorkerHealth::Alive
+        ));
+    }
+
+    #[test]
+    fn classify_health_path_mismatch_on_404() {
+        assert_eq!(
+            classify_worker_health("HTTP/1.1 404 Not Found\r\n\r\n"),
+            WorkerHealth::PathMismatch
+        );
+    }
+
+    #[test]
+    fn classify_health_suspended_on_9109() {
+        assert!(matches!(
+            classify_worker_health("HTTP/1.1 403 Forbidden\r\n\r\n{\"code\":9109}"),
+            WorkerHealth::Suspended { code: 9109 }
+        ));
+    }
+
+    #[test]
+    fn classify_health_unreachable_on_garbage() {
+        assert_eq!(
+            classify_worker_health("garbage bytes no http"),
+            WorkerHealth::Unreachable
+        );
     }
 }

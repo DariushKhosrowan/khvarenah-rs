@@ -757,6 +757,45 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
             println!("{}", summary.note);
             Ok(())
         }
+        crate::AutopilotAction::Health => {
+            let vless = dastyab_core::autopilot::base_vless(profile)?;
+            let target = dastyab_core::health::derive_ws_target(&vless);
+            let host = target.sni.clone();
+            println!("Probing worker {} …", host);
+            match dastyab_core::autopilot::probe_worker_health(&host, 10).await {
+                dastyab_core::autopilot::WorkerHealth::Alive => {
+                    println!("Worker HEALTHY (Alive). Scanning will proceed.");
+                }
+                other => {
+                    let cause = match other {
+                        dastyab_core::autopilot::WorkerHealth::Suspended { .. }
+                        | dastyab_core::autopilot::WorkerHealth::NotFound => {
+                            dastyab_core::diagnose::PlainCause::WorkerDead
+                        }
+                        dastyab_core::autopilot::WorkerHealth::PathMismatch => {
+                            dastyab_core::diagnose::PlainCause::WorkerPathMismatch
+                        }
+                        dastyab_core::autopilot::WorkerHealth::Unreachable => {
+                            dastyab_core::diagnose::PlainCause::NetworkBlocked
+                        }
+                        dastyab_core::autopilot::WorkerHealth::Alive => unreachable!(),
+                    };
+                    println!(
+                        "Worker NOT healthy: {}",
+                        dastyab_core::diagnose::plain_message(
+                            cause,
+                            dastyab_core::diagnose::Locale::En
+                        )
+                    );
+                    println!(
+                        "  Recommended: {}",
+                        dastyab_core::diagnose::recommended_action(cause)
+                            .label(dastyab_core::diagnose::Locale::En)
+                    );
+                }
+            }
+            Ok(())
+        }
         crate::AutopilotAction::On {
             interval_s,
             sample,

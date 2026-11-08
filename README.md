@@ -136,8 +136,13 @@ dastyab/
 │   │       ├── cf/            # Cloudflare v4 API client (rustls)
 │   │       ├── store/         # atomic per-profile JSON persistence
 │   │       ├── vless.rs       # VLESS profile + share-link generation
-│   │       ├── scanner.rs     # clean-IP scanning (SenPaiScanner)
-│   │       ├── health.rs      # TCP/TLS latency & throughput probe
+│   │       ├── scanner.rs     # legacy clean-IP scanning wrapper (SenPaiScanner)
+│   │       ├── slipscan.rs    # SlipNet-style two-phase streaming scanner + E2E pipeline
+│   │       ├── autopilot.rs   # clean-IP discovery engine, worker-health gate, monitor loop
+│   │       ├── health.rs      # TCP/TLS latency & real-client WS-upgrade gate (alt-port)
+│   │       ├── probe_jitter.rs # anti-DPI probe pacing + randomized WS request
+│   │       ├── e2e.rs        # sing-box end-to-end tunnel verification
+│   │       ├── diagnose.rs    # plain-language "why zero?" cause mapping
 │   │       ├── export.rs      # v2rayN / sing-box / Clash exporters
 │   │       ├── analytics.rs   # usage aggregation
 │   │       ├── diagnostics.rs # endpoint diagnostics

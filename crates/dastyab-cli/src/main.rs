@@ -282,6 +282,9 @@ enum AutopilotAction {
     },
     /// Run one monitor pass (without enabling the loop).
     Check,
+    /// Probe the worker's health directly (step-0 gate): a real TLS+HTTP
+    /// check against the deployed worker's hostname, before any scanning.
+    Health,
     /// Show autopilot status + current ledger.
     Status,
     /// Turn autopilot off (stop the loop). No-op for CLI (loop is per-run);
