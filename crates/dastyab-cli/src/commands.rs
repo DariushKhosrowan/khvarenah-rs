@@ -855,7 +855,11 @@ async fn cmd_discover(
         params.clone(),
         std::time::Duration::from_secs(300),
     );
-    let (found, summary) = engine.run_cycle().await?;
+    let (found, summary) = engine
+        .run_cycle_guarded(std::time::Duration::from_secs(
+            dastyab_core::cycle_guard::DISCOVERY_TIMEOUT_SECS,
+        ))
+        .await?;
     if found.is_empty() {
         println!("No clean IP found in this cycle. Try a larger --sample, --refresh, or re-deploy a worker.");
         return Ok(());
@@ -921,7 +925,11 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                 dastyab_core::autopilot::DiscoveryParams::default(),
                 std::time::Duration::from_secs(300),
             );
-            let summary = engine.monitor_cycle().await?;
+            let summary = engine
+                .monitor_cycle_guarded(std::time::Duration::from_secs(
+                    dastyab_core::cycle_guard::MONITOR_TIMEOUT_SECS,
+                ))
+                .await?;
             println!("{}", summary.note);
             Ok(())
         }
@@ -1193,7 +1201,11 @@ async fn cmd_protection(profile: &str, action: ProtectionAction) -> Result<(), C
                     })
                     .await?;
             } else {
-                let (_, summary) = engine.run_cycle().await?;
+                let (_, summary) = engine
+                    .run_cycle_guarded(std::time::Duration::from_secs(
+                        dastyab_core::cycle_guard::DISCOVERY_TIMEOUT_SECS,
+                    ))
+                    .await?;
                 println!("{}", summary.note);
             }
             Ok(())
@@ -1422,7 +1434,11 @@ async fn cmd_e2e(
         params,
         std::time::Duration::from_secs(300),
     );
-    let (found, summary) = engine.run_cycle().await?;
+    let (found, summary) = engine
+        .run_cycle_guarded(std::time::Duration::from_secs(
+            dastyab_core::cycle_guard::DISCOVERY_TIMEOUT_SECS,
+        ))
+        .await?;
     if found.is_empty() {
         return Err(CFError::new(
             "No clean IP",

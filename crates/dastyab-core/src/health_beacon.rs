@@ -79,6 +79,10 @@ pub struct HealthBeacon {
     pub last_rescue_ts: Option<i64>,
     /// Plaintext last error from the producing cycle's error path (None = ok).
     pub last_error: Option<String>,
+    /// Stage the cycle was in when it aborted (timeout/panic). None = clean
+    /// completion. Serde-default so older beacons load.
+    #[serde(default)]
+    pub last_stage: Option<String>,
 }
 
 impl HealthBeacon {
@@ -110,6 +114,7 @@ impl HealthBeacon {
             last_rescue_outcome: None,
             last_rescue_ts: None,
             last_error: None,
+            last_stage: None,
         }
     }
 }
@@ -128,6 +133,30 @@ pub fn beacon_path(profile_id: &str) -> PathBuf {
 /// Atomically write a beacon (tempfile + fsync + rename + parent fsync).
 pub fn write_beacon(profile_id: &str, beacon: &HealthBeacon) -> Result<(), CFError> {
     store::write_json(&beacon_path(profile_id), beacon)
+}
+
+/// Write an abort beacon for a timed-out / panicked cycle. This is the
+/// diagnostic left behind when the guarded wrapper kills a cycle that hung:
+/// it fills `last_error` with the reason and `last_stage` with the stage the
+/// cycle was last marked in (from the cycle_guard marker). Fills every other
+/// field `compose_beacon` can derive (worker health, ledger endpoint, bundle
+/// sync, strategy window) so the beacon stays as rich as a normal one.
+pub fn write_beacon_on_abort(
+    profile_id: &str,
+    kind: CycleKind,
+    reason: &str,
+) -> Result<(), CFError> {
+    let now = crate::store::now_ts() as i64;
+    let beacon = crate::autopilot::compose_beacon(
+        profile_id,
+        kind,
+        now,
+        0,
+        None,
+        None,
+        Some(reason.to_string()),
+    );
+    write_beacon(profile_id, &beacon)
 }
 
 /// Read a beacon. `Ok(None)` if the file is missing. `Err` if the schema is
