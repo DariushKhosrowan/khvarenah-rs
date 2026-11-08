@@ -297,6 +297,12 @@ pub fn compose_beacon(
         b.daemon_started_at = (dstate.started_at > 0).then_some(dstate.started_at);
     }
 
+    // Network reachability (as observed by the daemon's liveness gate). The
+    // daemon only runs a cycle when the DoH probe succeeds, so `network_ok`
+    // accurately reflects whether the cycle's network precondition held; a
+    // foreground CLI/GUI invocation leaves it at the default (unknown).
+    b.network_ok = !dstate.network_was_down;
+
     // Worker health label.
     b.worker_health =
         crate::health_beacon::worker_health_label(worker_health_label.unwrap_or("Skipped"));
