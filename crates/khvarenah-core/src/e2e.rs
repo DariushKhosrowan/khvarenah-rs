@@ -32,6 +32,57 @@ fn scratch_cfg() -> PathBuf {
         .join("e2e-tmp-config.json")
 }
 
+/// Handle to a spawned tunnel process (or, in tests, a spawned mock task) that
+/// must be killed/aborted when verification ends.
+pub enum ChildHandle {
+    /// A real sing-box child process.
+    Proc(tokio::process::Child),
+    /// A mock spawner task (tests only).
+    Task(tokio::task::JoinHandle<()>),
+}
+
+impl ChildHandle {
+    /// Stop the child (kill the process or abort the task).
+    pub async fn kill(self) {
+        match self {
+            ChildHandle::Proc(mut c) => {
+                let _ = c.kill().await;
+                let _ = c.wait().await;
+            }
+            ChildHandle::Task(h) => h.abort(),
+        }
+    }
+}
+
+/// Abstraction over "spawn the sing-box local proxy for a tunnel config". The
+/// real implementation runs the sing-box binary; tests substitute a fake whose
+/// SOCKS inbound returns a scripted egress IP.
+pub trait SingboxSpawner: Send + Sync {
+    /// Spawn the tunnel proxy. `config_path` is the JSON config to run (the
+    /// real spawner passes it to `sing-box run -c`); `socks_port` is the local
+    /// mixed-inbound port the proxy must listen on.
+    fn spawn(&self, config_path: &Path, socks_port: u16) -> Result<ChildHandle, CFError>;
+}
+
+/// Production spawner: runs the sing-box binary via `tokio::process::Command`.
+pub struct RealSingbox {
+    pub bin: PathBuf,
+}
+
+impl SingboxSpawner for RealSingbox {
+    fn spawn(&self, config_path: &Path, _socks_port: u16) -> Result<ChildHandle, CFError> {
+        let child = tokio::process::Command::new(&self.bin)
+            .arg("run")
+            .arg("-c")
+            .arg(config_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| CFError::new("E2E", format!("sing-box spawn failed: {e}"), ""))?;
+        Ok(ChildHandle::Proc(child))
+    }
+}
+
 /// Failure stage taxonomy for the E2E gate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum E2eFailureStage {
@@ -349,6 +400,30 @@ pub async fn verify_tunnel(
     singbox_bin: &Path,
     timeout_s: u64,
 ) -> E2eResult {
+    let spawner = RealSingbox {
+        bin: singbox_bin.to_path_buf(),
+    };
+    verify_tunnel_with(
+        endpoint_ip,
+        endpoint_port,
+        vless_link,
+        direct_ip,
+        &spawner,
+        timeout_s,
+    )
+    .await
+}
+
+/// Refactorable core of `verify_tunnel` that takes an injectable `SingboxSpawner`
+/// so the pipeline can be verified end-to-end against a mock tunnel in tests.
+pub async fn verify_tunnel_with(
+    endpoint_ip: &str,
+    endpoint_port: u16,
+    vless_link: &str,
+    direct_ip: &str,
+    spawner: &dyn SingboxSpawner,
+    timeout_s: u64,
+) -> E2eResult {
     let base = E2eResult {
         endpoint: format!("{endpoint_ip}:{endpoint_port}"),
         passed: false,
@@ -381,15 +456,8 @@ pub async fn verify_tunnel(
         return r;
     }
 
-    // Spawn sing-box run.
-    let child = tokio::process::Command::new(singbox_bin)
-        .arg("run")
-        .arg("-c")
-        .arg(&cfg_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    let mut child = match child {
+    // Spawn the tunnel proxy (real sing-box or mock).
+    let child = match spawner.spawn(&cfg_path, 2080) {
         Ok(c) => c,
         Err(_) => {
             let mut r = base;
@@ -397,6 +465,7 @@ pub async fn verify_tunnel(
             return r;
         }
     };
+    let mut child = Some(child);
 
     // Wait for the local mixed inbound (127.0.0.1:2080) to accept.
     let deadline = Instant::now() + Duration::from_secs(timeout_s);
@@ -411,9 +480,10 @@ pub async fn verify_tunnel(
     }
 
     // Cleanup guaranteed on every path.
-    async fn cleanup(child: &mut tokio::process::Child) {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+    async fn cleanup(child: &mut Option<ChildHandle>) {
+        if let Some(c) = child.take() {
+            c.kill().await;
+        }
     }
 
     if !inbound_ok {
