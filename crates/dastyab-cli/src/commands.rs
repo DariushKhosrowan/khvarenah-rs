@@ -782,7 +782,9 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                 println!("Probing worker {host} …");
             }
             let doh = dastyab_core::doh::DohResolver::new();
-            match dastyab_core::autopilot::probe_worker_health(&host, connect_ip, Some(&doh), 10).await {
+            match dastyab_core::autopilot::probe_worker_health(&host, connect_ip, Some(&doh), 10)
+                .await
+            {
                 dastyab_core::autopilot::WorkerHealth::Alive => {
                     println!("Worker HEALTHY (Alive). Scanning will proceed.");
                 }
