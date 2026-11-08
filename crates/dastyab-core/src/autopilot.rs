@@ -468,6 +468,14 @@ impl AutopilotEngine {
 
         write_ledger(&self.profile_id, &ledger)?;
 
+        // Refresh the user-facing bundle (~/dastyab-configs/<profile>/).
+        let live: Vec<CleanEndpoint> = ledger
+            .iter()
+            .filter(|e| e.verified && e.alive)
+            .cloned()
+            .collect();
+        let _ = crate::cleanip::write_user_bundle(&self.profile_id, &vless, &live);
+
         let alive = ledger.iter().filter(|e| e.alive).count();
         let summary = CycleSummary {
             cycle: 0,
@@ -562,6 +570,14 @@ impl AutopilotEngine {
         }
 
         write_ledger(&self.profile_id, &ledger)?;
+
+        // Keep the user-facing bundle current after any swap.
+        let live: Vec<CleanEndpoint> = ledger
+            .iter()
+            .filter(|e| e.verified && e.alive)
+            .cloned()
+            .collect();
+        let _ = crate::cleanip::write_user_bundle(&self.profile_id, &vless, &live);
 
         Ok(CycleSummary {
             cycle: 0,

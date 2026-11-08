@@ -33,6 +33,7 @@ pub mod analytics;
 pub mod autopilot;
 pub mod backup;
 pub mod cf;
+pub mod cleanip;
 pub mod diagnostics;
 pub mod error;
 pub mod export;
