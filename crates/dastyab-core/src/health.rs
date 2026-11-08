@@ -18,6 +18,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use rand::SeedableRng as _;
+
 use crate::error::CFError;
 use crate::vless::VlessProfile;
 
@@ -26,10 +28,41 @@ use crate::vless::VlessProfile;
 /// are frequently left open because DPI assumes "real HTTPS uses 443".
 pub const ALT_PORTS: &[u16] = &[443, 2053, 2087, 2096, 8443, 2083, 2082, 8880, 2052];
 
+/// A benign Cloudflare SNI used by the GenericCf fallback: the network sees
+/// this domain in the TLS ClientHello instead of the worker's `*.workers.dev`
+/// hostname, while the HTTP Host header still routes to the worker. This
+/// bypasses DPI that blocks on the SNI.
+pub const GENERIC_CF_SNI: &str = "www.cloudflare.com";
+
 /// Minimum worker payload bytes for a WS-upgrade to count as a real route.
 /// A 101 that immediately closes with < this many bytes is a dead route
 /// (edge upgraded but no worker behind it). (DeepSeek plan, Phase 3.)
 pub const MIN_WORKER_BYTES: u32 = 512;
+
+/// Why a WS probe failed, bucketed so the phase-2 histogram can tell Cause A
+/// (DPI resetting the TLS handshake — static ClientHello fingerprint) from
+/// Cause B (worker path dead / wrong route) in ONE run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum WsFailureReason {
+    /// TCP connect failed outright (network unreachable / edge dropped).
+    ConnectFailed,
+    /// TCP connect timed out (censored network throttling the port).
+    ConnectTimeout,
+    /// TLS handshake aborted (alert / connection reset) — the DPI signature
+    /// Cause A. Static ClientHello fingerprint being blacklisted.
+    TlsAlert,
+    /// TLS handshake timed out.
+    TlsTimeout,
+    /// Writing or flushing the WS upgrade request failed.
+    WriteFailed,
+    /// HTTP response never fully arrived (timeout / partial read).
+    ResponseIncomplete,
+    /// A non-101 HTTP status was returned by the edge (e.g. 403/421/404).
+    HttpStatus(u16),
+    /// Got 101 but fewer than `MIN_WORKER_BYTES` worker bytes — edge upgraded
+    /// but no worker behind it (Cause B: dead route / path mismatch).
+    DeadRoute,
+}
 
 /// A single WebSocket-upgrade probe verdict for one (ip, port).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -45,6 +78,10 @@ pub struct WsProbe {
     pub worker_bytes: u32,
     /// Failure stage if the probe did not pass ("tls" | "ws" | "route").
     pub failure_stage: Option<String>,
+    /// Enriched, bucketed failure reason (the phase-2 resurrection diagnostic).
+    pub failure_reason: Option<WsFailureReason>,
+    /// Which SNI this probe was sent under (worker hostname vs generic CF).
+    pub sni_used: String,
 }
 
 /// Derived target for a WS probe: what to connect to and what to request.
@@ -272,7 +309,27 @@ impl ServerCertVerifier for LenientVerifier {
     }
 }
 
+/// Build a lenient rustls ClientConfig for a given browser fingerprint profile.
+/// The verifier is intentionally lenient because we front a Cloudflare edge and
+/// the worker hostname is not the certificate owner (`allowInsecure`).
+fn lenient_client_config(
+    profile: crate::probe_jitter::ClientHelloProfile,
+) -> Result<rustls::ClientConfig, CFError> {
+    let provider = crate::probe_jitter::provider_for_profile(profile);
+    Ok(
+        rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| CFError::new("TLS config", format!("{e}"), ""))?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(LenientVerifier))
+            .with_no_client_auth(),
+    )
+}
+
 /// Connect a TLS stream to `ip:port` using `sni` as the SNI hostname.
+/// The ClientHello is rotated through browser fingerprint profiles (random per
+/// connection) so the scanner's TLS signature is not static — the phase-2
+/// resurrection fix for DPI blacklisting a fixed ClientHello.
 pub async fn tls_connect(
     ip: &str,
     port: u16,
@@ -287,14 +344,9 @@ pub async fn tls_connect(
         .map_err(|_| CFError::new("Probe timeout", "TCP connect timed out.", ""))?
         .map_err(|e| CFError::new("Probe error", format!("TCP connect failed: {e}"), ""))?;
 
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| CFError::new("TLS config", format!("{e}"), ""))?
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::new(LenientVerifier))
-    .with_no_client_auth();
+    let profile =
+        crate::probe_jitter::pick_client_hello_profile(&mut rand::rngs::StdRng::from_entropy());
+    let config = lenient_client_config(profile)?;
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from(sni.to_string())
         .map_err(|_| CFError::new("Invalid SNI", "SNI must be a valid DNS name.", ""))?;
@@ -310,10 +362,18 @@ pub async fn tls_connect(
 
 /// Perform the TLS + RFC 6455 WebSocket upgrade probe.
 ///
-/// Sends a minimal handshake request to `sni`'s `path` at `ip:port`, asserts a
-/// `101 Switching Protocols` response line, and counts the bytes received after
-/// the upgrade. Returns the detailed verdict.
-pub async fn probe_ws(ip: &str, port: u16, sni: &str, path: &str, timeout_ms: u64) -> WsProbe {
+/// `tls_sni` is the SNI used for the TLS handshake; `host` is the `Host`
+/// header value in the WS request. Normally they are identical (the worker's
+/// hostname). For the GenericCf SNI strategy they differ: the network sees a
+/// benign CF-domain SNI while the Host header still routes to the worker.
+pub async fn probe_ws_ex(
+    ip: &str,
+    port: u16,
+    tls_sni: &str,
+    host: &str,
+    path: &str,
+    timeout_ms: u64,
+) -> WsProbe {
     let started = Instant::now();
     let mut probe = WsProbe {
         port,
@@ -322,14 +382,23 @@ pub async fn probe_ws(ip: &str, port: u16, sni: &str, path: &str, timeout_ms: u6
         rtt_ms: 0,
         worker_bytes: 0,
         failure_stage: None,
+        failure_reason: None,
+        sni_used: tls_sni.to_string(),
     };
 
-    let mut stream = match tls_connect(ip, port, sni, timeout_ms).await {
+    let mut stream = match tls_connect(ip, port, tls_sni, timeout_ms).await {
         Ok(s) => s,
         Err(e) => {
             probe.failure_stage = Some("tls".into());
+            // Bucket the failure at the catch point — this is how we tell
+            // Cause A (DPI TLS reset) from a plain connect/network failure.
+            probe.failure_reason = Some(match e.title.as_str() {
+                "Probe timeout" => WsFailureReason::ConnectTimeout,
+                "Probe error" => WsFailureReason::ConnectFailed,
+                "TLS timeout" => WsFailureReason::TlsTimeout,
+                _ => WsFailureReason::TlsAlert,
+            });
             probe.rtt_ms = started.elapsed().as_millis() as u32;
-            let _ = e;
             return probe;
         }
     };
@@ -346,24 +415,24 @@ pub async fn probe_ws(ip: &str, port: u16, sni: &str, path: &str, timeout_ms: u6
 
     let path = if path.is_empty() { "/" } else { path };
     let base_req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {sni}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
     // Anti-DPI: randomize the wire image per probe (shuffle header order +
     // random header-name casing). A fixed request gets blacklisted within
     // seconds on censored networks (SlipNet-style).
     let mut rng = rand::rngs::StdRng::from_entropy();
     let req = crate::probe_jitter::randomize_ws_request(&mut rng, base_req.as_bytes());
-
-    if let Err(e) =
-        tokio::time::timeout(Duration::from_millis(timeout_ms), stream.write_all(&req)).await
+    if tokio::time::timeout(Duration::from_millis(timeout_ms), stream.write_all(&req))
+        .await
+        .is_err()
     {
         probe.failure_stage = Some("ws".into());
-        let _ = e;
+        probe.failure_reason = Some(WsFailureReason::WriteFailed);
         return probe;
     }
-    if let Err(e) = stream.flush().await {
+    if stream.flush().await.is_err() {
         probe.failure_stage = Some("ws".into());
-        let _ = e;
+        probe.failure_reason = Some(WsFailureReason::WriteFailed);
         return probe;
     }
 
@@ -399,6 +468,7 @@ pub async fn probe_ws(ip: &str, port: u16, sni: &str, path: &str, timeout_ms: u6
     if !headers_done {
         // No complete HTTP response arrived.
         probe.failure_stage = Some("ws".into());
+        probe.failure_reason = Some(WsFailureReason::ResponseIncomplete);
         return probe;
     }
 
@@ -413,8 +483,9 @@ pub async fn probe_ws(ip: &str, port: u16, sni: &str, path: &str, timeout_ms: u6
         probe.worker_bytes = body_bytes;
         if probe.worker_bytes < MIN_WORKER_BYTES {
             // Edge upgraded but closed before sending a real worker payload:
-            // dead route (no worker behind the edge).
+            // dead route (no worker behind the edge) — Cause B.
             probe.failure_stage = Some("Ws_NoRoute".into());
+            probe.failure_reason = Some(WsFailureReason::DeadRoute);
         } else {
             let _ = read_outcome;
         }
@@ -425,23 +496,41 @@ pub async fn probe_ws(ip: &str, port: u16, sni: &str, path: &str, timeout_ms: u6
             .and_then(|s| s.parse::<u16>().ok());
         probe.status = status;
         probe.failure_stage = Some("ws".into());
+        probe.failure_reason = Some(WsFailureReason::HttpStatus(status.unwrap_or(0)));
     }
 
     probe
 }
 
-/// Sweep `ports` in order, early-exiting on the first `101` hit. Returns
-/// per-port results up to and including the first accepted end.
-async fn probe_ports(
+/// Backward-compatible probe: single SNI used for both TLS and the Host header.
+pub async fn probe_ws(ip: &str, port: u16, sni: &str, path: &str, timeout_ms: u64) -> WsProbe {
+    probe_ws_ex(ip, port, sni, sni, path, timeout_ms).await
+}
+
+/// SNI strategies for the phase-2 probe (DeepSeek resurrection spec): try the
+/// worker hostname first; if DPI blocks that SNI, fall back to a benign generic
+/// Cloudflare domain while keeping the worker hostname as the Host header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SniStrategy {
+    /// Use only the worker hostname for both SNI and Host.
+    WorkerOnly,
+    /// Try the worker hostname first, then a generic CF domain SNI.
+    WorkerThenGenericCf,
+}
+
+/// Sweep `ports` with a fixed (tls_sni, host) pair, early-exiting on the first
+/// accepted `101`. Returns per-port results up to and including the first hit.
+async fn probe_ports_sni(
     ip: &str,
-    sni: &str,
+    tls_sni: &str,
+    host: &str,
     path: &str,
     timeout_ms: u64,
     ports: &[u16],
 ) -> Vec<WsProbe> {
     let mut results = Vec::new();
     for &port in ports {
-        let r = probe_ws(ip, port, sni, path, timeout_ms).await;
+        let r = probe_ws_ex(ip, port, tls_sni, host, path, timeout_ms).await;
         let hit = r.status == Some(101) && r.worker_bytes >= MIN_WORKER_BYTES;
         results.push(r);
         if hit {
@@ -451,10 +540,79 @@ async fn probe_ports(
     results
 }
 
-/// Sweep a candidate edge across all `ALT_PORTS`, early-exiting on the first
-/// `101`. Returns per-port results.
+/// Phase-2 fallback over an explicit port list: try `worker_sni` first; if
+/// no edge accepts the WS gate under it, retry under `generic_cf_sni` (which
+/// bypasses DPI that blocks `*.workers.dev` SNIs) while keeping `host` as the
+/// Host header. Both passes' probes are returned (worker pass first) so the
+/// phase-2 histogram captures the worker-pass TLS alerts too — that is the
+/// whole point of the resurrection diagnosis. `probe_all_alt_ports_sni` calls
+/// this with ALT_PORTS.
+pub async fn probe_ports_sni_fallback(
+    ip: &str,
+    worker_sni: &str,
+    generic_cf_sni: &str,
+    host: &str,
+    path: &str,
+    timeout_ms: u64,
+    ports: &[u16],
+) -> Vec<WsProbe> {
+    let worker_results = probe_ports_sni(ip, worker_sni, host, path, timeout_ms, ports).await;
+    let any_hit = worker_results
+        .iter()
+        .any(|r| r.status == Some(101) && r.worker_bytes >= MIN_WORKER_BYTES);
+    if any_hit {
+        return worker_results;
+    }
+    let generic_results = probe_ports_sni(ip, generic_cf_sni, host, path, timeout_ms, ports).await;
+    let mut combined = worker_results;
+    combined.extend(generic_results);
+    combined
+}
+
+/// Phase-2 probe across all alt ports with SNI-variant fallback.
+pub async fn probe_all_alt_ports_sni(
+    ip: &str,
+    worker_sni: &str,
+    generic_cf_sni: &str,
+    host: &str,
+    path: &str,
+    timeout_ms: u64,
+) -> Vec<WsProbe> {
+    probe_ports_sni_fallback(
+        ip,
+        worker_sni,
+        generic_cf_sni,
+        host,
+        path,
+        timeout_ms,
+        ALT_PORTS,
+    )
+    .await
+}
+
+/// Backward-compatible single-SNI sweep across all alt ports.
 pub async fn probe_all_alt_ports(ip: &str, sni: &str, path: &str, timeout_ms: u64) -> Vec<WsProbe> {
-    probe_ports(ip, sni, path, timeout_ms, ALT_PORTS).await
+    probe_all_alt_ports_sni(ip, sni, sni, sni, path, timeout_ms).await
+}
+
+/// Convenience: try SNI variants according to a [`SniStrategy`].
+pub async fn probe_with_sni_strategy(
+    ip: &str,
+    worker_sni: &str,
+    generic_cf_sni: &str,
+    host: &str,
+    path: &str,
+    timeout_ms: u64,
+    strategy: SniStrategy,
+) -> Vec<WsProbe> {
+    match strategy {
+        SniStrategy::WorkerOnly => {
+            probe_ports_sni(ip, worker_sni, host, path, timeout_ms, ALT_PORTS).await
+        }
+        SniStrategy::WorkerThenGenericCf => {
+            probe_all_alt_ports_sni(ip, worker_sni, generic_cf_sni, host, path, timeout_ms).await
+        }
+    }
 }
 
 /// The TCP fast-fail probe (SlipNet style). A tunnel with RTT above this
@@ -578,36 +736,86 @@ mod tests {
         }
     }
 
+    /// Gate the TLS handshake on the requested SNI. `None` accepts any SNI;
+    /// `Some(s)` only completes the handshake when the client's SNI equals
+    /// `s` (otherwise the handshake fails → the client records a TLS alert).
+    #[derive(Debug)]
+    struct SniGateResolver {
+        required: Option<String>,
+        certified_key: Arc<rustls::sign::CertifiedKey>,
+    }
+
+    impl rustls::server::ResolvesServerCert for SniGateResolver {
+        fn resolve(
+            &self,
+            hello: rustls::server::ClientHello,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            match &self.required {
+                None => Some(self.certified_key.clone()),
+                Some(req) if hello.server_name() == Some(req.as_str()) => {
+                    Some(self.certified_key.clone())
+                }
+                _ => None,
+            }
+        }
+    }
+
     /// Spawn a mock TLS server on an ephemeral loopback port.
     /// `mode` controls the response: "accept" → 101 + payload,
-    /// "200" → 200, "404" → 404, "accept_empty" → 101 without payload.
-    async fn start_mock_server(mode: &str) -> u16 {
+    /// "200" → 200, "404" → 404, "403" → 403, "421" → 421,
+    /// "accept_empty" → 101 without payload, "reset" → drop the socket
+    /// before TLS completes (simulates a connection reset / DPI interference).
+    /// `require_sni` optionally gates the handshake on a specific SNI.
+    async fn start_mock_server_gated(mode: &str, require_sni: Option<&str>) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let mode = mode.to_string();
+        let require_sni = require_sni.map(|s| s.to_string());
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let mode = mode.clone();
+                let req = require_sni.clone();
                 tokio::spawn(async move {
-                    handle_tls_client(tcp, &mode).await;
+                    handle_tls_client_gated(tcp, &mode, req.as_deref()).await;
                 });
             }
         });
         port
     }
 
-    async fn handle_tls_client(tcp: tokio::net::TcpStream, mode: &str) {
+    async fn start_mock_server(mode: &str) -> u16 {
+        start_mock_server_gated(mode, None).await
+    }
+
+    async fn handle_tls_client_gated(
+        tcp: tokio::net::TcpStream,
+        mode: &str,
+        require_sni: Option<&str>,
+    ) {
         let key = mock_cert();
+        let cert_der = rustls::pki_types::CertificateDer::from(key.cert);
         let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(key.key_pair.serialize_der().into());
+        let signing_key =
+            rustls::crypto::aws_lc_rs::sign::any_supported_type(&key_der).expect("signing key");
+        let certified_key = Arc::new(rustls::sign::CertifiedKey::new(vec![cert_der], signing_key));
+        let resolver = SniGateResolver {
+            required: require_sni.map(|s| s.to_string()),
+            certified_key,
+        };
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(vec![key.cert.into()], key_der)
-        .unwrap();
+        .with_cert_resolver(Arc::new(resolver));
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        // "reset" mode: drop the raw TCP socket before TLS — simulates DPI
+        // resetting the handshake (connection reset).
+        if mode == "reset" {
+            drop(tcp);
+            return;
+        }
         let mut stream = match acceptor.accept(tcp).await {
             Ok(s) => s,
             Err(_) => return,
@@ -638,6 +846,8 @@ mod tests {
             }
             "200" => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
             "404" => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string(),
+            "403" => "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_string(),
+            "421" => "HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\n\r\n".to_string(),
             "accept_empty" => concat!(
                 "HTTP/1.1 101 Switching Protocols\r\n",
                 "Upgrade: websocket\r\n",
@@ -752,7 +962,15 @@ mod tests {
     async fn test_probe_ports_returns_per_port() {
         let p200 = start_mock_server("200").await;
         let p404 = start_mock_server("404").await;
-        let results = probe_ports("127.0.0.1", "mock.test", "/ws", 5000, &[p200, p404]).await;
+        let results = probe_ports_sni(
+            "127.0.0.1",
+            "mock.test",
+            "mock.test",
+            "/ws",
+            5000,
+            &[p200, p404],
+        )
+        .await;
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, Some(200));
         assert_eq!(results[1].status, Some(404));
@@ -762,7 +980,15 @@ mod tests {
     async fn test_probe_ports_early_exits_on_first_101() {
         let p101 = start_mock_server("accept").await;
         let p200 = start_mock_server("200").await;
-        let results = probe_ports("127.0.0.1", "mock.test", "/ws", 5000, &[p101, p200]).await;
+        let results = probe_ports_sni(
+            "127.0.0.1",
+            "mock.test",
+            "mock.test",
+            "/ws",
+            5000,
+            &[p101, p200],
+        )
+        .await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, Some(101));
     }
@@ -875,5 +1101,96 @@ mod tests {
             let q = probe_fast_any_port("127.0.0.1", 3000).await;
             assert!(q.passed, "expected alt port {alt_port} to be reachable");
         }
+    }
+
+    // ── Phase-2 resurrection tests (2026-11) ──
+    // Each failure at the catch point must be bucketed into a WsFailureReason
+    // so the histogram can tell Cause A (DPI TLS reset) from Cause B (dead
+    // worker route) in one run — DeepSeek's phase2 resurrection spec.
+
+    #[tokio::test]
+    async fn test_ws_probe_records_http_403() {
+        let p = start_mock_server("403").await;
+        let r = probe_ws("127.0.0.1", p, "mock.test", "/ws", 5000).await;
+        assert_eq!(r.status, Some(403));
+        assert_eq!(r.failure_reason, Some(WsFailureReason::HttpStatus(403)));
+        assert_eq!(r.sni_used, "mock.test");
+    }
+
+    #[tokio::test]
+    async fn test_ws_probe_records_http_421() {
+        let p = start_mock_server("421").await;
+        let r = probe_ws("127.0.0.1", p, "mock.test", "/ws", 5000).await;
+        assert_eq!(r.status, Some(421));
+        assert_eq!(r.failure_reason, Some(WsFailureReason::HttpStatus(421)));
+    }
+
+    #[tokio::test]
+    async fn test_ws_probe_records_upgrade_missing_on_200() {
+        let p = start_mock_server("200").await;
+        let r = probe_ws("127.0.0.1", p, "mock.test", "/ws", 5000).await;
+        assert_eq!(r.status, Some(200));
+        assert_eq!(r.failure_reason, Some(WsFailureReason::HttpStatus(200)));
+        assert_eq!(r.failure_stage.as_deref(), Some("ws"));
+    }
+
+    #[tokio::test]
+    async fn test_ws_probe_records_tls_alert_on_connection_reset() {
+        // The "reset" mock drops the socket before TLS completes — this is the
+        // DPI signature (Cause A). It must bucket to TlsAlert, not a WS-stage
+        // reason, so the histogram separates it from dead-route causes.
+        let p = start_mock_server("reset").await;
+        let r = probe_ws("127.0.0.1", p, "mock.test", "/ws", 2000).await;
+        assert!(!r.tls_ok);
+        assert_eq!(r.failure_reason, Some(WsFailureReason::TlsAlert));
+        assert_eq!(r.failure_stage.as_deref(), Some("tls"));
+    }
+
+    #[tokio::test]
+    async fn test_ws_probe_records_dead_route() {
+        let p = start_mock_server("accept_empty").await;
+        let r = probe_ws("127.0.0.1", p, "mock.test", "/ws", 5000).await;
+        assert_eq!(r.status, Some(101));
+        assert_eq!(r.failure_reason, Some(WsFailureReason::DeadRoute));
+        assert_eq!(r.failure_stage.as_deref(), Some("Ws_NoRoute"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_ws_multi_sni_tries_worker_first() {
+        // A mock that only completes the handshake when the SNI is the worker
+        // hostname. Probing with the worker SNI must hit immediately, so the
+        // generic-CF fallback is never reached.
+        let p = start_mock_server_gated("accept", Some("worker.test")).await;
+        let results =
+            probe_ports_sni("127.0.0.1", "worker.test", "worker.test", "/ws", 5000, &[p]).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, Some(101));
+        assert_eq!(results[0].sni_used, "worker.test");
+    }
+
+    #[tokio::test]
+    async fn test_probe_ws_multi_sni_falls_back_to_generic_cf() {
+        // The mock only accepts the *generic* CF SNI. The worker-SNI pass
+        // fails (handshake rejected), so the fallback must retry under the
+        // generic CF SNI — proving the GenericCf bypass.
+        let p = start_mock_server_gated("accept", Some("generic.cloudflare.com")).await;
+        let results = probe_ports_sni_fallback(
+            "127.0.0.1",
+            "worker.test",
+            "generic.cloudflare.com",
+            "worker.test",
+            "/ws",
+            5000,
+            &[p],
+        )
+        .await;
+        assert_eq!(results.len(), 2, "worker pass + generic fallback pass");
+        // The worker pass (first) must have failed at TLS.
+        assert!(!results[0].tls_ok);
+        assert_eq!(results[0].failure_reason, Some(WsFailureReason::TlsAlert));
+        // The fallback pass must have found the worker under the generic SNI.
+        assert_eq!(results[1].status, Some(101));
+        assert!(results[1].worker_bytes >= MIN_WORKER_BYTES);
+        assert_eq!(results[1].sni_used, "generic.cloudflare.com");
     }
 }

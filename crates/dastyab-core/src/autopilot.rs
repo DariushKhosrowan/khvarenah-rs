@@ -232,7 +232,18 @@ async fn discover_native(
                 let sni = sni.to_string();
                 let path = path.to_string();
                 Box::pin(async move {
-                    crate::health::probe_all_alt_ports(&ip, &sni, &path, ws_timeout_ms).await
+                    // SNI-variant fallback: try the worker hostname first; if
+                    // DPI blocks that SNI, retry under a benign generic CF
+                    // domain (still routing the Host header to the worker).
+                    crate::health::probe_all_alt_ports_sni(
+                        &ip,
+                        &sni,
+                        crate::health::GENERIC_CF_SNI,
+                        &sni,
+                        &path,
+                        ws_timeout_ms,
+                    )
+                    .await
                 })
             });
         let e2e: crate::slipscan::E2eFn =

@@ -773,7 +773,7 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
             println!("{}", summary.note);
             Ok(())
         }
-        crate::AutopilotAction::Health { connect_ip } => {
+        crate::AutopilotAction::Health { connect_ip, verbose } => {
             let vless = dastyab_core::autopilot::base_vless(profile)?;
             let target = dastyab_core::health::derive_ws_target(&vless);
             let host = target.sni.clone();
@@ -815,6 +815,47 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                         dastyab_core::diagnose::recommended_action(cause)
                             .label(dastyab_core::diagnose::Locale::En)
                     );
+                }
+            }
+            // `--verbose`: dump the last scan's phase-2 failure histogram so
+            // the A-vs-B question is answerable in one command. TlsAlert
+            // dominant → DPI resetting the static ClientHello (Cause A);
+            // DeadRoute/HttpStatus(404,421) dominant → worker route dead
+            // (Cause B, rescue territory).
+            if verbose {
+                println!("\n--- phase-2 WS-failure histogram (last scan) ---");
+                if let Some(diag) = dastyab_core::store::profiles::load_last_diagnostics(profile) {
+                    if diag.ws_failure_histogram.is_empty() {
+                        println!("  (empty — no phase-2 probes recorded yet; run a discovery cycle first)");
+                    } else {
+                        let mut rows: Vec<_> = diag.ws_failure_histogram.iter().collect();
+                        rows.sort_by(|a, b| b.1.cmp(a.1));
+                        for (reason, count) in rows {
+                            println!("  {reason:?}: {count}");
+                        }
+                        let tls_alerts = *diag
+                            .ws_failure_histogram
+                            .get(&dastyab_core::health::WsFailureReason::TlsAlert)
+                            .unwrap_or(&0);
+                        let all: u32 = diag.ws_failure_histogram.values().sum();
+                        if all > 0 {
+                            let pct = tls_alerts as f64 * 100.0 / all as f64;
+                            println!(
+                                "\n  TlsAlert share: {pct:.0}% of {} phase-2 failures",
+                                all
+                            );
+                            println!(
+                                "  Verdict: {}",
+                                if pct > 50.0 {
+                                    "DPI is resetting the TLS handshake (static ClientHello fingerprint) — TLS-layer profile variation is the lever."
+                                } else {
+                                    "The worker route is dead (path/404/421) — rescue/redeploy territory, not a network problem."
+                                }
+                            );
+                        }
+                    }
+                } else {
+                    println!("  (no last-diagnostics file for profile {profile})");
                 }
             }
             Ok(())
