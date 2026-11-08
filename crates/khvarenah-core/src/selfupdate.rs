@@ -29,7 +29,10 @@ pub struct ReleaseInfo {
 #[derive(Debug, Clone)]
 pub struct ReleaseAsset {
     pub name: String,
+    /// Public download URL (GitHub CDN; may be redirected/blocked on some networks).
     pub url: String,
+    /// API asset endpoint (api.github.com) — more reliable on restricted networks.
+    pub api_url: String,
 }
 
 /// Parse a semantic-ish version string into a comparable tuple.
@@ -55,7 +58,13 @@ pub async fn latest_release(timeout: std::time::Duration) -> Result<ReleaseInfo,
         .build()
         .map_err(|e| CFError::new("Updater error", format!("{e}"), "Internal error."))?;
 
-    let resp = client.get(RELEASE_LATEST).send().await.map_err(|e| {
+    let mut req = client.get(RELEASE_LATEST);
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        if !token.is_empty() {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+    }
+    let resp = req.send().await.map_err(|e| {
         CFError::new(
             "Updater error",
             format!("Could not reach GitHub: {e}"),
@@ -105,8 +114,13 @@ pub async fn latest_release(timeout: std::time::Duration) -> Result<ReleaseInfo,
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let api_url = a
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if !name.is_empty() {
-                assets.push(ReleaseAsset { name, url });
+                assets.push(ReleaseAsset { name, url, api_url });
             }
         }
     }
@@ -128,20 +142,41 @@ pub async fn update_available(
     Ok((available, available.then_some(rel.tag)))
 }
 
-/// Pick the asset name that matches the current platform (or None).
+/// Pick the binary asset that matches the current platform (or None).
+///
+/// Prefers the exact CLI asset name (e.g. `khvarenah-linux-amd64`) and skips
+/// the GUI, TUI, `.deb`, `.exe`, and portable-zip variants that share the same
+/// platform substring (e.g. `khvarenah-gui-linux-amd64`).
 pub fn current_platform_asset(assets: &[ReleaseAsset]) -> Option<ReleaseAsset> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let needle = "linux-amd64";
+    let exact = "khvarenah-linux-amd64";
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    let needle = "linux-arm64";
+    let exact = "khvarenah-linux-arm64";
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let needle = "macos-aarch64";
+    let exact = "khvarenah-macos-arm64";
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    let needle = "macos-x86_64";
+    let exact = "khvarenah-macos-x86_64";
     #[cfg(windows)]
-    let needle = "windows";
+    let exact = "khvarenah-windows-amd64.exe";
 
-    assets.iter().find(|a| a.name.contains(needle)).cloned()
+    // Exact match first.
+    if let Some(a) = assets.iter().find(|a| a.name == exact) {
+        return Some(a.clone());
+    }
+
+    // Fallback: platform substring, but never a gui/tui/deb/exe/portable item.
+    let needle = exact.trim_start_matches("khvarenah-");
+    assets
+        .iter()
+        .find(|a| {
+            a.name.contains(needle)
+                && !a.name.contains("gui")
+                && !a.name.contains("tui")
+                && !a.name.ends_with(".deb")
+                && !a.name.ends_with(".exe")
+                && !a.name.contains("portable")
+        })
+        .cloned()
 }
 
 /// Download and install the matching release binary into the bin directory.
@@ -165,26 +200,49 @@ pub async fn apply_update(timeout: std::time::Duration) -> Result<String, CFErro
         .build()
         .map_err(|e| CFError::new("Updater error", format!("{e}"), "Internal error."))?;
 
-    let resp = client.get(&asset.url).send().await.map_err(|e| {
-        CFError::new(
-            "Updater error",
-            format!("Download failed: {e}"),
-            "Check your network connection.",
-        )
-    })?;
-
-    if !resp.status().is_success() {
-        return Err(CFError::new(
-            "Updater error",
-            format!("Download returned HTTP {}", resp.status()),
-            "The asset may not exist.",
-        ));
+    // Prefer the API asset endpoint (api.github.com) — the CDN URL is
+    // redirected and is frequently blocked/timeout on restricted networks.
+    // Fall back to the public CDN URL if the API endpoint is unavailable.
+    let urls: [&str; 2] = [&asset.api_url, &asset.url];
+    let mut body = None;
+    for u in &urls {
+        if u.is_empty() {
+            continue;
+        }
+        let resp = if u.starts_with("https://api.github.com") {
+            let mut req = client.get(*u).header("Accept", "application/octet-stream");
+            if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+                if !token.is_empty() {
+                    req = req.header("Authorization", format!("Bearer {token}"));
+                }
+            }
+            req.send().await
+        } else {
+            client.get(*u).send().await
+        };
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                body = Some(r.bytes().await.map_err(|e| {
+                    CFError::new("Updater error", format!("{e}"), "Incomplete download.")
+                })?);
+                break;
+            }
+            Ok(r) => {
+                eprintln!("[updater] download from {u} returned HTTP {}", r.status());
+            }
+            Err(e) => {
+                eprintln!("[updater] download from {u} failed: {e}");
+            }
+        }
     }
 
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| CFError::new("Updater error", format!("{e}"), "Incomplete download."))?;
+    let body = body.ok_or_else(|| {
+        CFError::new(
+            "Updater error",
+            "All download endpoints failed.",
+            "The asset may not exist, or the network blocks GitHub downloads.",
+        )
+    })?;
 
     let dir = crate::store::mem_dir().join("bin");
     std::fs::create_dir_all(&dir)
@@ -232,10 +290,12 @@ mod tests {
             ReleaseAsset {
                 name: "khvarenah-linux-amd64".into(),
                 url: "u1".into(),
+                api_url: "api1".into(),
             },
             ReleaseAsset {
                 name: "khvarenah-linux-arm64".into(),
                 url: "u2".into(),
+                api_url: "api2".into(),
             },
         ];
         let picked = current_platform_asset(&assets);
