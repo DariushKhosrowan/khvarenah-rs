@@ -130,6 +130,20 @@ pub struct ProfileConfig {
     /// UNIX epoch seconds the strategy was last (re)learned / rotated.
     #[serde(default)]
     pub strategy_last_updated_ts: i64,
+    /// --- v2 rolling-window strategy (round 3, replaces the streak design) ---
+    /// Current strategy name ("WorkerOnly" | "GenericCfFirst"). None = unlearned.
+    #[serde(default)]
+    pub strategy_current: Option<String>,
+    /// Rolling window of recent discovery-cycle outcomes: 0=zero-verified,
+    /// 1=any-101. Newest at end, capped at STRATEGY_WINDOW (10).
+    #[serde(default)]
+    pub strategy_recent_outcomes: Vec<u8>,
+    /// Discovery cycles since the last rotation (forced-exploration counter).
+    #[serde(default)]
+    pub strategy_cycles_since_rotation: u32,
+    /// UNIX epoch seconds of the last rotation.
+    #[serde(default)]
+    pub strategy_last_rotated_ts: i64,
 }
 
 fn default_light_interval() -> u64 {
@@ -156,6 +170,10 @@ impl Default for ProfileConfig {
             preferred_phase2_strategy: None,
             strategy_zero_streak: 0,
             strategy_last_updated_ts: 0,
+            strategy_current: None,
+            strategy_recent_outcomes: Vec::new(),
+            strategy_cycles_since_rotation: 0,
+            strategy_last_rotated_ts: 0,
         }
     }
 }
@@ -544,6 +562,44 @@ pub fn commit_strategy_state(
     cfg.preferred_phase2_strategy = preferred;
     cfg.strategy_zero_streak = zero_streak;
     cfg.strategy_last_updated_ts = crate::store::now_ts() as i64;
+    save_config(id, &cfg)
+}
+
+/// --- v2 rolling-window strategy persistence ---
+///
+/// Read the current v2 strategy name (None = unlearned).
+pub fn strategy_current(id: &str) -> Option<String> {
+    load_profile(id).config.strategy_current.clone()
+}
+
+/// Read the v2 rolling outcome window (0=zero-verified, 1=any-101).
+pub fn strategy_recent_outcomes(id: &str) -> Vec<u8> {
+    load_profile(id).config.strategy_recent_outcomes.clone()
+}
+
+/// Read the number of discovery cycles since the last rotation.
+pub fn strategy_cycles_since_rotation(id: &str) -> u32 {
+    load_profile(id).config.strategy_cycles_since_rotation
+}
+
+/// Read the last-rotation epoch timestamp.
+pub fn strategy_last_rotated_ts(id: &str) -> i64 {
+    load_profile(id).config.strategy_last_rotated_ts
+}
+
+/// Persist the v2 rolling-window strategy state atomically.
+pub fn commit_strategy_state_v2(
+    id: &str,
+    current: Option<String>,
+    recent_outcomes: Vec<u8>,
+    cycles_since_rotation: u32,
+    last_rotated_ts: i64,
+) -> Result<(), CFError> {
+    let mut cfg = load_profile(id).config;
+    cfg.strategy_current = current;
+    cfg.strategy_recent_outcomes = recent_outcomes;
+    cfg.strategy_cycles_since_rotation = cycles_since_rotation;
+    cfg.strategy_last_rotated_ts = last_rotated_ts;
     save_config(id, &cfg)
 }
 

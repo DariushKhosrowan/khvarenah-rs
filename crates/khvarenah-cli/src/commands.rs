@@ -926,22 +926,32 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                     println!("  (no last-diagnostics file for profile {profile})");
                 }
             }
-            // Self-learning phase-2 SNI strategy status (the autonomy knob).
+            // Self-learning phase-2 SNI strategy status (the autonomy knob, v2
+            // rolling-window).
             if verbose {
-                let strategy = khvarenah_core::autopilot::resolve_strategy(profile);
-                let streak = khvarenah_core::store::profiles::strategy_zero_streak(profile);
-                let updated = khvarenah_core::store::profiles::strategy_last_updated_ts(profile);
-                let name = match strategy {
+                let state = khvarenah_core::autopilot::resolve_strategy_v2(profile);
+                let name = match state.current {
                     khvarenah_core::health::SniStrategy::WorkerOnly => "WorkerOnly",
                     khvarenah_core::health::SniStrategy::GenericCfFirst => "GenericCfFirst",
                     khvarenah_core::health::SniStrategy::WorkerThenGenericCf => {
                         "WorkerThenGenericCf"
                     }
                 };
-                if streak >= 3 {
-                    println!("  Strategy: {name} (streak={streak}, rotating next cycle)");
-                } else if updated > 0 {
-                    println!("  Strategy: {name} (streak={streak}, updated {updated}s epoch)");
+                let window: Vec<u8> = state.recent_outcomes.iter().map(|&w| u8::from(w)).collect();
+                let rate = khvarenah_core::autopilot::success_rate(&state);
+                let should_rotate = khvarenah_core::autopilot::should_rotate(&state);
+                let cycles_left = khvarenah_core::autopilot::STRATEGY_FORCED_ROTATION_CYCLES
+                    .saturating_sub(state.cycles_since_rotation);
+                let rotated_ts = khvarenah_core::store::profiles::strategy_last_rotated_ts(profile);
+                if should_rotate {
+                    println!("  Strategy: {name} (rotating next cycle, window={window:?})");
+                } else if let Some(r) = rate {
+                    println!(
+                        "  Strategy: {name} (window={window:?}, rate={:.0}%, next rotation in {cycles_left} cycles)",
+                        r * 100.0
+                    );
+                } else if rotated_ts > 0 {
+                    println!("  Strategy: {name} (rotated {rotated_ts}s epoch, window empty)");
                 } else {
                     println!("  Strategy: {name} (not yet learned; auto)");
                 }
