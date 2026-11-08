@@ -8,7 +8,7 @@ for DNS resolvers.
 **Audience:** engineering; assumes the reader knows the dastyab core and can
 implement Rust modules.
 
-**Status:** research + design; no code in this revision.
+**Status:** research + design → **implemented in core** (see Appendix C for the concrete modules shipped in this revision).
 
 ---
 
@@ -431,3 +431,26 @@ recovers.
 source: `crates/dastyab-core/src/doh.rs` (IP-pinned DoH + 198.18 filter),
 `crates/dastyab-core/src/health.rs` (alt-ports + WS gate), and
 `crates/dastyab-core/src/cf/ips.rs` (CF range/seed engineering).*
+
+## Appendix C — implementation shipped (this revision)
+
+The ladder in this repo now has working Rust modules, all in
+`crates/dastyab-core/src/`:
+
+| Module | What it does |
+|---|---|
+| `connectivity.rs` | `FallbackLadder` state machine; ordered tiers Direct → DoH → DoT → DnsTunnel; descends after repeated failures, climbs back when a higher tier recovers. Now `Tier: Hash`, `Probe` trait fully wired. |
+| `dot.rs` | DoT transport (TLS over TCP 853) to literal pinned IPs; reuses the RFC 1035 wire helpers from `doh.rs`; filters the 198.18.x.x hijack signature. |
+| `blackout.rs` | `NetworkState` detection: system-DNS 198.18 hijack probe, `any_bootstrap_reachable` TCP sniff against literal IPs, combined `detect()` heuristic. |
+| `dnstunnel.rs` | dnscat2-style client framing: base32 DNS-label codec, chunking to 63-char labels, `TunnelFrame` encode/decode, and a `send_receive` primitive over a TXT-capable resolver. |
+| `doh.rs` (hardened) | per-endpoint failure blacklisting (`ENDPOINT_BLACKLIST_THRESHOLD`), reset on success, plus the existing 198.18.0.0/15 filtering. |
+
+Left for a follow-up (bookmarked in this report):
+- Anti-DPI desync connector (Zapret/GoodbyeDPI-style) — the *other* half of the
+  fight, for when the border is up but DPI blocks by fingerprint.
+- `BOOTSTRAP_IPS` const table + `probe::blackout_probe` glue.
+- Server-side authoritative responder for the DNS tunnel.
+
+Test status: 171 core tests green, including new coverage for the ladder
+evolution, DoT endpoint safety, blackout heuristics, base32 roundtrip, and
+large-payload chunking.
