@@ -582,6 +582,86 @@ pub fn load_seed_endpoints(profile_id: &str, max: usize) -> Vec<String> {
     out
 }
 
+/// Path to the profile's manual "known-good IPs" seed list.
+pub fn manual_seeds_path(profile_id: &str) -> PathBuf {
+    crate::store::profiles::profile_dir(profile_id).join("manual-seeds.txt")
+}
+
+/// Parse raw pasted text into validated manual seed endpoints. Accepted forms:
+/// - `1.2.3.4`
+/// - `1.2.3.4:443`
+/// - `1.2.3.4:443  # comment` (and Python-style `#` comments on their own line)
+/// Anything that isn't a valid IPv4 (optionally with a 1-65535 port) is
+/// skipped. Returns the count of accepted seeds and the parsed list.
+pub fn parse_seeds(raw: &str) -> (usize, Vec<String>) {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Strip trailing comment.
+        let bare = match line.find("#") {
+            Some(i) => line[..i].trim(),
+            None => line,
+        };
+        // Also strip a trailing description after whitespace/`,` if present.
+        let bare = bare.split_whitespace().next().unwrap_or("").trim();
+        if bare.is_empty() {
+            continue;
+        }
+        let (ip, port) = match bare.rsplit_once(':') {
+            Some((ip, p)) => {
+                if p.chars().all(|c| c.is_ascii_digit()) {
+                    let port: u16 = match p.parse() {
+                        Ok(v) if v >= 1 => v,
+                        _ => continue,
+                    };
+                    (ip.trim(), Some(port))
+                } else {
+                    (bare, None)
+                }
+            }
+            None => (bare, None),
+        };
+        if ip.parse::<Ipv4Addr>().is_err() {
+            continue;
+        }
+        let entry = match port {
+            Some(p) => format!("{ip}:{p}"),
+            None => ip.to_string(),
+        };
+        if seen.insert(entry.clone()) {
+            out.push(entry);
+        }
+    }
+    let n = out.len();
+    (n, out)
+}
+
+/// Import validated manual seed endpoints into the profile. The raw text is
+/// parsed (invalid entries skipped) and written atomically to
+/// `manual-seeds.txt`. Returns how many valid seeds were stored.
+pub fn import_manual_seeds(profile_id: &str, raw: &str) -> Result<usize, CFError> {
+    let (n, parsed) = parse_seeds(raw);
+    let path = manual_seeds_path(profile_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CFError::new("Storage error", format!("Cannot create profile dir: {e}"), "")
+        })?;
+    }
+    // Persist as JSON so it round-trips exactly (the plain-text pitfall).
+    crate::store::write_json(&path, &parsed)?;
+    Ok(n)
+}
+
+/// Read this profile's manual seed endpoints (from `import_manual_seeds`).
+pub fn load_manual_seeds(profile_id: &str) -> Vec<String> {
+    let path = manual_seeds_path(profile_id);
+    crate::store::read_opt::<Vec<String>>(&path).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +753,50 @@ mod tests {
     fn neighbors_of_invalid_ip_returns_empty() {
         assert!(neighbors_of("not-an-ip", 24, 10).is_empty());
         assert!(neighbors_of("104.16.1.1", 31, 10).is_empty());
+    }
+
+    #[test]
+    fn parse_seeds_parses_ip_and_ip_port_and_skips_comments() {
+        let raw = "\
+# my known-good IPs
+104.16.1.1
+104.16.2.1:2053
+1.2.3.4:443  # primary
+2001:db8::1
+not-an-ip
+999.1.1.1
+1.2.3.4:99999
+104.16.3.1
+104.16.1.1";
+        let (n, parsed) = parse_seeds(raw);
+        // Valid: 104.16.1.1, 104.16.2.1:2053, 1.2.3.4:443,
+        // 104.16.3.1 (with dedupe of 104.16.1.1).
+        assert_eq!(n, 4);
+        assert!(parsed.contains(&"104.16.1.1".to_string()));
+        assert!(parsed.contains(&"104.16.2.1:2053".to_string()));
+        assert!(parsed.contains(&"1.2.3.4:443".to_string()));
+        assert!(parsed.contains(&"104.16.3.1".to_string()));
+        assert_eq!(parsed.len(), 4);
+    }
+
+    #[test]
+    fn import_and_load_manual_seeds_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(dir.path().join(".dastyab"));
+        let id = "default";
+        let n = import_manual_seeds(id, "8.8.8.8\n8.8.4.4:443\n# comment\nbad").unwrap();
+        assert_eq!(n, 2);
+        let loaded = load_manual_seeds(id);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains(&"8.8.8.8".to_string()));
+        assert!(loaded.contains(&"8.8.4.4:443".to_string()));
+    }
+
+    #[test]
+    fn parse_seeds_handles_whitespace_and_empty() {
+        assert_eq!(parse_seeds("").0, 0);
+        assert_eq!(parse_seeds("   \n# only comment\n").0, 0);
+        assert_eq!(parse_seeds(" 104.16.1.1 \n\n").0, 1);
     }
 
     #[test]
