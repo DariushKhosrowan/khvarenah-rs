@@ -100,6 +100,19 @@ pub struct ProfileConfig {
     /// app restart (the product's main toggle).
     #[serde(default)]
     pub protection_enabled: bool,
+    /// Light-check cadence in seconds (WS-gate only; cheap ~200ms).
+    #[serde(default = "default_light_interval")]
+    pub light_interval_secs: u64,
+    /// Consecutive light-check failures; escalates to a deep E2E check at 2.
+    #[serde(default)]
+    pub failure_streak: u8,
+    /// UNIX epoch seconds of the last deep (E2E) check.
+    #[serde(default)]
+    pub last_deep_check: i64,
+}
+
+fn default_light_interval() -> u64 {
+    300
 }
 
 impl Default for ProfileConfig {
@@ -113,6 +126,9 @@ impl Default for ProfileConfig {
             scan_ports: "443".to_string(),
             scan_gentle: true,
             protection_enabled: false,
+            light_interval_secs: 300,
+            failure_streak: 0,
+            last_deep_check: 0,
         }
     }
 }
@@ -473,6 +489,34 @@ pub fn set_protection(id: &str, enabled: bool) -> Result<(), CFError> {
     save_config(id, &cfg)
 }
 
+/// The monitor's two-tier escalation state (light/deep cadence). DeepSeek
+/// plan: light WS-gate check every `light_interval_secs`; 2 consecutive light
+/// failures escalate to a deep E2E check; a deep failure triggers a swap.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProtectionState {
+    #[serde(default)]
+    pub failure_streak: u8,
+    #[serde(default)]
+    pub last_deep_check: i64,
+}
+
+/// Read the monitor's escalation state (defaults when absent).
+pub fn protection_state(id: &str) -> ProtectionState {
+    let cfg = load_profile(id).config;
+    ProtectionState {
+        failure_streak: cfg.failure_streak,
+        last_deep_check: cfg.last_deep_check,
+    }
+}
+
+/// Persist the monitor's escalation state.
+pub fn save_protection_state(id: &str, st: &ProtectionState) -> Result<(), CFError> {
+    let mut cfg = load_profile(id).config;
+    cfg.failure_streak = st.failure_streak;
+    cfg.last_deep_check = st.last_deep_check;
+    save_config(id, &cfg)
+}
+
 /// The last parallel-scan diagnostics (so the GUI/CLI can explain a zero
 /// result in plain language). Written by the discovery pipeline each cycle.
 pub fn save_last_diagnostics(id: &str, diag: &crate::slipscan::PipelineDiagnostics) -> Result<(), CFError> {
@@ -733,6 +777,57 @@ mod tests {
             // original moved to legacy/
             assert!(!mem_dir().join("tokens.json").exists());
             assert!(legacy_dir().join("tokens.json").exists());
+        });
+    }
+
+    #[test]
+    fn protection_state_defaults_when_absent() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let id = create_profile("work", "").unwrap();
+            let st = protection_state(&id);
+            assert_eq!(st.failure_streak, 0);
+            assert_eq!(st.last_deep_check, 0);
+        });
+    }
+
+    #[test]
+    fn protection_state_roundtrip() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let id = create_profile("work", "").unwrap();
+            let st = ProtectionState {
+                failure_streak: 2,
+                last_deep_check: 1_720_000_000,
+            };
+            save_protection_state(&id, &st).unwrap();
+            let got = protection_state(&id);
+            assert_eq!(got.failure_streak, 2);
+            assert_eq!(got.last_deep_check, 1_720_000_000);
+        });
+    }
+
+    #[test]
+    fn old_protection_state_deserializes_with_new_fields_default() {
+        with_home(|| {
+            ensure_mem_dir().unwrap();
+            let id = create_profile("work", "").unwrap();
+            // Simulate a profile written by an older version: config has only
+            // protection_enabled (no streak/deep fields). Loading must default
+            // the new fields instead of failing.
+            let mut cfg = load_profile(&id).config;
+            cfg.protection_enabled = true;
+            // Strip the new fields by serializing the old shape.
+            let old_json = serde_json::json!({
+                "active_account": cfg.active_account,
+                "protection_enabled": true,
+            });
+            write_json(&profile_dir(&id).join("config.json"), &old_json).unwrap();
+            let p = load_profile(&id);
+            assert!(p.config.protection_enabled);
+            assert_eq!(p.config.failure_streak, 0);
+            assert_eq!(p.config.last_deep_check, 0);
+            assert_eq!(p.config.light_interval_secs, 300);
         });
     }
 }

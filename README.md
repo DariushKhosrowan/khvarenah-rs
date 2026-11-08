@@ -27,6 +27,13 @@ Khvarenah turns a single **Cloudflare API token** into a complete, self-hosted
   stealth pacing and per-deploy byte-fingerprint humanization).
 - **Scan** for clean, fast Cloudflare IPs (via SenPaiScanner) that actually
   work with your configuration.
+- **Autopilot / Protection** — one toggle: the app deploys, finds the best
+  clean IP (SlipNet-style two-phase streaming scan + E2E tunnel gate), exports
+  vless configs, and **periodically monitors** them, auto-replacing dead
+  fronts. A **step-0 worker-health gate** checks your worker is alive before
+  any scan runs — so `khvarenah autopilot health` is the check to run first
+  if a scan ever finds zero clean IPs (a suspended CF account, error 9109,
+  or a dead route cannot be fixed by scanning).
 - **Generate** client configs for **v2rayN / v2rayNG**, **sing-box**, and
   **Clash / Clash.Meta** in one command.
 - **Manage** your Cloudflare account: DNS records, zones, worker routes,
