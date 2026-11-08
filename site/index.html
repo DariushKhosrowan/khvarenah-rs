@@ -7,18 +7,20 @@
   <link rel="manifest" href="site.webmanifest" />
 
   <!-- ===================== SEO: Primary ===================== -->
-  <title>DastYab — Cloudflare Workers VLESS VPN Console (Rust)</title>
-  <meta name="description" content="DastYab (دستیاب) is a Rust-powered Cloudflare Workers VLESS VPN console: deploy workers, scan clean IPs, and generate v2rayN, sing-box & Clash configs from a single static binary." />
-  <meta name="keywords" content="cloudflare workers, vless, vpn, rust, clean ip, senpaiscanner, v2rayn, sing-box, clash, proxy, cloudflare, iran, dastyab, dastyab" />
+  <title>DastYab — Cloudflare Workers VLESS VPN Console (Rust) | Dariush Khosrowan</title>
+  <meta name="description" content="DastYab (دستیاب) is a Rust-powered Cloudflare Workers VLESS VPN console: deploy workers, scan clean IPs, and generate v2rayN, sing-box & Clash configs from a single static binary. Built by Dariush Khosrowan — visit https://khosrowan.ir" />
+  <meta name="keywords" content="cloudflare workers, vless, vpn, rust, clean ip, senpaiscanner, v2rayn, sing-box, clash, proxy, cloudflare, iran, dastyab, dastyab, khosrowan, dariush khosrowan" />
   <meta name="author" content="Dariush Khosrowan" />
   <meta name="robots" content="index, follow" />
   <meta name="theme-color" content="#0a0806" />
   <link rel="canonical" href="https://dastyab.dev/" />
+  <meta name="referrer" content="origin" />
+  <meta name="twitter:site" content="@khosrowan" />
 
   <!-- ===================== SEO: Open Graph ===================== -->
   <meta property="og:type" content="website" />
-  <meta property="og:title" content="DastYab — Cloudflare Workers VLESS VPN Console (Rust)" />
-  <meta property="og:description" content="A single static Rust binary to deploy Cloudflare Workers, scan clean IPs, and export v2rayN / sing-box / Clash configs." />
+  <meta property="og:title" content="DastYab — Cloudflare Workers VLESS VPN Console (Rust) | Dariush Khosrowan" />
+  <meta property="og:description" content="A single static Rust binary to deploy Cloudflare Workers, scan clean IPs, and export v2rayN / sing-box / Clash configs. By Dariush Khosrowan — main website https://khosrowan.ir" />
   <meta property="og:url" content="https://dastyab.dev/" />
   <meta property="og:site_name" content="DastYab" />
   <meta property="og:locale" content="en_US" />
@@ -67,7 +69,32 @@
     "publisher": {
       "@type": "Organization",
       "name": "Dariush Khosrowan",
-      "url": "https://github.com/DariushKhosrowan"
+      "url": "https://khosrowan.ir",
+      "sameAs": [
+        "https://github.com/DariushKhosrowan",
+        "https://khosrowan.ir"
+      ]
+    },
+    "author": {
+      "@type": "Person",
+      "name": "Dariush Khosrowan",
+      "url": "https://khosrowan.ir",
+      "sameAs": "https://github.com/DariushKhosrowan"
+    }
+  }
+  </script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Organization",
+    "name": "Dariush Khosrowan",
+    "url": "https://khosrowan.ir",
+    "logo": "https://khosrowan.ir/favicon.svg",
+    "sameAs": ["https://github.com/DariushKhosrowan"],
+    "owns": {
+      "@type": "SoftwareApplication",
+      "name": "DastYab",
+      "url": "https://dastyab.dev/"
     }
   }
   </script>
@@ -98,6 +125,17 @@
     }
     a { color: var(--gold); text-decoration: none; }
     a:hover { color: #eccf63; }
+
+    /* Announcement banner */
+    .announce {
+      background: linear-gradient(90deg, #1a1408, #2a200c);
+      border-bottom: 1px solid rgba(212,175,55,.25);
+      text-align: center;
+      padding: 10px 20px;
+      font-size: .92rem;
+    }
+    .announce a { font-weight: 700; }
+    .announce .dot { color: var(--gold); }
 
     /* Header */
     header {
@@ -204,19 +242,25 @@
 </head>
 <body>
 
-  <!-- ===================== Header ===================== -->
-  <header>
-    <div class="nav">
-      <div class="brand"><span class="gold">◆</span> DastYab</div>
-      <nav class="nav-links">
-        <a href="#download">Download</a>
-        <a href="#why">Why Rust</a>
-        <a href="#features">Features</a>
-        <a href="#quickstart">Quick start</a>
-        <a href="https://github.com/DariushKhosrowan/dastyab">GitHub</a>
-      </nav>
-    </div>
-  </header>
+<!-- ===================== Announcement banner ===================== -->
+<div class="announce">
+  <span class="dot">◆</span> A project by <a href="https://khosrowan.ir">Dariush Khosrowan</a> — visit the main website <a href="https://khosrowan.ir">khosrowan.ir</a> <span class="dot">◆</span>
+</div>
+
+<!-- ===================== Header ===================== -->
+<header>
+  <div class="nav">
+    <div class="brand"><span class="gold">◆</span> DastYab</div>
+    <nav class="nav-links">
+      <a href="#download">Download</a>
+      <a href="#why">Why Rust</a>
+      <a href="#features">Features</a>
+      <a href="#quickstart">Quick start</a>
+      <a href="https://khosrowan.ir">khosrowan.ir</a>
+      <a href="https://github.com/DariushKhosrowan/dastyab">GitHub</a>
+    </nav>
+  </div>
+</header>
 
   <main>
     <!-- ===================== Hero ===================== -->
@@ -234,6 +278,9 @@
         <a class="btn btn-ghost" href="#quickstart">Quick start</a>
         <a class="btn btn-ghost" href="https://github.com/DariushKhosrowan/dastyab">View on GitHub</a>
       </div>
+      <p class="muted" style="margin-top:26px;font-size:.9rem;">
+        By <a href="https://khosrowan.ir">Dariush Khosrowan</a> — also visit my main website <a href="https://khosrowan.ir">khosrowan.ir</a>.
+      </p>
     </section>
 
     <!-- ===================== Why Rust ===================== -->
@@ -376,8 +423,9 @@ dastyab export v2rayn  --output xray.json</code></pre>
   </main>
 
   <footer>
-    <p>DastYab — Cloudflare Workers VLESS VPN Console · MIT © Dariush Khosrowan</p>
+    <p>DastYab — Cloudflare Workers VLESS VPN Console · MIT © <a href="https://khosrowan.ir">Dariush Khosrowan</a></p>
     <p style="margin-top:8px;">
+      <a href="https://khosrowan.ir">Main website: khosrowan.ir</a> ·
       <a href="https://github.com/DariushKhosrowan/dastyab">GitHub</a> ·
       <a href="https://dastyab.dev/docs/ARCHITECTURE.md">Architecture</a> ·
       <a href="https://dastyab.dev/docs/SECURITY.md">Security</a>
