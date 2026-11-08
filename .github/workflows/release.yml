@@ -85,7 +85,7 @@ jobs:
             cp target/debian/*.deb "dist/dastyab-${BASE}.deb"
           fi
           if [ "${{ matrix.zip }}" = "true" ]; then
-            (cd target/release && zip -r -X "../../dist/dastyab-${BASE}-portable.zip" dastyab.exe dastyab-tui.exe dastyab-gui.exe >/dev/null)
+            python scripts/bundle_windows.py "${{ matrix.artifact }}"
           fi
           ls -la dist/
 
