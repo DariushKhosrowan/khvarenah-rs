@@ -77,9 +77,32 @@ resolve_latest() {
   fi
 
   base_url="${GITHUB_API}/releases/tags/${tag}"
-  url="$(fetch "$base_url" | grep -o '"browser_download_url": *"[^"]*"' | sed 's/.*"\(.*\)"/\1/' | grep "/${asset}$" | grep -v '\.deb$' | grep -v '\.exe$' | head -n1)"
-  [ -n "$url" ] || die "No ${asset} asset found in ${tag}."
-  info "Asset: $(basename "$url")"
+  asset_json="$(fetch "$base_url")"
+  # Resolve the CLI asset's API + CDN URLs. Prefer python3 for correct JSON
+  # pairing; fall back to exact-name grep (CDN only) when python3 is absent.
+  if have python3; then
+    urls="$(printf '%s\n' "$asset_json" | python3 -c '
+import json,sys
+try:
+    rel = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+want = sys.argv[1] if len(sys.argv) > 1 else ""
+for a in rel.get("assets", []):
+    if a.get("name") == want:
+        print(a.get("url", ""))
+        print(a.get("browser_download_url", ""))
+        break
+' "$asset")"
+    api_url="$(printf '%s\n' "$urls" | sed -n '1p')"
+    cdn_url="$(printf '%s\n' "$urls" | sed -n '2p')"
+  fi
+  if [ -z "${cdn_url:-}" ]; then
+    cdn_url="$(printf '%s\n' "$asset_json" | grep -o '"browser_download_url": *"[^"]*"' | sed 's/.*"\(.*\)"/\1/' | grep "/${asset}$" | grep -v '\.deb$' | grep -v '\.exe$' | head -n1)"
+  fi
+  [ -n "${api_url:-}" ] || [ -n "$cdn_url" ] || die "No ${asset} asset found in ${tag}."
+  url="${api_url:-$cdn_url}"
+  info "Asset: ${asset}"
 }
 
 # ---- SHA-256 verification -------------------------------------------------
@@ -96,12 +119,25 @@ verify_sha() { # verify_sha <file> <expected_sha> -> true/false
 
 # ---- install --------------------------------------------------------------
 do_install() {
-  name="$(basename "$url")"
+  # With the API endpoint the URL ends in the numeric asset id, not the real
+  # filename — keep the asset name for file naming + checksum lookup.
+  name="$asset"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
   say "Downloading ${name}..."
-  if have curl; then curl -fsSL -o "$tmp/$name" "$url"; else wget -qO "$tmp/$name" "$url"; fi
+  case "$url" in
+    *api.github.com*)
+      if have curl; then
+        curl -fsSL -H "Accept: application/octet-stream" -o "$tmp/$name" "$url"
+      else
+        wget -q --header="Accept: application/octet-stream" -O "$tmp/$name" "$url"
+      fi
+      ;;
+    *)
+      if have curl; then curl -fsSL -o "$tmp/$name" "$url"; else wget -qO "$tmp/$name" "$url"; fi
+      ;;
+  esac
   [ -s "$tmp/$name" ] || die "Download failed or produced an empty file."
 
   # checksum against SHA256SUMS.txt
