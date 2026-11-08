@@ -154,7 +154,8 @@ async fn discover_native(
     // Step 0 — worker-health gate (DeepSeek plan #1). If the worker is dead,
     // suspended, or path-mismatched, no scanner can find clean IPs: short-
     // circuit with a plain-language diagnosis instead of wasting a scan.
-    match crate::autopilot::probe_worker_health(&sni, None, timeout_s as u64).await {
+    let cidrs = load_ranges(params.force_refresh_ranges).await?;
+    match crate::autopilot::step0_gate(&sni, timeout_s as u64, &cidrs).await {
         crate::autopilot::WorkerHealth::Alive => {}
         other => {
             let cause = match other {
@@ -178,8 +179,6 @@ async fn discover_native(
             ));
         }
     }
-
-    let cidrs = load_ranges(params.force_refresh_ranges).await?;
 
     // Candidate generation: seeds first, then /24 neighbors, then weighted
     // sampling proportional to CIDR block size (SlipNet-style).
@@ -358,7 +357,6 @@ pub async fn probe_worker_health(
     timeout_s: u64,
 ) -> WorkerHealth {
     let timeout_ms = (timeout_s.max(1) as u64) * 1000;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let connect_addr = match connect_ip {
         Some(ip) => ip.to_string(),
@@ -393,6 +391,19 @@ pub async fn probe_worker_health(
         Ok(s) => s,
         Err(_) => return WorkerHealth::Unreachable,
     };
+
+    classify_worker_response(stream, worker_host, timeout_ms).await
+}
+
+/// Perform the TLS handshake + `GET /cdn-cgi/trace` against `worker_host` via
+/// an already-established TLS stream, and classify the response. Shared by the
+/// hostname-gate and the DNS-free CF-sample gate.
+async fn classify_worker_response(
+    mut stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    worker_host: &str,
+    timeout_ms: u64,
+) -> WorkerHealth {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let req = format!(
         "GET /cdn-cgi/trace HTTP/1.1\r\nHost: {worker_host}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nAccept: */*\r\nConnection: close\r\n\r\n"
@@ -462,6 +473,102 @@ pub fn classify_worker_health(text: &str) -> WorkerHealth {
     }
     if text.contains("HTTP/1.1") {
         WorkerHealth::Suspended { code: 500 }
+    } else {
+        WorkerHealth::Unreachable
+    }
+}
+
+/// Summary of a DNS-free worker-health sweep across a sample of Cloudflare IPs.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerHealthSample {
+    pub alive: bool,
+    pub responding_ip: Option<std::net::Ipv4Addr>,
+    pub attempted: u32,
+    pub successful: u32,
+    pub path_mismatch: u32,
+    pub suspended: u32,
+    pub unreachable: u32,
+}
+
+/// Probe the worker's health by connecting to a sample of literal Cloudflare IPs
+/// (from the known ranges) with SNI=worker_host — **no DNS anywhere in the path**.
+/// On censored networks where system DNS is hijacked, this is the only reliable
+/// way to establish that the worker is alive before scanning. Early-exits on the
+/// first 200/101.
+pub async fn probe_worker_via_cf_sample(
+    worker_host: &str,
+    ranges: &[crate::cf::ips::Cidr],
+    sample: usize,
+    timeout_s: u64,
+) -> WorkerHealthSample {
+    let mut rng = rand::rngs::StdRng::from_entropy();
+    let ips = crate::cf::ips::weighted_sample_by_cidr(ranges, sample.max(1), &mut rng);
+    probe_worker_via_ips(worker_host, &ips, 443, timeout_s).await
+}
+
+/// The core sweep loop: probe each literal IP in `ips` with SNI=worker_host,
+/// early-exiting on the first 200/101. Split out so tests can drive it with a
+/// fixed IP list and a custom port (e.g. the mock worker on loopback).
+pub async fn probe_worker_via_ips(
+    worker_host: &str,
+    ips: &[String],
+    port: u16,
+    timeout_s: u64,
+) -> WorkerHealthSample {
+    let timeout_ms = (timeout_s.max(1) as u64) * 1000;
+    let mut out = WorkerHealthSample::default();
+    for ip_str in ips {
+        out.attempted += 1;
+        let stream =
+            match crate::health::tls_connect(ip_str, port, worker_host, timeout_ms).await {
+                Ok(s) => s,
+                Err(_) => {
+                    out.unreachable += 1;
+                    continue;
+                }
+            };
+        match classify_worker_response(stream, worker_host, timeout_ms).await {
+            WorkerHealth::Alive => {
+                out.alive = true;
+                out.successful += 1;
+                out.responding_ip = ip_str.parse().ok();
+                break;
+            }
+            WorkerHealth::PathMismatch => out.path_mismatch += 1,
+            WorkerHealth::Suspended { .. } => out.suspended += 1,
+            WorkerHealth::Unreachable | WorkerHealth::NotFound => out.unreachable += 1,
+        }
+    }
+    out
+}
+
+/// The step-0 gate used by discovery. First tries the fast hostname path
+/// (`probe_worker_health`), which works when DNS is healthy; if that fails to
+/// prove the worker is alive, falls back to the DNS-free CF-sample sweep so a
+/// hijacked resolver can never block a usable scan.
+pub async fn step0_gate(
+    worker_host: &str,
+    timeout_s: u64,
+    cidrs: &[crate::cf::ips::Cidr],
+) -> WorkerHealth {
+    // Fast path: try resolving through system DNS (rejecting hijacked answers).
+    if matches!(
+        probe_worker_health(worker_host, None, timeout_s).await,
+        WorkerHealth::Alive
+    ) {
+        return WorkerHealth::Alive;
+    }
+    // Fallback: DNS-free sweep across a sample of Cloudflare IPs.
+    if cidrs.is_empty() {
+        return WorkerHealth::Unreachable;
+    }
+    let sample = probe_worker_via_cf_sample(worker_host, cidrs, 24, timeout_s).await;
+    if sample.alive {
+        WorkerHealth::Alive
+    } else if sample.suspended > 0 {
+        WorkerHealth::Suspended { code: 9109 }
+    } else if sample.path_mismatch > 0 {
+        WorkerHealth::PathMismatch
     } else {
         WorkerHealth::Unreachable
     }
@@ -1032,5 +1139,36 @@ mod tests {
             classify_worker_health("garbage bytes no http"),
             WorkerHealth::Unreachable
         );
+    }
+
+    #[cfg(feature = "dev-mock")]
+    #[tokio::test]
+    async fn probe_via_ips_marks_alive_against_mock_worker() {
+        use crate::mock_worker::{MockWorkerConfig, run_mock_worker};
+        let cfg = MockWorkerConfig {
+            listen_addr: "127.0.0.1:18443".parse().unwrap(),
+            worker_path: "/api".into(),
+            ws_payload_bytes: 4096,
+            trace_ip: "198.51.100.1".into(),
+            cert_sni: "mock.workers.dev".into(),
+        };
+        let _handle = tokio::spawn(run_mock_worker(cfg));
+        // Give the mock worker a moment to bind.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let ips = vec!["127.0.0.1".to_string()];
+        let sample = probe_worker_via_ips("mock.workers.dev", &ips, 18443, 5).await;
+        assert!(sample.alive, "mock worker should be detected alive");
+        assert_eq!(sample.successful, 1);
+        assert_eq!(sample.responding_ip, Some("127.0.0.1".parse().unwrap()));
+    }
+
+    #[cfg(feature = "dev-mock")]
+    #[tokio::test]
+    async fn probe_via_ips_reports_unreachable_when_nothing_listens() {
+        let ips = vec!["127.0.0.1".to_string()];
+        // Port 1 on loopback is effectively closed.
+        let sample = probe_worker_via_ips("mock.workers.dev", &ips, 1, 3).await;
+        assert!(!sample.alive);
+        assert!(sample.unreachable >= 1);
     }
 }

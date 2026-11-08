@@ -245,7 +245,7 @@ mod tests {
             .accept(stream)
             .await
             .expect("tls handshake");
-        let (mut reader, mut writer) = tls_stream.split();
+        let (mut reader, mut writer) = tokio::io::split(tls_stream);
         writer
             .write_all(b"GET /cdn-cgi/trace HTTP/1.1\r\nHost: mock.workers.dev\r\nConnection: close\r\n\r\n")
             .await
@@ -259,7 +259,7 @@ mod tests {
         // WS upgrade on /api gets 101 + payload
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut tls_stream = acceptor.accept(stream).await.unwrap();
-        let (mut reader, mut writer) = tls_stream.split();
+        let (mut reader, mut writer) = tokio::io::split(tls_stream);
         writer
             .write_all(b"GET /api HTTP/1.1\r\nHost: mock.workers.dev\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: aaaa\r\n\r\n")
             .await
@@ -273,7 +273,7 @@ mod tests {
         // unknown path → 404
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut tls_stream = acceptor.accept(stream).await.unwrap();
-        let (mut reader, mut writer) = tls_stream.split();
+        let (mut reader, mut writer) = tokio::io::split(tls_stream);
         writer
             .write_all(b"GET /nope HTTP/1.1\r\nHost: mock.workers.dev\r\nConnection: close\r\n\r\n")
             .await
