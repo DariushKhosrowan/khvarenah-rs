@@ -52,6 +52,7 @@ pub mod error;
 pub mod export;
 pub mod geoip;
 pub mod health;
+pub mod health_beacon;
 pub mod presets;
 pub mod probe_jitter;
 pub mod qr;
