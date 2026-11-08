@@ -29,6 +29,11 @@
 //! presets.rs   — curated deploy presets
 //! ```
 
+//! Local mock-worker harness (dev/testing). Feature-gated behind
+//! `dev-mock` so release builds don't carry it.
+#[cfg(feature = "dev-mock")]
+pub mod mock_worker;
+
 pub mod analytics;
 pub mod autopilot;
 pub mod backup;

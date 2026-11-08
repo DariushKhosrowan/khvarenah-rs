@@ -29,10 +29,11 @@ qrcode.workspace = true
 futures-util = "0.3"
 tokio-rustls = { version = "0.26", features = ["aws_lc_rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+rcgen = { version = "0.13", optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
-rcgen = "0.13"
 
 [features]
 default = []
+dev-mock = ["rcgen"]
