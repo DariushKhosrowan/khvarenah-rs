@@ -65,6 +65,11 @@ pub enum BeaconEvent {
     AccountBlocked {
         state: String,
         since: i64,
+        /// The profile the blocked account belongs to. Drives the exact
+        /// recovery command: a non-default profile needs `--profile`, so the
+        /// beacon can hand the user a copy-paste-ready, profile-specific
+        /// recovery action rather than a generic one.
+        profile: String,
         /// Whether auto-rotation across the profile's stored tokens is enabled
         /// (default on). When true, the daemon will try to self-heal before
         /// any manual step is needed.
@@ -79,6 +84,8 @@ pub enum BeaconEvent {
     /// auto-recovery learns it actually failed and must add a fresh token.
     AccountBlockedRotationExhausted {
         state: String,
+        /// The profile whose stored tokens were exhausted (see `AccountBlocked`).
+        profile: String,
         /// Number of stored tokens that were tried and failed.
         stored_tokens: usize,
     },
@@ -246,6 +253,17 @@ pub fn should_send(
     }
 }
 
+/// Build the recovery command for a blocked account, qualified with the actual
+/// profile. A non-default profile needs `--profile` so the command is directly
+/// copy-pasteable for the right profile instead of silently targeting `default`.
+fn recovery_cmd(profile: &str) -> String {
+    if profile.is_empty() || profile == "default" {
+        "khvarenah token recover <label> <token>".to_string()
+    } else {
+        format!("khvarenah --profile {profile} token recover <label> <token>")
+    }
+}
+
 /// Build the message text for a given event + language. Pure.
 pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> String {
     match (event, lang) {
@@ -300,6 +318,7 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
         (
             BeaconEvent::AccountBlocked {
                 state,
+                profile,
                 auto_rotate_enabled,
                 stored_tokens,
                 ..
@@ -311,29 +330,34 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
                     "⛔ حساب مسدود شد ({state}) — {stored_tokens} توکن ذخیره‌شده است؛ چرخش خودکار فعال است و در چند لحظه تلاش می‌کند توکن سالم جایگزین کند"
                 )
             } else if *auto_rotate_enabled {
+                let cmd = recovery_cmd(profile);
                 format!(
-                    "⛔ حساب مسدود شد ({state}) — فقط ۱ توکن ذخیره شده است؛ با «khvarenah token recover <label> <token>» توکن دوم اضافه کنید تا چرخش خودکار فعال شود"
+                    "⛔ حساب مسدود شد ({state}) — فقط ۱ توکن ذخیره شده است؛ با «{cmd}» توکن دوم اضافه کنید تا چرخش خودکار فعال شود"
                 )
             } else {
+                let cmd = recovery_cmd(profile);
                 format!(
-                    "⛔ حساب مسدود شد ({state}) — چرخش خودکار خاموش است؛ «khvarenah token recover <label> <token>» را اجرا کنید"
+                    "⛔ حساب مسدود شد ({state}) — چرخش خودکار خاموش است؛ «{cmd}» را اجرا کنید"
                 )
             }
         }
         (
             BeaconEvent::AccountBlockedRotationExhausted {
                 state,
+                profile,
                 stored_tokens,
             },
             crate::diagnose::Locale::Fa,
         ) => {
+            let cmd = recovery_cmd(profile);
             format!(
-                "⛔ حساب مسدود شد ({state}) — چرخش خودکار هر {stored_tokens} توکن ذخیره‌شده را آزمایش کرد و هیچ‌کدام تأیید نشد؛ با «khvarenah token recover <label> <token>» توکن جدید اضافه کنید"
+                "⛔ حساب مسدود شد ({state}) — چرخش خودکار هر {stored_tokens} توکن ذخیره‌شده را آزمایش کرد و هیچ‌کدام تأیید نشد؛ با «{cmd}» توکن جدید اضافه کنید"
             )
         }
         (
             BeaconEvent::AccountBlocked {
                 state,
+                profile,
                 auto_rotate_enabled,
                 stored_tokens,
                 ..
@@ -345,24 +369,28 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
                     "⛔ Account blocked ({state}) — {stored_tokens} tokens stored; auto-rotation is ON and will try to swap to a working token in moments"
                 )
             } else if *auto_rotate_enabled {
+                let cmd = recovery_cmd(profile);
                 format!(
-                    "⛔ Account blocked ({state}) — only 1 token stored; run `khvarenah token recover <label> <token>` to add a second so auto-rotation can engage"
+                    "⛔ Account blocked ({state}) — only 1 token stored; run `{cmd}` to add a second so auto-rotation can engage"
                 )
             } else {
+                let cmd = recovery_cmd(profile);
                 format!(
-                    "⛔ Account blocked ({state}) — auto-rotation is OFF; run `khvarenah token recover <label> <token>` to replace the token and auto-resume protection"
+                    "⛔ Account blocked ({state}) — auto-rotation is OFF; run `{cmd}` to replace the token and auto-resume protection"
                 )
             }
         }
         (
             BeaconEvent::AccountBlockedRotationExhausted {
                 state,
+                profile,
                 stored_tokens,
             },
             _,
         ) => {
+            let cmd = recovery_cmd(profile);
             format!(
-                "⛔ Account blocked ({state}) — auto-rotation tried all {stored_tokens} stored tokens and none verified; run `khvarenah token recover <label> <token>` to add a fresh token and auto-resume"
+                "⛔ Account blocked ({state}) — auto-rotation tried all {stored_tokens} stored tokens and none verified; run `{cmd}` to add a fresh token and auto-resume"
             )
         }
         (BeaconEvent::TokenAutoRotated { from, to }, crate::diagnose::Locale::Fa) => {
@@ -691,6 +719,7 @@ mod tests {
         let ev = BeaconEvent::AccountBlocked {
             state: "token-invalid".into(),
             since: 1234,
+            profile: "default".into(),
             auto_rotate_enabled: false,
             stored_tokens: 1,
         };
@@ -717,6 +746,7 @@ mod tests {
         let ev = BeaconEvent::AccountBlocked {
             state: "suspended".into(),
             since: 1234,
+            profile: "default".into(),
             auto_rotate_enabled: true,
             stored_tokens: 3,
         };
@@ -737,6 +767,7 @@ mod tests {
         let ev = BeaconEvent::AccountBlocked {
             state: "token-invalid".into(),
             since: 1234,
+            profile: "default".into(),
             auto_rotate_enabled: true,
             stored_tokens: 1,
         };
@@ -744,6 +775,26 @@ mod tests {
         assert!(en.contains("only 1 token"), "en={en}");
         assert!(en.contains("token recover"), "en={en}");
         assert!(en.contains("add a second"), "en={en}");
+    }
+
+    #[test]
+    fn test_format_message_account_blocked_nondefault_profile_qualifies_recovery() {
+        // A non-default profile must yield a profile-qualified recovery command
+        // so the user's copy-paste doesn't silently target `default`.
+        let ev = BeaconEvent::AccountBlocked {
+            state: "suspended".into(),
+            since: 1234,
+            profile: "backup".into(),
+            auto_rotate_enabled: false,
+            stored_tokens: 1,
+        };
+        let en = format_message(&ev, crate::diagnose::Locale::En);
+        assert!(en.contains("--profile backup"), "en={en}");
+        assert!(en.contains("token recover"), "en={en}");
+        // The bare default-profile command must NOT appear.
+        assert!(!en.contains("token recover <label> <token> `"), "en={en}");
+        let fa = format_message(&ev, crate::diagnose::Locale::Fa);
+        assert!(fa.contains("--profile backup"), "fa={fa}");
     }
 
     #[test]

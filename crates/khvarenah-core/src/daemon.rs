@@ -837,6 +837,7 @@ pub async fn daemon_tick(
                     profile,
                     &crate::remote_beacon::BeaconEvent::AccountBlockedRotationExhausted {
                         state: state.account_state.label().to_string(),
+                        profile: profile.to_string(),
                         stored_tokens,
                     },
                     crate::diagnose::Locale::En,
@@ -905,6 +906,7 @@ pub async fn daemon_tick(
                         &crate::remote_beacon::BeaconEvent::AccountBlocked {
                             state: state.account_state.label().to_string(),
                             since: crate::store::now_ts() as i64,
+                            profile: profile.to_string(),
                             auto_rotate_enabled,
                             stored_tokens,
                         },
