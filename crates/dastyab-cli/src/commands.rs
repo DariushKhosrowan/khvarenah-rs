@@ -1447,6 +1447,26 @@ async fn daemon_loop(cfg: dastyab_core::daemon::DaemonConfig) -> Result<(), CFEr
         })
         .await;
         save_daemon_state(&active_profile, &state)?;
+
+        // Profile config hot-reload (round 22): if the profile dir mtime
+        // changed since we last looked (Settings edited, token/state files
+        // updated), log a reload notice and reset the interval so the new
+        // configuration applies without a manual daemon restart. Best-effort —
+        // never fail the loop on a stat error.
+        if let Ok(changed) = dastyab_core::account_state::profile_mtime_changed(
+            &active_profile,
+            state.last_profile_mtime,
+        ) {
+            if changed {
+                daemon_log_append(
+                    &cfg.log_path,
+                    &log_line("INFO", "profile config changed — reloading settings"),
+                );
+                state.last_profile_mtime = dastyab_core::store::now_ts() as i64;
+                interval = cfg.initial_interval_secs;
+                save_daemon_state(&active_profile, &state)?;
+            }
+        }
         // Scheduled config mutation: rotate the worker signature on a schedule
         // (only when the account is active — never mutate a blocked account).
         if !state.account_state.blocks_cycle() {

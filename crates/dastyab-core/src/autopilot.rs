@@ -1091,6 +1091,7 @@ pub struct AutopilotEngine {
     interval: Duration,
     provider: Box<dyn EndpointProvider>,
     worker_probe: Box<dyn WorkerHealthProbe>,
+    account_probe: Box<dyn crate::account_state::AccountStateProbe>,
 }
 
 impl AutopilotEngine {
@@ -1104,6 +1105,7 @@ impl AutopilotEngine {
                 profile_id: profile_id.clone(),
             }),
             worker_probe: Box::new(RealWorkerHealthProbe),
+            account_probe: Box::new(crate::account_state::RealAccountStateProbe),
         }
     }
 
@@ -1136,7 +1138,16 @@ impl AutopilotEngine {
             interval,
             provider,
             worker_probe,
+            account_probe: Box::new(crate::account_state::RealAccountStateProbe),
         }
+    }
+
+    /// Test-only setter: inject a scripted account probe so the cycle-level
+    /// account gate can be asserted without hitting Cloudflare.
+    #[cfg(test)]
+    fn with_account_probe(mut self, pb: Box<dyn crate::account_state::AccountStateProbe>) -> Self {
+        self.account_probe = pb;
+        self
     }
 
     /// A discovery-param copy seeded from the ledger's last-known-good
@@ -1338,6 +1349,19 @@ impl AutopilotEngine {
         let started = std::time::Instant::now();
         // Unguarded two-phase monitor (no hard timeouts; used by foreground /
         // run_forever paths). The daemon path uses monitor_cycle_guarded.
+
+        // Account gate (round 22): skip cycles against a suspended/invalid
+        // account at the monitor level too (GUI protection, CLI run_forever).
+        let acc = self.account_probe.probe(&self.profile_id).await;
+        if let Some(label) = crate::account_state::account_gate_verdict(&acc) {
+            return Ok(CycleSummary {
+                cycle: 0,
+                alive: 0,
+                replaced: 0,
+                note: format!("account {label} — skip cycle"),
+            });
+        }
+
         let mut summary = match self.monitor_light_phase().await {
             Ok(LightOutcome::Alive(s)) => s,
             Ok(LightOutcome::NeedDeep) => self.monitor_deep_phase().await?,
@@ -1404,6 +1428,23 @@ impl AutopilotEngine {
     ) -> Result<CycleSummary, CFError> {
         let cycle_start = crate::store::now_ts() as i64;
         let started = std::time::Instant::now();
+
+        // ── Account gate (round 22) ──
+        // Never burn probe budget against a suspended/invalid account from the
+        // cycle level. The daemon already gates in daemon_tick; this makes the
+        // GUI protection and CLI tick paths safe too. Unknown is treated as
+        // proceed — the daemon's own probe/classification will surface a real
+        // blocker, and Unknown is often just "no token yet", not a ban.
+        let acc = self.account_probe.probe(&self.profile_id).await;
+        if let Some(label) = crate::account_state::account_gate_verdict(&acc) {
+            let summary = CycleSummary {
+                cycle: 0,
+                alive: 0,
+                replaced: 0,
+                note: format!("account {label} — skip cycle"),
+            };
+            return Ok(summary);
+        }
 
         // ── Phase 1: LIGHT ──
         match tokio::time::timeout(timeouts.light, self.monitor_light_phase()).await {
@@ -3177,6 +3218,39 @@ mod tests {
         crate::store::profiles::remember_vless(id, rec).unwrap();
     }
 
+    /// Scripted account probe: returns a fixed state on every probe. Used to
+    /// prove the cycle-level account gate skips scanning a suspended/invalid
+    /// account without touching Cloudflare (round 22).
+    struct ScriptedAccountProbe {
+        state: crate::account_state::AccountState,
+    }
+
+    impl crate::account_state::AccountStateProbe for ScriptedAccountProbe {
+        fn probe<'a>(
+            &'a self,
+            _profile: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::account_state::AccountState> + Send + 'a>> {
+            let state = self.state.clone();
+            Box::pin(async move { state })
+        }
+    }
+
+    /// A provider that panics if discovery is ever invoked — used to prove the
+    /// account gate short-circuits BEFORE any scanning happens (round 22).
+    struct PanicDiscoveryProvider;
+
+    impl EndpointProvider for PanicDiscoveryProvider {
+        fn discover<'a>(
+            &'a self,
+            _vless: &'a VlessProfile,
+            _params: &'a DiscoveryParams,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<CleanEndpoint>, CFError>> + Send + 'a>> {
+            Box::pin(async move {
+                panic!("discovery must not run when the account is suspended")
+            })
+        }
+    }
+
     #[tokio::test]
     async fn test_run_cycle_writes_beacon_on_success() {
         let _home = rescue_home();
@@ -3774,6 +3848,132 @@ mod tests {
             .unwrap()
             .expect("abort beacon written");
         assert_eq!(beacon.cycle_kind, crate::health_beacon::CycleKind::Monitor);
+    }
+
+    // ── Round 22: cycle-level account gate ──
+    // The daemon already gates in daemon_tick; these tests prove the monitor
+    // and run_cycle entry points ALSO skip against a suspended/invalid account,
+    // so GUI protection and CLI tick paths never burn probe budget blindly.
+
+    /// The boss's mandated TDD test: a suspended account must force the guarded
+    /// monitor to skip — return fast, never invoke discovery, and report the
+    /// skip in the summary.
+    #[tokio::test]
+    async fn test_monitor_cycle_guarded_skips_when_account_suspended() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(PanicDiscoveryProvider),
+        )
+        .with_account_probe(Box::new(ScriptedAccountProbe {
+            state: crate::account_state::AccountState::Suspended { since: 0 },
+        }));
+
+        let started = std::time::Instant::now();
+        let summary = engine
+            .monitor_cycle_guarded(crate::autopilot::MonitorTimeouts::default())
+            .await
+            .expect("skip returns a summary, not an error");
+        // Zero probe budget consumed → returns immediately (<100ms).
+        assert!(
+            started.elapsed().as_millis() < 100,
+            "account gate must return instantly, took {}ms",
+            started.elapsed().as_millis()
+        );
+        assert_eq!(summary.alive, 0);
+        assert!(summary.note.contains("suspended"), "note={}", summary.note);
+    }
+
+    /// A suspended account must skip the UNguarded monitor path too (the
+    /// foreground / run_forever entry point).
+    #[tokio::test]
+    async fn test_monitor_cycle_skips_when_account_suspended() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(PanicDiscoveryProvider),
+        )
+        .with_account_probe(Box::new(ScriptedAccountProbe {
+            state: crate::account_state::AccountState::Suspended { since: 0 },
+        }));
+
+        let summary = engine
+            .monitor_cycle()
+            .await
+            .expect("skip returns a summary");
+        assert_eq!(summary.alive, 0);
+        assert!(summary.note.contains("suspended"), "note={}", summary.note);
+    }
+
+    /// A token-invalid account must skip just like a suspension — both are
+    /// blocking states.
+    #[tokio::test]
+    async fn test_monitor_cycle_guarded_skips_when_token_invalid() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(PanicDiscoveryProvider),
+        )
+        .with_account_probe(Box::new(ScriptedAccountProbe {
+            state: crate::account_state::AccountState::TokenInvalid { since: 0 },
+        }));
+
+        let summary = engine
+            .monitor_cycle_guarded(crate::autopilot::MonitorTimeouts::default())
+            .await
+            .expect("skip returns a summary");
+        assert_eq!(summary.alive, 0);
+        assert!(summary.note.contains("token-invalid"), "note={}", summary.note);
+    }
+
+    /// When the account is ACTIVE the gate lets the cycle proceed — discovery
+    /// is reached (no panic), proving the gate is not a blanket skip.
+    #[tokio::test]
+    async fn test_monitor_cycle_guarded_proceeds_when_account_active() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+
+        // Scripted account says Active → the monitor proceeds to the light
+        // phase, which finds no live ledger and returns a summary (alive 0).
+        let provider = Box::new(ScriptedProvider {
+            result: Ok(vec![]),
+        });
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            provider,
+        )
+        .with_account_probe(Box::new(ScriptedAccountProbe {
+            state: crate::account_state::AccountState::Active,
+        }));
+
+        let summary = engine
+            .monitor_cycle_guarded(MonitorTimeouts {
+                light: std::time::Duration::from_millis(300),
+                deep: std::time::Duration::from_secs(10),
+            })
+            .await
+            .expect("active account proceeds");
+        // It ran the light phase (not a skip) — summary produced normally.
+        assert_eq!(summary.alive, 0);
+        assert!(!summary.note.contains("skip"), "note={}", summary.note);
     }
 
     // ── Round 9: step-0 worker-health short-circuit gate ──
