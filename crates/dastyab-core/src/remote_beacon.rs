@@ -575,9 +575,11 @@ mod tests {
         std::fs::create_dir_all(store::profiles::profile_dir(profile)).unwrap();
 
         // Configure + enable the beacon.
-        let mut cfg = BeaconConfig::default();
-        cfg.enabled = true;
-        cfg.chat_id_or_url = "https://hook.test".into();
+        let cfg = BeaconConfig {
+            enabled: true,
+            chat_id_or_url: "https://hook.test".into(),
+            ..Default::default()
+        };
         let mut p = store::profiles::load_profile(profile);
         p.config.beacon = Some(cfg.clone());
         store::profiles::save_profile(&p).unwrap();
@@ -615,9 +617,11 @@ mod tests {
         let profile = "flush2-test";
         std::fs::create_dir_all(store::profiles::profile_dir(profile)).unwrap();
 
-        let mut cfg = BeaconConfig::default();
-        cfg.enabled = true;
-        cfg.chat_id_or_url = "https://hook.test".into();
+        let cfg = BeaconConfig {
+            enabled: true,
+            chat_id_or_url: "https://hook.test".into(),
+            ..Default::default()
+        };
         let mut p = store::profiles::load_profile(profile);
         p.config.beacon = Some(cfg.clone());
         store::profiles::save_profile(&p).unwrap();
