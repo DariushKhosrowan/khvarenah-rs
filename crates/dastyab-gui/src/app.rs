@@ -1502,11 +1502,26 @@ impl DastYabApp {
         } else {
             String::new()
         };
+        // Live blackout-resilience posture: the survival plan the daemon last
+        // computed (normal / dns-hijacked / total-blackout) and the best
+        // transport tier it reached (direct / DoH / DoT / dns-tunnel).
+        let survival = if !st.survival_plan.is_empty() {
+            format!(", survival={}", st.survival_plan)
+        } else {
+            String::new()
+        };
+        let tier = if !st.network_tier.is_empty() {
+            format!(", tier={}", st.network_tier)
+        } else {
+            String::new()
+        };
         format!(
-            "Daemon {} · last cycle {}{}",
+            "Daemon {} · last cycle {}{}{}{}",
             if running { "RUNNING" } else { "STOPPED" },
             up,
-            stre
+            stre,
+            survival,
+            tier
         )
     }
 
