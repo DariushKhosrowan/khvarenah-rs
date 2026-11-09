@@ -1134,7 +1134,15 @@ mod tests {
         let cycle = FakeCycle::new(true);
         let acct = FakeAccountProbe::default();
 
-        let sleep = daemon_tick(&profile, &mut state, &mut probe, &acct, &cycle, &mut |_l| {}).await;
+        let sleep = daemon_tick(
+            &profile,
+            &mut state,
+            &mut probe,
+            &acct,
+            &cycle,
+            &mut |_l| {},
+        )
+        .await;
         assert_eq!(sleep, DEFAULT_INITIAL_INTERVAL_SECS);
         // The automatic flush attempt ran (beacon disabled on this profile →
         // noop, but the attempt is recorded).
@@ -1142,7 +1150,15 @@ mod tests {
 
         // A second tick within the interval must NOT re-flush.
         let before = state.last_outbox_flush_ts;
-        let _sleep2 = daemon_tick(&profile, &mut state, &mut probe, &acct, &cycle, &mut |_l| {}).await;
+        let _sleep2 = daemon_tick(
+            &profile,
+            &mut state,
+            &mut probe,
+            &acct,
+            &cycle,
+            &mut |_l| {},
+        )
+        .await;
         assert_eq!(state.last_outbox_flush_ts, before);
     }
 
@@ -1160,7 +1176,15 @@ mod tests {
         let cycle = FakeCycle::new(true);
         let acct = FakeAccountProbe::default();
 
-        let sleep = daemon_tick(&profile, &mut state, &mut probe, &acct, &cycle, &mut |_l| {}).await;
+        let sleep = daemon_tick(
+            &profile,
+            &mut state,
+            &mut probe,
+            &acct,
+            &cycle,
+            &mut |_l| {},
+        )
+        .await;
         assert_eq!(sleep, 0, "must cycle immediately on restore");
         assert!(
             state.last_outbox_flush_ts > 0,
