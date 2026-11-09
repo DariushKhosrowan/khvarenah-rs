@@ -81,6 +81,9 @@ pub struct DaemonState {
     /// Last epoch-seconds we probed account status while waiting.
     #[serde(default)]
     pub last_account_poll_ts: i64,
+    /// Last blackout survival plan label (set when network goes down).
+    #[serde(default)]
+    pub survival_plan: String,
 }
 
 fn default_interval() -> u64 {
@@ -99,6 +102,7 @@ impl Default for DaemonState {
             network_was_down: false,
             account_state: crate::account_state::AccountState::Active,
             last_account_poll_ts: 0,
+            survival_plan: String::new(),
         }
     }
 }
@@ -349,10 +353,25 @@ pub async fn daemon_tick(
     let net_up = probe.liveness().await;
 
     if !net_up {
-        // c. Network down → skip cycle, don't burn rescue budget.
+        // c. Network down → skip cycle, don't burn rescue budget. Compute the
+        // blackout survival plan so the daemon / beacon knows whether a DNS
+        // tunnel is available to descend to.
+        let tunnel_ok = crate::vps_deploy::is_dns_tunnel_configured(profile);
+        let plan = crate::blackout_bridge::SurvivalPlan::from_state(
+            crate::blackout::NetworkState::TotalBlackout,
+            tunnel_ok,
+        );
         if !state.network_was_down {
-            log(&log_line("WARN", "network=down skipping"));
+            log(&log_line(
+                "WARN",
+                &format!(
+                    "network=down skipping (survival={}, tunnel={})",
+                    plan.label(),
+                    if tunnel_ok { "yes" } else { "no" }
+                ),
+            ));
             state.network_was_down = true;
+            state.survival_plan = plan.label().to_string();
         }
         return NETWORK_DOWN_SLEEP_SECS;
     }
@@ -701,6 +720,28 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// On blackout the daemon must record the survival plan (tunnel available
+    /// vs not) so the status line + beacon can report the honest ceiling.
+    #[tokio::test]
+    async fn test_daemon_records_survival_plan_on_blackout() {
+        let _home = daemon_home();
+        let profile = "default";
+        let mut state = DaemonState::default();
+        let probe = FakeProbe::new(false);
+        let cycle = FakeCycle::new(true);
+        let mut log_lines = Vec::new();
+        let acct = FakeAccountProbe::default();
+
+        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+            log_lines.push(l.to_string())
+        })
+        .await;
+        assert_eq!(sleep, NETWORK_DOWN_SLEEP_SECS);
+        // No tunnel configured for the test profile → blackout-no-tunnel plan.
+        assert_eq!(state.survival_plan, "total-blackout");
+        assert!(log_lines.iter().any(|l| l.contains("survival=total-blackout")));
     }
 
     /// The complementary safety contract: when the network comes back, the

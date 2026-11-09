@@ -39,6 +39,7 @@ pub mod analytics;
 pub mod autopilot;
 pub mod backup;
 pub mod blackout;
+pub mod blackout_bridge;
 pub mod bootstrap;
 pub mod bootstrap_diagnose;
 pub mod cf;
