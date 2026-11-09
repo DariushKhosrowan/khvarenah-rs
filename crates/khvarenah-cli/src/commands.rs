@@ -1,6 +1,7 @@
 //! CLI command implementations.
 
 use khvarenah_core::cf::{Client, DnsRecord};
+use std::path::PathBuf;
 use khvarenah_core::diagnostics::{run_diagnostics, split_endpoint};
 use khvarenah_core::export::{render, ExportFormat};
 use khvarenah_core::scanner::{scan_many, scan_once, ScanParams};
@@ -814,6 +815,19 @@ async fn update_apply() -> Result<(), CFError> {
     let msg = khvarenah_core::selfupdate::apply_update(std::time::Duration::from_secs(120)).await?;
     println!("{msg}");
     Ok(())
+}
+
+/// Expand a leading `~` to the user's home dir (for CLI path args).
+fn shell_expand(s: &str) -> String {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                return PathBuf::from(home).join(rest).display().to_string();
+            }
+        }
+    }
+    s.to_string()
 }
 
 /// Block on a future using a fresh tokio runtime.
@@ -1889,6 +1903,7 @@ fn save_beacon(profile: &str, cfg: &BeaconConfig) -> Result<(), CFError> {
 /// One-command DNS tunnel deploy to a VPS (total-blackout survival).
 async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result<(), CFError> {
     use khvarenah_core::vps_deploy as vps;
+    use khvarenah_core::vps_provision as vp;
     match action {
         crate::DnsTunnelAction::Status => {
             if vps::is_dns_tunnel_configured(profile) {
@@ -1902,6 +1917,69 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
                 println!(
                     "No DNS tunnel configured for profile '{profile}'. Run: khvarenah dns-tunnel deploy"
                 );
+            }
+            Ok(())
+        }
+        crate::DnsTunnelAction::Provision {
+            api_token,
+            location,
+            server_type,
+            domain,
+            ssh_key,
+            ssh_user,
+        } => {
+            let creds = vp::HetznerCredentials {
+                api_token,
+                location,
+                server_type,
+                server_name: "khvarenah-tunnel".into(),
+            };
+            if !creds.is_complete() {
+                return Err(CFError::new(
+                    "dns-tunnel",
+                    "missing Hetzner API token",
+                    "Provide --api-token (read/write Hetzner Cloud token).",
+                ));
+            }
+            if domain.trim().is_empty() {
+                return Err(CFError::new(
+                    "dns-tunnel",
+                    "missing --domain",
+                    "Provide the base DNS domain the tunnel server will answer for.",
+                ));
+            }
+            // Expand ~ in the ssh-key path.
+            let key_path = {
+                let raw = shell_expand(&ssh_key);
+                std::path::PathBuf::from(raw)
+            };
+            let api = vp::RealHetznerApi;
+            println!(
+                "Provisioning Hetzner VPS (location={}, type={}) ...",
+                creds.location, creds.server_type
+            );
+            let prov = vp::provision_vps(&api, &creds, &key_path, None).await?;
+            for step in &prov.completed_steps {
+                println!("  ✓ {}", step.label());
+            }
+            println!("  VPS ready at {}", prov.host);
+            // Now deploy the DNS tunnel to the fresh VPS.
+            let vps_creds = vps::VpsCredentials {
+                host: prov.host.clone(),
+                ssh_user,
+                ssh_key_path: prov.identity.private_key_path.clone(),
+                ssh_port: 22,
+            };
+            let peer = vps::RealVpsSshPeer;
+            println!("Deploying DNS tunnel to {} ...", prov.host);
+            let res = vps::deploy_dns_tunnel(&vps_creds, &peer, profile, &domain, None).await?;
+            for step in &res.completed_steps {
+                println!("  ✓ {}", step.label());
+            }
+            if res.verified {
+                println!("DNS tunnel deployed and verified. It will be used automatically when DoH/DoT fail.");
+            } else {
+                println!("Deploy completed but the tunnel service did not report active. Check the VPS.");
             }
             Ok(())
         }

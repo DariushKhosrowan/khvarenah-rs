@@ -264,6 +264,27 @@ pub enum DnsTunnelAction {
     },
     /// Show whether a DNS tunnel is deployed for the active profile.
     Status,
+    /// Provision a fresh Hetzner Cloud VPS, then deploy the DNS tunnel to it.
+    Provision {
+        /// Hetzner Cloud API token.
+        #[arg(long)]
+        api_token: String,
+        /// Hetzner datacenter/location (nbg1 | fsn1 | hel1 | ash | hil).
+        #[arg(long, default_value = "nbg1")]
+        location: String,
+        /// Hetzner server type (default cx22).
+        #[arg(long, default_value = "cx22")]
+        server_type: String,
+        /// Base DNS domain the tunnel server answers for.
+        #[arg(long)]
+        domain: String,
+        /// Path to write the generated SSH private key (default ~/.khvarenah/key-hetzner).
+        #[arg(long, default_value = "~/.khvarenah/key-hetzner")]
+        ssh_key: String,
+        /// SSH user to use on the provisioned VPS.
+        #[arg(long, default_value = "khvarenah")]
+        ssh_user: String,
+    },
     /// Probe the VPS reachability (pure TCP check, no SSH).
     Test {
         /// VPS host / IP.

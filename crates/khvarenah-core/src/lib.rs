@@ -73,6 +73,7 @@ pub mod stealth;
 pub mod store;
 pub mod vless;
 pub mod vps_deploy;
+pub mod vps_provision;
 pub mod worker;
 
 pub use blackout::NetworkState;
