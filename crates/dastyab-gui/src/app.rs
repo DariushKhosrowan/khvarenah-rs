@@ -2146,6 +2146,41 @@ impl DastYabApp {
         ui.heading(egui::RichText::new("Autonomy").color(GOLD));
         ui.label("Hands-off readiness — what still needs you, and what the app can fix itself.");
 
+        // Live daemon health snapshot (real evidence from the loop's persisted
+        // state — not just "is the process up").
+        if let Some(st) = load_daemon_state_opt(&self.profile_id) {
+            ui.add_space(4.0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut health = format!(
+                "daemon state — failures: {} · interval: {}s · tier: {}{}",
+                st.failure_streak,
+                st.current_interval_secs,
+                if st.network_tier.is_empty() {
+                    "?"
+                } else {
+                    &st.network_tier
+                },
+                if st.network_was_down {
+                    " · network-down"
+                } else {
+                    ""
+                },
+            );
+            if st.last_success_ts > 0 {
+                let age = (now - st.last_success_ts).max(0);
+                health.push_str(&format!(" · last-ok {age}s ago"));
+            } else {
+                health.push_str(" · no-ok-yet");
+            }
+            if !st.survival_plan.is_empty() {
+                health.push_str(&format!(" · plan:{}", st.survival_plan));
+            }
+            ui.colored_label(egui::Color32::from_rgb(170, 170, 190), health);
+        }
+
         let report = dastyab_core::autonomy::run_audit(p);
 
         // One-click config fixes the app can apply directly. The audit is
@@ -2246,6 +2281,11 @@ impl DastYabApp {
             );
         }
     }
+}
+
+/// Load the daemon state for a profile, returning None when absent/unreadable.
+fn load_daemon_state_opt(profile: &str) -> Option<dastyab_core::daemon::DaemonState> {
+    Some(dastyab_core::daemon::load_daemon_state(profile))
 }
 
 async fn deploy_worker(token: &str, _pid: &str) -> Result<(String, String), CFError> {
