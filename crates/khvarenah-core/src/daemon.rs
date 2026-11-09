@@ -84,6 +84,10 @@ pub struct DaemonState {
     /// Last blackout survival plan label (set when network goes down).
     #[serde(default)]
     pub survival_plan: String,
+    /// Best transport tier reachable at the last probe (label, or empty when
+    /// no tier info was reported). Filled by the ladder-backed probe.
+    #[serde(default)]
+    pub network_tier: String,
     /// Last epoch-seconds the daemon checked for an auto-update.
     #[serde(default)]
     pub last_update_check_ts: i64,
@@ -109,6 +113,7 @@ impl Default for DaemonState {
             account_state: crate::account_state::AccountState::Active,
             last_account_poll_ts: 0,
             survival_plan: String::new(),
+            network_tier: String::new(),
             last_update_check_ts: 0,
             last_backup_ts: 0,
         }
@@ -276,17 +281,60 @@ pub fn systemd_unit(binary: &Path, profile: &str) -> String {
     )
 }
 
-/// Abstraction over the network-liveness probe so the loop is testable.
-pub trait NetworkProbe: Send + Sync {
-    fn liveness(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+/// Result of a network-liveness probe: whether the network is up at all, plus
+/// the best transport tier that was reachable (None when nothing worked).
+#[derive(Debug, Clone, Default)]
+pub struct NetStatus {
+    pub up: bool,
+    pub tier: Option<crate::connectivity::Tier>,
 }
 
-/// Real probe backed by the DoH resolver.
-pub struct RealNetworkProbe(pub crate::doh::DohResolver);
+impl NetStatus {
+    pub fn tier_label(&self) -> String {
+        self.tier.map(|t| t.label().to_string()).unwrap_or_default()
+    }
+}
+
+/// Abstraction over the network-liveness probe so the loop is testable.
+pub trait NetworkProbe: Send + Sync {
+    fn liveness(&self) -> Pin<Box<dyn Future<Output = NetStatus> + Send + '_>>;
+}
+
+/// Real probe backed by the DoH resolver + the full fallback ladder. Probes
+/// every tier best-first (direct → DoH → DoT → DNS tunnel) so the daemon knows
+/// the best transport actually reachable right now.
+pub struct RealNetworkProbe {
+    pub profile: String,
+    pub resolver: crate::doh::DohResolver,
+}
+
+impl RealNetworkProbe {
+    pub fn new(profile: &str) -> Self {
+        Self {
+            profile: profile.to_string(),
+            resolver: crate::doh::DohResolver::new(),
+        }
+    }
+}
 
 impl NetworkProbe for RealNetworkProbe {
-    fn liveness(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
-        Box::pin(async move { crate::doh::probe_network_liveness(&self.0).await })
+    fn liveness(&self) -> Pin<Box<dyn Future<Output = NetStatus> + Send + '_>> {
+        let probe = crate::connectivity::RealLadderProbe {
+            profile: &self.profile,
+            resolver: &self.resolver,
+        };
+        Box::pin(async move {
+            match crate::connectivity::first_available(probe).await {
+                Some(tier) => NetStatus {
+                    up: true,
+                    tier: Some(tier),
+                },
+                None => NetStatus {
+                    up: false,
+                    tier: None,
+                },
+            }
+        })
     }
 }
 
@@ -357,8 +405,11 @@ pub async fn daemon_tick(
     cycle: &dyn CycleRunner,
     log: &mut dyn FnMut(&str),
 ) -> u64 {
-    // b. Network liveness probe.
-    let net_up = probe.liveness().await;
+    // b. Network liveness probe (full fallback ladder: direct → DoH → DoT
+    // → DNS tunnel). `status` carries the best tier actually reachable.
+    let status = probe.liveness().await;
+    let net_up = status.up;
+    state.network_tier = status.tier_label();
 
     if !net_up {
         // c. Network down → skip cycle, don't burn rescue budget. Compute the
@@ -618,22 +669,34 @@ mod tests {
     // ── daemon_tick loop behavior (established NetworkProbe/CycleRunner) ──
 
     struct FakeProbe {
-        up: bool,
+        status: NetStatus,
         calls: std::sync::atomic::AtomicUsize,
     }
     impl FakeProbe {
         fn new(up: bool) -> Self {
             Self {
-                up,
+                status: NetStatus {
+                    up,
+                    tier: Some(crate::connectivity::Tier::Direct),
+                },
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn with_tier(up: bool, tier: crate::connectivity::Tier) -> Self {
+            Self {
+                status: NetStatus {
+                    up,
+                    tier: Some(tier),
+                },
                 calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
     impl NetworkProbe for FakeProbe {
-        fn liveness(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        fn liveness(&self) -> Pin<Box<dyn Future<Output = NetStatus> + Send + '_>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let up = self.up;
-            Box::pin(async move { up })
+            let st = self.status.clone();
+            Box::pin(async move { st })
         }
     }
 
@@ -750,6 +813,34 @@ mod tests {
         // No tunnel configured for the test profile → blackout-no-tunnel plan.
         assert_eq!(state.survival_plan, "total-blackout");
         assert!(log_lines.iter().any(|l| l.contains("survival=total-blackout")));
+    }
+
+    /// The ladder-backed probe reports the best reachable tier; the daemon must
+    /// persist it so status/health can show how the app is connected (direct
+    /// vs DoH vs DoT vs tunnel) without re-probing.
+    #[tokio::test]
+    async fn test_daemon_records_reachable_tier() {
+        let _home = daemon_home();
+        let profile = "default";
+        let mut state = DaemonState::default();
+        // Network up via DoH (direct unavailable).
+        let probe = FakeProbe::with_tier(true, crate::connectivity::Tier::DoH);
+        let cycle = FakeCycle::new(true);
+        let acct = FakeAccountProbe::default();
+
+        let sleep = daemon_tick(
+            profile,
+            &mut state,
+            &probe,
+            &acct,
+            &cycle,
+            &mut |_l| {},
+        )
+        .await;
+        // Up via DoH + a healthy cycle → success, interval reset, tier recorded.
+        assert_eq!(sleep, DEFAULT_INITIAL_INTERVAL_SECS);
+        assert_eq!(cycle.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.network_tier, "doh");
     }
 
     /// The complementary safety contract: when the network comes back, the

@@ -6,6 +6,9 @@
 //! soon as a higher tier recovers. Each tier owns a probe; the app plugs in the
 //! real probes (CLI/GUI), tests plug in scripted ones.
 
+use std::future::Future;
+use std::pin::Pin;
+
 /// Ordered transport tiers, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Tier {
@@ -71,9 +74,9 @@ impl ProbeVerdict {
 }
 
 /// A probe provider. Implement this in the app for real probing; tests use a
-/// scripted mock.
+/// scripted mock. Probes are async because every real tier does network I/O.
 pub trait Probe {
-    fn probe(&self, tier: Tier) -> ProbeVerdict;
+    fn probe(&self, tier: Tier) -> Pin<Box<dyn Future<Output = ProbeVerdict> + Send + '_>>;
 }
 
 /// Default policy constants.
@@ -136,8 +139,8 @@ impl<P: Probe> FallbackLadder<P> {
 
     /// Probe the current tier. Returns true if it still works; if it has
     /// failed `max_fails` times in a row, descend one step and return false.
-    pub fn poll(&mut self) -> bool {
-        let verdict = self.probe.probe(self.current);
+    pub async fn poll(&mut self) -> bool {
+        let verdict = self.probe.probe(self.current).await;
         if verdict.ok {
             self.fails_in_row = 0;
             return true;
@@ -151,13 +154,13 @@ impl<P: Probe> FallbackLadder<P> {
 
     /// Try to climb back up: probe every strictly-higher tier, best first, and
     /// adopt the first that works. Returns Some(tier) if we improved.
-    pub fn climb_back(&mut self) -> Option<Tier> {
+    pub async fn climb_back(&mut self) -> Option<Tier> {
         let cur_rank = self.current.rank();
         for tier in TIER_ORDER.iter().copied() {
             if tier.rank() >= cur_rank {
                 break; // only strictly-higher tiers
             }
-            if self.probe.probe(tier).ok {
+            if self.probe.probe(tier).await.ok {
                 self.current = tier;
                 self.fails_in_row = 0;
                 return Some(tier);
@@ -168,11 +171,11 @@ impl<P: Probe> FallbackLadder<P> {
 
     /// Full watchdog tick: poll the current tier; if it failed and we
     /// descended, opportunistically try to climb back to a recovered tier.
-    pub fn watchdog_tick(&mut self) -> TierChange {
-        if self.poll() {
+    pub async fn watchdog_tick(&mut self) -> TierChange {
+        if self.poll().await {
             return TierChange::Stable(self.current);
         }
-        if let Some(tier) = self.climb_back() {
+        if let Some(tier) = self.climb_back().await {
             return TierChange::Recovered(tier);
         }
         TierChange::Descended(self.current)
@@ -187,6 +190,87 @@ impl<P: Probe> FallbackLadder<P> {
     }
 }
 
+/// Probe every tier best-first and return the first that currently works. This
+/// is the one-shot "what tier is reachable right now" query the daemon uses; the
+/// stateful `FallbackLadder` is for continuous watchdog operation.
+pub async fn first_available<P: Probe>(probe: P) -> Option<Tier> {
+    for tier in TIER_ORDER.iter().copied() {
+        if probe.probe(tier).await.ok {
+            return Some(tier);
+        }
+    }
+    None
+}
+
+// ── Real tier probes (used by the daemon's `RealNetworkProbe`) ──
+
+const DIRECT_PROBE_TIMEOUT_MS: u64 = 2000;
+
+/// Direct tier: a raw TCP connect to well-known anycast addresses (no DNS), so
+/// it is immune to both poisoned resolvers and HTTPS-DPI fingerprinting.
+async fn probe_direct() -> ProbeVerdict {
+    let targets: [([u8; 4], u16); 2] = [([1, 1, 1, 1], 443), ([8, 8, 8, 8], 443)];
+    let dur = std::time::Duration::from_millis(DIRECT_PROBE_TIMEOUT_MS);
+    for (ip, port) in targets {
+        let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::from(ip), port));
+        if let Ok(Ok(_)) = tokio::time::timeout(dur, tokio::net::TcpStream::connect(addr)).await
+        {
+            return ProbeVerdict::up("tcp ok");
+        }
+    }
+    ProbeVerdict::down("direct unreachable")
+}
+
+async fn probe_doh(resolver: &crate::doh::DohResolver) -> ProbeVerdict {
+    if crate::doh::probe_network_liveness(resolver).await {
+        ProbeVerdict::up("doh ok")
+    } else {
+        ProbeVerdict::down("doh failed/poisoned")
+    }
+}
+
+async fn probe_dot() -> ProbeVerdict {
+    match crate::dot::resolve("cloudflare-dns.com", crate::dot::DEFAULT_DOT_ENDPOINTS).await {
+        Ok(ips) if !ips.is_empty() => ProbeVerdict::up(format!("dot ok ({} ip)", ips.len())),
+        Ok(_) => ProbeVerdict::down("dot empty"),
+        Err(e) => ProbeVerdict::down(format!("dot: {}", e.brief())),
+    }
+}
+
+async fn probe_tunnel(profile: &str) -> ProbeVerdict {
+    if crate::vps_deploy::is_dns_tunnel_configured(profile) {
+        // Honest scope: we verify configuration presence, not a live server
+        // round-trip (that would require a live authoritative responder).
+        ProbeVerdict::up("dns-tunnel configured")
+    } else {
+        ProbeVerdict::down("no tunnel configured")
+    }
+}
+
+/// Real ladder probe wiring the four tiers to their actual transports. Borrows
+/// a profile id and the DoH resolver (both owned by the caller / daemon).
+pub struct RealLadderProbe<'a> {
+    pub profile: &'a str,
+    pub resolver: &'a crate::doh::DohResolver,
+}
+
+impl Probe for RealLadderProbe<'_> {
+    fn probe(&self, tier: Tier) -> Pin<Box<dyn Future<Output = ProbeVerdict> + Send + '_>> {
+        match tier {
+            Tier::Direct => Box::pin(async move { probe_direct().await }),
+            Tier::DoH => {
+                let resolver = self.resolver;
+                Box::pin(async move { probe_doh(resolver).await })
+            }
+            Tier::DoT => Box::pin(async move { probe_dot().await }),
+            Tier::DnsTunnel => {
+                let profile = self.profile;
+                Box::pin(async move { probe_tunnel(profile).await })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,11 +282,13 @@ mod tests {
     }
 
     impl Probe for ScriptedProbe {
-        fn probe(&self, tier: Tier) -> ProbeVerdict {
-            self.results
+        fn probe(&self, tier: Tier) -> Pin<Box<dyn Future<Output = ProbeVerdict> + Send + '_>> {
+            let r = self
+                .results
                 .get(&tier)
                 .cloned()
-                .unwrap_or_else(|| ProbeVerdict::down("not scripted"))
+                .unwrap_or_else(|| ProbeVerdict::down("not scripted"));
+            Box::pin(async move { r })
         }
     }
 
@@ -212,23 +298,23 @@ mod tests {
         assert_eq!(TIER_ORDER[3], Tier::DnsTunnel);
     }
 
-    #[test]
-    fn descends_after_repeated_failures() {
+    #[tokio::test]
+    async fn descends_after_repeated_failures() {
         let p = ScriptedProbe::default(); // everything down
         let mut ladder = FallbackLadder::new(p, Tier::Direct);
         assert_eq!(ladder.current(), Tier::Direct);
-        ladder.poll(); // fail 1 (below threshold)
+        ladder.poll().await; // fail 1 (below threshold)
         assert_eq!(ladder.current(), Tier::Direct);
-        ladder.poll(); // fail 2 -> descend
+        ladder.poll().await; // fail 2 -> descend
         assert_eq!(ladder.current(), Tier::DoH);
     }
 
-    #[test]
-    fn recovers_when_higher_tier_returns() {
+    #[tokio::test]
+    async fn recovers_when_higher_tier_returns() {
         // Drive down to DoT with an all-down probe.
         let mut ladder = FallbackLadder::new(ScriptedProbe::default(), Tier::Direct);
         for _ in 0..4 {
-            ladder.poll();
+            ladder.poll().await;
         }
         assert_eq!(ladder.current(), Tier::DoT);
 
@@ -237,16 +323,45 @@ mod tests {
         results.insert(Tier::DoH, ProbeVerdict::up("ok"));
         ladder.probe = ScriptedProbe { results };
 
-        let change = ladder.watchdog_tick();
+        let change = ladder.watchdog_tick().await;
         assert_eq!(change, TierChange::Recovered(Tier::DoH));
         assert_eq!(ladder.current(), Tier::DoH);
     }
 
-    #[test]
-    fn stable_when_current_tier_healthy() {
+    #[tokio::test]
+    async fn stable_when_current_tier_healthy() {
         let mut results = HashMap::new();
         results.insert(Tier::Direct, ProbeVerdict::up("ok"));
         let mut ladder = FallbackLadder::new(ScriptedProbe { results }, Tier::Direct);
-        assert_eq!(ladder.watchdog_tick(), TierChange::Stable(Tier::Direct));
+        assert_eq!(ladder.watchdog_tick().await, TierChange::Stable(Tier::Direct));
+    }
+
+    #[tokio::test]
+    async fn first_available_returns_best_working_tier() {
+        // Direct down, DoH up → returns DoH (not DoT even though DoT also up).
+        let mut results = HashMap::new();
+        results.insert(Tier::Direct, ProbeVerdict::down("d"));
+        results.insert(Tier::DoH, ProbeVerdict::up("ok"));
+        results.insert(Tier::DoT, ProbeVerdict::up("ok"));
+        assert_eq!(first_available(ScriptedProbe { results }).await, Some(Tier::DoH));
+
+        // All down → None.
+        assert_eq!(first_available(ScriptedProbe::default()).await, None);
+
+        // Only the tunnel works → DnsTunnel.
+        let mut results = HashMap::new();
+        results.insert(Tier::DnsTunnel, ProbeVerdict::up("ok"));
+        assert_eq!(
+            first_available(ScriptedProbe { results }).await,
+            Some(Tier::DnsTunnel)
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_probe_honors_configured_flag() {
+        // No tunnel configured for a non-existent profile → down.
+        let verdict = probe_tunnel("no-such-profile").await;
+        assert!(!verdict.ok);
+        assert!(verdict.note.contains("no tunnel"));
     }
 }

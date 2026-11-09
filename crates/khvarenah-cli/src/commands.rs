@@ -1335,7 +1335,7 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
     state.started_at = khvarenah_core::store::now_ts() as i64;
     save_daemon_state(&cfg.profile, &state)?;
 
-    let probe = RealNetworkProbe(khvarenah_core::doh::DohResolver::new());
+    let probe = RealNetworkProbe::new(&cfg.profile);
     let acct = RealAccountProbe;
     let cycle = RealCycleRunner;
     let mut interval = cfg.initial_interval_secs;
