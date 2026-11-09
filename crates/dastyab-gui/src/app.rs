@@ -109,6 +109,13 @@ pub struct DastYabApp {
     pub beacon_target: String,
     pub beacon_rate_limit: i64,
     pub beacon_note: String,
+    // blackout resilience / VPS DNS-tunnel config
+    pub vps_host: String,
+    pub vps_user: String,
+    pub vps_key: String,
+    pub vps_port: u16,
+    pub vps_domain: String,
+    pub vps_note: String,
 }
 
 /// What to do when the open dialog submits.
@@ -231,6 +238,12 @@ impl DastYabApp {
                 .map(|b| b.rate_limit_secs)
                 .unwrap_or(900),
             beacon_note: String::new(),
+            vps_host: String::new(),
+            vps_user: String::new(),
+            vps_key: "~/.ssh/id_ed25519".to_string(),
+            vps_port: 22,
+            vps_domain: String::new(),
+            vps_note: String::new(),
             view: View::DeployScan,
         };
         app.refresh_diagnostics();
@@ -341,6 +354,74 @@ impl DastYabApp {
                 }
             }
             Ok::<String, CFError>("beacon-test done".to_string())
+        });
+    }
+
+    /// Persist the VPS DNS-tunnel client config so the connectivity ladder can
+    /// use it automatically when DoH/DoT fail.
+    fn save_vps(&mut self) {
+        if self.vps_host.trim().is_empty() || self.vps_domain.trim().is_empty() {
+            self.vps_note = "Set at least the VPS host and the base DNS domain first.".to_string();
+            return;
+        }
+        let cfg = dastyab_core::vps_deploy::TunnelClientConfig {
+            host: self.vps_host.trim().to_string(),
+            base_domain: self.vps_domain.trim().to_string(),
+            session: String::new(),
+            resolver: "doh".to_string(),
+        };
+        match dastyab_core::vps_deploy::write_tunnel_client_config(&self.profile_id, &cfg) {
+            Ok(()) => self.vps_note = "VPS config saved. The DNS tunnel will be used automatically when DoH/DoT fail.".to_string(),
+            Err(e) => self.vps_note = format!("Save failed: {}", e.brief()),
+        }
+    }
+
+    /// Deploy the DNS tunnel server to the VPS via SSH (one-command, driven
+    /// from inside the app). Reports progress/errors via the bridge UiEvent.
+    fn deploy_vps_tunnel(&mut self) {
+        if self.vps_host.trim().is_empty()
+            || self.vps_user.trim().is_empty()
+            || self.vps_domain.trim().is_empty()
+        {
+            self.vps_note = "Set VPS host, SSH user, and base DNS domain first.".to_string();
+            return;
+        }
+        let creds = dastyab_core::vps_deploy::VpsCredentials {
+            host: self.vps_host.trim().to_string(),
+            ssh_user: self.vps_user.trim().to_string(),
+            ssh_key_path: std::path::PathBuf::from(&self.vps_key),
+            ssh_port: self.vps_port,
+        };
+        if !creds.is_complete() {
+            self.vps_note = "Incomplete VPS credentials.".to_string();
+            return;
+        }
+        let pid = self.profile_id.clone();
+        let domain = self.vps_domain.trim().to_string();
+        let tx = self.tx.clone();
+        self.running.push("dns-tunnel".to_string());
+        self.vps_note = "Deploying DNS tunnel on the VPS (SSH)…".to_string();
+        let tx2 = tx.clone();
+        bridge::spawn("dns-tunnel", tx.clone(), async move {
+            let peer = dastyab_core::vps_deploy::RealVpsSshPeer;
+            match dastyab_core::vps_deploy::deploy_dns_tunnel(&creds, &peer, &pid, &domain, None).await {
+                Ok(res) => {
+                    let _ = tx2.send(crate::bridge::UiEvent::Log {
+                        task: "dns-tunnel".to_string(),
+                        line: format!(
+                            "[dns-tunnel] deployed to {} (steps={}, verified={})",
+                            res.host, res.completed_steps.len(), res.verified
+                        ),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
+                        task: "dns-tunnel".to_string(),
+                        error: CFError::new("DNS tunnel", e.brief(), "Check VPS connectivity / SSH key / domain."),
+                    });
+                }
+            }
+            Ok::<String, CFError>("dns-tunnel done".to_string())
         });
     }
 
@@ -1094,6 +1175,41 @@ impl DastYabApp {
         });
         if !self.beacon_note.is_empty() {
             ui.colored_label(GOLD, &self.beacon_note);
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading(egui::RichText::new("Blackout resilience").color(GOLD));
+        ui.label("Total-blackout fallback: when direct/DoH/DoT all fail, the app");
+        ui.label("uses a DNS tunnel hosted on your own VPS. Configure it here once.");
+        ui.horizontal(|ui| {
+            ui.label("VPS host (IP):");
+            ui.add(egui::TextEdit::singleline(&mut self.vps_host).desired_width(220.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("SSH user:");
+            ui.add(egui::TextEdit::singleline(&mut self.vps_user).desired_width(120.0));
+            ui.label("SSH port:");
+            ui.add(egui::DragValue::new(&mut self.vps_port).range(1..=65535));
+        });
+        ui.horizontal(|ui| {
+            ui.label("SSH key path:");
+            ui.add(egui::TextEdit::singleline(&mut self.vps_key).desired_width(240.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Base DNS domain:");
+            ui.add(egui::TextEdit::singleline(&mut self.vps_domain).desired_width(200.0));
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Save VPS config").clicked() {
+                self.save_vps();
+            }
+            if ui.button("Deploy DNS tunnel").clicked() {
+                self.deploy_vps_tunnel();
+            }
+        });
+        if !self.vps_note.is_empty() {
+            ui.colored_label(GOLD, &self.vps_note);
         }
     }
 

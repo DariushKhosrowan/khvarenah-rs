@@ -235,6 +235,44 @@ enum Command {
         #[command(subcommand)]
         action: SniSpoofAction,
     },
+    /// One-command DNS tunnel deploy to a VPS (total-blackout survival).
+    DnsTunnel {
+        #[command(subcommand)]
+        action: DnsTunnelAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DnsTunnelAction {
+    /// Deploy the DNS tunnel server to a VPS and persist the client config.
+    Deploy {
+        /// VPS host / IP.
+        #[arg(long)]
+        host: String,
+        /// SSH user.
+        #[arg(long)]
+        ssh_user: String,
+        /// Path to the SSH private key.
+        #[arg(long, default_value = "~/.ssh/id_ed25519")]
+        ssh_key: String,
+        /// SSH port.
+        #[arg(long, default_value_t = 22)]
+        ssh_port: u16,
+        /// Base DNS domain the tunnel server answers for.
+        #[arg(long)]
+        domain: String,
+    },
+    /// Show whether a DNS tunnel is deployed for the active profile.
+    Status,
+    /// Probe the VPS reachability (pure TCP check, no SSH).
+    Test {
+        /// VPS host / IP.
+        #[arg(long)]
+        host: String,
+        /// VPS TCP port (SSH).
+        #[arg(long, default_value_t = 22)]
+        port: u16,
+    },
 }
 
 #[derive(Subcommand)]

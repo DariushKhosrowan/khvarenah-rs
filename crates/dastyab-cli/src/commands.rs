@@ -134,6 +134,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::Up { profile: profile_override } => cmd_up(profile_override).await,
         Command::Beacon { action } => cmd_beacon(&profile, action).await,
         Command::SniSpoof { action } => cmd_sni_spoof(&profile, action).await,
+        Command::DnsTunnel { action } => cmd_dns_tunnel(&profile, action).await,
     }
 }
 
@@ -1883,6 +1884,73 @@ fn save_beacon(profile: &str, cfg: &BeaconConfig) -> Result<(), CFError> {
     let mut p = load_profile(profile);
     p.config.beacon = Some(cfg.clone());
     dastyab_core::store::profiles::save_profile(&p)
+}
+
+/// One-command DNS tunnel deploy to a VPS (total-blackout survival).
+async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result<(), CFError> {
+    use dastyab_core::vps_deploy as vps;
+    match action {
+        crate::DnsTunnelAction::Status => {
+            if vps::is_dns_tunnel_configured(profile) {
+                if let Some(cfg) = vps::load_tunnel_client_config(profile) {
+                    println!("DNS tunnel deployed for profile '{profile}':");
+                    println!("  host        : {}", cfg.host);
+                    println!("  base domain : {}", cfg.base_domain);
+                    println!("  resolver    : {}", cfg.resolver);
+                }
+            } else {
+                println!(
+                    "No DNS tunnel configured for profile '{profile}'. Run: dastyab dns-tunnel deploy"
+                );
+            }
+            Ok(())
+        }
+        crate::DnsTunnelAction::Test { host, port } => {
+            if vps::probe_vps_reachable(&host, port) {
+                println!("VPS {host}:{port} is reachable (TCP).");
+                Ok(())
+            } else {
+                Err(CFError::new(
+                    "dns-tunnel",
+                    format!("VPS {host}:{port} is unreachable"),
+                    "Check the host/IP and that the port is open.",
+                ))
+            }
+        }
+        crate::DnsTunnelAction::Deploy {
+            host,
+            ssh_user,
+            ssh_key,
+            ssh_port,
+            domain,
+        } => {
+            let creds = vps::VpsCredentials {
+                host,
+                ssh_user,
+                ssh_key_path: std::path::PathBuf::from(ssh_key),
+                ssh_port,
+            };
+            if !creds.is_complete() {
+                return Err(CFError::new(
+                    "dns-tunnel",
+                    "incomplete VPS credentials",
+                    "Provide --host, --ssh-user, --ssh-key, and --domain.",
+                ));
+            }
+            let peer = vps::RealVpsSshPeer;
+            println!("Deploying DNS tunnel to {}@{} ({}):", creds.ssh_user, creds.host, creds.ssh_port);
+            let res = vps::deploy_dns_tunnel(&creds, &peer, profile, &domain, None).await?;
+            for step in &res.completed_steps {
+                println!("  ✓ {}", step.label());
+            }
+            if res.verified {
+                println!("DNS tunnel deployed and verified. It will be used automatically when DoH/DoT fail.");
+            } else {
+                println!("Deploy completed but the tunnel service did not report active. Check the VPS manually.");
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
