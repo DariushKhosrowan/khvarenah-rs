@@ -619,8 +619,21 @@ pub async fn daemon_tick(
     if !net_up {
         // c. Network down → skip cycle, don't burn rescue budget. Compute the
         // blackout survival plan so the daemon / beacon knows whether a DNS
-        // tunnel is available to descend to.
-        let tunnel_ok = crate::vps_deploy::is_dns_tunnel_configured(profile);
+        // tunnel is actually reachable to descend to. Tunnel availability is
+        // judged by a LIVE round-trip (probe_tunnel_live), not config
+        // presence — so a dead/unreachable VPS reports the honest "no tunnel"
+        // ceiling instead of a false "tunnel=yes".
+        let tunnel_ok = match crate::vps_deploy::load_tunnel_client_config(profile) {
+            Some(cfg) => {
+                // Short timeout: during a blackout we want a quick verdict.
+                crate::dnstunnel::probe_tunnel_live(
+                    &cfg,
+                    std::time::Duration::from_millis(1500),
+                )
+                .await
+            }
+            None => false,
+        };
         let plan = crate::blackout_bridge::SurvivalPlan::from_state(
             crate::blackout::NetworkState::TotalBlackout,
             tunnel_ok,
