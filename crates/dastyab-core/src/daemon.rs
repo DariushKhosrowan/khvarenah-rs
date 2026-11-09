@@ -234,7 +234,13 @@ pub fn is_cycle_timeout(e: &CFError) -> bool {
 /// for the transient timeout class. Otherwise identical to `backoff_next`.
 pub fn backoff_for_failure(current: u64, max: u64, e: &CFError) -> u64 {
     if is_cycle_timeout(e) {
+        // Timeouts are transient — never hold a multi-hour interval. Clamp to
+        // the 1h ceiling, *stepping down* if we're already above it (so a
+        // daemon that escalated before this fix — or during a long partial
+        // blackout — converges back to prompt recovery instead of lingering at
+        // 6h).
         backoff_next(current, max.min(TIMEOUT_BACKOFF_CAP_SECS))
+            .min(TIMEOUT_BACKOFF_CAP_SECS)
     } else {
         backoff_next(current, max)
     }
@@ -731,6 +737,13 @@ mod tests {
             backoff_for_failure(3600, 21600, &timeout_err),
             3600,
             "timeout stays capped at 1h"
+        );
+        // A daemon already escalated to 6h must STEP DOWN to the 1h ceiling on
+        // the next timeout, so recovery isn't stuck at 6h.
+        assert_eq!(
+            backoff_for_failure(21600, 21600, &timeout_err),
+            3600,
+            "timeout pulls an elevated interval back down to 1h"
         );
     }
 
