@@ -627,6 +627,11 @@ pub enum DaemonAction {
 
 #[tokio::main]
 async fn main() {
+    // Install the process-level rustls provider before any network/TLS work
+    // (core uses aws-lc-rs; reqwest pulls ring too — explicit install avoids
+    // the "could not determine CryptoProvider" panic, e.g. on `drill`).
+    khvarenah_core::tls::install_tls_provider();
+
     let cli = Cli::parse();
 
     if cli.no_stealth {

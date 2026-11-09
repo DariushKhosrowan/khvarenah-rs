@@ -10,6 +10,9 @@ mod state;
 mod views;
 
 fn main() -> eframe::Result {
+    // Install the process-level rustls provider before any network/TLS work.
+    khvarenah_core::tls::install_tls_provider();
+
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "Khvarenah",
