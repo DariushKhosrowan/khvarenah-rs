@@ -109,6 +109,13 @@ pub struct DaemonState {
     /// during a blackout are delivered on restore, then periodically).
     #[serde(default)]
     pub last_outbox_flush_ts: i64,
+    /// Set once per blocked episode when auto-rotation was *attempted* but
+    /// every stored token failed verification. Guards the
+    /// `AccountBlockedRotationExhausted` beacon so the user is told exactly
+    /// once that a manual token add is required, instead of on every poll
+    /// cycle. Reset to false when the account returns to Active.
+    #[serde(default)]
+    pub account_rotate_exhausted_notified: bool,
 }
 
 fn default_interval() -> u64 {
@@ -133,6 +140,7 @@ impl Default for DaemonState {
             last_backup_ts: 0,
             last_profile_mtime: 0,
             last_outbox_flush_ts: 0,
+            account_rotate_exhausted_notified: false,
         }
     }
 }
@@ -717,6 +725,7 @@ pub async fn daemon_tick(
         // automatically. Configurable via auto_rotate_on_blocked (default on).
         if let Some((from, to)) = acct.try_rotate(profile).await {
             state.account_state = crate::account_state::AccountState::Active;
+            state.account_rotate_exhausted_notified = false;
             state.last_account_poll_ts = now;
             log(&log_line(
                 "INFO",
@@ -728,39 +737,69 @@ pub async fn daemon_tick(
                 crate::diagnose::Locale::En,
             )
             .await;
-        } else if crate::account_state::should_poll_account(state.last_account_poll_ts, now) {
-            let st = acct.probe_account(profile).await;
-            state.last_account_poll_ts = now;
-            let still_blocked = st.blocks_cycle();
-            state.account_state = st;
-            if still_blocked {
+        } else {
+            // Auto-rotation returned None. That happens either because it is
+            // disabled (or there is only a single token), or because it was
+            // attempted and every stored token failed verification. Only the
+            // latter is a genuine "exhausted" condition the user must act on.
+            // Notify exactly once per episode so the user who was promised
+            // auto-recovery learns it actually failed and must add a token.
+            let p = crate::store::profiles::load_profile(profile);
+            let auto_rotate_eligible = p.config.auto_rotate_on_blocked && p.tokens.len() >= 2;
+            if auto_rotate_eligible && !state.account_rotate_exhausted_notified {
+                state.account_rotate_exhausted_notified = true;
+                let stored_tokens = p.tokens.len();
                 log(&log_line(
                     "WARN",
                     &format!(
-                        "account={} still blocked (polling again in {}s)",
-                        state.account_state.label(),
-                        crate::account_state::ACCOUNT_POLL_INTERVAL_SECS
+                        "account={} auto-rotation exhausted after {stored_tokens} tokens — manual token add required",
+                        state.account_state.label()
+                    ),
+                ));
+                let _ = crate::remote_beacon::maybe_emit(
+                    profile,
+                    &crate::remote_beacon::BeaconEvent::AccountBlockedRotationExhausted {
+                        state: state.account_state.label().to_string(),
+                        stored_tokens,
+                    },
+                    crate::diagnose::Locale::En,
+                )
+                .await;
+            }
+            if crate::account_state::should_poll_account(state.last_account_poll_ts, now) {
+                let st = acct.probe_account(profile).await;
+                state.last_account_poll_ts = now;
+                let still_blocked = st.blocks_cycle();
+                state.account_state = st;
+                if still_blocked {
+                    log(&log_line(
+                        "WARN",
+                        &format!(
+                            "account={} still blocked (polling again in {}s)",
+                            state.account_state.label(),
+                            crate::account_state::ACCOUNT_POLL_INTERVAL_SECS
+                        ),
+                    ));
+                    return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
+                }
+                log(&log_line(
+                    "INFO",
+                    &format!(
+                        "account={} restored, resuming cycle",
+                        state.account_state.label()
+                    ),
+                ));
+            } else {
+                // Not yet time to re-poll — hold this cycle.
+                log(&log_line(
+                    "INFO",
+                    &format!(
+                        "account={} waiting (skip cycle)",
+                        state.account_state.label()
                     ),
                 ));
                 return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
             }
-            log(&log_line(
-                "INFO",
-                &format!(
-                    "account={} restored, resuming cycle",
-                    state.account_state.label()
-                ),
-            ));
-        } else {
-            // Not yet time to re-poll — hold this cycle.
-            log(&log_line(
-                "INFO",
-                &format!(
-                    "account={} waiting (skip cycle)",
-                    state.account_state.label()
-                ),
-            ));
-            return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
         }
     } else {
         // Not blocked, but periodically confirm so we notice a suspension even
@@ -1584,6 +1623,58 @@ mod tests {
             .iter()
             .any(|l| l.contains("token-auto-rotated")));
         assert_eq!(sleep, backoff_reset());
+    }
+
+    /// When auto-rotation is attempted but every stored token fails (rotate =
+    /// None with >=2 tokens in the store), the daemon must notify the user
+    /// exactly once that a manual token add is required — instead of holding
+    /// silently forever.
+    #[tokio::test]
+    async fn test_daemon_notifies_once_when_rotation_exhausted() {
+        let _home = daemon_home();
+        let profile = "default";
+        // Two stored tokens so auto-rotation is "eligible" — but the scripted
+        // probe returns None (both fail verification).
+        crate::store::profiles::add_token(profile, "a", "tok-a").unwrap();
+        crate::store::profiles::add_token(profile, "b", "tok-b").unwrap();
+        crate::store::profiles::set_active_token(profile, "a").unwrap();
+
+        let mut state = DaemonState::default();
+        state.account_state = crate::account_state::AccountState::TokenInvalid { since: 1 };
+        state.last_account_poll_ts = crate::store::now_ts() as i64; // inside window
+        let mut probe = FakeProbe::new(true);
+        let acct = FakeAccountProbe {
+            state: crate::account_state::AccountState::TokenInvalid { since: 1 },
+            rotate: None,
+        };
+        let cycle = FakeCycle::new(true);
+        let mut log_lines = Vec::new();
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
+            log_lines.push(l.to_string());
+        })
+        .await;
+
+        // Still blocked → no cycle runs, we wait for the next poll.
+        assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert_eq!(cycle.calls.load(Ordering::SeqCst), 0);
+        // The one-shot exhausted notification was recorded.
+        assert!(state.account_rotate_exhausted_notified);
+        assert!(log_lines
+            .iter()
+            .any(|l| l.contains("auto-rotation exhausted")));
+
+        // A second tick must NOT re-notify (guard works).
+        let mut log_lines2 = Vec::new();
+        state.last_account_poll_ts = crate::store::now_ts() as i64;
+        let sleep2 =
+            daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
+                log_lines2.push(l.to_string());
+            })
+            .await;
+        assert_eq!(sleep2, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert!(!log_lines2
+            .iter()
+            .any(|l| l.contains("auto-rotation exhausted")));
     }
 
     /// When a suspended account is reactivated, the daemon must notice on the

@@ -32,6 +32,10 @@ pub enum BeaconEventKind {
     DailySummary,
     ConfigMutated,
     AccountBlocked,
+    /// Auto-rotation was attempted but every stored token failed verification
+    /// — a fresh token must be added. Rate-limited as its own class so it is
+    /// distinct from the initial `AccountBlocked` transition.
+    AccountBlockedRotationExhausted,
     /// The daemon automatically rotated to another stored token because the
     /// active one was blocked/invalid (no manual `token recover` needed).
     TokenAutoRotated,
@@ -70,6 +74,14 @@ pub enum BeaconEvent {
         /// demands a manual token add (single token / rotation off).
         stored_tokens: usize,
     },
+    /// Auto-rotation was attempted but every stored token failed verification.
+    /// Emitted once per blocked episode, so a user who was promised
+    /// auto-recovery learns it actually failed and must add a fresh token.
+    AccountBlockedRotationExhausted {
+        state: String,
+        /// Number of stored tokens that were tried and failed.
+        stored_tokens: usize,
+    },
     /// The daemon automatically rotated to another stored token (the active
     /// one was blocked/invalid). Carries the old and new token labels.
     TokenAutoRotated {
@@ -93,6 +105,9 @@ impl BeaconEvent {
             BeaconEvent::DailySummary { .. } => BeaconEventKind::DailySummary,
             BeaconEvent::ConfigMutated { .. } => BeaconEventKind::ConfigMutated,
             BeaconEvent::AccountBlocked { .. } => BeaconEventKind::AccountBlocked,
+            BeaconEvent::AccountBlockedRotationExhausted { .. } => {
+                BeaconEventKind::AccountBlockedRotationExhausted
+            }
             BeaconEvent::TokenAutoRotated { .. } => BeaconEventKind::TokenAutoRotated,
             BeaconEvent::NetworkDown { .. } => BeaconEventKind::NetworkDown,
             BeaconEvent::NetworkRestored => BeaconEventKind::NetworkRestored,
@@ -297,6 +312,14 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
                 )
             }
         }
+        (
+            BeaconEvent::AccountBlockedRotationExhausted { state, stored_tokens },
+            crate::diagnose::Locale::Fa,
+        ) => {
+            format!(
+                "⛔ حساب مسدود شد ({state}) — چرخش خودکار هر {stored_tokens} توکن ذخیره‌شده را آزمایش کرد و هیچ‌کدام تأیید نشد؛ با «dastyab token recover <label> <token>» توکن جدید اضافه کنید"
+            )
+        }
         (BeaconEvent::AccountBlocked { state, auto_rotate_enabled, stored_tokens, .. }, _) => {
             if *auto_rotate_enabled && *stored_tokens >= 2 {
                 format!(
@@ -311,6 +334,11 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
                     "⛔ Account blocked ({state}) — auto-rotation is OFF; run `dastyab token recover <label> <token>` to replace the token and auto-resume protection"
                 )
             }
+        }
+        (BeaconEvent::AccountBlockedRotationExhausted { state, stored_tokens }, _) => {
+            format!(
+                "⛔ Account blocked ({state}) — auto-rotation tried all {stored_tokens} stored tokens and none verified; run `dastyab token recover <label> <token>` to add a fresh token and auto-resume"
+            )
         }
         (BeaconEvent::TokenAutoRotated { from, to }, crate::diagnose::Locale::Fa) => {
             format!(
