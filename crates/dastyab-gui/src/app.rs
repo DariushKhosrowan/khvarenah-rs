@@ -116,6 +116,10 @@ pub struct DastYabApp {
     pub vps_port: u16,
     pub vps_domain: String,
     pub vps_note: String,
+    // zero-touch Hetzner VPS provisioning config
+    pub hz_token: String,
+    pub hz_location: String,
+    pub hz_server_type: String,
 }
 
 /// What to do when the open dialog submits.
@@ -244,6 +248,9 @@ impl DastYabApp {
             vps_port: 22,
             vps_domain: String::new(),
             vps_note: String::new(),
+            hz_token: String::new(),
+            hz_location: "nbg1".to_string(),
+            hz_server_type: "cx22".to_string(),
             view: View::DeployScan,
         };
         app.refresh_diagnostics();
@@ -422,6 +429,92 @@ impl DastYabApp {
                 }
             }
             Ok::<String, CFError>("dns-tunnel done".to_string())
+        });
+    }
+
+    /// Zero-touch Hetzner provisioning: create a fresh VPS via the Hetzner
+    /// Cloud API, wait for it to boot, then deploy the DNS tunnel to it —
+    /// all from inside the app. Reports progress/errors via the bridge.
+    fn provision_vps_tunnel(&mut self) {
+        if self.hz_token.trim().is_empty() || self.vps_domain.trim().is_empty() {
+            self.vps_note = "Set the Hetzner API token and base DNS domain first.".to_string();
+            return;
+        }
+        let creds = dastyab_core::vps_provision::HetznerCredentials {
+            api_token: self.hz_token.trim().to_string(),
+            location: self.hz_location.trim().to_string(),
+            server_type: self.hz_server_type.trim().to_string(),
+            server_name: "dastyab-tunnel".to_string(),
+        };
+        let pid = self.profile_id.clone();
+        let domain = self.vps_domain.trim().to_string();
+        let ssh_user = self.vps_user.trim().to_string();
+        let key_path = std::path::PathBuf::from(
+            std::env::var("HOME")
+                .map(|h| format!("{h}/.dastyab/key-hetzner"))
+                .unwrap_or_else(|_| "~/.dastyab/key-hetzner".to_string()),
+        );
+        let tx = self.tx.clone();
+        self.running.push("hz-provision".to_string());
+        self.vps_note = "Provisioning Hetzner VPS… (this can take 1-2 min)".to_string();
+        let tx2 = tx.clone();
+        bridge::spawn("hz-provision", tx.clone(), async move {
+            let api = dastyab_core::vps_provision::RealHetznerApi;
+            match dastyab_core::vps_provision::provision_vps(&api, &creds, &key_path, None).await {
+                Ok(prov) => {
+                    let _ = tx2.send(crate::bridge::UiEvent::Log {
+                        task: "hz-provision".to_string(),
+                        line: format!(
+                            "[hz-provision] VPS {} ready (steps={}), deploying tunnel…",
+                            prov.host,
+                            prov.completed_steps.len()
+                        ),
+                    });
+                    let vps_creds = dastyab_core::vps_deploy::VpsCredentials {
+                        host: prov.host.clone(),
+                        ssh_user: ssh_user.clone(),
+                        ssh_key_path: prov.identity.private_key_path.clone(),
+                        ssh_port: 22,
+                    };
+                    let peer = dastyab_core::vps_deploy::RealVpsSshPeer;
+                    match dastyab_core::vps_deploy::deploy_dns_tunnel(
+                        &vps_creds, &peer, &pid, &domain, None,
+                    )
+                    .await
+                    {
+                        Ok(res) => {
+                            let _ = tx2.send(crate::bridge::UiEvent::Log {
+                                task: "hz-provision".to_string(),
+                                line: format!(
+                                    "[hz-provision] tunnel deployed to {} (verified={})",
+                                    res.host, res.verified
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
+                                task: "hz-provision".to_string(),
+                                error: CFError::new(
+                                    "Hetzner",
+                                    format!("VPS provisioned but tunnel deploy failed: {}", e.brief()),
+                                    "Check the VPS is reachable and the tunnel server install succeeded.",
+                                ),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
+                        task: "hz-provision".to_string(),
+                        error: CFError::new(
+                            "Hetzner",
+                            e.brief(),
+                            "Check the API token is read/write and the location/server-type are valid.",
+                        ),
+                    });
+                }
+            }
+            Ok::<String, CFError>("hz-provision done".to_string())
         });
     }
 
@@ -1210,6 +1303,25 @@ impl DastYabApp {
         });
         if !self.vps_note.is_empty() {
             ui.colored_label(GOLD, &self.vps_note);
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading(egui::RichText::new("Zero-touch Hetzner VPS").color(GOLD));
+        ui.label("No VPS yet? Paste a Hetzner Cloud API token and the app provisions");
+        ui.label("a server, then deploys the DNS tunnel to it. (Read/write token.)");
+        ui.horizontal(|ui| {
+            ui.label("Hetzner API token:");
+            ui.add(egui::TextEdit::singleline(&mut self.hz_token).desired_width(280.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Location:");
+            ui.add(egui::TextEdit::singleline(&mut self.hz_location).desired_width(90.0));
+            ui.label("Server type:");
+            ui.add(egui::TextEdit::singleline(&mut self.hz_server_type).desired_width(90.0));
+        });
+        if ui.button("Provision VPS + deploy tunnel").clicked() {
+            self.provision_vps_tunnel();
         }
     }
 
