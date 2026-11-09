@@ -98,6 +98,20 @@ pub struct BeaconConfig {
     /// Rate-limit seconds per event class.
     #[serde(default = "default_rate_limit_secs")]
     pub rate_limit_secs: i64,
+    /// Failover channel: when the primary channel fails (Telegram blocked in
+    /// Iran, webhook down), the beacon automatically retries on this secondary
+    /// channel before queueing to the outbox. This makes alerts resilient to
+    /// any single channel being censored/blocked.
+    #[serde(default)]
+    pub failover_enabled: bool,
+    #[serde(default)]
+    pub failover_kind: BeaconKind,
+    /// Secondary Telegram bot token (when failover_kind == Telegram).
+    #[serde(default)]
+    pub failover_token: String,
+    /// Secondary Telegram chat id OR webhook URL.
+    #[serde(default)]
+    pub failover_chat_id_or_url: String,
 }
 
 fn default_rate_limit_secs() -> i64 {
@@ -112,6 +126,10 @@ impl Default for BeaconConfig {
             token: String::new(),
             chat_id_or_url: String::new(),
             rate_limit_secs: 900,
+            failover_enabled: false,
+            failover_kind: BeaconKind::Telegram,
+            failover_token: String::new(),
+            failover_chat_id_or_url: String::new(),
         }
     }
 }
@@ -317,6 +335,68 @@ pub async fn send(config: &BeaconConfig, message: &str) -> Result<(), CFError> {
     }
 }
 
+/// Build the failover channel config from a beacon config, when failover is
+/// enabled and the secondary channel is complete for its kind. Pure.
+fn failover_config(config: &BeaconConfig) -> Option<BeaconConfig> {
+    if !config.failover_enabled {
+        return None;
+    }
+    let fc = BeaconConfig {
+        enabled: true,
+        kind: config.failover_kind.clone(),
+        token: config.failover_token.clone(),
+        chat_id_or_url: config.failover_chat_id_or_url.clone(),
+        rate_limit_secs: config.rate_limit_secs,
+        failover_enabled: false,
+        failover_kind: BeaconKind::Telegram,
+        failover_token: String::new(),
+        failover_chat_id_or_url: String::new(),
+    };
+    match fc.kind {
+        BeaconKind::Telegram => {
+            if fc.token.is_empty() || fc.chat_id_or_url.is_empty() {
+                None
+            } else {
+                Some(fc)
+            }
+        }
+        BeaconKind::GenericWebhook => {
+            if fc.chat_id_or_url.is_empty() {
+                None
+            } else {
+                Some(fc)
+            }
+        }
+    }
+}
+
+/// The ordered list of channels to try, primary first, then failover. Pure.
+fn delivery_order(config: &BeaconConfig) -> Vec<BeaconConfig> {
+    let mut v = vec![config.clone()];
+    if let Some(fc) = failover_config(config) {
+        v.push(fc);
+    }
+    v
+}
+
+/// Deliver a message trying every configured channel (primary, then failover)
+/// in order. Returns Ok as soon as any channel delivers; the caller only sees
+/// an error when every channel failed — at which point the alert is queued to
+/// the outbox for later delivery.
+pub async fn send_with_failover(config: &BeaconConfig, message: &str) -> Result<(), CFError> {
+    let chain = delivery_order(config);
+    let mut last_err = None;
+    for c in chain {
+        match send(&c, message).await {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        CFError::new("Beacon", "no channel configured", "Enable notifications first.")
+    }))
+}
+
 /// Load the stored config for a profile (defaults when absent).
 pub fn load_config(profile_id: &str) -> BeaconConfig {
     let p = store::profiles::load_profile(profile_id);
@@ -341,7 +421,7 @@ pub async fn maybe_emit(
         return Ok(false);
     }
     let text = format_message(event, lang);
-    match send(&cfg, &text).await {
+    match send_with_failover(&cfg, &text).await {
         Ok(()) => {
             record_sent(profile_id, event.kind(), now)?;
             Ok(true)
@@ -362,7 +442,10 @@ pub async fn maybe_emit(
 /// disabled or the outbox is empty.
 pub async fn flush_outbox(profile_id: &str) -> usize {
     let cfg = load_config(profile_id);
-    flush_outbox_with_profile(profile_id, &cfg, |text, cfg| Box::pin(send(cfg, text))).await
+    flush_outbox_with_profile(profile_id, &cfg, |text, cfg| {
+        Box::pin(send_with_failover(cfg, text))
+    })
+    .await
 }
 
 /// Hermetic core of `flush_outbox`. `deliver` is injected so tests can script
@@ -667,5 +750,79 @@ mod tests {
         assert_eq!(load_outbox(profile).len(), 1);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- failover channel logic (pure) ----
+
+    fn base_cfg() -> BeaconConfig {
+        BeaconConfig {
+            enabled: true,
+            kind: BeaconKind::Telegram,
+            token: "primary-token".into(),
+            chat_id_or_url: "111".into(),
+            rate_limit_secs: 900,
+            failover_enabled: false,
+            failover_kind: BeaconKind::GenericWebhook,
+            failover_token: String::new(),
+            failover_chat_id_or_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn failover_disabled_means_no_failover_chain() {
+        let cfg = base_cfg(); // failover_enabled = false
+        assert!(failover_config(&cfg).is_none());
+        assert_eq!(delivery_order(&cfg).len(), 1, "primary only when failover off");
+    }
+
+    #[test]
+    fn failover_requires_complete_secondary() {
+        // Enabled but empty secondary webhook → no failover (can't send).
+        let mut cfg = base_cfg();
+        cfg.failover_enabled = true;
+        cfg.failover_kind = BeaconKind::GenericWebhook;
+        cfg.failover_chat_id_or_url.clear();
+        assert!(failover_config(&cfg).is_none());
+        assert_eq!(delivery_order(&cfg).len(), 1);
+
+        // Complete secondary webhook is appended after primary.
+        cfg.failover_chat_id_or_url = "https://hooks.example.com/x".into();
+        let fc = failover_config(&cfg).expect("complete failover present");
+        assert_eq!(fc.kind, BeaconKind::GenericWebhook);
+        assert_eq!(fc.chat_id_or_url, "https://hooks.example.com/x");
+        let order = delivery_order(&cfg);
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0].kind, BeaconKind::Telegram);
+        assert_eq!(order[1].kind, BeaconKind::GenericWebhook);
+    }
+
+    #[test]
+    fn failover_secondary_telegram_needs_token_and_chat() {
+        let mut cfg = base_cfg();
+        cfg.failover_enabled = true;
+        cfg.failover_kind = BeaconKind::Telegram;
+        cfg.failover_token = "backup-token".into();
+        cfg.failover_chat_id_or_url = "222".into();
+        assert!(failover_config(&cfg).is_some());
+        let order = delivery_order(&cfg);
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[1].token, "backup-token");
+        assert_eq!(order[1].chat_id_or_url, "222");
+
+        // Missing token → no failover.
+        cfg.failover_token.clear();
+        assert!(failover_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn failover_self_recursion_is_disabled_in_secondary() {
+        let mut cfg = base_cfg();
+        cfg.failover_enabled = true;
+        cfg.failover_kind = BeaconKind::GenericWebhook;
+        cfg.failover_chat_id_or_url = "https://hooks.example.com/x".into();
+        let fc = failover_config(&cfg).unwrap();
+        // The secondary must never again try to fail over (no infinite loop).
+        assert!(!fc.failover_enabled);
+        assert_eq!(delivery_order(&fc).len(), 1);
     }
 }

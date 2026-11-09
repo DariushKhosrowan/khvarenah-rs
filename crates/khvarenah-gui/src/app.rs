@@ -109,6 +109,11 @@ pub struct KhvarenahApp {
     pub beacon_target: String,
     pub beacon_rate_limit: i64,
     pub beacon_note: String,
+    // failover channel (secondary alert delivery path when primary is blocked)
+    pub beacon_failover_enabled: bool,
+    pub beacon_failover_channel: String,
+    pub beacon_failover_token: String,
+    pub beacon_failover_target: String,
     // blackout resilience / VPS DNS-tunnel config
     pub vps_host: String,
     pub vps_user: String,
@@ -263,6 +268,37 @@ impl KhvarenahApp {
                 .map(|b| b.rate_limit_secs)
                 .unwrap_or(900),
             beacon_note: String::new(),
+            beacon_failover_enabled: profile
+                .config
+                .beacon
+                .as_ref()
+                .map(|b| b.failover_enabled)
+                .unwrap_or(false),
+            beacon_failover_channel: profile
+                .config
+                .beacon
+                .as_ref()
+                .map(|b| match b.failover_kind {
+                    khvarenah_core::remote_beacon::BeaconKind::Telegram => {
+                        "Telegram".to_string()
+                    }
+                    khvarenah_core::remote_beacon::BeaconKind::GenericWebhook => {
+                        "Webhook".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "Webhook".to_string()),
+            beacon_failover_token: profile
+                .config
+                .beacon
+                .as_ref()
+                .map(|b| b.failover_token.clone())
+                .unwrap_or_default(),
+            beacon_failover_target: profile
+                .config
+                .beacon
+                .as_ref()
+                .map(|b| b.failover_chat_id_or_url.clone())
+                .unwrap_or_default(),
             vps_host: String::new(),
             vps_user: String::new(),
             vps_key: "~/.ssh/id_ed25519".to_string(),
@@ -378,6 +414,11 @@ impl KhvarenahApp {
         } else {
             khvarenah_core::remote_beacon::BeaconKind::Telegram
         };
+        let fo_kind = if self.beacon_failover_channel == "Webhook" {
+            khvarenah_core::remote_beacon::BeaconKind::GenericWebhook
+        } else {
+            khvarenah_core::remote_beacon::BeaconKind::Telegram
+        };
         let mut p = khvarenah_core::store::profiles::load_profile(&self.profile_id);
         p.config.beacon = Some(khvarenah_core::remote_beacon::BeaconConfig {
             enabled: self.beacon_enabled,
@@ -385,6 +426,10 @@ impl KhvarenahApp {
             token: self.beacon_token.clone(),
             chat_id_or_url: self.beacon_target.clone(),
             rate_limit_secs: self.beacon_rate_limit.max(1),
+            failover_enabled: self.beacon_failover_enabled,
+            failover_kind: fo_kind,
+            failover_token: self.beacon_failover_token.clone(),
+            failover_chat_id_or_url: self.beacon_failover_target.clone(),
         });
         match khvarenah_core::store::profiles::save_profile(&p) {
             Ok(()) => self.beacon_note = "Notifications saved.".to_string(),
@@ -405,6 +450,14 @@ impl KhvarenahApp {
             token: self.beacon_token.clone(),
             chat_id_or_url: self.beacon_target.clone(),
             rate_limit_secs: self.beacon_rate_limit.max(1),
+            failover_enabled: self.beacon_failover_enabled,
+            failover_kind: if self.beacon_failover_channel == "Webhook" {
+                khvarenah_core::remote_beacon::BeaconKind::GenericWebhook
+            } else {
+                khvarenah_core::remote_beacon::BeaconKind::Telegram
+            },
+            failover_token: self.beacon_failover_token.clone(),
+            failover_chat_id_or_url: self.beacon_failover_target.clone(),
         };
         if cfg.chat_id_or_url.is_empty() {
             self.beacon_note = "Set a chat ID / webhook URL first.".to_string();
@@ -413,17 +466,21 @@ impl KhvarenahApp {
         let msg = "✅ Khvarenah test notification — protection is working.";
         let tx = self.tx.clone();
         bridge::spawn("beacon-test", tx.clone(), async move {
-            match khvarenah_core::remote_beacon::send(&cfg, msg).await {
+            match khvarenah_core::remote_beacon::send_with_failover(&cfg, msg).await {
                 Ok(()) => {
                     let _ = tx.send(crate::bridge::UiEvent::Log {
                         task: "beacon-test".to_string(),
-                        line: "[beacon] test message sent".to_string(),
+                        line: "[beacon] test message sent (primary or failover)".to_string(),
                     });
                 }
                 Err(e) => {
                     let _ = tx.send(crate::bridge::UiEvent::TaskErr {
                         task: "beacon-test".to_string(),
-                        error: CFError::new("Beacon test", e.brief(), "Check the channel config."),
+                        error: CFError::new(
+                            "Beacon test",
+                            e.brief(),
+                            "Check the primary/failover channel config.",
+                        ),
                     });
                 }
             }
@@ -1521,6 +1578,57 @@ impl KhvarenahApp {
             ui.label("Rate limit (s/event):");
             ui.add(egui::DragValue::new(&mut self.beacon_rate_limit).range(1..=86400));
         });
+        ui.add_space(6.0);
+        ui.separator();
+        ui.colored_label(
+            GOLD,
+            "Failover channel (used when the primary is blocked)",
+        );
+        ui.label("Telegram is sometimes blocked in Iran — if the primary channel");
+        ui.label("fails, alerts auto-route to this backup. Configure it once here.");
+        ui.checkbox(
+            &mut self.beacon_failover_enabled,
+            "Enable failover channel",
+        );
+        if self.beacon_failover_enabled {
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("beacon_fo_ch")
+                    .selected_text(&self.beacon_failover_channel)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.beacon_failover_channel,
+                            "Telegram".to_string(),
+                            "Telegram",
+                        );
+                        ui.selectable_value(
+                            &mut self.beacon_failover_channel,
+                            "Webhook".to_string(),
+                            "Webhook",
+                        );
+                    });
+                ui.label("failover channel");
+            });
+            if self.beacon_failover_channel == "Telegram" {
+                ui.label("Failover bot token:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.beacon_failover_token)
+                        .password(true)
+                        .desired_width(260.0),
+                );
+                ui.label("Failover Chat ID:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.beacon_failover_target)
+                        .desired_width(260.0),
+                );
+            } else {
+                ui.label("Failover webhook URL:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.beacon_failover_target)
+                        .desired_width(260.0),
+                );
+            }
+        }
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("Save notifications").clicked() {
                 self.save_beacon();
