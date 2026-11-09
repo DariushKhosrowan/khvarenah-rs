@@ -234,7 +234,7 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
             );
             println!(
                 "  beacon notifications         : {}",
-                if c.beacon.as_ref().map_or(false, |b| b.enabled) {
+                if c.beacon.as_ref().is_some_and(|b| b.enabled) {
                     "ON"
                 } else {
                     "OFF"
