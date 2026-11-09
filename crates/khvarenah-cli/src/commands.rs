@@ -1291,6 +1291,51 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
             return Ok(());
         }
 
+        // Auto self-update: roughly once per day, check for a newer release,
+        // download it, and atomically swap it over the running binary. If an
+        // update was applied, re-exec ourselves so the new version takes over
+        // without a manual restart. Best-effort — never fail the loop.
+        if khvarenah_core::store::now_ts() as i64 - state.last_update_check_ts
+            >= khvarenah_core::selfupdate::AUTO_UPDATE_INTERVAL_SECS as i64
+        {
+            state.last_update_check_ts = khvarenah_core::store::now_ts() as i64;
+            match khvarenah_core::selfupdate::ensure_updated_with_swap(
+                std::time::Duration::from_secs(120),
+            )
+            .await
+            {
+                Ok(khvarenah_core::selfupdate::UpdateOutcome::Updated { tag }) => {
+                    daemon_log_append(
+                        &cfg.log_path,
+                        &log_line(
+                            "INFO",
+                            &format!("auto-update applied {tag}, re-execing…"),
+                        ),
+                    );
+                    save_daemon_state(&active_profile, &state)?;
+                    // Re-exec the (now updated) binary with the same args.
+                    let exe = std::env::current_exe().map_err(|e| {
+                        CFError::new("Daemon", e.to_string(), "Cannot locate the binary.")
+                    })?;
+                    let _ = std::process::Command::new(exe)
+                        .arg("daemon")
+                        .arg("start")
+                        .arg("--profile")
+                        .arg(&cfg.profile)
+                        .arg("--foreground")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    return Ok(());
+                }
+                Ok(khvarenah_core::selfupdate::UpdateOutcome::Failed(msg)) => {
+                    daemon_log_append(&cfg.log_path, &log_line("WARN", &format!("auto-update failed: {msg}")));
+                }
+                _ => {}
+            }
+        }
+
         // Cross-worker failover: follow the active profile marker. When the
         // store's active profile changes (e.g. rescue rotated to a backup
         // worker), adopt it — but only if it is a real, known profile.
