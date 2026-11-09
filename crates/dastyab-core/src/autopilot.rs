@@ -1822,9 +1822,14 @@ impl AutopilotEngine {
         // Probe health via the worker's SNI. Passing an empty CIDR slice means
         // the gate uses its embedded/default range fallback (we only care about
         // the worker-health verdict here, not scanning).
-        let cidrs: &[crate::cf::ips::Cidr] = &[];
-        let health =
-            crate::autopilot::step0_gate(&ws.sni, self.params.timeout_s.max(3) as u64, cidrs).await;
+        // Reuse the engine's injected worker-health probe (same seam as the
+        // step-0 gate in the monitor cycle). This keeps the rescue path
+        // deterministic under scripted probes in tests and avoids a second,
+        // divergent real-network probe for the same worker.
+        let health = self
+            .worker_probe
+            .probe(&ws.sni, self.params.timeout_s.max(3) as u64)
+            .await;
         if !should_rescue(&health) {
             return false;
         }
@@ -3890,11 +3895,12 @@ mod tests {
         };
 
         for n in 0..STRATEGY_EARLY_DEAD_CYCLES {
-            let engine = AutopilotEngine::with_provider(
+            let engine = AutopilotEngine::with_components(
                 id.clone(),
                 DiscoveryParams::default(),
                 std::time::Duration::from_secs(300),
                 Box::new(HangingProvider),
+                Box::new(AliveWorkerProbe),
             );
             let err = engine
                 .monitor_cycle_guarded(timeouts.clone())
@@ -4122,11 +4128,12 @@ mod tests {
         // Scripted account says Active → the monitor proceeds to the light
         // phase, which finds no live ledger and returns a summary (alive 0).
         let provider = Box::new(ScriptedProvider { result: Ok(vec![]) });
-        let engine = AutopilotEngine::with_provider(
+        let engine = AutopilotEngine::with_components(
             id.clone(),
             DiscoveryParams::default(),
             std::time::Duration::from_secs(300),
             provider,
+            Box::new(AliveWorkerProbe),
         )
         .with_account_probe(Box::new(ScriptedAccountProbe {
             state: crate::account_state::AccountState::Active,
@@ -4157,6 +4164,22 @@ mod tests {
             _timeout_s: u64,
         ) -> Pin<Box<dyn Future<Output = WorkerHealth> + Send + 'a>> {
             Box::pin(async move { WorkerHealth::NotFound })
+        }
+    }
+
+    /// A worker-health probe that always answers Alive — lets a cycle reach
+    /// the deep phase deterministically without a live worker (the step-0
+    /// gate passes, and the rescue path sees an unrecoverable state so it
+    /// returns immediately).
+    struct AliveWorkerProbe;
+
+    impl WorkerHealthProbe for AliveWorkerProbe {
+        fn probe<'a>(
+            &'a self,
+            _worker_host: &'a str,
+            _timeout_s: u64,
+        ) -> Pin<Box<dyn Future<Output = WorkerHealth> + Send + 'a>> {
+            Box::pin(async move { WorkerHealth::Alive })
         }
     }
 

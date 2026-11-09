@@ -136,6 +136,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             tunnel_ip,
         } => cmd_verify(&direct_ip, &tunnel_ip),
         Command::Bundle { action } => cmd_bundle(&profile, action),
+        Command::Config { action } => cmd_config(&profile, action),
         Command::Up {
             profile: profile_override,
         } => cmd_up(profile_override).await,
@@ -209,6 +210,63 @@ fn cmd_bundle(profile: &str, action: crate::BundleAction) -> Result<(), CFError>
                     ));
                 }
             }
+            Ok(())
+        }
+    }
+}
+
+/// Inspect / tune the per-profile blackout-resilience knobs.
+fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError> {
+    match action {
+        crate::ConfigAction::Show => {
+            let p = dastyab_core::store::profiles::load_profile(profile);
+            let c = &p.config;
+            let eff_light = dastyab_core::store::profiles::effective_light_timeout_secs(c);
+            let eff_deep = dastyab_core::store::profiles::effective_deep_timeout_secs(c);
+            let eff_backoff = dastyab_core::store::profiles::effective_max_backoff_secs(c);
+            println!("Profile: {profile}");
+            println!("  monitor light phase budget : {}s (configured {}s, system default 120s)", eff_light, c.light_timeout_secs);
+            println!("  monitor deep phase budget   : {}s (configured {}s, system default 600s)", eff_deep, c.deep_timeout_secs);
+            println!("  daemon backoff ceiling      : {}s (configured {}s, system default 21600s)", eff_backoff, c.max_backoff_secs);
+            println!(
+                "  protection                  : {}",
+                if c.protection_enabled { "ON" } else { "OFF" }
+            );
+            println!(
+                "  beacon notifications         : {}",
+                if c.beacon.as_ref().map_or(false, |b| b.enabled) {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            );
+            Ok(())
+        }
+        crate::ConfigAction::Timeouts {
+            light,
+            deep,
+            max_backoff,
+        } => {
+            let mut p = dastyab_core::store::profiles::load_profile(profile);
+            if light > 0 {
+                p.config.light_timeout_secs = light;
+            }
+            if deep > 0 {
+                p.config.deep_timeout_secs = deep;
+            }
+            if max_backoff > 0 {
+                p.config.max_backoff_secs = max_backoff;
+            }
+            dastyab_core::store::profiles::save_profile(&p)?;
+            // Re-read to print the resolved values after save.
+            let c = &p.config;
+            let eff_light = dastyab_core::store::profiles::effective_light_timeout_secs(c);
+            let eff_deep = dastyab_core::store::profiles::effective_deep_timeout_secs(c);
+            let eff_backoff = dastyab_core::store::profiles::effective_max_backoff_secs(c);
+            println!("Saved. Effective values for {profile}:");
+            println!("  monitor light phase budget : {eff_light}s");
+            println!("  monitor deep phase budget   : {eff_deep}s");
+            println!("  daemon backoff ceiling      : {eff_backoff}s");
             Ok(())
         }
     }
