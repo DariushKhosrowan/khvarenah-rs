@@ -1292,6 +1292,69 @@ mod tests {
         assert!(generic_404 > 0, "expected generic-CF-layer 404, got {m:?}");
     }
 
+    #[tokio::test]
+    async fn pipeline_records_success_by_clienthello_profile() {
+        let cands: Vec<String> = (0..12).map(|i| format!("candidate-{i}")).collect();
+        let p1 = phase1_ok(usize::MAX);
+        // Every accepted probe carries a ClientHello profile (ws_accepted sets
+        // Chrome120). The success-side histogram must count each accepted probe
+        // under (profile, SniLayer).
+        let p2: Phase2Fn = Box::new(move |ip: &str, _sni, _path, _to| {
+            let n: usize = ip.trim_start_matches("candidate-").parse().unwrap_or(0);
+            let out = if n % 2 == 0 {
+                vec![ws_accepted(443, 4096)]
+            } else {
+                vec![ws_rejected(443)]
+            };
+            Box::pin(async move { out })
+        });
+        let e2e: E2eFn = Box::new(move |ip, _port, _vless, _t| {
+            let ip = ip.to_string();
+            Box::pin(async move {
+                crate::e2e::E2eResult {
+                    endpoint: format!("{ip}:443"),
+                    passed: true,
+                    failure_stage: None,
+                    verified_at: 0,
+                    tunnel_ip: Some("9.9.9.9".into()),
+                }
+            })
+        });
+        let res = pipeline_scan(
+            cands,
+            "sni.test",
+            "/ws",
+            "vless://x@y:443?security=tls&type=ws",
+            Some("1.1.1.1".into()),
+            PipelineParams::default(),
+            p1,
+            p2,
+            e2e,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let m = &res.diagnostics.success_by_profile;
+        let key = (
+            crate::probe_jitter::ClientHelloProfile::Chrome120,
+            crate::health::SniLayer::Worker,
+        );
+        let counted = *m.get(&key).unwrap_or(&0);
+        // 6 of 12 candidates are accepted (even indices); each accepted probe
+        // uses Chrome120 under the worker SNI.
+        assert!(
+            counted >= 3 && counted <= 6,
+            "expected Chrome120/Worker success buckets, got {m:?}"
+        );
+        // No success recorded under any other profile (only ws_accepted ran).
+        assert_eq!(
+            m.keys().filter(|(prof, _)| *prof != crate::probe_jitter::ClientHelloProfile::Chrome120).count(),
+            0,
+            "only Chrome120 should have successes: {m:?}"
+        );
+    }
+
     #[test]
     fn sni_verdict_worker_only_tls_alert() {
         assert_eq!(
