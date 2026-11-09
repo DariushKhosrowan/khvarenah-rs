@@ -727,7 +727,7 @@ async fn export_cmd(
     Ok(())
 }
 
-fn backup(_profile: String, action: BackupAction) -> Result<(), CFError> {
+fn backup(profile: String, action: BackupAction) -> Result<(), CFError> {
     use khvarenah_core::backup::*;
     match action {
         BackupAction::Export { profile_id } => {
@@ -740,6 +740,37 @@ fn backup(_profile: String, action: BackupAction) -> Result<(), CFError> {
         }
         BackupAction::List => {
             print!("{}", backup_summary());
+        }
+        BackupAction::Autosync {
+            disable,
+            interval,
+            keep,
+        } => {
+            use khvarenah_core::store::profiles::{load_profile, save_profile};
+            let mut p = load_profile(&profile);
+            let mut cfg = p.config.backup_autosync.clone();
+            if disable {
+                cfg.enabled = false;
+            } else {
+                cfg.enabled = true;
+            }
+            if let Some(i) = interval {
+                cfg.interval_secs = i;
+            }
+            if let Some(k) = keep {
+                cfg.keep = k;
+            }
+            p.config.backup_autosync = cfg.clone();
+            save_profile(&p)?;
+            println!(
+                "✓ Auto-backup: enabled={} interval={}s keep={}",
+                cfg.enabled, cfg.interval_secs, cfg.keep
+            );
+            println!(
+                "  Backups dir: {}",
+                khvarenah_core::backup::backup_dir().display()
+            );
+            println!("  (daemon snapshots the profile on this schedule; run `daemon status` to see last backup)");
         }
     }
     Ok(())
