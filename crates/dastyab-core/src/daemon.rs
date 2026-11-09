@@ -305,6 +305,26 @@ pub fn systemd_unit(binary: &Path, profile: &str) -> String {
     )
 }
 
+/// Build the argv for a `systemctl --user <action> <unit>` invocation. Pure,
+/// so the command shape is unit-testable without a running systemd instance.
+pub fn systemctl_user_argv(action: &str, unit_name: &str) -> Vec<String> {
+    vec!["--user".into(), action.to_string(), unit_name.to_string()]
+}
+
+/// Run `systemctl --user <action> <unit>` and return whether it succeeded.
+///
+/// This is the per-user systemd manager — no root required — so the app can
+/// close the last manual step (running `systemctl --user enable --now` by
+/// hand). The unit file itself must already be written. Returns `Ok(true)`
+/// on a clean exit, `Ok(false)` when systemctl ran but reported failure, and
+/// `Err` when the executable is missing/unrunnable.
+pub fn systemctl_user(action: &str, unit_name: &str) -> std::io::Result<bool> {
+    let outp = std::process::Command::new("systemctl")
+        .args(systemctl_user_argv(action, unit_name))
+        .output()?;
+    Ok(outp.status.success())
+}
+
 /// Result of a network-liveness probe: whether the network is up at all, plus
 /// the best transport tier that was reachable (None when nothing worked).
 #[derive(Debug, Clone, Default)]
@@ -691,6 +711,16 @@ mod tests {
         assert!(unit.contains("WantedBy=default.target"));
         // Must NOT auto-run systemctl (privilege escalation is user's call).
         assert!(!unit.contains("systemctl"));
+    }
+
+    #[test]
+    fn systemctl_user_argv_is_user_scoped_enable_now() {
+        let argv = systemctl_user_argv("enable --now", "dastyab-daemon.service");
+        assert_eq!(argv, vec!["--user", "enable --now", "dastyab-daemon.service"]);
+        let argv_start = systemctl_user_argv("start", "dastyab-daemon.service");
+        assert_eq!(argv_start[0], "--user");
+        assert_eq!(argv_start[1], "start");
+        assert_eq!(argv_start[2], "dastyab-daemon.service");
     }
 
     #[test]

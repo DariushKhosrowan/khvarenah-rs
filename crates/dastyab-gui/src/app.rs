@@ -129,6 +129,8 @@ pub struct DastYabApp {
     pub desync_max: usize,
     pub desync_delay_us: u64,
     pub desync_note: String,
+    // protection daemon control
+    pub daemon_note: String,
 }
 
 /// What to do when the open dialog submits.
@@ -262,6 +264,7 @@ impl DastYabApp {
             desync_max: profile.config.desync.max_fragment,
             desync_delay_us: profile.config.desync.inter_fragment_delay_us,
             desync_note: String::new(),
+            daemon_note: String::new(),
             hz_token: String::new(),
             hz_location: "nbg1".to_string(),
             hz_server_type: "cx22".to_string(),
@@ -1293,6 +1296,67 @@ impl DastYabApp {
         }
     }
 
+    /// Install (if absent) and start the persistent protection daemon through
+    /// systemd --user. This closes the last manual step: the app runs
+    /// `systemctl --user enable --now` itself instead of printing the command.
+    fn daemon_install_start(&mut self) {
+        let pid = self.profile_id.clone();
+        let current_exe = std::env::current_exe();
+        let exe = match current_exe {
+            Ok(p) => p,
+            Err(e) => {
+                self.daemon_note = format!("Cannot locate the binary: {e}");
+                return;
+            }
+        };
+        // Write the unit (idempotent) and enable+start it.
+        match dastyab_core::bootstrap::ensure_daemon_installed(&exe, &pid, true) {
+            Ok(_outcome) => {
+                self.daemon_note = "Daemon installed and enabled (systemd --user, restarts on boot).".to_string();
+            }
+            Err(e) => {
+                self.daemon_note = format!("Daemon install failed: {}", e.brief());
+            }
+        }
+    }
+
+    /// Stop the daemon via the stop-file (clean, loop exits on next tick).
+    fn daemon_stop(&mut self) {
+        let cfg = dastyab_core::daemon::DaemonConfig::new(&self.profile_id);
+        match dastyab_core::store::write_json(&cfg.stop_file, &true) {
+            Ok(()) => {
+                self.daemon_note = "Stop requested — the daemon exits on its next tick.".to_string();
+            }
+            Err(e) => {
+                self.daemon_note = format!("Stop failed: {e}");
+            }
+        }
+    }
+
+    /// Refresh the daemon status line in the Blackout settings section.
+    fn daemon_status_line(&self) -> String {
+        let cfg = dastyab_core::daemon::DaemonConfig::new(&self.profile_id);
+        let running = dastyab_core::daemon::is_daemon_running(&cfg.pid_file);
+        let st = dastyab_core::daemon::load_daemon_state(&self.profile_id);
+        let up = if running && st.started_at > 0 {
+            let secs = (dastyab_core::store::now_ts() as i64) - st.started_at;
+            format!(", uptime {secs}s")
+        } else {
+            String::new()
+        };
+        let stre = if st.failure_streak > 0 {
+            format!(", failure streak {}", st.failure_streak)
+        } else {
+            String::new()
+        };
+        format!(
+            "Daemon {} · last cycle {}{}",
+            if running { "RUNNING" } else { "STOPPED" },
+            up,
+            stre
+        )
+    }
+
     fn settings_panel(&mut self, ui: &mut egui::Ui, _p: &dastyab_core::store::profiles::Profile) {
         ui.heading(egui::RichText::new("Settings").color(GOLD));
         ui.checkbox(&mut self.scan_gentle, "gentle scan");
@@ -1395,6 +1459,24 @@ impl DastYabApp {
         });
         if !self.vps_note.is_empty() {
             ui.colored_label(GOLD, &self.vps_note);
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading(egui::RichText::new("Daemon").color(GOLD));
+        ui.label("Persistent protection daemon: safe to run 24/7. It scans,");
+        ui.label("resurfaces, fails-over, and reports — no manual care needed.");
+        ui.label(&self.daemon_status_line());
+        ui.horizontal(|ui| {
+            if ui.button("Install + start (systemd)").clicked() {
+                self.daemon_install_start();
+            }
+            if ui.button("Stop").clicked() {
+                self.daemon_stop();
+            }
+        });
+        if !self.daemon_note.is_empty() {
+            ui.colored_label(GOLD, &self.daemon_note);
         }
 
         ui.add_space(10.0);
