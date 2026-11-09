@@ -810,11 +810,11 @@ mod tests {
         // Start at the initial interval so the next failure escalates through
         // the configured ceiling.
         state.current_interval_secs = DEFAULT_INITIAL_INTERVAL_SECS;
-        let probe = FakeProbe::new(true);
+        let mut probe = FakeProbe::new(true);
         let cycle = FakeCycle::new(false); // always fails → escalates backoff
         let acct = FakeAccountProbe::default();
         let mut log_lines = Vec::new();
-        let sleep = daemon_tick(&profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let sleep = daemon_tick(&profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -950,7 +950,7 @@ mod tests {
         }
     }
     impl NetworkProbe for FakeProbe {
-        fn liveness(&self) -> Pin<Box<dyn Future<Output = NetStatus> + Send + '_>> {
+        fn liveness(&mut self) -> Pin<Box<dyn Future<Output = NetStatus> + Send + '_>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let st = self.status.clone();
             Box::pin(async move { st })
@@ -1016,13 +1016,13 @@ mod tests {
         let _home = daemon_home();
         let profile = "default";
         let mut state = DaemonState::default();
-        let probe = FakeProbe::new(false);
+        let mut probe = FakeProbe::new(false);
         let cycle = FakeCycle::new(true);
         let mut log_lines = Vec::new();
         let acct = FakeAccountProbe::default();
 
         // First tick: network down → skip cycle.
-        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -1036,7 +1036,7 @@ mod tests {
         assert!(log_lines.iter().any(|l| l.contains("network=down")));
 
         // Second tick: still down → still no cycle, and no duplicate "down" log.
-        let sleep2 = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let sleep2 = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -1058,12 +1058,12 @@ mod tests {
         let _home = daemon_home();
         let profile = "default";
         let mut state = DaemonState::default();
-        let probe = FakeProbe::new(false);
+        let mut probe = FakeProbe::new(false);
         let cycle = FakeCycle::new(true);
         let mut log_lines = Vec::new();
         let acct = FakeAccountProbe::default();
 
-        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -1084,11 +1084,11 @@ mod tests {
         let profile = "default";
         let mut state = DaemonState::default();
         // Network up via DoH (direct unavailable).
-        let probe = FakeProbe::with_tier(true, crate::connectivity::Tier::DoH);
+        let mut probe = FakeProbe::with_tier(true, crate::connectivity::Tier::DoH);
         let cycle = FakeCycle::new(true);
         let acct = FakeAccountProbe::default();
 
-        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |_l| {}).await;
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |_l| {}).await;
         // Up via DoH + a healthy cycle → success, interval reset, tier recorded.
         assert_eq!(sleep, DEFAULT_INITIAL_INTERVAL_SECS);
         assert_eq!(cycle.calls.load(Ordering::SeqCst), 1);
@@ -1105,12 +1105,12 @@ mod tests {
             network_was_down: true, // was down
             ..Default::default()
         };
-        let probe = FakeProbe::new(true); // now up
+        let mut probe = FakeProbe::new(true); // now up
         let cycle = FakeCycle::new(true);
         let mut log_lines = Vec::new();
         let acct = FakeAccountProbe::default();
 
-        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -1130,11 +1130,11 @@ mod tests {
         let _home = daemon_home();
         let profile = crate::store::profiles::create_profile("default", "").unwrap();
         let mut state = DaemonState::default();
-        let probe = FakeProbe::new(true);
+        let mut probe = FakeProbe::new(true);
         let cycle = FakeCycle::new(true);
         let acct = FakeAccountProbe::default();
 
-        let sleep = daemon_tick(&profile, &mut state, &probe, &acct, &cycle, &mut |_l| {}).await;
+        let sleep = daemon_tick(&profile, &mut state, &mut probe, &acct, &cycle, &mut |_l| {}).await;
         assert_eq!(sleep, DEFAULT_INITIAL_INTERVAL_SECS);
         // The automatic flush attempt ran (beacon disabled on this profile →
         // noop, but the attempt is recorded).
@@ -1142,7 +1142,7 @@ mod tests {
 
         // A second tick within the interval must NOT re-flush.
         let before = state.last_outbox_flush_ts;
-        let _sleep2 = daemon_tick(&profile, &mut state, &probe, &acct, &cycle, &mut |_l| {}).await;
+        let _sleep2 = daemon_tick(&profile, &mut state, &mut probe, &acct, &cycle, &mut |_l| {}).await;
         assert_eq!(state.last_outbox_flush_ts, before);
     }
 
@@ -1156,11 +1156,11 @@ mod tests {
             network_was_down: true, // was down
             ..Default::default()
         };
-        let probe = FakeProbe::new(true); // now up
+        let mut probe = FakeProbe::new(true); // now up
         let cycle = FakeCycle::new(true);
         let acct = FakeAccountProbe::default();
 
-        let sleep = daemon_tick(&profile, &mut state, &probe, &acct, &cycle, &mut |_l| {}).await;
+        let sleep = daemon_tick(&profile, &mut state, &mut probe, &acct, &cycle, &mut |_l| {}).await;
         assert_eq!(sleep, 0, "must cycle immediately on restore");
         assert!(
             state.last_outbox_flush_ts > 0,
@@ -1175,33 +1175,33 @@ mod tests {
         let _home = daemon_home();
         let profile = "default";
         let mut state = DaemonState::default();
-        let probe = FakeProbe::new(true);
+        let mut probe = FakeProbe::new(true);
         let cycle = FakeCycle::new(false); // always fails
         let mut log_lines = Vec::new();
         let acct = FakeAccountProbe::default();
 
-        let s1 = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let s1 = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
         assert_eq!(s1, 900, "300 → 900");
         assert_eq!(state.failure_streak, 1);
 
-        let s2 = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let s2 = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
         assert_eq!(s2, 3600, "900 → 3600");
         assert_eq!(state.failure_streak, 2);
 
-        let s3 = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let s3 = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
         assert_eq!(s3, 21600, "3600 → 21600");
         assert_eq!(state.failure_streak, 3);
 
-        let s4 = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let s4 = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -1219,12 +1219,12 @@ mod tests {
             current_interval_secs: 21600,
             ..Default::default()
         };
-        let probe = FakeProbe::new(true);
+        let mut probe = FakeProbe::new(true);
         let cycle = FakeCycle::new(true); // succeeds
         let mut log_lines = Vec::new();
         let acct = FakeAccountProbe::default();
 
-        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -1278,13 +1278,13 @@ mod tests {
         let mut state = DaemonState::default();
         state.account_state = crate::account_state::AccountState::Suspended { since: 1 };
         state.last_account_poll_ts = crate::store::now_ts() as i64; // inside window
-        let probe = FakeProbe::new(true);
+        let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
             state: crate::account_state::AccountState::Suspended { since: 1 },
         };
         let cycle = FakeCycle::new(true);
         let mut log_lines = Vec::new();
-        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string());
         })
         .await;
@@ -1307,13 +1307,13 @@ mod tests {
         state.account_state = crate::account_state::AccountState::Suspended { since: 1 };
         // Advance the poll window so a re-probe actually happens.
         state.last_account_poll_ts = (crate::store::now_ts() as i64) - 2000;
-        let probe = FakeProbe::new(true);
+        let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
             state: crate::account_state::AccountState::Active,
         };
         let cycle = FakeCycle::new(true);
         let mut log_lines = Vec::new();
-        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string());
         })
         .await;
@@ -1336,12 +1336,12 @@ mod tests {
         let mut state = DaemonState::default();
         state.account_state = crate::account_state::AccountState::TokenInvalid { since: 1 };
         state.last_account_poll_ts = crate::store::now_ts() as i64;
-        let probe = FakeProbe::new(true);
+        let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
             state: crate::account_state::AccountState::TokenInvalid { since: 1 },
         };
         let cycle = FakeCycle::new(true);
-        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |_| {}).await;
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |_| {}).await;
         assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
         assert_eq!(cycle.calls.load(Ordering::SeqCst), 0);
     }
@@ -1355,12 +1355,12 @@ mod tests {
         let mut state = DaemonState::default();
         state.account_state = crate::account_state::AccountState::Active;
         state.last_account_poll_ts = (crate::store::now_ts() as i64) - 2000;
-        let probe = FakeProbe::new(true);
+        let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
             state: crate::account_state::AccountState::Suspended { since: 1 },
         };
         let cycle = FakeCycle::new(true);
-        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |_| {}).await;
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |_| {}).await;
         assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
         assert_eq!(cycle.calls.load(Ordering::SeqCst), 0);
         assert!(state.account_state.blocks_cycle());

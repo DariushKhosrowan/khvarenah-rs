@@ -144,32 +144,34 @@ impl<P: Probe> FallbackLadder<P> {
         self.probe.probe(tier).await
     }
 
-    /// Network-liveness query backed by ladder state. Polls the current tier and
-    /// descends (statefully) when it fails; if a lower tier works we report it
-    /// as the surviving tier. When the current tier is dead and nothing lower
-    /// works, it sweeps the whole ladder best-first so a recovered higher tier is
-    /// adopted again. Returns `(up, best_reachable_tier)`.
+    /// Network-liveness query backed by ladder state. If the current tier is
+    /// healthy, we report it and opportunistically climb back to a better tier
+    /// if one has recovered. If the current tier fails, we descend rung by
+    /// rung (direct → DoH → DoT → DNS tunnel) until we find one that works, or
+    /// report `(false, None)` when every tier is down (total blackout). The
+    /// ladder's `current` tier is updated so successive ticks remember where we
+    /// landed instead of restarting from Direct every time.
     pub async fn liveness_status(&mut self) -> (bool, Option<Tier>) {
-        // 1. Current tier still healthy?
-        if self.poll().await {
-            return (true, Some(self.current));
-        }
-        // 2. We may have descended — does the new current tier actually work?
+        // 1. Is the current tier still healthy?
         if self.probe_tier(self.current).await.ok {
+            self.fails_in_row = 0;
+            // Opportunistic climb-back: if a strictly-higher tier has
+            // recovered, adopt it (we prefer the best tier).
+            if let Some(higher) = self.climb_back().await {
+                return (true, Some(higher));
+            }
             return (true, Some(self.current));
         }
-        // 3. Full sweep best-first (climb back to any recovered higher tier, or
-        //    accept a lower one). Adopt the first working tier found.
-        for tier in TIER_ORDER.iter().copied() {
-            if tier == self.current {
-                continue;
-            }
-            if self.probe_tier(tier).await.ok {
-                self.current = tier;
+        // 2. Current tier failed — descend rung by rung until one works.
+        while self.current.rank() < TIER_ORDER.len() - 1 {
+            let next = TIER_ORDER[self.current.rank() + 1];
+            self.current = next;
+            if self.probe_tier(next).await.ok {
                 self.fails_in_row = 0;
-                return (true, Some(tier));
+                return (true, Some(next));
             }
         }
+        self.fails_in_row += 1;
         (false, None)
     }
 
@@ -466,5 +468,83 @@ mod tests {
         assert!(!report[2].1.ok);
         assert_eq!(report[3].0, Tier::DnsTunnel);
         assert!(report[3].1.ok);
+    }
+
+    // ── liveness_status (daemon-backed stateful probe) ──
+
+    fn scripted(up: &[(Tier, bool)]) -> ScriptedProbe {
+        let mut results = HashMap::new();
+        for (t, ok) in up {
+            results.insert(
+                *t,
+                if *ok {
+                    ProbeVerdict::up("ok")
+                } else {
+                    ProbeVerdict::down("down")
+                },
+            );
+        }
+        ScriptedProbe { results }
+    }
+
+    /// Direct healthy → up, Direct tier reported (and the ladder stays put).
+    #[tokio::test]
+    async fn liveness_direct_healthy_reports_direct() {
+        let mut ladder = FallbackLadder::new(scripted(&[(Tier::Direct, true)]), Tier::Direct);
+        assert_eq!(ladder.liveness_status().await, (true, Some(Tier::Direct)));
+        // Still Direct — no pointless descend.
+        assert_eq!(ladder.current(), Tier::Direct);
+    }
+
+    /// Direct down but DoH up → the ladder descends and reports DoH.
+    #[tokio::test]
+    async fn liveness_descends_to_working_lower_tier() {
+        let mut ladder = FallbackLadder::new(
+            scripted(&[(Tier::Direct, false), (Tier::DoH, true)]),
+            Tier::Direct,
+        );
+        assert_eq!(ladder.liveness_status().await, (true, Some(Tier::DoH)));
+    }
+
+    /// Total blackout → down, None tier, and the ladder keeps descending stepwise.
+    #[tokio::test]
+    async fn liveness_all_down_reports_down() {
+        let all_down = scripted(&[
+            (Tier::Direct, false),
+            (Tier::DoH, false),
+            (Tier::DoT, false),
+            (Tier::DnsTunnel, false),
+        ]);
+        let mut ladder = FallbackLadder::new(all_down, Tier::Direct);
+        assert_eq!(ladder.liveness_status().await, (false, None));
+        // Descended at least one rung (Direct failed → DoH).
+        assert!(ladder.current().rank() > Tier::Direct.rank());
+    }
+
+    /// A worker tier recovers → the ladder climbs back to it (stateful recovery).
+    #[tokio::test]
+    async fn liveness_climbs_back_when_higher_tier_recovers() {
+        // Start with Direct down, DoH up → we settle on DoH.
+        let mut ladder = FallbackLadder::new(
+            scripted(&[(Tier::Direct, false), (Tier::DoH, true)]),
+            Tier::Direct,
+        );
+        assert_eq!(ladder.liveness_status().await, (true, Some(Tier::DoH)));
+
+        // Now Direct recovers: next probe should climb back to Direct.
+        ladder.probe = scripted(&[(Tier::Direct, true), (Tier::DoH, true)]);
+        assert_eq!(ladder.liveness_status().await, (true, Some(Tier::Direct)));
+        assert_eq!(ladder.current(), Tier::Direct);
+    }
+
+    /// Direct flaky: a transient Direct failure with a healthy DoH fallback is
+    /// reported as up, not down (net still reachable via DoH).
+    #[tokio::test]
+    async fn liveness_transient_direct_failure_still_up_via_doh() {
+        let mut ladder = FallbackLadder::new(
+            scripted(&[(Tier::Direct, false), (Tier::DoH, true)]),
+            Tier::Direct,
+        );
+        assert_eq!(ladder.liveness_status().await, (true, Some(Tier::DoH)));
     }
 }
