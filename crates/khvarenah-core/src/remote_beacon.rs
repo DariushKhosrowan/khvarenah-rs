@@ -61,6 +61,14 @@ pub enum BeaconEvent {
     AccountBlocked {
         state: String,
         since: i64,
+        /// Whether auto-rotation across the profile's stored tokens is enabled
+        /// (default on). When true, the daemon will try to self-heal before
+        /// any manual step is needed.
+        auto_rotate_enabled: bool,
+        /// Number of tokens recorded in the profile at emission time. Drives
+        /// whether the beacon message promises auto-recovery (>=2 tokens) or
+        /// demands a manual token add (single token / rotation off).
+        stored_tokens: usize,
     },
     /// The daemon automatically rotated to another stored token (the active
     /// one was blocked/invalid). Carries the old and new token labels.
@@ -274,15 +282,35 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
         ) => {
             format!("🔄 Worker signature rotated: {old_worker} → {new_worker}")
         }
-        (BeaconEvent::AccountBlocked { state, .. }, crate::diagnose::Locale::Fa) => {
-            format!(
-                "⛔ حساب مسدود شد ({state}) — دستور «khvarenah token recover <label> <token>» را اجرا کنید تا توکن جدید جایگزین و حفاظت خودکار دوباره شروع شود"
-            )
+        (BeaconEvent::AccountBlocked { state, auto_rotate_enabled, stored_tokens, .. }, crate::diagnose::Locale::Fa) => {
+            if *auto_rotate_enabled && *stored_tokens >= 2 {
+                format!(
+                    "⛔ حساب مسدود شد ({state}) — {stored_tokens} توکن ذخیره‌شده است؛ چرخش خودکار فعال است و در چند لحظه تلاش می‌کند توکن سالم جایگزین کند"
+                )
+            } else if *auto_rotate_enabled {
+                format!(
+                    "⛔ حساب مسدود شد ({state}) — فقط ۱ توکن ذخیره شده است؛ با «khvarenah token recover <label> <token>» توکن دوم اضافه کنید تا چرخش خودکار فعال شود"
+                )
+            } else {
+                format!(
+                    "⛔ حساب مسدود شد ({state}) — چرخش خودکار خاموش است؛ «khvarenah token recover <label> <token>» را اجرا کنید"
+                )
+            }
         }
-        (BeaconEvent::AccountBlocked { state, .. }, _) => {
-            format!(
-                "⛔ Account blocked ({state}) — run `khvarenah token recover <label> <token>` to replace the token and auto-resume protection"
-            )
+        (BeaconEvent::AccountBlocked { state, auto_rotate_enabled, stored_tokens, .. }, _) => {
+            if *auto_rotate_enabled && *stored_tokens >= 2 {
+                format!(
+                    "⛔ Account blocked ({state}) — {stored_tokens} tokens stored; auto-rotation is ON and will try to swap to a working token in moments"
+                )
+            } else if *auto_rotate_enabled {
+                format!(
+                    "⛔ Account blocked ({state}) — only 1 token stored; run `khvarenah token recover <label> <token>` to add a second so auto-rotation can engage"
+                )
+            } else {
+                format!(
+                    "⛔ Account blocked ({state}) — auto-rotation is OFF; run `khvarenah token recover <label> <token>` to replace the token and auto-resume protection"
+                )
+            }
         }
         (BeaconEvent::TokenAutoRotated { from, to }, crate::diagnose::Locale::Fa) => {
             format!(
@@ -608,6 +636,8 @@ mod tests {
         let ev = BeaconEvent::AccountBlocked {
             state: "token-invalid".into(),
             since: 1234,
+            auto_rotate_enabled: false,
+            stored_tokens: 1,
         };
         let en = format_message(&ev, crate::diagnose::Locale::En);
         assert!(en.contains("token-invalid"), "en={en}");
@@ -623,6 +653,42 @@ mod tests {
             fa.contains("token recover"),
             "fa should carry the recovery action: {fa}"
         );
+    }
+
+    #[test]
+    fn test_format_message_account_blocked_auto_rotate_promises_selfheal() {
+        // Auto-rotation on with >=2 stored tokens → the message promises the
+        // daemon will self-heal, not demand a manual command.
+        let ev = BeaconEvent::AccountBlocked {
+            state: "suspended".into(),
+            since: 1234,
+            auto_rotate_enabled: true,
+            stored_tokens: 3,
+        };
+        let en = format_message(&ev, crate::diagnose::Locale::En);
+        assert!(en.contains("auto-rotation is ON"), "en={en}");
+        assert!(en.contains("3 tokens stored"), "en={en}");
+        // The manual step should NOT be the headline when auto-rotation engages.
+        assert!(!en.contains("run `khvarenah token recover"), "en={en}");
+        let fa = format_message(&ev, crate::diagnose::Locale::Fa);
+        assert!(fa.contains("چرخش خودکار فعال"), "fa={fa}");
+        assert!(!fa.contains("token recover"), "fa={fa}");
+    }
+
+    #[test]
+    fn test_format_message_account_blocked_auto_rotate_single_token_asks_for_second() {
+        // Auto-rotation on but only ONE token stored → cannot rotate; the
+        // message must tell the user to add a second token.
+        let ev = BeaconEvent::AccountBlocked {
+            state: "token-invalid".into(),
+            since: 1234,
+            auto_rotate_enabled: true,
+            stored_tokens: 1,
+        };
+        let en = format_message(&ev, crate::diagnose::Locale::En);
+        assert!(en.contains("only 1 token"), "en={en}");
+        assert!(en.contains("token recover"), "en={en}");
+        assert!(en.contains("add a second"), "en={en}");
     }
 
     #[test]
