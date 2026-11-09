@@ -177,6 +177,13 @@ enum Command {
         #[command(subcommand)]
         action: ProtectionAction,
     },
+    /// Anti-DPI TCP desync fragmenter: configure and report it. When enabled,
+    /// the WS-gate writes the upgrade request as irregular segments so DPI
+    /// can't reassemble it (helps when healthy edges get reset on upgrade).
+    Desync {
+        #[command(subcommand)]
+        action: DesyncAction,
+    },
     /// Persistent protection daemon (unattended monitor with network-liveness
     /// probe, exponential backoff, and daemon.log).
     Daemon {
@@ -556,6 +563,27 @@ pub enum ProtectionAction {
         #[arg(long)]
         stdin: bool,
     },
+}
+
+/// Anti-DPI TCP desync fragmenter subcommands.
+#[derive(Subcommand)]
+pub enum DesyncAction {
+    /// Show whether desync fragmentation is enabled (and its tuning).
+    Status,
+    /// Enable desync fragmentation (persisted on the profile).
+    On {
+        /// Smallest fragment size in bytes.
+        #[arg(long, default_value_t = 8)]
+        min_fragment: usize,
+        /// Largest fragment size in bytes.
+        #[arg(long, default_value_t = 64)]
+        max_fragment: usize,
+        /// Pause between flushed fragments, microseconds.
+        #[arg(long, default_value_t = 300)]
+        delay_us: u64,
+    },
+    /// Disable desync fragmentation (persisted).
+    Off,
 }
 
 /// Persistent daemon subcommands (unattended protection monitor).

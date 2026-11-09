@@ -121,6 +121,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         } => cmd_discover(&profile, sample, workers, refresh).await,
         Command::Autopilot { action } => cmd_autopilot(&profile, action).await,
         Command::Protection { action } => cmd_protection(&profile, action).await,
+        Command::Desync { action } => cmd_desync(&profile, action),
         Command::Daemon { action } => cmd_daemon(&profile, action).await,
         Command::Health { json } => cmd_health(&profile, json),
         Command::E2e {
@@ -1265,6 +1266,47 @@ async fn cmd_protection(profile: &str, action: ProtectionAction) -> Result<(), C
                     .await?;
                 println!("{}", summary.note);
             }
+            Ok(())
+        }
+    }
+}
+
+/// Configure / report the anti-DPI TCP desync fragmenter (persisted per-profile).
+fn cmd_desync(profile: &str, action: crate::DesyncAction) -> Result<(), CFError> {
+    match action {
+        crate::DesyncAction::Status => {
+            let cfg = khvarenah_core::store::profiles::load_profile(profile)
+                .config
+                .desync;
+            println!("Desync fragmentation: {}", if cfg.enabled { "ON" } else { "OFF" });
+            if cfg.enabled {
+                println!("  min fragment: {} B", cfg.min_fragment);
+                println!("  max fragment: {} B", cfg.max_fragment);
+                println!("  inter-fragment delay: {} us", cfg.inter_fragment_delay_us);
+            }
+            Ok(())
+        }
+        crate::DesyncAction::On {
+            min_fragment,
+            max_fragment,
+            delay_us,
+        } => {
+            let mut p = khvarenah_core::store::profiles::load_profile(profile);
+            p.config.desync.enabled = true;
+            p.config.desync.min_fragment = min_fragment.max(1);
+            p.config.desync.max_fragment = max_fragment.max(min_fragment.max(1));
+            p.config.desync.inter_fragment_delay_us = delay_us;
+            khvarenah_core::store::profiles::save_profile(&p)?;
+            khvarenah_core::desync::apply_from_profile(profile);
+            println!("Desync fragmentation ON (saved). Next scan/cycle will write WS upgrades as irregular segments.");
+            Ok(())
+        }
+        crate::DesyncAction::Off => {
+            let mut p = khvarenah_core::store::profiles::load_profile(profile);
+            p.config.desync.enabled = false;
+            khvarenah_core::store::profiles::save_profile(&p)?;
+            khvarenah_core::desync::apply_from_profile(profile);
+            println!("Desync fragmentation OFF (saved).");
             Ok(())
         }
     }

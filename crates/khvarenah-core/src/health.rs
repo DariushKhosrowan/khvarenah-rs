@@ -422,9 +422,15 @@ pub async fn probe_ws_ex(
     // seconds on censored networks (SlipNet-style).
     let mut rng = rand::rngs::StdRng::from_entropy();
     let req = crate::probe_jitter::randomize_ws_request(&mut rng, base_req.as_bytes());
-    if tokio::time::timeout(Duration::from_millis(timeout_ms), stream.write_all(&req))
-        .await
-        .is_err()
+    // Anti-DPI desync: when enabled, write the WS upgrade as irregular TLS
+    // segments (small randomized flushed fragments) so stateful DPI can't
+    // reassemble the request before we own the connection.
+    let desync = crate::desync::active_config();
+    if tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        crate::desync::write_fragmented(&mut stream, &req, &desync).await
+    })
+    .await
+    .is_err()
     {
         probe.failure_stage = Some("ws".into());
         probe.failure_reason = Some(WsFailureReason::WriteFailed);
