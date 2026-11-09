@@ -1775,6 +1775,8 @@ pub enum RescueAction {
     ReseedFromManualSeeds,
     /// Nuclear: re-deploy the worker (rate-limited to 1/hour).
     RedeployWorker,
+    /// Switch to another healthy worker in this profile's multi-worker set.
+    FailoverWorkerSet,
     /// Every step failed; surface the plain-language diagnosis.
     GiveUp,
 }
@@ -2269,7 +2271,62 @@ pub async fn rescue_from_failure(
         crate::store::profiles::save_rescue_meta(profile_id, now, now, Some("gave_up".into()))?;
     }
 
-    // Step 5 — GiveUp. The current profile's worker is unrecoverable: every
+    // Step 5 — FailoverWorkerSet. Before giving up on the whole profile, try
+    // switching to another healthy worker in this profile's multi-worker set.
+    // This is a cheaper recovery than profile-level failover and keeps the
+    // same account/token working.
+    let wpeer = crate::multi_worker::RealWorkerPeer;
+    match crate::multi_worker::failover_worker_set(&wpeer, profile_id).await {
+        Ok(true) => {
+            chain.attempts.push(RescueAttempt {
+                action: RescueAction::FailoverWorkerSet,
+                attempted_at: now,
+                outcome: RescueOutcome::Success {
+                    endpoint: "switched to standby worker in set".into(),
+                    rtt_ms: 0,
+                },
+            });
+            // Try the fallback pool again under the new active worker.
+            if let Some((ep, rtt)) = pick_fallback_endpoint(profile_id, peer).await {
+                chain.attempts.push(RescueAttempt {
+                    action: RescueAction::TryFallbackPool,
+                    attempted_at: now,
+                    outcome: RescueOutcome::Success {
+                        endpoint: ep.clone(),
+                        rtt_ms: rtt,
+                    },
+                });
+                chain.final_state = Some(CycleSummary {
+                    cycle: crate::store::now_ts() as u64,
+                    alive: 1,
+                    replaced: 0,
+                    note: "recovered via worker-set failover".into(),
+                });
+                chain.gave_up = false;
+                return Ok(chain);
+            }
+        }
+        Ok(false) => {
+            chain.attempts.push(RescueAttempt {
+                action: RescueAction::FailoverWorkerSet,
+                attempted_at: now,
+                outcome: RescueOutcome::Skipped {
+                    reason: "no healthy standby worker in set".into(),
+                },
+            });
+        }
+        Err(e) => {
+            chain.attempts.push(RescueAttempt {
+                action: RescueAction::FailoverWorkerSet,
+                attempted_at: now,
+                outcome: RescueOutcome::Failed {
+                    reason: format!("worker-set failover error: {}", e.brief()),
+                },
+            });
+        }
+    }
+
+    // Step 6 — GiveUp. The current profile's worker is unrecoverable: every
     // rescue step is exhausted. Mark this profile failed and fail over to a
     // different profile whose worker may still be alive (cross-worker
     // failover). If no alternative exists, we stay and surface the diagnosis.

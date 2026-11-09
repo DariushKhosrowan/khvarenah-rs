@@ -154,6 +154,9 @@ pub struct ProfileConfig {
     /// UNIX epoch seconds of the last config mutation.
     #[serde(default)]
     pub last_mutation_ts: i64,
+    /// Multi-worker parallel redundancy set (round 19).
+    #[serde(default)]
+    pub worker_set: crate::multi_worker::WorkerSet,
 }
 
 fn default_light_interval() -> u64 {
@@ -187,6 +190,7 @@ impl Default for ProfileConfig {
             beacon: None,
             mutation: crate::config_mutation::MutationConfig::default(),
             last_mutation_ts: 0,
+            worker_set: crate::multi_worker::WorkerSet::default(),
         }
     }
 }
