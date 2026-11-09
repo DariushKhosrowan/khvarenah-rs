@@ -327,11 +327,101 @@ pub fn build_dns_query_a(host: &str, id: u16) -> Vec<u8> {
     out
 }
 
+/// Build a DNS query for a TXT record (QTYPE=16) of `host` with the given id.
+/// Used by the live DNS-tunnel liveness probe (raw UDP, not the OS resolver).
+pub fn build_dns_query_txt(host: &str, id: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+
+    // Header (12 bytes)
+    out.extend_from_slice(&id.to_be_bytes()); // ID
+    out.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD=1
+    out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+
+    // QNAME: labels
+    for label in host.split('.') {
+        if label.is_empty() {
+            continue;
+        }
+        debug_assert!(label.len() <= 63);
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0); // root
+
+    // QTYPE=TXT (16), QCLASS=IN
+    out.extend_from_slice(&16u16.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out
+}
+
+/// Parse a DNS response and return all TXT character-strings found (as UTF-8
+/// lossy strings). Handles the TXT RDATA format: one or more length-prefixed
+/// character-strings concatenated in the RDATA.
+pub fn parse_dns_response_txt(bytes: &[u8]) -> Result<Vec<String>, CFError> {
+    if bytes.len() < 12 {
+        return Err(CFError::new("DoH parse", "Response too short.", ""));
+    }
+
+    let qdcount = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    let ancount = u16::from_be_bytes([bytes[6], bytes[7]]) as usize;
+
+    let mut pos = 12usize;
+
+    // Skip questions
+    for _ in 0..qdcount {
+        pos = skip_name(bytes, pos)?;
+        pos += 4; // QTYPE + QCLASS
+        if pos > bytes.len() {
+            return Err(CFError::new("DoH parse", "Question overran message.", ""));
+        }
+    }
+
+    let mut txts = Vec::new();
+    for _ in 0..ancount {
+        pos = skip_name(bytes, pos)?;
+        if pos + 10 > bytes.len() {
+            return Err(CFError::new("DoH parse", "Answer header truncated.", ""));
+        }
+        let rtype = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        let _rclass = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]);
+        let rdlen = u16::from_be_bytes([bytes[pos + 8], bytes[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > bytes.len() {
+            return Err(CFError::new("DoH parse", "Answer data truncated.", ""));
+        }
+        if rtype == 16 {
+            // TXT RDATA: one or more length-prefixed character-strings.
+            let end = pos + rdlen;
+            let mut p = pos;
+            while p < end {
+                let len = bytes[p] as usize;
+                p += 1;
+                if p + len > end {
+                    return Err(CFError::new("DoH parse", "TXT string overran RDATA.", ""));
+                }
+                txts.push(String::from_utf8_lossy(&bytes[p..p + len]).into_owned());
+                p += len;
+            }
+        }
+        pos += rdlen;
+    }
+
+    Ok(txts)
+}
+
 /// Read a possibly-compressed name at `pos`, returning the position just past
 /// the name. Handles compression pointers (0xC0 mask).
 fn skip_name(bytes: &[u8], mut pos: usize) -> Result<usize, CFError> {
     let mut jumped = false;
     let mut start = pos;
+    // Cycle guard: a compression pointer may only follow the chain forward in
+    // message offset (RFC 1035 pointers always reference earlier labels), but
+    // malformed/adversarial data could point in a loop. Cap the pointer hops
+    // so a crafted reply cannot spin the parser forever.
+    let mut hops = 0u32;
     loop {
         if pos >= bytes.len() {
             return Err(CFError::new(
@@ -344,6 +434,14 @@ fn skip_name(bytes: &[u8], mut pos: usize) -> Result<usize, CFError> {
         if len & 0xC0 == 0xC0 {
             if pos + 1 >= bytes.len() {
                 return Err(CFError::new("DoH parse", "Truncated pointer.", ""));
+            }
+            hops += 1;
+            if hops > 32 {
+                return Err(CFError::new(
+                    "DoH parse",
+                    "Compression pointer loop detected.",
+                    "",
+                ));
             }
             if !jumped {
                 start = pos + 2;
@@ -505,6 +603,122 @@ mod tests {
         assert!(parse_dns_response_a(&[0, 0, 0, 0]).is_err());
         let r = build_dns_query_a("example.com", 1);
         assert!(parse_dns_response_a(&r[..20]).is_err() || parse_dns_response_a(&r[..20]).is_ok());
+    }
+
+    #[test]
+    fn test_build_dns_query_txt_is_well_formed() {
+        let q = build_dns_query_txt("tun.example.com", 0x4321);
+        // Header 12 + name ("tun.example.com": 1+3+1+7+1+3+1=17) + QTYPE + QCLASS
+        let name_len = 3 + 1 + 7 + 1 + 3 + 1 + 1; // labels + lengths + root
+        assert_eq!(name_len, 17);
+        assert_eq!(q.len(), 12 + name_len + 2 + 2);
+        assert_eq!(&q[0..2], &[0x43, 0x21]);
+        assert_eq!(&q[2..4], &[0x01, 0x00]);
+        assert_eq!(&q[4..6], &[0x00, 0x01]);
+        // QTYPE=TXT = 16
+        let qtype_off = 12 + name_len;
+        assert_eq!(&q[qtype_off..qtype_off + 2], &[0x00, 0x10]);
+        assert_eq!(&q[qtype_off + 2..qtype_off + 4], &[0x00, 0x01]);
+    }
+
+    #[test]
+    fn test_parse_dns_response_txt_extracts_strings() {
+        // Build a response with one TXT answer containing a single string.
+        // The owner name is written inline (no compression pointer) to keep the
+        // answer self-contained.
+        let mut r: Vec<u8> = Vec::new();
+        r.extend_from_slice(&0x4321u16.to_be_bytes());
+        r.extend_from_slice(&0x8180u16.to_be_bytes()); // QR+RD+RA
+        r.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        r.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT
+        r.extend_from_slice(&0u16.to_be_bytes());
+        r.extend_from_slice(&0u16.to_be_bytes());
+        // Question: tun.example.com + QTYPE TXT + QCLASS IN
+        r.push(3);
+        r.extend_from_slice(b"tun");
+        r.push(7);
+        r.extend_from_slice(b"example");
+        r.push(3);
+        r.extend_from_slice(b"com");
+        r.push(0);
+        r.extend_from_slice(&16u16.to_be_bytes());
+        r.extend_from_slice(&1u16.to_be_bytes());
+        // Answer: same inline name + TXT RDATA with one string.
+        r.push(3);
+        r.extend_from_slice(b"tun");
+        r.push(7);
+        r.extend_from_slice(b"example");
+        r.push(3);
+        r.extend_from_slice(b"com");
+        r.push(0);
+        r.extend_from_slice(&16u16.to_be_bytes()); // TYPE TXT
+        r.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+        r.extend_from_slice(&60u32.to_be_bytes()); // TTL
+        r.extend_from_slice(&7u16.to_be_bytes()); // RDLENGTH
+        r.push(6); // "status" string length
+        r.extend_from_slice(b"status");
+        let txts = parse_dns_response_txt(&r).unwrap();
+        assert_eq!(txts, vec!["status".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_dns_response_txt_handles_multiple_strings() {
+        let mut r: Vec<u8> = Vec::new();
+        r.extend_from_slice(&0x0025u16.to_be_bytes());
+        r.extend_from_slice(&0x8180u16.to_be_bytes());
+        r.extend_from_slice(&1u16.to_be_bytes());
+        r.extend_from_slice(&1u16.to_be_bytes());
+        r.extend_from_slice(&0u16.to_be_bytes());
+        r.extend_from_slice(&0u16.to_be_bytes());
+        r.push(3);
+        r.extend_from_slice(b"tun");
+        r.push(7);
+        r.extend_from_slice(b"example");
+        r.push(3);
+        r.extend_from_slice(b"com");
+        r.push(0);
+        r.extend_from_slice(&16u16.to_be_bytes());
+        r.extend_from_slice(&1u16.to_be_bytes());
+        r.push(3);
+        r.extend_from_slice(b"tun");
+        r.push(7);
+        r.extend_from_slice(b"example");
+        r.push(3);
+        r.extend_from_slice(b"com");
+        r.push(0);
+        r.extend_from_slice(&16u16.to_be_bytes());
+        r.extend_from_slice(&1u16.to_be_bytes());
+        r.extend_from_slice(&60u32.to_be_bytes());
+        r.extend_from_slice(&12u16.to_be_bytes());
+        r.push(5);
+        r.extend_from_slice(b"hello");
+        r.push(5);
+        r.extend_from_slice(b"world");
+        let txts = parse_dns_response_txt(&r).unwrap();
+        assert_eq!(txts, vec!["hello".to_string(), "world".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_dns_response_txt_rejects_truncated() {
+        assert!(parse_dns_response_txt(&[0, 0, 0, 0]).is_err());
+        let q = build_dns_query_txt("tun.example.com", 1);
+        assert!(parse_dns_response_txt(&q[..18]).is_err());
+    }
+
+    #[test]
+    fn test_skip_name_rejects_pointer_loop() {
+        // A compression pointer that references its own offset must not spin
+        // forever — the cycle guard should return an error instead.
+        let mut r: Vec<u8> = Vec::new();
+        r.extend_from_slice(&0x0001u16.to_be_bytes());
+        r.extend_from_slice(&0x8180u16.to_be_bytes());
+        r.extend_from_slice(&0u16.to_be_bytes()); // QDCOUNT=0 → answer starts at 12
+        r.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT
+        r.extend_from_slice(&0u16.to_be_bytes());
+        r.extend_from_slice(&0u16.to_be_bytes());
+        // Owner name = pointer to offset 12 (itself).
+        r.extend_from_slice(&[0xC0, 0x0C]);
+        assert!(parse_dns_response_txt(&r).is_err());
     }
 
     #[test]
