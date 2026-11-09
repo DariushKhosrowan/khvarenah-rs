@@ -75,6 +75,12 @@ pub struct DaemonState {
     pub current_interval_secs: u64,
     #[serde(default)]
     pub network_was_down: bool,
+    /// Account-level state (serde-default→Active so old state loads cleanly).
+    #[serde(default)]
+    pub account_state: crate::account_state::AccountState,
+    /// Last epoch-seconds we probed account status while waiting.
+    #[serde(default)]
+    pub last_account_poll_ts: i64,
 }
 
 fn default_interval() -> u64 {
@@ -91,6 +97,8 @@ impl Default for DaemonState {
             failure_streak: 0,
             current_interval_secs: DEFAULT_INITIAL_INTERVAL_SECS,
             network_was_down: false,
+            account_state: crate::account_state::AccountState::Active,
+            last_account_poll_ts: 0,
         }
     }
 }
@@ -279,6 +287,28 @@ pub trait CycleRunner: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>>;
 }
 
+/// Abstraction over the account-status probe so the loop is testable. Returns
+/// the current account state without blocking on the full cycle.
+pub trait AccountProbe: Send + Sync {
+    fn probe_account(
+        &self,
+        profile: &str,
+    ) -> Pin<Box<dyn Future<Output = crate::account_state::AccountState> + Send + '_>>;
+}
+
+/// Real account probe backed by the Cloudflare API.
+pub struct RealAccountProbe;
+
+impl AccountProbe for RealAccountProbe {
+    fn probe_account(
+        &self,
+        profile: &str,
+    ) -> Pin<Box<dyn Future<Output = crate::account_state::AccountState> + Send + '_>> {
+        let profile = profile.to_string();
+        Box::pin(async move { crate::account_state::probe_account_state(&profile).await })
+    }
+}
+
 /// Real cycle runner: runs the autopilot monitor cycle.
 pub struct RealCycleRunner;
 
@@ -306,11 +336,12 @@ impl CycleRunner for RealCycleRunner {
 
 /// Run one iteration of the daemon loop. Returns the number of seconds to
 /// sleep before the next iteration. Pure-ish: all side effects go through
-/// `probe`, `cycle`, and the logger callback, so it is fully unit-testable.
+/// `probe`, `acct`, `cycle`, and the logger callback, so it is fully unit-testable.
 pub async fn daemon_tick(
     profile: &str,
     state: &mut DaemonState,
     probe: &dyn NetworkProbe,
+    acct: &dyn AccountProbe,
     cycle: &dyn CycleRunner,
     log: &mut dyn FnMut(&str),
 ) -> u64 {
@@ -324,6 +355,64 @@ pub async fn daemon_tick(
             state.network_was_down = true;
         }
         return NETWORK_DOWN_SLEEP_SECS;
+    }
+
+    // d. Account-level gate. If the account is suspended/invalid, hold cycles
+    // so we don't burn rescue/scan budget against a dead account. Re-probe at
+    // ACCOUNT_POLL_INTERVAL_SECS and resume automatically when the account
+    // comes back — no manual daemon restart required.
+    let now = crate::store::now_ts() as i64;
+    if state.account_state.blocks_cycle() {
+        if crate::account_state::should_poll_account(state.last_account_poll_ts, now) {
+            let st = acct.probe_account(profile).await;
+            state.last_account_poll_ts = now;
+            let still_blocked = st.blocks_cycle();
+            state.account_state = st;
+            if still_blocked {
+                log(&log_line(
+                    "WARN",
+                    &format!(
+                        "account={} still blocked (polling again in {}s)",
+                        state.account_state.label(),
+                        crate::account_state::ACCOUNT_POLL_INTERVAL_SECS
+                    ),
+                ));
+                return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
+            }
+            log(&log_line(
+                "INFO",
+                &format!(
+                    "account={} restored, resuming cycle",
+                    state.account_state.label()
+                ),
+            ));
+        } else {
+            // Not yet time to re-poll — hold this cycle.
+            log(&log_line(
+                "INFO",
+                &format!(
+                    "account={} waiting (skip cycle)",
+                    state.account_state.label()
+                ),
+            ));
+            return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
+        }
+    } else {
+        // Not blocked, but periodically confirm so we notice a suspension even
+        // while the token itself still verifies.
+        if crate::account_state::should_poll_account(state.last_account_poll_ts, now) {
+            let st = acct.probe_account(profile).await;
+            state.last_account_poll_ts = now;
+            if st.blocks_cycle() {
+                state.account_state = st;
+                log(&log_line(
+                    "WARN",
+                    &format!("account now {} — blocking cycles", state.account_state.label()),
+                ));
+                return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
+            }
+            state.account_state = st;
+        }
     }
 
     if state.network_was_down {
@@ -551,6 +640,27 @@ mod tests {
         }
     }
 
+    /// A scripted account probe for daemon_tick tests.
+    struct FakeAccountProbe {
+        state: crate::account_state::AccountState,
+    }
+    impl Default for FakeAccountProbe {
+        fn default() -> Self {
+            Self {
+                state: crate::account_state::AccountState::Active,
+            }
+        }
+    }
+    impl AccountProbe for FakeAccountProbe {
+        fn probe_account(
+            &self,
+            _profile: &str,
+        ) -> Pin<Box<dyn Future<Output = crate::account_state::AccountState> + Send + '_>> {
+            let st = self.state.clone();
+            Box::pin(async move { st })
+        }
+    }
+
     /// The self-inflicted-DoS guard: when the network is down, the cycle must
     /// NOT run at all (no scan, no rescue burn), and we must log network=down.
     #[tokio::test]
@@ -561,9 +671,10 @@ mod tests {
         let probe = FakeProbe::new(false);
         let cycle = FakeCycle::new(true);
         let mut log_lines = Vec::new();
+        let acct = FakeAccountProbe::default();
 
         // First tick: network down → skip cycle.
-        let sleep = daemon_tick(profile, &mut state, &probe, &cycle, &mut |l| {
+        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -577,7 +688,7 @@ mod tests {
         assert!(log_lines.iter().any(|l| l.contains("network=down")));
 
         // Second tick: still down → still no cycle, and no duplicate "down" log.
-        let sleep2 = daemon_tick(profile, &mut state, &probe, &cycle, &mut |l| {
+        let sleep2 = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -605,8 +716,9 @@ mod tests {
         let probe = FakeProbe::new(true); // now up
         let cycle = FakeCycle::new(true);
         let mut log_lines = Vec::new();
+        let acct = FakeAccountProbe::default();
 
-        let sleep = daemon_tick(profile, &mut state, &probe, &cycle, &mut |l| {
+        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -628,29 +740,30 @@ mod tests {
         let probe = FakeProbe::new(true);
         let cycle = FakeCycle::new(false); // always fails
         let mut log_lines = Vec::new();
+        let acct = FakeAccountProbe::default();
 
-        let s1 = daemon_tick(profile, &mut state, &probe, &cycle, &mut |l| {
+        let s1 = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
         assert_eq!(s1, 900, "300 → 900");
         assert_eq!(state.failure_streak, 1);
 
-        let s2 = daemon_tick(profile, &mut state, &probe, &cycle, &mut |l| {
+        let s2 = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
         assert_eq!(s2, 3600, "900 → 3600");
         assert_eq!(state.failure_streak, 2);
 
-        let s3 = daemon_tick(profile, &mut state, &probe, &cycle, &mut |l| {
+        let s3 = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
         assert_eq!(s3, 21600, "3600 → 21600");
         assert_eq!(state.failure_streak, 3);
 
-        let s4 = daemon_tick(profile, &mut state, &probe, &cycle, &mut |l| {
+        let s4 = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -671,8 +784,9 @@ mod tests {
         let probe = FakeProbe::new(true);
         let cycle = FakeCycle::new(true); // succeeds
         let mut log_lines = Vec::new();
+        let acct = FakeAccountProbe::default();
 
-        let sleep = daemon_tick(profile, &mut state, &probe, &cycle, &mut |l| {
+        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string())
         })
         .await;
@@ -714,4 +828,87 @@ mod tests {
         let profile = crate::store::profiles::create_profile("rl", "").unwrap();
         assert!(reset_daemon_state(&profile).unwrap().is_none());
     }
+    // ── Account gate (2026-11) ──
+
+    /// When the account is suspended and we are inside the poll window, the
+    /// daemon must NOT run a cycle (no rescue/scan budget burned) and must
+    /// wait for the poll interval.
+    #[tokio::test]
+    async fn test_daemon_skips_cycle_when_account_suspended() {
+        let _home = daemon_home();
+        let profile = "default";
+        let mut state = DaemonState::default();
+        state.account_state = crate::account_state::AccountState::Suspended { since: 1 };
+        state.last_account_poll_ts = crate::store::now_ts() as i64; // inside window
+        let probe = FakeProbe::new(true);
+        let acct = FakeAccountProbe { state: crate::account_state::AccountState::Suspended { since: 1 } };
+        let cycle = FakeCycle::new(true);
+        let mut log_lines = Vec::new();
+        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+            log_lines.push(l.to_string());
+        }).await;
+        assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert_eq!(cycle.calls.load(Ordering::SeqCst), 0, "no cycle while suspended");
+        assert!(log_lines.iter().any(|l| l.contains("waiting")));
+    }
+
+    /// When a suspended account is reactivated, the daemon must notice on the
+    /// next poll and run the cycle again — no manual restart.
+    #[tokio::test]
+    async fn test_daemon_resumes_when_account_restored() {
+        let _home = daemon_home();
+        let profile = "default";
+        let mut state = DaemonState::default();
+        state.account_state = crate::account_state::AccountState::Suspended { since: 1 };
+        // Advance the poll window so a re-probe actually happens.
+        state.last_account_poll_ts = (crate::store::now_ts() as i64) - 2000;
+        let probe = FakeProbe::new(true);
+        let acct = FakeAccountProbe { state: crate::account_state::AccountState::Active };
+        let cycle = FakeCycle::new(true);
+        let mut log_lines = Vec::new();
+        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+            log_lines.push(l.to_string());
+        }).await;
+        // Restored → cycle ran (calls becomes 1) and we advance normally.
+        assert_eq!(cycle.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.account_state, crate::account_state::AccountState::Active);
+        assert!(log_lines.iter().any(|l| l.contains("restored")));
+        // sleep is the normal reset interval (a cycle succeeded).
+        assert_eq!(sleep, backoff_reset());
+    }
+
+    /// A token-invalid account is just as blocking as a suspension.
+    #[tokio::test]
+    async fn test_daemon_skips_cycle_when_token_invalid() {
+        let _home = daemon_home();
+        let profile = "default";
+        let mut state = DaemonState::default();
+        state.account_state = crate::account_state::AccountState::TokenInvalid { since: 1 };
+        state.last_account_poll_ts = crate::store::now_ts() as i64;
+        let probe = FakeProbe::new(true);
+        let acct = FakeAccountProbe { state: crate::account_state::AccountState::TokenInvalid { since: 1 } };
+        let cycle = FakeCycle::new(true);
+        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |_| {}).await;
+        assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert_eq!(cycle.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// While active, the daemon periodically confirms the account; if the
+    /// account becomes suspended it switches to the wait state.
+    #[tokio::test]
+    async fn test_daemon_detects_suspension_from_active() {
+        let _home = daemon_home();
+        let profile = "default";
+        let mut state = DaemonState::default();
+        state.account_state = crate::account_state::AccountState::Active;
+        state.last_account_poll_ts = (crate::store::now_ts() as i64) - 2000;
+        let probe = FakeProbe::new(true);
+        let acct = FakeAccountProbe { state: crate::account_state::AccountState::Suspended { since: 1 } };
+        let cycle = FakeCycle::new(true);
+        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |_| {}).await;
+        assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert_eq!(cycle.calls.load(Ordering::SeqCst), 0);
+        assert!(state.account_state.blocks_cycle());
+    }
+
 }
