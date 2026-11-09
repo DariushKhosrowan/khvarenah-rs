@@ -320,6 +320,21 @@ pub struct PipelineDiagnostics {
     /// dead route.
     #[serde(default)]
     pub failure_by_sni: HashMap<(crate::health::SniLayer, crate::health::WsFailureReason), u32>,
+    /// Successful (accepted, ≥ MIN_WORKER_BYTES) WS probes stratified by the
+    /// browser-fingerprint ClientHello profile and SNI layer used. Key =
+    /// (ClientHelloProfile, SniLayer). This is the success-side counterpart to
+    /// `failure_by_sni`: a profile with zero successes while others succeed is
+    /// a blacklisted ClientHello fingerprint — the signal to rotate the
+    /// fingerprint / enable desync. Empty on older persisted configs (serde
+    /// default → migration-safe).
+    #[serde(default)]
+    pub success_by_profile: HashMap<
+        (
+            crate::probe_jitter::ClientHelloProfile,
+            crate::health::SniLayer,
+        ),
+        u32,
+    >,
     /// True when we early-exited at target_n.
     pub cancelled_early: bool,
     /// False when E2E was skipped (no direct IP available).
@@ -479,6 +494,17 @@ pub async fn pipeline_scan(
     let ws_fail_sni: Arc<
         Mutex<HashMap<(crate::health::SniLayer, crate::health::WsFailureReason), u32>>,
     > = Arc::new(Mutex::new(HashMap::new()));
+    let ws_success_profile: Arc<
+        Mutex<
+            HashMap<
+                (
+                    crate::probe_jitter::ClientHelloProfile,
+                    crate::health::SniLayer,
+                ),
+                u32,
+            >,
+        >,
+    > = Arc::new(Mutex::new(HashMap::new()));
     let results: Arc<Mutex<Vec<CleanEndpoint>>> = Arc::new(Mutex::new(Vec::new()));
     let candidates = Arc::new(candidates);
     let phase1 = Arc::new(phase1);
@@ -585,6 +611,7 @@ pub async fn pipeline_scan(
         let gated_c = gated.clone();
         let ws_fail_c = ws_fail.clone();
         let ws_fail_sni_c = ws_fail_sni.clone();
+        let ws_success_profile_c = ws_success_profile.clone();
         let done_c = done.clone();
         let sni = sni.to_string();
         let path = path.to_string();
@@ -605,6 +632,7 @@ pub async fn pipeline_scan(
                 let gated_c = gated_c.clone();
                 let ws_fail_c = ws_fail_c.clone();
                 let ws_fail_sni_c = ws_fail_sni_c.clone();
+                let ws_success_profile_c = ws_success_profile_c.clone();
                 let params2 = params;
                 handles.push(tokio::spawn(async move {
                     let _permit = permit;
@@ -627,6 +655,13 @@ pub async fn pipeline_scan(
                     });
                     if let Some(ws) = accepted {
                         phase2_pass_c.fetch_add(1, Ordering::Relaxed);
+                        // Record the success per (ClientHello profile, SNI
+                        // layer) — the success-side blacklist diagnostic.
+                        if let Some(profile) = ws.hello_profile {
+                            let layer = crate::health::SniLayer::classify(&ws.sni_used);
+                            let mut sm = ws_success_profile_c.lock().unwrap();
+                            *sm.entry((profile, layer)).or_insert(0) += 1;
+                        }
                         let gate = phase2_score(&fast, ws);
                         if gate >= params2.score_threshold {
                             gated_c.fetch_add(1, Ordering::Relaxed);
@@ -710,6 +745,7 @@ pub async fn pipeline_scan(
         e2e_fail_by_stage: e2e_fail.lock().unwrap().clone(),
         ws_failure_histogram: ws_fail.lock().unwrap().clone(),
         failure_by_sni: ws_fail_sni.lock().unwrap().clone(),
+        success_by_profile: ws_success_profile.lock().unwrap().clone(),
         cancelled_early: done.load(Ordering::Relaxed),
         e2e_enabled,
     };
@@ -752,6 +788,7 @@ mod tests {
             failure_stage: None,
             failure_reason: None,
             sni_used: "mock.workers.dev".to_string(),
+            hello_profile: Some(crate::probe_jitter::ClientHelloProfile::Chrome120),
         }
     }
 
@@ -765,6 +802,7 @@ mod tests {
             failure_stage: Some("ws".into()),
             failure_reason: Some(crate::health::WsFailureReason::HttpStatus(404)),
             sni_used: "mock.workers.dev".to_string(),
+            hello_profile: Some(crate::probe_jitter::ClientHelloProfile::Chrome120),
         }
     }
 

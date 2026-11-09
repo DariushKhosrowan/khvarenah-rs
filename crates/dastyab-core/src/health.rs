@@ -82,6 +82,11 @@ pub struct WsProbe {
     pub failure_reason: Option<WsFailureReason>,
     /// Which SNI this probe was sent under (worker hostname vs generic CF).
     pub sni_used: String,
+    /// Which browser-fingerprint ClientHello profile the TLS handshake used.
+    /// `None` for probes that never reached the TLS layer. This is the
+    /// success-side diagnostic: bucketing accepted probes by profile reveals
+    /// a fingerprint that is blacklisted (0 successes while others succeed).
+    pub hello_profile: Option<crate::probe_jitter::ClientHelloProfile>,
 }
 
 /// Which SNI layer a WS probe ran under. Worker = the worker hostname;
@@ -359,6 +364,30 @@ pub async fn tls_connect(
     sni: &str,
     timeout_ms: u64,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, CFError> {
+    tls_connect_inner(ip, port, sni, timeout_ms, None).await
+}
+
+/// Like [`tls_connect`], but with a pinned browser-fingerprint profile. The
+/// caller records *which* fingerprint was used — the success-side diagnostic
+/// for spotting a blacklisted ClientHello (it would show zero accepted probes
+/// while other profiles succeed).
+pub async fn tls_connect_with_profile(
+    ip: &str,
+    port: u16,
+    sni: &str,
+    timeout_ms: u64,
+    force_profile: crate::probe_jitter::ClientHelloProfile,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, CFError> {
+    tls_connect_inner(ip, port, sni, timeout_ms, Some(force_profile)).await
+}
+
+async fn tls_connect_inner(
+    ip: &str,
+    port: u16,
+    sni: &str,
+    timeout_ms: u64,
+    force_profile: Option<crate::probe_jitter::ClientHelloProfile>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, CFError> {
     let addr: SocketAddr = format!("{ip}:{port}")
         .parse()
         .map_err(|e| CFError::new("Invalid addr", format!("{e}"), "Bad IP/port."))?;
@@ -367,8 +396,9 @@ pub async fn tls_connect(
         .map_err(|_| CFError::new("Probe timeout", "TCP connect timed out.", ""))?
         .map_err(|e| CFError::new("Probe error", format!("TCP connect failed: {e}"), ""))?;
 
-    let profile =
-        crate::probe_jitter::pick_client_hello_profile(&mut rand::rngs::StdRng::from_entropy());
+    let profile = force_profile.unwrap_or_else(|| {
+        crate::probe_jitter::pick_client_hello_profile(&mut rand::rngs::StdRng::from_entropy())
+    });
     let config = lenient_client_config(profile)?;
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from(sni.to_string())
@@ -407,9 +437,18 @@ pub async fn probe_ws_ex(
         failure_stage: None,
         failure_reason: None,
         sni_used: tls_sni.to_string(),
+        hello_profile: None,
     };
 
-    let mut stream = match tls_connect(ip, port, tls_sni, timeout_ms).await {
+    // Select the browser-fingerprint profile up front so we can record which
+    // one was used. Random per probe (the anti-static-fingerprint strategy),
+    // and it is surfaced in the result so the pipeline can bucket accepted
+    // probes by profile — the success-side diagnostic for blacklisted ClientHellos.
+    let hello_profile =
+        crate::probe_jitter::pick_client_hello_profile(&mut rand::rngs::StdRng::from_entropy());
+    probe.hello_profile = Some(hello_profile);
+
+    let mut stream = match tls_connect_with_profile(ip, port, tls_sni, timeout_ms, hello_profile).await {
         Ok(s) => s,
         Err(e) => {
             probe.failure_stage = Some("tls".into());
