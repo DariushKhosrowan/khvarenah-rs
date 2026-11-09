@@ -393,43 +393,38 @@ impl NetStatus {
 
 /// Abstraction over the network-liveness probe so the loop is testable.
 pub trait NetworkProbe: Send + Sync {
-    fn liveness(&self) -> Pin<Box<dyn Future<Output = NetStatus> + Send + '_>>;
+    fn liveness(&mut self) -> Pin<Box<dyn Future<Output = NetStatus> + Send + '_>>;
 }
 
-/// Real probe backed by the DoH resolver + the full fallback ladder. Probes
-/// every tier best-first (direct → DoH → DoT → DNS tunnel) so the daemon knows
-/// the best transport actually reachable right now.
+/// Real probe backed by the DoH resolver + the full fallback ladder. Holds a
+/// persistent, stateful `FallbackLadder<OwnedLadderProbe>` so tier state is
+/// retained across daemon ticks: when the current tier fails it descends
+/// (direct → DoH → DoT → DNS tunnel) and climbs back up when a higher tier
+/// returns — rather than re-probing the whole ladder from scratch every tick.
 pub struct RealNetworkProbe {
-    pub profile: String,
-    pub resolver: crate::doh::DohResolver,
+    pub ladder: crate::connectivity::FallbackLadder<crate::connectivity::OwnedLadderProbe>,
 }
 
 impl RealNetworkProbe {
     pub fn new(profile: &str) -> Self {
-        Self {
+        let probe = crate::connectivity::OwnedLadderProbe {
             profile: profile.to_string(),
             resolver: crate::doh::DohResolver::new(),
+        };
+        Self {
+            ladder: crate::connectivity::FallbackLadder::new(
+                probe,
+                crate::connectivity::Tier::Direct,
+            ),
         }
     }
 }
 
 impl NetworkProbe for RealNetworkProbe {
-    fn liveness(&self) -> Pin<Box<dyn Future<Output = NetStatus> + Send + '_>> {
-        let probe = crate::connectivity::RealLadderProbe {
-            profile: &self.profile,
-            resolver: &self.resolver,
-        };
+    fn liveness(&mut self) -> Pin<Box<dyn Future<Output = NetStatus> + Send + '_>> {
         Box::pin(async move {
-            match crate::connectivity::first_available(probe).await {
-                Some(tier) => NetStatus {
-                    up: true,
-                    tier: Some(tier),
-                },
-                None => NetStatus {
-                    up: false,
-                    tier: None,
-                },
-            }
+            let (up, tier) = self.ladder.liveness_status().await;
+            NetStatus { up, tier }
         })
     }
 }
@@ -495,7 +490,7 @@ impl CycleRunner for RealCycleRunner {
 pub async fn daemon_tick(
     profile: &str,
     state: &mut DaemonState,
-    probe: &dyn NetworkProbe,
+    probe: &mut dyn NetworkProbe,
     acct: &dyn AccountProbe,
     cycle: &dyn CycleRunner,
     log: &mut dyn FnMut(&str),
