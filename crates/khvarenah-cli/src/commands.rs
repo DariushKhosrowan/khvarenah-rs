@@ -138,6 +138,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         } => cmd_verify(&direct_ip, &tunnel_ip),
         Command::Bundle { action } => cmd_bundle(&profile, action),
         Command::Up { profile: profile_override } => cmd_up(profile_override).await,
+        Command::Drill => cmd_drill(&profile).await,
         Command::Beacon { action } => cmd_beacon(&profile, action).await,
         Command::SniSpoof { action } => cmd_sni_spoof(&profile, action).await,
         Command::DnsTunnel { action } => cmd_dns_tunnel(&profile, action).await,
@@ -1846,6 +1847,41 @@ fn cmd_verify(direct_ip: &str, tunnel_ip: &str) -> Result<(), CFError> {
         ));
     }
     println!("✓ E2E PASS — direct {d} ≠ tunnel {t}. Tunnel routes through the Worker.");
+    Ok(())
+}
+
+/// Blackout drill: probe every fallback-ladder rung (Direct → DoH → DoT →
+/// DNS tunnel) once with the real transports and print a per-tier verdict.
+/// This is a self-test for resilience — the user verifies what would survive
+/// a blackout without disconnecting.
+async fn cmd_drill(profile: &str) -> Result<(), CFError> {
+    use khvarenah_core::connectivity::{drill_all_tiers, RealLadderProbe, Tier};
+    let resolver = khvarenah_core::doh::DohResolver::new();
+    let report = drill_all_tiers(RealLadderProbe { profile, resolver: &resolver }).await;
+    println!("Blackout drill — fallback ladder (top-down):");
+    let mut survivors = 0;
+    for (tier, verdict) in report {
+        let mark = if verdict.ok { "OK  " } else { "FAIL" };
+        println!(
+            "  {mark}  {}  {}",
+            tier.label(),
+            verdict.note
+        );
+        if verdict.ok {
+            survivors += 1;
+        }
+    }
+    println!(
+        "Result: {survivors}/4 rungs reachable. {}",
+        if survivors == 4 {
+            "Full resilience."
+        } else if survivors == 0 {
+            "Total blackout — consider configuring a DNS tunnel (dns-tunnel deploy)."
+        } else {
+            "Partial resilience — worst surviving rung will carry you."
+        }
+    );
+    let _ = Tier::Direct; // keep import meaningful if unused
     Ok(())
 }
 
