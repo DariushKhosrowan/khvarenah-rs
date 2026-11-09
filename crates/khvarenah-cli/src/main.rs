@@ -410,6 +410,9 @@ pub enum BeaconAction {
         #[arg()]
         secs: i64,
     },
+    /// Deliver any alerts queued in the durable outbox (e.g. during a
+    /// blackout) right now. Returns how many were delivered.
+    Flush,
 }
 
 #[derive(Subcommand)]

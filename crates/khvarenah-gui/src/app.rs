@@ -409,6 +409,25 @@ impl KhvarenahApp {
         });
     }
 
+    /// Deliver any undelivered alerts in the durable outbox (queued during a
+    /// blackout / blocked channel). Async over the bridge.
+    fn flush_beacon_outbox(&mut self) {
+        let profile = self.state.active_profile_id.clone();
+        let tx = self.tx.clone();
+        bridge::spawn("beacon-flush", tx.clone(), async move {
+            let sent = khvarenah_core::remote_beacon::flush_outbox(&profile).await;
+            let remaining = khvarenah_core::remote_beacon::load_outbox(&profile).len();
+            let line = format!(
+                "[beacon] flushed {sent} queued alert(s); {remaining} still queued"
+            );
+            let _ = tx.send(crate::bridge::UiEvent::Log {
+                task: "beacon-flush".to_string(),
+                line,
+            });
+            Ok::<String, CFError>(format!("beacon-flush sent={sent}"))
+        });
+    }
+
     /// Persist the VPS DNS-tunnel client config so the connectivity ladder can
     /// use it automatically when DoH/DoT fail.
     fn save_vps(&mut self) {
@@ -1456,6 +1475,22 @@ impl KhvarenahApp {
                 self.send_beacon_test();
             }
         });
+        // Durable outbox: alerts queued during a blackout / blocked channel.
+        let queued = self.state.beacon_outbox;
+        if queued > 0 {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(212, 175, 55),
+                    format!("⚠ {queued} alert(s) queued during blackout — awaiting delivery"),
+                );
+                if ui.button("Flush now").clicked() {
+                    self.state.reload_pending = true;
+                    self.flush_beacon_outbox();
+                }
+            });
+        } else {
+            ui.label("No queued alerts (outbox empty).");
+        }
         if !self.beacon_note.is_empty() {
             ui.colored_label(GOLD, &self.beacon_note);
         }

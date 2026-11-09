@@ -109,6 +109,45 @@ fn beacon_state_path(profile_id: &str) -> PathBuf {
     store::profiles::profile_dir(profile_id).join("beacon-state.json")
 }
 
+/// One queued alert that could not be delivered (e.g. network blackout,
+/// Telegram blocked) and is waiting to be flushed when the network returns.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OutboxEntry {
+    /// UNIX seconds when the alert was first queued.
+    pub ts: i64,
+    /// The formatted alert text (already localized).
+    pub text: String,
+}
+
+/// Path to the durable beacon outbox for a profile.
+fn outbox_path(profile_id: &str) -> PathBuf {
+    store::profiles::profile_dir(profile_id).join("beacon-outbox.json")
+}
+
+/// Load the queued (undelivered) alerts for a profile.
+pub fn load_outbox(profile_id: &str) -> Vec<OutboxEntry> {
+    let p = outbox_path(profile_id);
+    store::read_opt::<Vec<OutboxEntry>>(&p).unwrap_or_default()
+}
+
+/// Persist the outbox. Empty slice removes the file's contents (keeps the
+/// file but trims it to `[]`).
+pub fn save_outbox(profile_id: &str, entries: &[OutboxEntry]) -> Result<(), CFError> {
+    store::write_json(&outbox_path(profile_id), &entries)
+}
+
+/// Durable-queue an alert text. Called when a send fails — during a total
+/// blackout or when the deliver channel is blocked, the alert is persisted so
+/// it can be flushed once the network returns. Never loses an alert.
+pub fn queue_for_retry(profile_id: &str, text: &str) -> Result<(), CFError> {
+    let mut ob = load_outbox(profile_id);
+    ob.push(OutboxEntry {
+        ts: store::now_ts() as i64,
+        text: text.to_string(),
+    });
+    save_outbox(profile_id, &ob)
+}
+
 /// Load the last-sent map (per event class → UNIX seconds).
 pub fn load_last_sent(profile_id: &str) -> HashMap<BeaconEventKind, i64> {
     let path = beacon_state_path(profile_id);
@@ -285,9 +324,60 @@ pub async fn maybe_emit(
         return Ok(false);
     }
     let text = format_message(event, lang);
-    send(&cfg, &text).await?;
-    record_sent(profile_id, event.kind(), now)?;
-    Ok(true)
+    match send(&cfg, &text).await {
+        Ok(()) => {
+            record_sent(profile_id, event.kind(), now)?;
+            Ok(true)
+        }
+        Err(_) => {
+            // Durable queue: never lose an alert during a blackout or a
+            // blocked channel. Persist it, and it will be flushed once the
+            // network returns (see `flush_outbox`).
+            queue_for_retry(profile_id, &text)?;
+            Ok(false)
+        }
+    }
+}
+
+/// Attempt to deliver every queued alert (outbox). Returns the number of
+/// alerts successfully delivered. Failed deliveries stay queued for the next
+/// flush. Best-effort — never fails the caller. No-op when notifications are
+/// disabled or the outbox is empty.
+pub async fn flush_outbox(profile_id: &str) -> usize {
+    let cfg = load_config(profile_id);
+    flush_outbox_with_profile(profile_id, &cfg, |text, cfg| {
+        Box::pin(send(cfg, text))
+    })
+    .await
+}
+
+/// Hermetic core of `flush_outbox`. `deliver` is injected so tests can script
+/// success/failure per alert without network access.
+async fn flush_outbox_with_profile<F>(
+    profile_id: &str,
+    cfg: &BeaconConfig,
+    deliver: F,
+) -> usize
+where
+    F: for<'a> Fn(&'a str, &'a BeaconConfig) -> futures_util::future::BoxFuture<'a, Result<(), CFError>>,
+{
+    if !cfg.enabled {
+        return 0;
+    }
+    let mut ob = load_outbox(profile_id);
+    if ob.is_empty() {
+        return 0;
+    }
+    let mut remaining = Vec::with_capacity(ob.len());
+    let mut sent = 0usize;
+    for entry in ob.drain(..) {
+        match deliver(&entry.text, cfg).await {
+            Ok(()) => sent += 1,
+            Err(_) => remaining.push(entry),
+        }
+    }
+    let _ = save_outbox(profile_id, &remaining);
+    sent
 }
 
 #[cfg(test)]
@@ -419,5 +509,166 @@ mod tests {
         let cfg = BeaconConfig::default();
         assert!(!cfg.enabled);
         assert!(cfg.rate_limit_secs >= 900);
+    }
+
+    #[test]
+    fn test_queue_for_retry_persists_and_loads() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let tmp = std::env::temp_dir().join(format!(
+            "kvrvn-outbox-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        crate::store::set_mem_dir_override(tmp.join(".khvarenah"));
+        let profile = "outbox-test";
+        std::fs::create_dir_all(store::profiles::profile_dir(profile)).unwrap();
+
+        assert!(load_outbox(profile).is_empty());
+        queue_for_retry(profile, "alert one").unwrap();
+        queue_for_retry(profile, "alert two").unwrap();
+        let ob = load_outbox(profile);
+        assert_eq!(ob.len(), 2);
+        assert_eq!(ob[0].text, "alert one");
+        assert_eq!(ob[1].text, "alert two");
+        // ts is a UNIX epoch (positive for any realistic clock).
+        assert!(ob[0].ts > 0);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_outbox_roundtrip_trim_when_empty() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let tmp = std::env::temp_dir().join(format!(
+            "kvrvn-outbox2-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        crate::store::set_mem_dir_override(tmp.join(".khvarenah"));
+        let profile = "outbox2-test";
+        std::fs::create_dir_all(store::profiles::profile_dir(profile)).unwrap();
+
+        queue_for_retry(profile, "x").unwrap();
+        assert_eq!(load_outbox(profile).len(), 1);
+        save_outbox(profile, &[]).unwrap();
+        assert!(load_outbox(profile).is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_flush_outbox_delivers_and_drains() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let tmp = std::env::temp_dir().join(format!(
+            "kvrvn-flush-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        crate::store::set_mem_dir_override(tmp.join(".khvarenah"));
+        let profile = "flush-test";
+        std::fs::create_dir_all(store::profiles::profile_dir(profile)).unwrap();
+
+        // Configure + enable the beacon.
+        let mut cfg = BeaconConfig::default();
+        cfg.enabled = true;
+        cfg.chat_id_or_url = "https://hook.test".into();
+        let mut p = store::profiles::load_profile(profile);
+        p.config.beacon = Some(cfg.clone());
+        store::profiles::save_profile(&p).unwrap();
+
+        // Queue two alerts.
+        queue_for_retry(profile, "a").unwrap();
+        queue_for_retry(profile, "b").unwrap();
+
+        // Hermetic flush: both deliver → 2 sent, outbox empty.
+        let sent = flush_outbox_with_profile(profile, &cfg, |text, _cfg| {
+            let text = text.to_string();
+            Box::pin(async move {
+                assert!(text == "a" || text == "b");
+                Ok(())
+            })
+        })
+        .await;
+        assert_eq!(sent, 2);
+        assert!(load_outbox(profile).is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_flush_outbox_keeps_failures() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let tmp = std::env::temp_dir().join(format!(
+            "kvrvn-flush2-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        crate::store::set_mem_dir_override(tmp.join(".khvarenah"));
+        let profile = "flush2-test";
+        std::fs::create_dir_all(store::profiles::profile_dir(profile)).unwrap();
+
+        let mut cfg = BeaconConfig::default();
+        cfg.enabled = true;
+        cfg.chat_id_or_url = "https://hook.test".into();
+        let mut p = store::profiles::load_profile(profile);
+        p.config.beacon = Some(cfg.clone());
+        store::profiles::save_profile(&p).unwrap();
+
+        queue_for_retry(profile, "fail").unwrap();
+
+        // Deliver always fails → 0 sent, alert stays queued.
+        let sent =
+            flush_outbox_with_profile(profile, &cfg, |_text, _cfg| {
+                Box::pin(async move {
+                    Err(CFError::new(
+                        "Test",
+                        "channel blocked",
+                        "blackout",
+                    ))
+                })
+            })
+            .await;
+        assert_eq!(sent, 0);
+        let ob = load_outbox(profile);
+        assert_eq!(ob.len(), 1);
+        assert_eq!(ob[0].text, "fail");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_flush_outbox_disabled_is_noop() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let tmp = std::env::temp_dir().join(format!(
+            "kvrvn-flush3-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        crate::store::set_mem_dir_override(tmp.join(".khvarenah"));
+        let profile = "flush3-test";
+        std::fs::create_dir_all(store::profiles::profile_dir(profile)).unwrap();
+
+        let cfg = BeaconConfig::default(); // enabled = false
+        queue_for_retry(profile, "a").unwrap();
+
+        let sent = flush_outbox_with_profile(profile, &cfg, |_text, _cfg| {
+            Box::pin(async move { Ok(()) })
+        })
+        .await;
+        assert_eq!(sent, 0);
+        // Outbox untouched.
+        assert_eq!(load_outbox(profile).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
