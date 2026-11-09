@@ -178,10 +178,14 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
             format!("🔄 Worker signature rotated: {old_worker} → {new_worker}")
         }
         (BeaconEvent::AccountBlocked { state, .. }, crate::diagnose::Locale::Fa) => {
-            format!("⛔ حساب مسدود شد ({state}) — در انتظار فعالسازی مجدد")
+            format!(
+                "⛔ حساب مسدود شد ({state}) — دستور «dastyab token recover <label> <token>» را اجرا کنید تا توکن جدید جایگزین و حفاظت خودکار دوباره شروع شود"
+            )
         }
         (BeaconEvent::AccountBlocked { state, .. }, _) => {
-            format!("⛔ Account blocked ({state}) — holding cycles until reactivation")
+            format!(
+                "⛔ Account blocked ({state}) — run `dastyab token recover <label> <token>` to replace the token and auto-resume protection"
+            )
         }
     }
 }
@@ -384,9 +388,11 @@ mod tests {
         let en = format_message(&ev, crate::diagnose::Locale::En);
         assert!(en.contains("token-invalid"), "en={en}");
         assert!(en.contains("Account blocked"));
+        assert!(en.contains("token recover"), "en should carry the recovery action: {en}");
         let fa = format_message(&ev, crate::diagnose::Locale::Fa);
         assert!(fa.contains("token-invalid"), "fa={fa}");
         assert!(fa.contains("حساب"));
+        assert!(fa.contains("token recover"), "fa should carry the recovery action: {fa}");
     }
 
     #[test]
