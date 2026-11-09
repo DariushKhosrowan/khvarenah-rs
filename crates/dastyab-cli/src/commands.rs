@@ -224,10 +224,12 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
             let eff_light = dastyab_core::store::profiles::effective_light_timeout_secs(c);
             let eff_deep = dastyab_core::store::profiles::effective_deep_timeout_secs(c);
             let eff_backoff = dastyab_core::store::profiles::effective_max_backoff_secs(c);
+            let eff_blackout = dastyab_core::store::profiles::effective_network_down_sleep_secs(c);
             println!("Profile: {profile}");
             println!("  monitor light phase budget : {}s (configured {}s, system default 120s)", eff_light, c.light_timeout_secs);
             println!("  monitor deep phase budget   : {}s (configured {}s, system default 600s)", eff_deep, c.deep_timeout_secs);
             println!("  daemon backoff ceiling      : {}s (configured {}s, system default 21600s)", eff_backoff, c.max_backoff_secs);
+            println!("  blackout poll cadence      : {}s (configured {}s, system default 60s)", eff_blackout, c.network_down_sleep_secs);
             println!(
                 "  protection                  : {}",
                 if c.protection_enabled { "ON" } else { "OFF" }
@@ -250,6 +252,7 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
             light,
             deep,
             max_backoff,
+            network_down_sleep,
         } => {
             let mut p = dastyab_core::store::profiles::load_profile(profile);
             if light > 0 {
@@ -261,16 +264,21 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
             if max_backoff > 0 {
                 p.config.max_backoff_secs = max_backoff;
             }
+            if network_down_sleep > 0 {
+                p.config.network_down_sleep_secs = network_down_sleep;
+            }
             dastyab_core::store::profiles::save_profile(&p)?;
             // Re-read to print the resolved values after save.
             let c = &p.config;
             let eff_light = dastyab_core::store::profiles::effective_light_timeout_secs(c);
             let eff_deep = dastyab_core::store::profiles::effective_deep_timeout_secs(c);
             let eff_backoff = dastyab_core::store::profiles::effective_max_backoff_secs(c);
+            let eff_blackout = dastyab_core::store::profiles::effective_network_down_sleep_secs(c);
             println!("Saved. Effective values for {profile}:");
             println!("  monitor light phase budget : {eff_light}s");
             println!("  monitor deep phase budget   : {eff_deep}s");
             println!("  daemon backoff ceiling      : {eff_backoff}s");
+            println!("  blackout poll cadence      : {eff_blackout}s");
             Ok(())
         }
     }

@@ -395,6 +395,11 @@ pub enum ConfigAction {
         /// Daemon backoff ceiling in seconds. 0 = default 21600 (6h).
         #[arg(long, default_value_t = 0)]
         max_backoff: u64,
+        /// Daemon poll cadence (seconds) while the network is fully down
+        /// (total blackout). 0 = default 60. Lower = re-probe for a restored
+        /// path sooner; higher = conserve battery/CPU during a long outage.
+        #[arg(long, default_value_t = 0)]
+        network_down_sleep: u64,
     },
 }
 

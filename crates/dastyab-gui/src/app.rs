@@ -142,6 +142,7 @@ pub struct DastYabApp {
     pub light_timeout_s: u64,
     pub deep_timeout_s: u64,
     pub max_backoff_s: u64,
+    pub network_down_sleep_s: u64,
     pub timeouts_note: String,
     // automatic token rotation on account-blocked (default on)
     pub auto_rotate_enabled: bool,
@@ -328,6 +329,7 @@ impl DastYabApp {
             light_timeout_s: profile.config.light_timeout_secs,
             deep_timeout_s: profile.config.deep_timeout_secs,
             max_backoff_s: profile.config.max_backoff_secs,
+            network_down_sleep_s: profile.config.network_down_sleep_secs,
             timeouts_note: String::new(),
             auto_rotate_enabled: profile.config.auto_rotate_on_blocked,
             auto_rotate_note: String::new(),
@@ -412,6 +414,7 @@ impl DastYabApp {
         p.config.light_timeout_secs = self.light_timeout_s;
         p.config.deep_timeout_secs = self.deep_timeout_s;
         p.config.max_backoff_secs = self.max_backoff_s;
+        p.config.network_down_sleep_secs = self.network_down_sleep_s;
         match dastyab_core::store::profiles::save_profile(&p) {
             Ok(()) => self.timeouts_note = "Protection pacing saved to profile.".to_string(),
             Err(e) => self.timeouts_note = e.brief(),
@@ -1867,6 +1870,8 @@ impl DastYabApp {
         ui.horizontal(|ui| {
             ui.label("Max backoff (s):");
             ui.add(egui::DragValue::new(&mut self.max_backoff_s).range(0..=86400));
+            ui.label("Blackout poll (s):");
+            ui.add(egui::DragValue::new(&mut self.network_down_sleep_s).range(0..=3600));
             if ui.button("Save pacing").clicked() {
                 self.save_timeouts();
             }

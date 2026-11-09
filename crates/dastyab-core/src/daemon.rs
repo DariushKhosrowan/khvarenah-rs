@@ -777,7 +777,11 @@ pub async fn daemon_tick(
             )
             .await;
         }
-        return NETWORK_DOWN_SLEEP_SECS;
+        // Network down → skip cycle, don't burn rescue budget. Sleep the
+        // configured blackout poll cadence (per-profile `network_down_sleep_secs`,
+        // 0 = default 60s). A shorter value re-probes for a restored path sooner;
+        // a longer value conserves battery/CPU during a long outage.
+        return crate::store::profiles::effective_network_down_sleep_secs(&cfg);
     }
 
     // d. Account-level gate. If the account is suspended/invalid, hold cycles
@@ -1106,6 +1110,32 @@ mod tests {
         // From 300 with a 900 max, escalation is capped at 900 (not 3600).
         assert_eq!(state.current_interval_secs, 900);
         assert_eq!(sleep, 900);
+    }
+
+    /// When a profile configures `network_down_sleep_secs`, the daemon must
+    /// use it (not the 60s default) as the poll cadence while the network is
+    /// fully down — the blackout-resilience knob for re-probing a restored
+    /// path sooner (short) or conserving battery (long).
+    #[tokio::test]
+    async fn daemon_tick_uses_configured_network_down_sleep() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("blackoutcfg", "").unwrap();
+        let mut p = crate::store::profiles::load_profile(&profile);
+        p.config.network_down_sleep_secs = 15;
+        crate::store::profiles::save_profile(&p).unwrap();
+
+        let mut state = DaemonState::default();
+        let mut probe = FakeProbe::new(false); // network down
+        let cycle = FakeCycle::new(true);
+        let acct = FakeAccountProbe::default();
+        let mut log_lines = Vec::new();
+        let sleep = daemon_tick(&profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
+            log_lines.push(l.to_string())
+        })
+        .await;
+        assert_eq!(sleep, 15, "configured blackout sleep must be used");
+        // Default profile (0) still returns the system 60s default.
+        assert_eq!(NETWORK_DOWN_SLEEP_SECS, 60);
     }
 
     /// Scheduled auto-backup (when enabled + due) writes a backup and records
