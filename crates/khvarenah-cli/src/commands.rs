@@ -1377,7 +1377,7 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
     state.started_at = khvarenah_core::store::now_ts() as i64;
     save_daemon_state(&cfg.profile, &state)?;
 
-    let probe = RealNetworkProbe::new(&cfg.profile);
+    let mut probe = RealNetworkProbe::new(&cfg.profile);
     let acct = RealAccountProbe;
     let cycle = RealCycleRunner;
     let mut interval = cfg.initial_interval_secs;
@@ -1490,7 +1490,7 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
         let sleep = daemon_tick(
             &active_profile,
             &mut state,
-            &probe,
+            &mut probe,
             &acct,
             &cycle,
             &mut |line| daemon_log_append(&cfg.log_path, line),
