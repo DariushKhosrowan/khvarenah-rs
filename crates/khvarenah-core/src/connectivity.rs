@@ -213,8 +213,7 @@ async fn probe_direct() -> ProbeVerdict {
     let dur = std::time::Duration::from_millis(DIRECT_PROBE_TIMEOUT_MS);
     for (ip, port) in targets {
         let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::from(ip), port));
-        if let Ok(Ok(_)) = tokio::time::timeout(dur, tokio::net::TcpStream::connect(addr)).await
-        {
+        if let Ok(Ok(_)) = tokio::time::timeout(dur, tokio::net::TcpStream::connect(addr)).await {
             return ProbeVerdict::up("tcp ok");
         }
     }
@@ -348,7 +347,10 @@ mod tests {
         let mut results = HashMap::new();
         results.insert(Tier::Direct, ProbeVerdict::up("ok"));
         let mut ladder = FallbackLadder::new(ScriptedProbe { results }, Tier::Direct);
-        assert_eq!(ladder.watchdog_tick().await, TierChange::Stable(Tier::Direct));
+        assert_eq!(
+            ladder.watchdog_tick().await,
+            TierChange::Stable(Tier::Direct)
+        );
     }
 
     #[tokio::test]
@@ -358,7 +360,10 @@ mod tests {
         results.insert(Tier::Direct, ProbeVerdict::down("d"));
         results.insert(Tier::DoH, ProbeVerdict::up("ok"));
         results.insert(Tier::DoT, ProbeVerdict::up("ok"));
-        assert_eq!(first_available(ScriptedProbe { results }).await, Some(Tier::DoH));
+        assert_eq!(
+            first_available(ScriptedProbe { results }).await,
+            Some(Tier::DoH)
+        );
 
         // All down → None.
         assert_eq!(first_available(ScriptedProbe::default()).await, None);

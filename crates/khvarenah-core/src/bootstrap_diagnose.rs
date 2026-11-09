@@ -29,10 +29,7 @@ pub enum UpFailure {
     /// The worker exists but is not reachable.
     WorkerUnreachable { worker_health: String },
     /// No candidate IPs were even reachable from this network.
-    DiscoveryNoCandidates {
-        phase1_pass: u32,
-        phase1_total: u32,
-    },
+    DiscoveryNoCandidates { phase1_pass: u32, phase1_total: u32 },
     /// Candidates were found but none passed the real handshake. The histogram
     /// top (e.g. "TlsAlert" or "Timeout") is the diagnosis signal for the next
     /// round.
@@ -54,9 +51,7 @@ impl UpFailure {
     pub fn stage(&self) -> &'static str {
         match self {
             UpFailure::NoTokenFound | UpFailure::TokenInvalid { .. } => "token",
-            UpFailure::WorkerDeployFailed { .. } | UpFailure::WorkerUnreachable { .. } => {
-                "worker"
-            }
+            UpFailure::WorkerDeployFailed { .. } | UpFailure::WorkerUnreachable { .. } => "worker",
             UpFailure::DiscoveryNoCandidates { .. }
             | UpFailure::DiscoveryCandidatesButNoWs { .. }
             | UpFailure::DiscoveryNoE2e { .. } => "discovery",
@@ -95,7 +90,15 @@ pub struct DiagnosisResult {
 
 /// Terms that must never appear in a plain_message.
 pub const INTERNAL_TERMS: [&str; 9] = [
-    "ws", "websocket", "sni", "tls", "e2e", "phase1", "phase2", "uuid", "cdn-cgi",
+    "ws",
+    "websocket",
+    "sni",
+    "tls",
+    "e2e",
+    "phase1",
+    "phase2",
+    "uuid",
+    "cdn-cgi",
 ];
 
 fn contains_internal_term(s: &str) -> bool {
@@ -150,12 +153,11 @@ pub fn diagnose(failure: &UpFailure, elapsed_ms: u64) -> DiagnosisResult {
         ),
         UpFailure::DiscoveryCandidatesButNoWs { ws_histogram_top } => {
             let action = match ws_histogram_top.as_str() {
-                "TlsAlert" => {
-                    "This network is actively blocking the connection — try again later."
-                        .to_string()
-                }
-                "Timeout" => "This network is slow or throttled — try again in 15 minutes."
+                "TlsAlert" => "This network is actively blocking the connection — try again later."
                     .to_string(),
+                "Timeout" => {
+                    "This network is slow or throttled — try again in 15 minutes.".to_string()
+                }
                 _ => "Run: khvarenah autopilot health --verbose".to_string(),
             };
             (
@@ -257,14 +259,24 @@ mod tests {
 
     #[test]
     fn test_diagnose_token_invalid_returns_action() {
-        let r = diagnose(&UpFailure::TokenInvalid { cf_error: "x".into() }, 0);
+        let r = diagnose(
+            &UpFailure::TokenInvalid {
+                cf_error: "x".into(),
+            },
+            0,
+        );
         assert_eq!(r.failure.as_ref().unwrap().exit_code(), 2);
         assert!(r.recommended_action.contains("cloudflare.com"));
     }
 
     #[test]
     fn test_diagnose_worker_deploy_failed_returns_action() {
-        let r = diagnose(&UpFailure::WorkerDeployFailed { cf_error: "x".into() }, 0);
+        let r = diagnose(
+            &UpFailure::WorkerDeployFailed {
+                cf_error: "x".into(),
+            },
+            0,
+        );
         assert_eq!(r.failure.as_ref().unwrap().exit_code(), 3);
         assert!(r.plain_message.contains("worker"));
     }
@@ -286,7 +298,12 @@ mod tests {
 
     #[test]
     fn test_diagnose_worker_unreachable_returns_action() {
-        let r = diagnose(&UpFailure::WorkerUnreachable { worker_health: "x".into() }, 0);
+        let r = diagnose(
+            &UpFailure::WorkerUnreachable {
+                worker_health: "x".into(),
+            },
+            0,
+        );
         assert_eq!(r.failure.as_ref().unwrap().exit_code(), 3);
         assert!(r.recommended_action.contains("autopilot health"));
     }
@@ -362,15 +379,37 @@ mod tests {
         // human-facing representation.
         let variants = [
             UpFailure::NoTokenFound,
-            UpFailure::TokenInvalid { cf_error: "x".into() },
-            UpFailure::WorkerDeployFailed { cf_error: "x".into() },
-            UpFailure::WorkerUnreachable { worker_health: "x".into() },
-            UpFailure::DiscoveryNoCandidates { phase1_pass: 0, phase1_total: 2000 },
-            UpFailure::DiscoveryCandidatesButNoWs { ws_histogram_top: "TlsAlert".into() },
-            UpFailure::DiscoveryCandidatesButNoWs { ws_histogram_top: "Timeout".into() },
-            UpFailure::DiscoveryNoE2e { phase2_pass: 5, e2e_pass: 0, e2e_failure_stage: "WorkerDead".into() },
-            UpFailure::BundleWriteFailed { path: "/tmp".into(), reason: "readonly".into() },
-            UpFailure::DaemonStartFailed { reason: "systemd user session unavailable".into() },
+            UpFailure::TokenInvalid {
+                cf_error: "x".into(),
+            },
+            UpFailure::WorkerDeployFailed {
+                cf_error: "x".into(),
+            },
+            UpFailure::WorkerUnreachable {
+                worker_health: "x".into(),
+            },
+            UpFailure::DiscoveryNoCandidates {
+                phase1_pass: 0,
+                phase1_total: 2000,
+            },
+            UpFailure::DiscoveryCandidatesButNoWs {
+                ws_histogram_top: "TlsAlert".into(),
+            },
+            UpFailure::DiscoveryCandidatesButNoWs {
+                ws_histogram_top: "Timeout".into(),
+            },
+            UpFailure::DiscoveryNoE2e {
+                phase2_pass: 5,
+                e2e_pass: 0,
+                e2e_failure_stage: "WorkerDead".into(),
+            },
+            UpFailure::BundleWriteFailed {
+                path: "/tmp".into(),
+                reason: "readonly".into(),
+            },
+            UpFailure::DaemonStartFailed {
+                reason: "systemd user session unavailable".into(),
+            },
         ];
         for v in variants {
             let r = diagnose(&v, 0);
@@ -389,22 +428,41 @@ mod tests {
     #[test]
     fn test_exit_codes_are_scriptable() {
         assert_eq!(UpFailure::NoTokenFound.exit_code(), 1);
-        assert_eq!(UpFailure::TokenInvalid { cf_error: "x".into() }.exit_code(), 2);
         assert_eq!(
-            UpFailure::WorkerDeployFailed { cf_error: "x".into() }.exit_code(),
+            UpFailure::TokenInvalid {
+                cf_error: "x".into()
+            }
+            .exit_code(),
+            2
+        );
+        assert_eq!(
+            UpFailure::WorkerDeployFailed {
+                cf_error: "x".into()
+            }
+            .exit_code(),
             3
         );
         assert_eq!(
-            UpFailure::DiscoveryCandidatesButNoWs { ws_histogram_top: "TlsAlert".into() }
-                .exit_code(),
+            UpFailure::DiscoveryCandidatesButNoWs {
+                ws_histogram_top: "TlsAlert".into()
+            }
+            .exit_code(),
             4
         );
         assert_eq!(
-            UpFailure::DiscoveryNoCandidates { phase1_pass: 0, phase1_total: 1 }.exit_code(),
+            UpFailure::DiscoveryNoCandidates {
+                phase1_pass: 0,
+                phase1_total: 1
+            }
+            .exit_code(),
             4
         );
         assert_eq!(
-            UpFailure::BundleWriteFailed { path: "/".into(), reason: "x".into() }.exit_code(),
+            UpFailure::BundleWriteFailed {
+                path: "/".into(),
+                reason: "x".into()
+            }
+            .exit_code(),
             5
         );
         assert_eq!(
@@ -428,7 +486,10 @@ mod tests {
         hist.insert(WsFailureReason::TlsAlert, 42);
         hist.insert(WsFailureReason::HttpStatus(404), 3);
         assert_eq!(ws_histogram_top(&hist), "TlsAlert");
-        assert_eq!(ws_histogram_top(&std::collections::HashMap::new()), "Unknown");
+        assert_eq!(
+            ws_histogram_top(&std::collections::HashMap::new()),
+            "Unknown"
+        );
     }
 
     #[test]

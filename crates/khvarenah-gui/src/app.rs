@@ -222,15 +222,18 @@ impl KhvarenahApp {
             audit_output: String::new(),
             backup_output: String::new(),
             export_output: String::new(),
-            beacon_enabled: profile.config.beacon.as_ref().map(|b| b.enabled).unwrap_or(false),
+            beacon_enabled: profile
+                .config
+                .beacon
+                .as_ref()
+                .map(|b| b.enabled)
+                .unwrap_or(false),
             beacon_channel: profile
                 .config
                 .beacon
                 .as_ref()
                 .map(|b| match b.kind {
-                    khvarenah_core::remote_beacon::BeaconKind::Telegram => {
-                        "Telegram".to_string()
-                    }
+                    khvarenah_core::remote_beacon::BeaconKind::Telegram => "Telegram".to_string(),
                     khvarenah_core::remote_beacon::BeaconKind::GenericWebhook => {
                         "Webhook".to_string()
                     }
@@ -397,11 +400,7 @@ impl KhvarenahApp {
                 Err(e) => {
                     let _ = tx.send(crate::bridge::UiEvent::TaskErr {
                         task: "beacon-test".to_string(),
-                        error: CFError::new(
-                            "Beacon test",
-                            e.brief(),
-                            "Check the channel config.",
-                        ),
+                        error: CFError::new("Beacon test", e.brief(), "Check the channel config."),
                     });
                 }
             }
@@ -417,9 +416,7 @@ impl KhvarenahApp {
         bridge::spawn("beacon-flush", tx.clone(), async move {
             let sent = khvarenah_core::remote_beacon::flush_outbox(&profile).await;
             let remaining = khvarenah_core::remote_beacon::load_outbox(&profile).len();
-            let line = format!(
-                "[beacon] flushed {sent} queued alert(s); {remaining} still queued"
-            );
+            let line = format!("[beacon] flushed {sent} queued alert(s); {remaining} still queued");
             let _ = tx.send(crate::bridge::UiEvent::Log {
                 task: "beacon-flush".to_string(),
                 line,
@@ -442,7 +439,11 @@ impl KhvarenahApp {
             resolver: "doh".to_string(),
         };
         match khvarenah_core::vps_deploy::write_tunnel_client_config(&self.profile_id, &cfg) {
-            Ok(()) => self.vps_note = "VPS config saved. The DNS tunnel will be used automatically when DoH/DoT fail.".to_string(),
+            Ok(()) => {
+                self.vps_note =
+                    "VPS config saved. The DNS tunnel will be used automatically when DoH/DoT fail."
+                        .to_string()
+            }
             Err(e) => self.vps_note = format!("Save failed: {}", e.brief()),
         }
     }
@@ -475,20 +476,28 @@ impl KhvarenahApp {
         let tx2 = tx.clone();
         bridge::spawn("dns-tunnel", tx.clone(), async move {
             let peer = khvarenah_core::vps_deploy::RealVpsSshPeer;
-            match khvarenah_core::vps_deploy::deploy_dns_tunnel(&creds, &peer, &pid, &domain, None).await {
+            match khvarenah_core::vps_deploy::deploy_dns_tunnel(&creds, &peer, &pid, &domain, None)
+                .await
+            {
                 Ok(res) => {
                     let _ = tx2.send(crate::bridge::UiEvent::Log {
                         task: "dns-tunnel".to_string(),
                         line: format!(
                             "[dns-tunnel] deployed to {} (steps={}, verified={})",
-                            res.host, res.completed_steps.len(), res.verified
+                            res.host,
+                            res.completed_steps.len(),
+                            res.verified
                         ),
                     });
                 }
                 Err(e) => {
                     let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
                         task: "dns-tunnel".to_string(),
-                        error: CFError::new("DNS tunnel", e.brief(), "Check VPS connectivity / SSH key / domain."),
+                        error: CFError::new(
+                            "DNS tunnel",
+                            e.brief(),
+                            "Check VPS connectivity / SSH key / domain.",
+                        ),
                     });
                 }
             }
@@ -524,7 +533,8 @@ impl KhvarenahApp {
         let tx2 = tx.clone();
         bridge::spawn("hz-provision", tx.clone(), async move {
             let api = khvarenah_core::vps_provision::RealHetznerApi;
-            match khvarenah_core::vps_provision::provision_vps(&api, &creds, &key_path, None).await {
+            match khvarenah_core::vps_provision::provision_vps(&api, &creds, &key_path, None).await
+            {
                 Ok(prov) => {
                     let _ = tx2.send(crate::bridge::UiEvent::Log {
                         task: "hz-provision".to_string(),
@@ -627,7 +637,11 @@ impl KhvarenahApp {
                 Err(e) => {
                     let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
                         task: "multi-worker".to_string(),
-                        error: CFError::new("multi-worker", e.brief(), "Check the active token/account."),
+                        error: CFError::new(
+                            "multi-worker",
+                            e.brief(),
+                            "Check the active token/account.",
+                        ),
                     });
                 }
             }
@@ -1336,7 +1350,8 @@ impl KhvarenahApp {
         // Write the unit (idempotent) and enable+start it.
         match khvarenah_core::bootstrap::ensure_daemon_installed(&exe, &pid, true) {
             Ok(_outcome) => {
-                self.daemon_note = "Daemon installed and enabled (systemd --user, restarts on boot).".to_string();
+                self.daemon_note =
+                    "Daemon installed and enabled (systemd --user, restarts on boot).".to_string();
             }
             Err(e) => {
                 self.daemon_note = format!("Daemon install failed: {}", e.brief());
@@ -1349,7 +1364,8 @@ impl KhvarenahApp {
         let cfg = khvarenah_core::daemon::DaemonConfig::new(&self.profile_id);
         match khvarenah_core::store::write_json(&cfg.stop_file, &true) {
             Ok(()) => {
-                self.daemon_note = "Stop requested — the daemon exits on its next tick.".to_string();
+                self.daemon_note =
+                    "Stop requested — the daemon exits on its next tick.".to_string();
             }
             Err(e) => {
                 self.daemon_note = format!("Stop failed: {e}");
@@ -1367,7 +1383,11 @@ impl KhvarenahApp {
         bridge::spawn("blackout-drill", tx, async move {
             use khvarenah_core::connectivity::{drill_all_tiers, RealLadderProbe};
             let resolver = khvarenah_core::doh::DohResolver::new();
-            let report = drill_all_tiers(RealLadderProbe { profile: &pid, resolver: &resolver }).await;
+            let report = drill_all_tiers(RealLadderProbe {
+                profile: &pid,
+                resolver: &resolver,
+            })
+            .await;
             let mut out = String::from("Blackout drill — fallback ladder (top-down):\n");
             let mut survivors = 0;
             for (tier, verdict) in report {
@@ -1444,19 +1464,30 @@ impl KhvarenahApp {
         ui.add_space(10.0);
         ui.separator();
         ui.heading(egui::RichText::new("Notifications").color(GOLD));
-        ui.checkbox(&mut self.beacon_enabled, "Enable push notifications (Telegram / webhook)");
+        ui.checkbox(
+            &mut self.beacon_enabled,
+            "Enable push notifications (Telegram / webhook)",
+        );
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("beacon_ch")
                 .selected_text(&self.beacon_channel)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.beacon_channel, "Telegram".to_string(), "Telegram");
+                    ui.selectable_value(
+                        &mut self.beacon_channel,
+                        "Telegram".to_string(),
+                        "Telegram",
+                    );
                     ui.selectable_value(&mut self.beacon_channel, "Webhook".to_string(), "Webhook");
                 });
             ui.label("channel");
         });
         if self.beacon_channel == "Telegram" {
             ui.label("Bot token:");
-            ui.add(egui::TextEdit::singleline(&mut self.beacon_token).password(true).desired_width(260.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.beacon_token)
+                    .password(true)
+                    .desired_width(260.0),
+            );
             ui.label("Chat ID:");
             ui.add(egui::TextEdit::singleline(&mut self.beacon_target).desired_width(260.0));
         } else {
@@ -1551,7 +1582,7 @@ impl KhvarenahApp {
         ui.heading(egui::RichText::new("Daemon").color(GOLD));
         ui.label("Persistent protection daemon: safe to run 24/7. It scans,");
         ui.label("resurfaces, fails-over, and reports — no manual care needed.");
-        ui.label(&self.daemon_status_line());
+        ui.label(self.daemon_status_line());
         ui.horizontal(|ui| {
             if ui.button("Install + start (systemd)").clicked() {
                 self.daemon_install_start();

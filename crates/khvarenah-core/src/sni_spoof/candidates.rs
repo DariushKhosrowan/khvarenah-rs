@@ -72,7 +72,9 @@ mod tests {
         assert_eq!(c[0], "edge-subdomain.workers.dev");
         // worker not duplicated later in the defaults
         assert_eq!(
-            c.iter().filter(|s| s.as_str() == "edge-subdomain.workers.dev").count(),
+            c.iter()
+                .filter(|s| s.as_str() == "edge-subdomain.workers.dev")
+                .count(),
             1
         );
     }

@@ -31,7 +31,11 @@ pub fn clear_allowlist(profile_id: &str) -> Result<(), CFError> {
     let p = allowlist_path(profile_id)?;
     if p.exists() {
         std::fs::remove_file(&p).map_err(|e| {
-            CFError::new("SniSpoof", e.to_string(), "Cannot remove the allowlist file.")
+            CFError::new(
+                "SniSpoof",
+                e.to_string(),
+                "Cannot remove the allowlist file.",
+            )
         })?;
     }
     Ok(())

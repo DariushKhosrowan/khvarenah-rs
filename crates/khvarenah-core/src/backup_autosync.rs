@@ -66,10 +66,7 @@ pub fn should_autosync(cfg: &BackupAutoSyncConfig, last_sync_ts: i64, now: i64) 
 /// removed. Never removes a non-json file.
 pub fn trim_backups(keep: usize) -> usize {
     let mut records = crate::backup::list_backups();
-    records.sort_by(|a, b| {
-        b.created_at
-            .cmp(&a.created_at)
-    });
+    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     let mut removed = 0;
     for r in records.into_iter().skip(keep.max(1)) {
         let is_json = std::path::Path::new(&r.path)
@@ -86,7 +83,12 @@ pub fn trim_backups(keep: usize) -> usize {
 /// Run one auto-backup if due. Returns `Some(path)` if a backup was written,
 /// `None` if not due (or disabled). Never errors on a due-but-failed export —
 /// returns the error for the caller to log, and the daemon will retry next tick.
-pub fn run_autosync_if_due(cfg: &BackupAutoSyncConfig, profile_id: &str, last_sync_ts: i64, now: i64) -> Result<Option<std::path::PathBuf>, CFError> {
+pub fn run_autosync_if_due(
+    cfg: &BackupAutoSyncConfig,
+    profile_id: &str,
+    last_sync_ts: i64,
+    now: i64,
+) -> Result<Option<std::path::PathBuf>, CFError> {
     if !should_autosync(cfg, last_sync_ts, now) {
         return Ok(None);
     }

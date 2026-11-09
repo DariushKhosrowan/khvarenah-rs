@@ -253,10 +253,9 @@ impl HetznerApi for RealHetznerApi {
                 .await
                 .map_err(|e| CFError::new("hetzner", format!("get server failed: {e}"), ""))?;
             if resp.status().is_success() {
-                let body: serde_json::Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| CFError::new("hetzner", format!("bad server response: {e}"), ""))?;
+                let body: serde_json::Value = resp.json().await.map_err(|e| {
+                    CFError::new("hetzner", format!("bad server response: {e}"), "")
+                })?;
                 let status = body["server"]["status"].as_str().unwrap_or("");
                 if status == "running" {
                     let ip = body["server"]["public_net"]["ipv4"]["ip"]
@@ -300,18 +299,16 @@ pub fn ensure_ssh_identity(private_key_path: &std::path::Path) -> Result<SshIden
             .map_err(|e| CFError::new("hetzner", format!("mkdir failed: {e}"), ""))?;
     }
     let out = std::process::Command::new("ssh-keygen")
-        .args([
-            "-t",
-            "ed25519",
-            "-N",
-            "",
-            "-C",
-            "khvarenah-provision",
-            "-f",
-        ])
+        .args(["-t", "ed25519", "-N", "", "-C", "khvarenah-provision", "-f"])
         .arg(private_key_path)
         .output()
-        .map_err(|e| CFError::new("hetzner", format!("ssh-keygen spawn failed: {e}"), "Install openssh-client."))?;
+        .map_err(|e| {
+            CFError::new(
+                "hetzner",
+                format!("ssh-keygen spawn failed: {e}"),
+                "Install openssh-client.",
+            )
+        })?;
     if !out.status.success() {
         return Err(CFError::new(
             "hetzner",
@@ -354,7 +351,9 @@ pub async fn provision_vps<A: HetznerApi>(
 
     emit(ProvisionStep::UploadSshKey, &mut completed);
     let key_name = format!("khvarenah-{}", std::process::id());
-    let ssh_key_id = api.upload_ssh_key(creds, &key_name, &identity.public_key).await?;
+    let ssh_key_id = api
+        .upload_ssh_key(creds, &key_name, &identity.public_key)
+        .await?;
 
     emit(ProvisionStep::CreateServer, &mut completed);
     let server_id = api
@@ -454,7 +453,9 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("id_ed25519");
-        let res = provision_vps(&api, &test_creds(), &key, None).await.unwrap();
+        let res = provision_vps(&api, &test_creds(), &key, None)
+            .await
+            .unwrap();
         assert_eq!(res.host, "1.2.3.4");
         assert_eq!(res.completed_steps, ProvisionStep::all());
         assert!(key.exists());
@@ -470,7 +471,9 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("id_ed25519");
-        let err = provision_vps(&api, &test_creds(), &key, None).await.unwrap_err();
+        let err = provision_vps(&api, &test_creds(), &key, None)
+            .await
+            .unwrap_err();
         assert!(err.brief().to_lowercase().contains("bad token"));
     }
 
@@ -484,7 +487,9 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("id_ed25519");
-        let err = provision_vps(&api, &test_creds(), &key, None).await.unwrap_err();
+        let err = provision_vps(&api, &test_creds(), &key, None)
+            .await
+            .unwrap_err();
         assert!(err.brief().contains("create failed"));
     }
 
@@ -498,7 +503,9 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("id_ed25519");
-        let err = provision_vps(&api, &test_creds(), &key, None).await.unwrap_err();
+        let err = provision_vps(&api, &test_creds(), &key, None)
+            .await
+            .unwrap_err();
         assert!(err.brief().to_lowercase().contains("timeout"));
     }
 }

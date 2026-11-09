@@ -67,26 +67,55 @@ pub async fn test_sni(sni: &str, ip: &str, port: u16, timeout_ms: u64) -> SniTes
     let addr: std::net::SocketAddr = format!("{ip}:{port}")
         .parse()
         .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], port)));
-    let mut tcp = match tokio::time::timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(_)) => return SniTestResult::failed(SniTestFailure::Reset, started.elapsed().as_millis() as u64),
-        Err(_) => return SniTestResult::failed(SniTestFailure::Timeout, started.elapsed().as_millis() as u64),
-    };
+    let mut tcp =
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr))
+            .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(_)) => {
+                return SniTestResult::failed(
+                    SniTestFailure::Reset,
+                    started.elapsed().as_millis() as u64,
+                )
+            }
+            Err(_) => {
+                return SniTestResult::failed(
+                    SniTestFailure::Timeout,
+                    started.elapsed().as_millis() as u64,
+                )
+            }
+        };
     tcp.set_nodelay(true).ok();
 
     // 2 — Build a lenient rustls client with a browser fingerprint profile.
-    let profile = crate::probe_jitter::pick_client_hello_profile(&mut rand::rngs::StdRng::from_entropy());
+    let profile =
+        crate::probe_jitter::pick_client_hello_profile(&mut rand::rngs::StdRng::from_entropy());
     let config = match crate::health::lenient_client_config(profile) {
         Ok(c) => c,
-        Err(_) => return SniTestResult::failed(SniTestFailure::Reset, started.elapsed().as_millis() as u64),
+        Err(_) => {
+            return SniTestResult::failed(
+                SniTestFailure::Reset,
+                started.elapsed().as_millis() as u64,
+            )
+        }
     };
     let server_name = match rustls::pki_types::ServerName::try_from(sni.to_string()) {
         Ok(n) => n,
-        Err(_) => return SniTestResult::failed(SniTestFailure::Reset, started.elapsed().as_millis() as u64),
+        Err(_) => {
+            return SniTestResult::failed(
+                SniTestFailure::Reset,
+                started.elapsed().as_millis() as u64,
+            )
+        }
     };
     let mut conn = match rustls::ClientConnection::new(Arc::new(config), server_name) {
         Ok(c) => c,
-        Err(_) => return SniTestResult::failed(SniTestFailure::Reset, started.elapsed().as_millis() as u64),
+        Err(_) => {
+            return SniTestResult::failed(
+                SniTestFailure::Reset,
+                started.elapsed().as_millis() as u64,
+            )
+        }
     };
 
     // 3 — Transmit the ClientHello (first flight) as raw bytes.
@@ -113,20 +142,26 @@ pub async fn test_sni(sni: &str, ip: &str, port: u16, timeout_ms: u64) -> SniTes
         .await
         .is_err()
     {
-        return SniTestResult::failed(SniTestFailure::Timeout, started.elapsed().as_millis() as u64);
+        return SniTestResult::failed(
+            SniTestFailure::Timeout,
+            started.elapsed().as_millis() as u64,
+        );
     }
 
     // 4 — Watch for ANY server response. Bytes ⇒ the SNI was allowed.
     let mut buf = [0u8; 4096];
     match tokio::time::timeout(Duration::from_millis(timeout_ms), tcp.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => {
-            SniTestResult::passed(started.elapsed().as_millis() as u64)
+        Ok(Ok(n)) if n > 0 => SniTestResult::passed(started.elapsed().as_millis() as u64),
+        Ok(Ok(_)) => {
+            SniTestResult::failed(SniTestFailure::Reset, started.elapsed().as_millis() as u64)
         }
-        Ok(Ok(_)) => SniTestResult::failed(SniTestFailure::Reset, started.elapsed().as_millis() as u64),
         Ok(Err(_)) => {
             SniTestResult::failed(SniTestFailure::Reset, started.elapsed().as_millis() as u64)
         }
-        Err(_) => SniTestResult::failed(SniTestFailure::Timeout, started.elapsed().as_millis() as u64),
+        Err(_) => SniTestResult::failed(
+            SniTestFailure::Timeout,
+            started.elapsed().as_millis() as u64,
+        ),
     }
 }
 
@@ -138,8 +173,8 @@ pub async fn scan_snis(
     timeout_ms: u64,
     workers: usize,
 ) -> Vec<(String, SniTestResult)> {
-    use std::sync::Arc as SyncArc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as SyncArc;
     use tokio::sync::Semaphore;
 
     let limiter = SyncArc::new(Semaphore::new(workers.max(1)));
@@ -246,16 +281,27 @@ mod tests {
     #[tokio::test]
     async fn test_sni_passes_when_server_responds() {
         let port = start_mock("echo").await;
-        let port = if port_override() != 0 { port_override() } else { port };
+        let port = if port_override() != 0 {
+            port_override()
+        } else {
+            port
+        };
         let r = test_sni("example.com", "127.0.0.1", port, 2000).await;
-        assert!(r.passed, "expected pass when a ServerHello-like echo comes back: {r:?}");
+        assert!(
+            r.passed,
+            "expected pass when a ServerHello-like echo comes back: {r:?}"
+        );
         assert!(r.failure.is_none());
     }
 
     #[tokio::test]
     async fn test_sni_returns_reset_when_tcp_resets() {
         let port = start_mock("reset").await;
-        let port = if port_override() != 0 { port_override() } else { port };
+        let port = if port_override() != 0 {
+            port_override()
+        } else {
+            port
+        };
         let r = test_sni("example.com", "127.0.0.1", port, 2000).await;
         assert!(!r.passed, "expected fail on reset: {r:?}");
         assert_eq!(r.failure, Some(SniTestFailure::Reset));
@@ -297,8 +343,14 @@ mod tests {
     fn test_summarize_splits_allowed_blocked_timeouts() {
         let results = vec![
             ("a.com".to_string(), SniTestResult::passed(10)),
-            ("b.com".to_string(), SniTestResult::failed(SniTestFailure::Reset, 5)),
-            ("c.com".to_string(), SniTestResult::failed(SniTestFailure::Timeout, 400)),
+            (
+                "b.com".to_string(),
+                SniTestResult::failed(SniTestFailure::Reset, 5),
+            ),
+            (
+                "c.com".to_string(),
+                SniTestResult::failed(SniTestFailure::Timeout, 400),
+            ),
         ];
         let s = summarize(&results);
         assert_eq!(s.allowed, vec!["a.com"]);

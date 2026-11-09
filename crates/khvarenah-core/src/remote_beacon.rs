@@ -40,11 +40,23 @@ pub enum BeaconEvent {
     ProtectionStarted,
     ProtectionStopped,
     WorkerDeadGiveUp,
-    FailoverSwitched { from: String, to: String },
+    FailoverSwitched {
+        from: String,
+        to: String,
+    },
     RescueRecovered,
-    DailySummary { cycles: u32, uptime_pct: f32 },
-    ConfigMutated { old_worker: String, new_worker: String },
-    AccountBlocked { state: String, since: i64 },
+    DailySummary {
+        cycles: u32,
+        uptime_pct: f32,
+    },
+    ConfigMutated {
+        old_worker: String,
+        new_worker: String,
+    },
+    AccountBlocked {
+        state: String,
+        since: i64,
+    },
 }
 
 impl BeaconEvent {
@@ -192,10 +204,9 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
         (BeaconEvent::WorkerDeadGiveUp, _) => {
             "⚠️ Worker dead: all rescue attempts failed".to_string()
         }
-        (
-            BeaconEvent::FailoverSwitched { from, to },
-            crate::diagnose::Locale::Fa,
-        ) => format!("🔁 سوئیچ به پروفایل {to} (از {from})"),
+        (BeaconEvent::FailoverSwitched { from, to }, crate::diagnose::Locale::Fa) => {
+            format!("🔁 سوئیچ به پروفایل {to} (از {from})")
+        }
         (BeaconEvent::FailoverSwitched { from, to }, _) => {
             format!("🔁 Failover switched to profile {to} (from {from})")
         }
@@ -203,17 +214,28 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
             "✅ اتصال بازیابی شد".to_string()
         }
         (BeaconEvent::RescueRecovered, _) => "✅ Connection recovered".to_string(),
-        (
-            BeaconEvent::DailySummary { cycles, uptime_pct },
-            crate::diagnose::Locale::Fa,
-        ) => format!("📊 خلاصه روزانه: {cycles} چرخه، {uptime_pct:.0}٪ آپ‌تایم"),
+        (BeaconEvent::DailySummary { cycles, uptime_pct }, crate::diagnose::Locale::Fa) => {
+            format!("📊 خلاصه روزانه: {cycles} چرخه، {uptime_pct:.0}٪ آپ‌تایم")
+        }
         (BeaconEvent::DailySummary { cycles, uptime_pct }, _) => {
             format!("📊 Daily summary: {cycles} cycles, {uptime_pct:.0}% uptime")
         }
-        (BeaconEvent::ConfigMutated { old_worker, new_worker }, crate::diagnose::Locale::Fa) => {
+        (
+            BeaconEvent::ConfigMutated {
+                old_worker,
+                new_worker,
+            },
+            crate::diagnose::Locale::Fa,
+        ) => {
             format!("🔄 امضای کارگر چرخید: {old_worker} ← {new_worker}")
         }
-        (BeaconEvent::ConfigMutated { old_worker, new_worker }, _) => {
+        (
+            BeaconEvent::ConfigMutated {
+                old_worker,
+                new_worker,
+            },
+            _,
+        ) => {
             format!("🔄 Worker signature rotated: {old_worker} → {new_worker}")
         }
         (BeaconEvent::AccountBlocked { state, .. }, crate::diagnose::Locale::Fa) => {
@@ -235,9 +257,7 @@ pub async fn send(config: &BeaconConfig, message: &str) -> Result<(), CFError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| {
-            CFError::new("Beacon", e.to_string(), "Cannot build HTTP client.")
-        })?;
+        .map_err(|e| CFError::new("Beacon", e.to_string(), "Cannot build HTTP client."))?;
 
     match config.kind {
         BeaconKind::Telegram => {
@@ -248,10 +268,7 @@ pub async fn send(config: &BeaconConfig, message: &str) -> Result<(), CFError> {
                     "Set both bot token and chat id.",
                 ));
             }
-            let url = format!(
-                "https://api.telegram.org/bot{}/sendMessage",
-                config.token
-            );
+            let url = format!("https://api.telegram.org/bot{}/sendMessage", config.token);
             let body = serde_json::json!({
                 "chat_id": config.chat_id_or_url,
                 "text": message,
@@ -345,21 +362,17 @@ pub async fn maybe_emit(
 /// disabled or the outbox is empty.
 pub async fn flush_outbox(profile_id: &str) -> usize {
     let cfg = load_config(profile_id);
-    flush_outbox_with_profile(profile_id, &cfg, |text, cfg| {
-        Box::pin(send(cfg, text))
-    })
-    .await
+    flush_outbox_with_profile(profile_id, &cfg, |text, cfg| Box::pin(send(cfg, text))).await
 }
 
 /// Hermetic core of `flush_outbox`. `deliver` is injected so tests can script
 /// success/failure per alert without network access.
-async fn flush_outbox_with_profile<F>(
-    profile_id: &str,
-    cfg: &BeaconConfig,
-    deliver: F,
-) -> usize
+async fn flush_outbox_with_profile<F>(profile_id: &str, cfg: &BeaconConfig, deliver: F) -> usize
 where
-    F: for<'a> Fn(&'a str, &'a BeaconConfig) -> futures_util::future::BoxFuture<'a, Result<(), CFError>>,
+    F: for<'a> Fn(
+        &'a str,
+        &'a BeaconConfig,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), CFError>>,
 {
     if !cfg.enabled {
         return 0;
@@ -478,11 +491,17 @@ mod tests {
         let en = format_message(&ev, crate::diagnose::Locale::En);
         assert!(en.contains("token-invalid"), "en={en}");
         assert!(en.contains("Account blocked"));
-        assert!(en.contains("token recover"), "en should carry the recovery action: {en}");
+        assert!(
+            en.contains("token recover"),
+            "en should carry the recovery action: {en}"
+        );
         let fa = format_message(&ev, crate::diagnose::Locale::Fa);
         assert!(fa.contains("token-invalid"), "fa={fa}");
         assert!(fa.contains("حساب"));
-        assert!(fa.contains("token recover"), "fa should carry the recovery action: {fa}");
+        assert!(
+            fa.contains("token recover"),
+            "fa should carry the recovery action: {fa}"
+        );
     }
 
     #[test]
@@ -490,10 +509,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!(
-            "kvrvn-beacon-{}-{n}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kvrvn-beacon-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         crate::store::set_mem_dir_override(tmp.join(".khvarenah"));
         let profile = "beacon-test";
@@ -516,10 +532,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!(
-            "kvrvn-outbox-{}-{n}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kvrvn-outbox-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         crate::store::set_mem_dir_override(tmp.join(".khvarenah"));
         let profile = "outbox-test";
@@ -543,10 +556,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!(
-            "kvrvn-outbox2-{}-{n}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kvrvn-outbox2-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         crate::store::set_mem_dir_override(tmp.join(".khvarenah"));
         let profile = "outbox2-test";
@@ -565,10 +575,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!(
-            "kvrvn-flush-{}-{n}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kvrvn-flush-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         crate::store::set_mem_dir_override(tmp.join(".khvarenah"));
         let profile = "flush-test";
@@ -608,10 +615,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!(
-            "kvrvn-flush2-{}-{n}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kvrvn-flush2-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         crate::store::set_mem_dir_override(tmp.join(".khvarenah"));
         let profile = "flush2-test";
@@ -629,17 +633,10 @@ mod tests {
         queue_for_retry(profile, "fail").unwrap();
 
         // Deliver always fails → 0 sent, alert stays queued.
-        let sent =
-            flush_outbox_with_profile(profile, &cfg, |_text, _cfg| {
-                Box::pin(async move {
-                    Err(CFError::new(
-                        "Test",
-                        "channel blocked",
-                        "blackout",
-                    ))
-                })
-            })
-            .await;
+        let sent = flush_outbox_with_profile(profile, &cfg, |_text, _cfg| {
+            Box::pin(async move { Err(CFError::new("Test", "channel blocked", "blackout")) })
+        })
+        .await;
         assert_eq!(sent, 0);
         let ob = load_outbox(profile);
         assert_eq!(ob.len(), 1);
@@ -653,10 +650,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!(
-            "kvrvn-flush3-{}-{n}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kvrvn-flush3-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         crate::store::set_mem_dir_override(tmp.join(".khvarenah"));
         let profile = "flush3-test";
@@ -665,10 +659,9 @@ mod tests {
         let cfg = BeaconConfig::default(); // enabled = false
         queue_for_retry(profile, "a").unwrap();
 
-        let sent = flush_outbox_with_profile(profile, &cfg, |_text, _cfg| {
-            Box::pin(async move { Ok(()) })
-        })
-        .await;
+        let sent =
+            flush_outbox_with_profile(profile, &cfg, |_text, _cfg| Box::pin(async move { Ok(()) }))
+                .await;
         assert_eq!(sent, 0);
         // Outbox untouched.
         assert_eq!(load_outbox(profile).len(), 1);

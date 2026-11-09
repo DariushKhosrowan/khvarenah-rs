@@ -143,8 +143,12 @@ pub trait VpsSshPeer: Send + Sync {
     /// Run a remote command via ssh; return trimmed stdout on success.
     async fn run_remote(&self, creds: &VpsCredentials, cmd: &str) -> Result<String, CFError>;
     /// Copy a local file to the remote host via scp.
-    async fn copy_to(&self, creds: &VpsCredentials, local: &Path, remote: &str)
-        -> Result<(), CFError>;
+    async fn copy_to(
+        &self,
+        creds: &VpsCredentials,
+        local: &Path,
+        remote: &str,
+    ) -> Result<(), CFError>;
     /// Probe reachability of the VPS host:port (TCP).
     async fn probe_reachable(&self, creds: &VpsCredentials) -> bool;
 }
@@ -153,11 +157,7 @@ pub trait VpsSshPeer: Send + Sync {
 pub struct RealVpsSshPeer;
 
 impl VpsSshPeer for RealVpsSshPeer {
-    async fn run_remote(
-        &self,
-        creds: &VpsCredentials,
-        cmd: &str,
-    ) -> Result<String, CFError> {
+    async fn run_remote(&self, creds: &VpsCredentials, cmd: &str) -> Result<String, CFError> {
         let mut args = creds.ssh_args();
         args.push(cmd.to_string());
         let out = StdCommand::new("ssh")
@@ -170,7 +170,11 @@ impl VpsSshPeer for RealVpsSshPeer {
             let stderr = String::from_utf8_lossy(&out.stderr);
             Err(CFError::new(
                 "vps-deploy",
-                format!("ssh command failed ({}): {}", out.status.code().unwrap_or(-1), stderr.trim()),
+                format!(
+                    "ssh command failed ({}): {}",
+                    out.status.code().unwrap_or(-1),
+                    stderr.trim()
+                ),
                 "",
             ))
         }
@@ -291,7 +295,11 @@ pub async fn deploy_dns_tunnel<P: VpsSshPeer>(
         ));
     }
     peer.run_remote(creds, "echo ok").await.map_err(|e| {
-        CFError::new("vps-deploy", format!("SSH handshake failed: {}", e.brief()), "")
+        CFError::new(
+            "vps-deploy",
+            format!("SSH handshake failed: {}", e.brief()),
+            "",
+        )
     })?;
     emit(DeployStep::VerifySsh, &mut completed);
 
@@ -350,7 +358,8 @@ WantedBy=multi-user.target
     let remote_unit = "/etc/systemd/system/dnstt.service";
     std::fs::write("/tmp/dnstt.unit", &unit)
         .map_err(|e| CFError::new("vps-deploy", format!("temp write: {e}"), ""))?;
-    peer.copy_to(creds, Path::new("/tmp/dnstt.unit"), remote_unit).await?;
+    peer.copy_to(creds, Path::new("/tmp/dnstt.unit"), remote_unit)
+        .await?;
     peer.run_remote(
         creds,
         "systemctl daemon-reload && systemctl enable --now dnstt.service && echo enabled",
@@ -403,7 +412,11 @@ mod tests {
     fn fresh_profile() -> String {
         let base = tempfile::tempdir().unwrap().path().join(".khvarenah");
         crate::store::set_mem_dir_override(base);
-        crate::store::profiles::create_profile(&format!("vps-test-{}", crate::store::new_id()), "test").unwrap()
+        crate::store::profiles::create_profile(
+            &format!("vps-test-{}", crate::store::new_id()),
+            "test",
+        )
+        .unwrap()
     }
 
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -424,12 +437,7 @@ mod tests {
                 Ok("inactive".into())
             }
         }
-        async fn copy_to(
-            &self,
-            _c: &VpsCredentials,
-            _l: &Path,
-            r: &str,
-        ) -> Result<(), CFError> {
+        async fn copy_to(&self, _c: &VpsCredentials, _l: &Path, r: &str) -> Result<(), CFError> {
             self.calls.lock().unwrap().push(format!("copy:{r}"));
             Ok(())
         }
@@ -451,7 +459,10 @@ mod tests {
     async fn deploy_unreachable_vps_errors_before_any_step() {
         let _guard = TEST_LOCK.lock().unwrap();
         let profile = fresh_profile();
-        let peer = FakePeer { reachable: false, ..Default::default() };
+        let peer = FakePeer {
+            reachable: false,
+            ..Default::default()
+        };
         let err = deploy_dns_tunnel(&creds(), &peer, &profile, "t.example.com", None).await;
         assert!(err.is_err());
         assert!(peer.calls.lock().unwrap().is_empty());
@@ -461,8 +472,14 @@ mod tests {
     async fn deploy_runs_all_steps_in_order() {
         let _guard = TEST_LOCK.lock().unwrap();
         let profile = fresh_profile();
-        let peer = FakePeer { reachable: true, active: true, ..Default::default() };
-        let res = deploy_dns_tunnel(&creds(), &peer, &profile, "t.example.com", None).await.unwrap();
+        let peer = FakePeer {
+            reachable: true,
+            active: true,
+            ..Default::default()
+        };
+        let res = deploy_dns_tunnel(&creds(), &peer, &profile, "t.example.com", None)
+            .await
+            .unwrap();
         assert_eq!(res.completed_steps.len(), DeployStep::all().len());
         assert!(res.verified);
         let calls = peer.calls.lock().unwrap();
@@ -474,8 +491,14 @@ mod tests {
     async fn deploy_reports_unverified_when_service_inactive() {
         let _guard = TEST_LOCK.lock().unwrap();
         let profile = fresh_profile();
-        let peer = FakePeer { reachable: true, active: false, ..Default::default() };
-        let res = deploy_dns_tunnel(&creds(), &peer, &profile, "t.example.com", None).await.unwrap();
+        let peer = FakePeer {
+            reachable: true,
+            active: false,
+            ..Default::default()
+        };
+        let res = deploy_dns_tunnel(&creds(), &peer, &profile, "t.example.com", None)
+            .await
+            .unwrap();
         assert!(!res.verified);
     }
 

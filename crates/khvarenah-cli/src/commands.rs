@@ -1,7 +1,6 @@
 //! CLI command implementations.
 
 use khvarenah_core::cf::{Client, DnsRecord};
-use std::path::PathBuf;
 use khvarenah_core::diagnostics::{run_diagnostics, split_endpoint};
 use khvarenah_core::export::{render, ExportFormat};
 use khvarenah_core::scanner::{scan_many, scan_once, ScanParams};
@@ -15,6 +14,7 @@ use khvarenah_core::worker::{
     find_worker_js, generate_uuid, safe_worker_name, validate_worker_js, worker_name_from_account,
 };
 use khvarenah_core::{CFError, BRAND, VERSION};
+use std::path::PathBuf;
 
 use crate::{BackupAction, Command, DaemonAction, DnsAction, ProtectionAction, RoutesAction};
 use khvarenah_core::remote_beacon::BeaconConfig;
@@ -66,9 +66,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             println!("Token '{label}' saved to profile '{profile}'");
             Ok(())
         }
-        Command::TokenRecover { label, token } => {
-            token_recover(&profile, &label, &token).await
-        }
+        Command::TokenRecover { label, token } => token_recover(&profile, &label, &token).await,
         Command::TokenList => {
             let p = load_profile(&profile);
             if p.tokens.is_empty() {
@@ -137,7 +135,9 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             tunnel_ip,
         } => cmd_verify(&direct_ip, &tunnel_ip),
         Command::Bundle { action } => cmd_bundle(&profile, action),
-        Command::Up { profile: profile_override } => cmd_up(profile_override).await,
+        Command::Up {
+            profile: profile_override,
+        } => cmd_up(profile_override).await,
         Command::Drill => cmd_drill(&profile).await,
         Command::Beacon { action } => cmd_beacon(&profile, action).await,
         Command::SniSpoof { action } => cmd_sni_spoof(&profile, action).await,
@@ -364,7 +364,10 @@ async fn token_recover(profile: &str, label: &str, token: &str) -> Result<(), CF
             return Err(e);
         }
     };
-    println!("Token '{label}' verified. status={} id={}", res.status, res.id);
+    println!(
+        "Token '{label}' verified. status={} id={}",
+        res.status, res.id
+    );
     // 3. Set it active.
     set_active_token(profile, label)?;
     // 4. Clear any blocked daemon account state so cycles resume immediately.
@@ -1314,7 +1317,10 @@ fn cmd_desync(profile: &str, action: crate::DesyncAction) -> Result<(), CFError>
             let cfg = khvarenah_core::store::profiles::load_profile(profile)
                 .config
                 .desync;
-            println!("Desync fragmentation: {}", if cfg.enabled { "ON" } else { "OFF" });
+            println!(
+                "Desync fragmentation: {}",
+                if cfg.enabled { "ON" } else { "OFF" }
+            );
             if cfg.enabled {
                 println!("  min fragment: {} B", cfg.min_fragment);
                 println!("  max fragment: {} B", cfg.max_fragment);
@@ -1413,10 +1419,7 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
                 Ok(khvarenah_core::selfupdate::UpdateOutcome::Updated { tag }) => {
                     daemon_log_append(
                         &cfg.log_path,
-                        &log_line(
-                            "INFO",
-                            &format!("auto-update applied {tag}, re-execing…"),
-                        ),
+                        &log_line("INFO", &format!("auto-update applied {tag}, re-execing…")),
                     );
                     save_daemon_state(&active_profile, &state)?;
                     // Re-exec the (now updated) binary with the same args.
@@ -1436,7 +1439,10 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
                     return Ok(());
                 }
                 Ok(khvarenah_core::selfupdate::UpdateOutcome::Failed(msg)) => {
-                    daemon_log_append(&cfg.log_path, &log_line("WARN", &format!("auto-update failed: {msg}")));
+                    daemon_log_append(
+                        &cfg.log_path,
+                        &log_line("WARN", &format!("auto-update failed: {msg}")),
+                    );
                 }
                 _ => {}
             }
@@ -1455,7 +1461,10 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
                     &cfg.log_path,
                     &log_line(
                         "INFO",
-                        &format!("failover: switching profile {} -> {}", active_profile, store_active),
+                        &format!(
+                            "failover: switching profile {} -> {}",
+                            active_profile, store_active
+                        ),
                     ),
                 );
                 // Notify on failover (rate-limited by event class).
@@ -1478,9 +1487,14 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
             }
         }
 
-        let sleep = daemon_tick(&active_profile, &mut state, &probe, &acct, &cycle, &mut |line| {
-            daemon_log_append(&cfg.log_path, line)
-        })
+        let sleep = daemon_tick(
+            &active_profile,
+            &mut state,
+            &probe,
+            &acct,
+            &cycle,
+            &mut |line| daemon_log_append(&cfg.log_path, line),
+        )
         .await;
         save_daemon_state(&active_profile, &state)?;
 
@@ -1523,11 +1537,15 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
         // (only when the account is active — never mutate a blocked account).
         if !state.account_state.blocks_cycle() {
             let peer = khvarenah_core::autopilot::RealMutationPeer;
-            match khvarenah_core::config_mutation::run_mutation_if_due(&active_profile, &peer).await {
+            match khvarenah_core::config_mutation::run_mutation_if_due(&active_profile, &peer).await
+            {
                 Ok(Some(outcome)) => {
                     let line = log_line(
                         "INFO",
-                        &format!("config mutation applied: {} -> {}", outcome.old_path, outcome.new_path),
+                        &format!(
+                            "config mutation applied: {} -> {}",
+                            outcome.old_path, outcome.new_path
+                        ),
                     );
                     daemon_log_append(&cfg.log_path, &line);
                     let _ = khvarenah_core::remote_beacon::maybe_emit(
@@ -1537,7 +1555,8 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
                             new_worker: outcome.new_uuid,
                         },
                         khvarenah_core::diagnose::Locale::En,
-                    ).await;
+                    )
+                    .await;
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -1582,7 +1601,9 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
         let current_rescue = khvarenah_core::store::profiles::load_profile(&active_profile)
             .config
             .last_rescue_outcome;
-        if current_rescue.as_deref() == Some("gave_up") && last_rescue_outcome.as_deref() != Some("gave_up") {
+        if current_rescue.as_deref() == Some("gave_up")
+            && last_rescue_outcome.as_deref() != Some("gave_up")
+        {
             let _ = khvarenah_core::remote_beacon::maybe_emit(
                 &active_profile,
                 &khvarenah_core::remote_beacon::BeaconEvent::WorkerDeadGiveUp,
@@ -1679,7 +1700,10 @@ async fn cmd_daemon(profile: &str, action: DaemonAction) -> Result<(), CFError> 
             println!("  network was down: {}", state.network_was_down);
             println!("  account: {}", state.account_state.label());
             if let Some(since) = state.account_state.since() {
-                println!("  account blocked since: {} (waiting for reactivation)", since);
+                println!(
+                    "  account blocked since: {} (waiting for reactivation)",
+                    since
+                );
             }
             Ok(())
         }
@@ -1892,16 +1916,16 @@ fn cmd_verify(direct_ip: &str, tunnel_ip: &str) -> Result<(), CFError> {
 async fn cmd_drill(profile: &str) -> Result<(), CFError> {
     use khvarenah_core::connectivity::{drill_all_tiers, RealLadderProbe, Tier};
     let resolver = khvarenah_core::doh::DohResolver::new();
-    let report = drill_all_tiers(RealLadderProbe { profile, resolver: &resolver }).await;
+    let report = drill_all_tiers(RealLadderProbe {
+        profile,
+        resolver: &resolver,
+    })
+    .await;
     println!("Blackout drill — fallback ladder (top-down):");
     let mut survivors = 0;
     for (tier, verdict) in report {
         let mark = if verdict.ok { "OK  " } else { "FAIL" };
-        println!(
-            "  {mark}  {}  {}",
-            tier.label(),
-            verdict.note
-        );
+        println!("  {mark}  {}  {}", tier.label(), verdict.note);
         if verdict.ok {
             survivors += 1;
         }
@@ -1927,7 +1951,10 @@ async fn cmd_up(profile_override: Option<String>) -> Result<(), CFError> {
         let bundle = khvarenah_core::cleanip::user_config_dir("default")
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "~/khvarenah-configs/default/".to_string());
-        println!("✓ Protection active in {mins:.0}m {:.0}s", (diag.elapsed_ms % 60000) as f64 / 1000.0);
+        println!(
+            "✓ Protection active in {mins:.0}m {:.0}s",
+            (diag.elapsed_ms % 60000) as f64 / 1000.0
+        );
         println!("  Bundle: {bundle}");
         println!("  → active.png   (scan with your phone)");
         println!("  → active.vless (paste into your desktop client)");
@@ -1936,7 +1963,10 @@ async fn cmd_up(profile_override: Option<String>) -> Result<(), CFError> {
         std::process::exit(0);
     }
     // Failure — print the honest one-line diagnosis + exit scriptably.
-    eprintln!("✗ Setup could not complete (failed at stage: {})", diag.stage_reached);
+    eprintln!(
+        "✗ Setup could not complete (failed at stage: {})",
+        diag.stage_reached
+    );
     eprintln!("  {}", diag.plain_message);
     eprintln!("  Recommended: {}", diag.recommended_action);
     let code = diag.failure.as_ref().map(|f| f.exit_code()).unwrap_or(1);
@@ -1968,8 +1998,9 @@ async fn cmd_sni_spoof(profile: &str, action: crate::SniSpoofAction) -> Result<(
                 println!("No scan saved yet. Run: khvarenah sni-spoof scan");
                 return Ok(());
             }
-            let raw = std::fs::read_to_string(&p)
-                .map_err(|e| CFError::new("SniSpoof", e.to_string(), "Cannot read the saved scan."))?;
+            let raw = std::fs::read_to_string(&p).map_err(|e| {
+                CFError::new("SniSpoof", e.to_string(), "Cannot read the saved scan.")
+            })?;
             println!("{raw}");
             Ok(())
         }
@@ -2014,7 +2045,9 @@ async fn cmd_sni_spoof(profile: &str, action: crate::SniSpoofAction) -> Result<(
             for (sni, r) in &results {
                 let mark = if r.passed {
                     "✓ ALLOWED".to_string()
-                } else if r.failure == Some(khvarenah_core::sni_spoof::scanner::SniTestFailure::Timeout) {
+                } else if r.failure
+                    == Some(khvarenah_core::sni_spoof::scanner::SniTestFailure::Timeout)
+                {
                     "… TIMEOUT".to_string()
                 } else {
                     "✗ BLOCKED".to_string()
@@ -2055,9 +2088,7 @@ async fn cmd_sni_spoof(profile: &str, action: crate::SniSpoofAction) -> Result<(
             targets.push(("www.cloudflare.com".to_string(), "cf".to_string()));
             targets.push(("workers.dev".to_string(), "workers".to_string()));
 
-            println!(
-                "WS-upgrade probe → {ip}:{port}{path} (timeout {timeout_ms}ms)…"
-            );
+            println!("WS-upgrade probe → {ip}:{port}{path} (timeout {timeout_ms}ms)…");
             for (sni, label) in &targets {
                 let r = khvarenah_core::sni_spoof::ws_probe::probe_ws_upgrade(
                     sni, &ip, port, &path, timeout_ms,
@@ -2098,7 +2129,10 @@ async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CF
             println!("  target:       {}", cfg.chat_id_or_url);
             println!("  rate limit:   {}s/event class", cfg.rate_limit_secs);
             let queued = khvarenah_core::remote_beacon::load_outbox(profile).len();
-            println!("  outbox:       {} queued alert(s) awaiting delivery", queued);
+            println!(
+                "  outbox:       {} queued alert(s) awaiting delivery",
+                queued
+            );
             println!("  ---");
             println!("  configure:   khvarenah beacon telegram <token> <chat-id>");
             println!("               khvarenah beacon webhook <url>");
@@ -2133,7 +2167,9 @@ async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CF
             cfg.token = token;
             cfg.chat_id_or_url = chat_id;
             save_beacon(profile, &cfg)?;
-            println!("Telegram channel configured (notifications still disabled — run `beacon enable`).");
+            println!(
+                "Telegram channel configured (notifications still disabled — run `beacon enable`)."
+            );
             Ok(())
         }
         crate::BeaconAction::Webhook { url } => {
@@ -2142,7 +2178,9 @@ async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CF
             cfg.token.clear();
             cfg.chat_id_or_url = url;
             save_beacon(profile, &cfg)?;
-            println!("Webhook channel configured (notifications still disabled — run `beacon enable`).");
+            println!(
+                "Webhook channel configured (notifications still disabled — run `beacon enable`)."
+            );
             Ok(())
         }
         crate::BeaconAction::RateLimit { secs } => {
@@ -2174,9 +2212,7 @@ async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CF
             }
             let sent = khvarenah_core::remote_beacon::flush_outbox(profile).await;
             let remaining = khvarenah_core::remote_beacon::load_outbox(profile).len();
-            println!(
-                "Flushed {sent}/{queued} queued alert(s); {remaining} still queued."
-            );
+            println!("Flushed {sent}/{queued} queued alert(s); {remaining} still queued.");
             Ok(())
         }
     }
@@ -2267,7 +2303,9 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
             if res.verified {
                 println!("DNS tunnel deployed and verified. It will be used automatically when DoH/DoT fail.");
             } else {
-                println!("Deploy completed but the tunnel service did not report active. Check the VPS.");
+                println!(
+                    "Deploy completed but the tunnel service did not report active. Check the VPS."
+                );
             }
             Ok(())
         }
@@ -2304,7 +2342,10 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
                 ));
             }
             let peer = vps::RealVpsSshPeer;
-            println!("Deploying DNS tunnel to {}@{} ({}):", creds.ssh_user, creds.host, creds.ssh_port);
+            println!(
+                "Deploying DNS tunnel to {}@{} ({}):",
+                creds.ssh_user, creds.host, creds.ssh_port
+            );
             let res = vps::deploy_dns_tunnel(&creds, &peer, profile, &domain, None).await?;
             for step in &res.completed_steps {
                 println!("  ✓ {}", step.label());
@@ -2324,7 +2365,9 @@ async fn cmd_multi_worker(profile: &str, action: crate::MultiWorkerAction) -> Re
     use khvarenah_core::multi_worker::{RealWorkerPeer, WorkerSet};
     match action {
         crate::MultiWorkerAction::Status => {
-            let set: WorkerSet = khvarenah_core::store::profiles::load_profile(profile).config.worker_set;
+            let set: WorkerSet = khvarenah_core::store::profiles::load_profile(profile)
+                .config
+                .worker_set;
             if set.is_empty() {
                 println!(
                     "No worker set configured for profile '{profile}'. Run: khvarenah multi-worker deploy --count 2"
@@ -2338,7 +2381,14 @@ async fn cmd_multi_worker(profile: &str, action: crate::MultiWorkerAction) -> Re
                     "  {marker} {} (host: {}, uuid: …{})",
                     w.name,
                     w.host,
-                    w.uuid.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>()
+                    w.uuid
+                        .chars()
+                        .rev()
+                        .take(6)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect::<String>()
                 );
             }
             println!("(active worker marked with *)");
@@ -2374,11 +2424,23 @@ async fn cmd_multi_worker(profile: &str, action: crate::MultiWorkerAction) -> Re
         crate::MultiWorkerAction::Failover => {
             let peer = RealWorkerPeer;
             let changed = khvarenah_core::multi_worker::failover_worker_set(&peer, profile).await?;
-            let set: WorkerSet = khvarenah_core::store::profiles::load_profile(profile).config.worker_set;
+            let set: WorkerSet = khvarenah_core::store::profiles::load_profile(profile)
+                .config
+                .worker_set;
             if changed {
-                println!("Failover: switched active worker to '{}'.", set.active_worker().map(|w| w.name.as_str()).unwrap_or("none"));
+                println!(
+                    "Failover: switched active worker to '{}'.",
+                    set.active_worker()
+                        .map(|w| w.name.as_str())
+                        .unwrap_or("none")
+                );
             } else {
-                println!("Failover: active worker unchanged ('{}').", set.active_worker().map(|w| w.name.as_str()).unwrap_or("none"));
+                println!(
+                    "Failover: active worker unchanged ('{}').",
+                    set.active_worker()
+                        .map(|w| w.name.as_str())
+                        .unwrap_or("none")
+                );
             }
             Ok(())
         }
@@ -2400,7 +2462,6 @@ async fn cmd_multi_worker(profile: &str, action: crate::MultiWorkerAction) -> Re
 }
 
 #[cfg(test)]
-
 
 mod tests {
     use super::*;

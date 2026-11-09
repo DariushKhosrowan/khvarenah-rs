@@ -1118,7 +1118,13 @@ impl AutopilotEngine {
         interval: Duration,
         provider: Box<dyn EndpointProvider>,
     ) -> Self {
-        Self::with_components(profile_id, params, interval, provider, Box::new(RealWorkerHealthProbe))
+        Self::with_components(
+            profile_id,
+            params,
+            interval,
+            provider,
+            Box::new(RealWorkerHealthProbe),
+        )
     }
 
     /// Test-only constructor: inject both a scripted provider and a scripted
@@ -1508,7 +1514,10 @@ impl AutopilotEngine {
                 }
             };
             let sni = crate::health::derive_ws_target(&vless).sni;
-            let verdict = self.worker_probe.probe(&sni, u64::from(params.timeout_s.max(1))).await;
+            let verdict = self
+                .worker_probe
+                .probe(&sni, u64::from(params.timeout_s.max(1)))
+                .await;
             match verdict {
                 crate::autopilot::WorkerHealth::Alive => worker_label = "Alive",
                 other => {
@@ -1997,7 +2006,10 @@ impl<'a> RescuePeer for RealRescuePeer<'a> {
 
 /// Redeploy this profile's worker using the active token + built-in preset
 /// worker JS. Rate-limiting is handled by the caller (via `last_redeploy_ts`).
-async fn redeploy_worker_core(profile_id: &str, override_uuid: Option<&str>) -> Result<(), CFError> {
+async fn redeploy_worker_core(
+    profile_id: &str,
+    override_uuid: Option<&str>,
+) -> Result<(), CFError> {
     let label = match crate::store::profiles::get_active_token(profile_id)? {
         Some(l) => l,
         None => {
@@ -2726,7 +2738,10 @@ mod tests {
         // (which it wouldn't — alive workers don't enter rescue).
         assert!(!should_failover(&WorkerHealth::Alive, true));
         assert!(should_failover(&WorkerHealth::NotFound, true));
-        assert!(should_failover(&WorkerHealth::Suspended { code: 9109 }, true));
+        assert!(should_failover(
+            &WorkerHealth::Suspended { code: 9109 },
+            true
+        ));
         assert!(should_failover(&WorkerHealth::Unreachable, true));
         // Rescue must have actually given up — never fail over pre-rescue.
         assert!(!should_failover(&WorkerHealth::NotFound, false));
@@ -2737,7 +2752,10 @@ mod tests {
         // The canonical case: worker dead + rescue exhausted → failover fires.
         assert!(should_failover(&WorkerHealth::NotFound, true));
         assert!(should_failover(&WorkerHealth::Unreachable, true));
-        assert!(should_failover(&WorkerHealth::Suspended { code: 9109 }, true));
+        assert!(should_failover(
+            &WorkerHealth::Suspended { code: 9109 },
+            true
+        ));
         // Alive worker never fails over.
         assert!(!should_failover(&WorkerHealth::Alive, true));
     }
@@ -2752,12 +2770,7 @@ mod tests {
         );
         assert_eq!(decision, FailoverDecision::FailoverTo("b".to_string()));
         // Current profile is filtered out.
-        let decision = decide_failover(
-            "a",
-            &WorkerHealth::NotFound,
-            true,
-            &["a".to_string()],
-        );
+        let decision = decide_failover("a", &WorkerHealth::NotFound, true, &["a".to_string()]);
         assert_eq!(decision, FailoverDecision::NoAlternative);
     }
 
@@ -3244,10 +3257,9 @@ mod tests {
             &'a self,
             _vless: &'a VlessProfile,
             _params: &'a DiscoveryParams,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<CleanEndpoint>, CFError>> + Send + 'a>> {
-            Box::pin(async move {
-                panic!("discovery must not run when the account is suspended")
-            })
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<CleanEndpoint>, CFError>> + Send + 'a>>
+        {
+            Box::pin(async move { panic!("discovery must not run when the account is suspended") })
         }
     }
 
@@ -3938,7 +3950,11 @@ mod tests {
             .await
             .expect("skip returns a summary");
         assert_eq!(summary.alive, 0);
-        assert!(summary.note.contains("token-invalid"), "note={}", summary.note);
+        assert!(
+            summary.note.contains("token-invalid"),
+            "note={}",
+            summary.note
+        );
     }
 
     /// When the account is ACTIVE the gate lets the cycle proceed — discovery
@@ -3951,9 +3967,7 @@ mod tests {
 
         // Scripted account says Active → the monitor proceeds to the light
         // phase, which finds no live ledger and returns a summary (alive 0).
-        let provider = Box::new(ScriptedProvider {
-            result: Ok(vec![]),
-        });
+        let provider = Box::new(ScriptedProvider { result: Ok(vec![]) });
         let engine = AutopilotEngine::with_provider(
             id.clone(),
             DiscoveryParams::default(),
@@ -4060,8 +4074,7 @@ mod tests {
         );
         // Honest worker verdict — never "Skipped" when we probed.
         assert_eq!(
-            beacon.worker_health,
-            "NotFound",
+            beacon.worker_health, "NotFound",
             "beacon must record the honest worker verdict"
         );
         // The cycle must not look like a clean success (worker is dead).
