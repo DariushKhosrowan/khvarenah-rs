@@ -1611,6 +1611,15 @@ impl AutopilotEngine {
                     crate::health_beacon::CycleKind::Monitor,
                     "DeepPhaseTimeout",
                 );
+                // Feed the self-learning phase-2 SNI loop a LOSS even though
+                // discovery never returned (it hung). A hung discovery means
+                // the current exclusive SNI strategy produced zero accepted-101
+                // endpoints — exactly as if it had "won nothing". Recording the
+                // zero outcome lets the rolling-window learner rotate away from
+                // a cable-pinned strategy after the early-dead threshold, so a
+                // censored/hung path no longer degrades silently for hours.
+                let mut strategy = resolve_strategy_v2(&self.profile_id);
+                let _ = commit_strategy_v2(&self.profile_id, &mut strategy, false);
                 Err(CFError::new(
                     "Cycle timeout",
                     format!(
@@ -3826,6 +3835,61 @@ mod tests {
             .unwrap()
             .expect("abort beacon written");
         assert_eq!(beacon.last_error.as_deref(), Some("DeepPhaseTimeout"));
+    }
+
+    /// A hung deep discovery must feed the self-learning SNI loop a LOSS so
+    /// the rolling-window learner rotates away from a cable-pinned strategy
+    /// after the early-dead threshold — instead of degrading silently forever.
+    #[tokio::test]
+    async fn test_monitor_deep_timeout_feeds_strategy_loss_and_rotates() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        write_ledger(&id, &dead_loopback_ledger()).unwrap();
+        // Confirm the starting strategy is the default (WorkerOnly).
+        assert_eq!(
+            crate::autopilot::resolve_strategy_v2(&id).current,
+            crate::health::SniStrategy::WorkerOnly
+        );
+
+        // Focus the deep budget so the timeout / hang aborts fast; the light
+        // budget is also short (all ledger endpoints are dead loopback).
+        let timeouts = MonitorTimeouts {
+            light: std::time::Duration::from_millis(200),
+            deep: std::time::Duration::from_millis(500),
+        };
+
+        for n in 0..STRATEGY_EARLY_DEAD_CYCLES {
+            let engine = AutopilotEngine::with_provider(
+                id.clone(),
+                DiscoveryParams::default(),
+                std::time::Duration::from_secs(300),
+                Box::new(HangingProvider),
+            );
+            let err = engine
+                .monitor_cycle_guarded(timeouts.clone())
+                .await
+                .expect_err("hanging deep phase must time out");
+            assert!(err.brief().contains("deep phase"));
+            // Before the rotation threshold is hit, each timeout records a loss
+            // in the window. On the threshold cycle the window clears (rotation).
+            // n is 0-indexed, so rotation happens when n == THRESHOLD-1.
+            if n < STRATEGY_EARLY_DEAD_CYCLES - 1 {
+                let st = crate::autopilot::resolve_strategy_v2(&id);
+                assert_eq!(st.recent_outcomes.len(), n as usize + 1);
+                assert!(st.recent_outcomes.iter().all(|&w| !w));
+            }
+        }
+
+        // After the early-dead threshold (3 consecutive losses) the strategy
+        // must have rotated away from WorkerOnly.
+        let after = crate::autopilot::resolve_strategy_v2(&id);
+        assert_ne!(
+            after.current,
+            crate::health::SniStrategy::WorkerOnly,
+            "3 consecutive deep timeouts must rotate the SNI strategy"
+        );
+        assert_eq!(after.recent_outcomes.len(), 0, "rotation clears the window");
     }
 
     /// When the light phase's probe succeeds, the expensive deep discovery is
