@@ -61,6 +61,7 @@ pub mod export;
 pub mod geoip;
 pub mod health;
 pub mod health_beacon;
+pub mod journal;
 pub mod multi_worker;
 pub mod presets;
 pub mod probe_jitter;

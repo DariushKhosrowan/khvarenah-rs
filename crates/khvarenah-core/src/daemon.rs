@@ -526,6 +526,7 @@ pub async fn daemon_tick(
             let n = crate::remote_beacon::flush_outbox(profile).await;
             if n > 0 {
                 log(&log_line("INFO", &format!("outbox flushed {} alert(s)", n)));
+                let _ = crate::journal::append(profile, crate::journal::JournalKind::OutboxFlushed, &format!("{n} alert(s)"));
             }
             state.last_outbox_flush_ts = now;
         }
@@ -551,6 +552,11 @@ pub async fn daemon_tick(
             ));
             state.network_was_down = true;
             state.survival_plan = plan.label().to_string();
+            let _ = crate::journal::append(
+                profile,
+                crate::journal::JournalKind::NetworkDown,
+                plan.label(),
+            );
         }
         return NETWORK_DOWN_SLEEP_SECS;
     }
@@ -636,6 +642,7 @@ pub async fn daemon_tick(
         // backoff. We return 0 so the caller cycles immediately, keeping the
         // current (possibly backed-off) interval for the *next* failure.
         state.network_was_down = false;
+        let _ = crate::journal::append(profile, crate::journal::JournalKind::NetworkUp, "");
         // Still run a cycle now.
         state.last_cycle_ts = crate::store::now_ts() as i64;
         match cycle.run_cycle(profile, false, timeouts).await {
