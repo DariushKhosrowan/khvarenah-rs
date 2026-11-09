@@ -448,22 +448,23 @@ pub async fn probe_ws_ex(
         crate::probe_jitter::pick_client_hello_profile(&mut rand::rngs::StdRng::from_entropy());
     probe.hello_profile = Some(hello_profile);
 
-    let mut stream = match tls_connect_with_profile(ip, port, tls_sni, timeout_ms, hello_profile).await {
-        Ok(s) => s,
-        Err(e) => {
-            probe.failure_stage = Some("tls".into());
-            // Bucket the failure at the catch point — this is how we tell
-            // Cause A (DPI TLS reset) from a plain connect/network failure.
-            probe.failure_reason = Some(match e.title.as_str() {
-                "Probe timeout" => WsFailureReason::ConnectTimeout,
-                "Probe error" => WsFailureReason::ConnectFailed,
-                "TLS timeout" => WsFailureReason::TlsTimeout,
-                _ => WsFailureReason::TlsAlert,
-            });
-            probe.rtt_ms = started.elapsed().as_millis() as u32;
-            return probe;
-        }
-    };
+    let mut stream =
+        match tls_connect_with_profile(ip, port, tls_sni, timeout_ms, hello_profile).await {
+            Ok(s) => s,
+            Err(e) => {
+                probe.failure_stage = Some("tls".into());
+                // Bucket the failure at the catch point — this is how we tell
+                // Cause A (DPI TLS reset) from a plain connect/network failure.
+                probe.failure_reason = Some(match e.title.as_str() {
+                    "Probe timeout" => WsFailureReason::ConnectTimeout,
+                    "Probe error" => WsFailureReason::ConnectFailed,
+                    "TLS timeout" => WsFailureReason::TlsTimeout,
+                    _ => WsFailureReason::TlsAlert,
+                });
+                probe.rtt_ms = started.elapsed().as_millis() as u32;
+                return probe;
+            }
+        };
     probe.tls_ok = true;
     probe.rtt_ms = started.elapsed().as_millis() as u32;
 

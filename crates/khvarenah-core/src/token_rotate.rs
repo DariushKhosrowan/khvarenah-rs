@@ -35,9 +35,7 @@ pub async fn try_auto_rotate<V>(
     verify: V,
 ) -> Result<Option<(String, String)>, crate::error::CFError>
 where
-    V: for<'a> Fn(
-        &'a str,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>,
+    V: for<'a> Fn(&'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>,
 {
     let active = crate::store::profiles::get_active_token(profile)?;
     let p = crate::store::profiles::load_profile(profile);
@@ -75,7 +73,9 @@ mod tests {
     }
 
     /// Fake verifier: a token is "working" iff its plaintext equals `good`.
-    fn fake_verify(good: &'static str) -> impl Fn(&str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+    fn fake_verify(
+        good: &'static str,
+    ) -> impl Fn(&str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         move |tok: &str| {
             let ok = tok == good;
             Box::pin(async move { ok })
@@ -91,10 +91,14 @@ mod tests {
         crate::store::profiles::set_active_token(&profile, "a").unwrap();
 
         // "a" is active; "b" verifies (its token "tok-b" == good) → rotate to b.
-        let out = try_auto_rotate(&profile, fake_verify("tok-b")).await.unwrap();
+        let out = try_auto_rotate(&profile, fake_verify("tok-b"))
+            .await
+            .unwrap();
         assert_eq!(out, Some(("a".to_string(), "b".to_string())));
         assert_eq!(
-            crate::store::profiles::get_active_token(&profile).unwrap().unwrap(),
+            crate::store::profiles::get_active_token(&profile)
+                .unwrap()
+                .unwrap(),
             "b"
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -107,10 +111,14 @@ mod tests {
         crate::store::profiles::add_token(&profile, "only", "tok-only").unwrap();
         crate::store::profiles::set_active_token(&profile, "only").unwrap();
 
-        let out = try_auto_rotate(&profile, fake_verify("tok-only")).await.unwrap();
+        let out = try_auto_rotate(&profile, fake_verify("tok-only"))
+            .await
+            .unwrap();
         assert_eq!(out, None);
         assert_eq!(
-            crate::store::profiles::get_active_token(&profile).unwrap().unwrap(),
+            crate::store::profiles::get_active_token(&profile)
+                .unwrap()
+                .unwrap(),
             "only"
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -124,10 +132,14 @@ mod tests {
         crate::store::profiles::add_token(&profile, "b", "tok-b").unwrap();
         crate::store::profiles::set_active_token(&profile, "a").unwrap();
 
-        let out = try_auto_rotate(&profile, fake_verify("tok-none")).await.unwrap();
+        let out = try_auto_rotate(&profile, fake_verify("tok-none"))
+            .await
+            .unwrap();
         assert_eq!(out, None);
         assert_eq!(
-            crate::store::profiles::get_active_token(&profile).unwrap().unwrap(),
+            crate::store::profiles::get_active_token(&profile)
+                .unwrap()
+                .unwrap(),
             "a"
         );
         let _ = std::fs::remove_dir_all(&tmp);

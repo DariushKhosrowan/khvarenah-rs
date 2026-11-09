@@ -225,19 +225,36 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
             let eff_light = khvarenah_core::store::profiles::effective_light_timeout_secs(c);
             let eff_deep = khvarenah_core::store::profiles::effective_deep_timeout_secs(c);
             let eff_backoff = khvarenah_core::store::profiles::effective_max_backoff_secs(c);
-            let eff_blackout = khvarenah_core::store::profiles::effective_network_down_sleep_secs(c);
+            let eff_blackout =
+                khvarenah_core::store::profiles::effective_network_down_sleep_secs(c);
             println!("Profile: {profile}");
-            println!("  monitor light phase budget : {}s (configured {}s, system default 120s)", eff_light, c.light_timeout_secs);
-            println!("  monitor deep phase budget   : {}s (configured {}s, system default 600s)", eff_deep, c.deep_timeout_secs);
-            println!("  daemon backoff ceiling      : {}s (configured {}s, system default 21600s)", eff_backoff, c.max_backoff_secs);
-            println!("  blackout poll cadence      : {}s (configured {}s, system default 60s)", eff_blackout, c.network_down_sleep_secs);
+            println!(
+                "  monitor light phase budget : {}s (configured {}s, system default 120s)",
+                eff_light, c.light_timeout_secs
+            );
+            println!(
+                "  monitor deep phase budget   : {}s (configured {}s, system default 600s)",
+                eff_deep, c.deep_timeout_secs
+            );
+            println!(
+                "  daemon backoff ceiling      : {}s (configured {}s, system default 21600s)",
+                eff_backoff, c.max_backoff_secs
+            );
+            println!(
+                "  blackout poll cadence      : {}s (configured {}s, system default 60s)",
+                eff_blackout, c.network_down_sleep_secs
+            );
             println!(
                 "  protection                  : {}",
                 if c.protection_enabled { "ON" } else { "OFF" }
             );
             println!(
                 "  auto token-rotate on blocked : {}",
-                if c.auto_rotate_on_blocked { "ON" } else { "OFF" }
+                if c.auto_rotate_on_blocked {
+                    "ON"
+                } else {
+                    "OFF"
+                }
             );
             println!(
                 "  beacon notifications         : {}",
@@ -274,7 +291,8 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
             let eff_light = khvarenah_core::store::profiles::effective_light_timeout_secs(c);
             let eff_deep = khvarenah_core::store::profiles::effective_deep_timeout_secs(c);
             let eff_backoff = khvarenah_core::store::profiles::effective_max_backoff_secs(c);
-            let eff_blackout = khvarenah_core::store::profiles::effective_network_down_sleep_secs(c);
+            let eff_blackout =
+                khvarenah_core::store::profiles::effective_network_down_sleep_secs(c);
             println!("Saved. Effective values for {profile}:");
             println!("  monitor light phase budget : {eff_light}s");
             println!("  monitor deep phase budget   : {eff_deep}s");
@@ -1231,7 +1249,8 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                                 println!("    {profile:?} × {layer:?}: {count}");
                             }
                             let total_success: u32 = diag.success_by_profile.values().sum();
-                            let min_count = diag.success_by_profile.values().min().copied().unwrap_or(0);
+                            let min_count =
+                                diag.success_by_profile.values().min().copied().unwrap_or(0);
                             if total_success > 0 {
                                 let low = diag
                                     .success_by_profile
@@ -1851,8 +1870,12 @@ async fn cmd_daemon(profile: &str, action: DaemonAction) -> Result<(), CFError> 
                 );
             }
             match is_linger_enabled() {
-                Some(true) => println!("  boot autostart: yes (loginctl linger — starts before login)"),
-                Some(false) => println!("  boot autostart: no (allow linger; daemon starts at login only)"),
+                Some(true) => {
+                    println!("  boot autostart: yes (loginctl linger — starts before login)")
+                }
+                Some(false) => {
+                    println!("  boot autostart: no (allow linger; daemon starts at login only)")
+                }
                 None => println!("  boot autostart: unknown (loginctl unavailable)"),
             }
             Ok(())
@@ -2667,95 +2690,34 @@ fn cmd_journal(profile: &str, action: crate::JournalAction) -> Result<(), CFErro
 /// hands-off. Each item prints OK / ACTION (one-time setup exists) / MANUAL
 /// (requires a human). Exit code 0 when everything is armed, 1 otherwise —
 /// scriptable for a remote one-line check.
+///
+/// This is a thin wrapper over `khvarenah_core::autonomy::run_audit` so the
+/// CLI and the GUI report the *identical* safeguard status.
 async fn cmd_autonomy(profile: &str, action: crate::AutonomyAction) -> Result<(), CFError> {
-    use khvarenah_core::daemon::{DaemonConfig, is_daemon_running, is_linger_enabled};
+    use khvarenah_core::autonomy::CheckStatus;
 
     let _ = action; // only Audit today
-    let mut needs_action = false;
     let p = khvarenah_core::store::profiles::load_profile(profile);
+    let report = khvarenah_core::autonomy::run_audit(&p);
 
     println!("Automation audit for profile '{profile}':");
-
-    // 1. Daemon running.
-    let cfg = DaemonConfig::new(profile);
-    let running = is_daemon_running(&cfg.pid_file);
-    println!("  [{}] daemon running (protection/self-heal)", if running { "OK" } else { "ACTION" });
-    if !running {
-        needs_action = true;
-        println!("        → `khvarenah daemon install-systemd` + `daemon start`, or `khvarenah up`");
-    }
-
-    // 2. Boot-before-login autostart (loginctl linger).
-    match is_linger_enabled() {
-        Some(true) => println!("  [OK] boot autostart (starts before login — survives blackout reboot)"),
-        Some(false) => {
-            needs_action = true;
-            println!("  [ACTION] boot autostart disabled — daemon starts only at login");
-            println!("        → `khvarenah daemon install-systemd` (enables linger)");
+    for item in &report.items {
+        println!("  [{}] {}", item.status.label(), item.title);
+        if !item.detail.is_empty() {
+            println!("        {}", item.detail);
         }
-        None => {
-            needs_action = true;
-            println!("  [ACTION] boot autostart unknown (loginctl unavailable)");
-        }
-    }
-
-    // 3. Auto token-rotation armed (≥2 tokens + enabled).
-    let rotate_enabled = p.config.auto_rotate_on_blocked;
-    let token_count = p.tokens.len();
-    match (rotate_enabled, token_count >= 2) {
-        (true, true) => {
-            println!("  [OK] auto token-rotation on ({token_count} tokens stored)");
-        }
-        (true, false) => {
-            needs_action = true;
-            println!("  [ACTION] auto token-rotation on but only {token_count} token stored — add a backup");
-            println!("        → `khvarenah token add --label <name> --token <cf-token>`");
-        }
-        (false, _) => {
-            needs_action = true;
-            println!("  [ACTION] auto token-rotation OFF — blocked token needs manual recover");
-            println!("        → toggle on in GUI Settings or edit profile config");
-        }
-    }
-
-    // 4. Scheduled auto-backup.
-    if p.config.backup_autosync.enabled {
-        println!("  [OK] scheduled auto-backup (every {}s, keep {})", p.config.backup_autosync.interval_secs, p.config.backup_autosync.keep);
-    } else {
-        needs_action = true;
-        println!("  [ACTION] scheduled auto-backup OFF — no crash/blackout snapshot");
-        println!("        → enable in GUI Settings (auto-backup), or ~/.khvarenah config");
-    }
-
-    // 5. Worker-signature rotation (moving target vs stateful DPI).
-    if p.config.mutation.enabled {
-        println!("  [OK] scheduled worker-signature rotation (every {}s)", p.config.mutation.interval_secs);
-    } else {
-        needs_action = true;
-        println!("  [ACTION] scheduled signature rotation OFF — not a moving target");
-        println!("        → enable in GUI Settings (signature rotation)");
-    }
-
-    // 6. DNS tunnel (total-blackout survival).
-    if khvarenah_core::vps_deploy::load_tunnel_client_config(profile).is_some() {
-        println!("  [OK] DNS tunnel configured (total-blackout fallback)");
-    } else {
-        println!("  [ACTION] DNS tunnel not configured — deep blackout has no data channel");
-        println!("        → `khvarenah dns-tunnel deploy --host <vps> --domain <dns-domain>`");
-    }
-
-    // 7. Beacon notifications (so the user learns of events) — optional but
-    // recommended for hands-off operation.
-    match p.config.beacon.as_ref() {
-        Some(b) if b.enabled => println!("  [OK] remote notifications enabled (Telegram/webhook)"),
-        _ => {
-            println!("  [INFO] remote notifications off — events are logged to the journal only");
+        // Only actionable items carry a "→ next step" line; OK/INFO rows
+        // are already resolved and don't need one.
+        if item.status == CheckStatus::Action && !item.fix.is_empty() {
+            println!("        → {}", item.fix);
         }
     }
 
     println!();
-    if needs_action {
-        println!("Not fully hands-off yet — complete the ACTION items above (each is a one-time step).");
+    if report.needs_action() {
+        println!(
+            "Not fully hands-off yet — complete the ACTION items above (each is a one-time step)."
+        );
         std::process::exit(1);
     } else {
         println!("All autonomous safeguards armed — the app runs hands-off.");

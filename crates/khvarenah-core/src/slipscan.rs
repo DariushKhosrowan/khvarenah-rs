@@ -1349,7 +1349,9 @@ mod tests {
         );
         // No success recorded under any other profile (only ws_accepted ran).
         assert_eq!(
-            m.keys().filter(|(prof, _)| *prof != crate::probe_jitter::ClientHelloProfile::Chrome120).count(),
+            m.keys()
+                .filter(|(prof, _)| *prof != crate::probe_jitter::ClientHelloProfile::Chrome120)
+                .count(),
             0,
             "only Chrome120 should have successes: {m:?}"
         );

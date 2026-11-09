@@ -36,6 +36,7 @@ pub mod mock_worker;
 
 pub mod account_state;
 pub mod analytics;
+pub mod autonomy;
 pub mod autopilot;
 pub mod backup;
 pub mod backup_autosync;

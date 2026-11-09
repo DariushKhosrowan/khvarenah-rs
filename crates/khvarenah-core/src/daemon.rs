@@ -440,16 +440,16 @@ mod linger_tests {
 
     #[test]
     fn parses_yes_no_and_weird_whitespace() {
-    #[test]
-    fn parses_yes_no_and_weird_whitespace() {
-        assert!(parse_linger(b"yes\n"));
-        assert!(parse_linger(b"yes"));
-        assert!(parse_linger(b" YES \n"));
-        assert!(!parse_linger(b"no\n"));
-        assert!(!parse_linger(b""));
-        assert!(!parse_linger(b"nonsense"));
+        #[test]
+        fn parses_yes_no_and_weird_whitespace() {
+            assert!(parse_linger(b"yes\n"));
+            assert!(parse_linger(b"yes"));
+            assert!(parse_linger(b" YES \n"));
+            assert!(!parse_linger(b"no\n"));
+            assert!(!parse_linger(b""));
+            assert!(!parse_linger(b"nonsense"));
+        }
     }
-}
 }
 
 /// Result of a network-liveness probe: whether the network is up at all, plus
@@ -561,9 +561,7 @@ impl AccountProbe for RealAccountProbe {
             }
             crate::token_rotate::try_auto_rotate(&profile, |tok| {
                 let tok = tok.to_string();
-                Box::pin(async move {
-                    crate::cf::Client::new(&tok).verify_token().await.is_ok()
-                })
+                Box::pin(async move { crate::cf::Client::new(&tok).verify_token().await.is_ok() })
             })
             .await
             .unwrap_or(None)
@@ -631,12 +629,18 @@ async fn run_self_maintenance(
                 crate::journal::JournalKind::BackupWritten,
                 &path.display().to_string(),
             );
-            log(&log_line("INFO", &format!("auto-backup written → {}", path.display())));
+            log(&log_line(
+                "INFO",
+                &format!("auto-backup written → {}", path.display()),
+            ));
             let _ = crate::store::profiles::save_profile(&p);
         }
         Ok(None) => {}
         Err(e) => {
-            log(&log_line("WARN", &format!("auto-backup failed: {}", e.brief())));
+            log(&log_line(
+                "WARN",
+                &format!("auto-backup failed: {}", e.brief()),
+            ));
         }
     }
 
@@ -645,7 +649,8 @@ async fn run_self_maintenance(
     // run in `daemon_tick` and its result is passed in as `net_up`.
     if net_up {
         match crate::config_mutation::run_mutation_if_due::<crate::autopilot::RealMutationPeer>(
-            profile, &crate::autopilot::RealMutationPeer,
+            profile,
+            &crate::autopilot::RealMutationPeer,
         )
         .await
         {
@@ -720,7 +725,11 @@ pub async fn daemon_tick(
             let n = crate::remote_beacon::flush_outbox(profile).await;
             if n > 0 {
                 log(&log_line("INFO", &format!("outbox flushed {} alert(s)", n)));
-                let _ = crate::journal::append(profile, crate::journal::JournalKind::OutboxFlushed, &format!("{n} alert(s)"));
+                let _ = crate::journal::append(
+                    profile,
+                    crate::journal::JournalKind::OutboxFlushed,
+                    &format!("{n} alert(s)"),
+                );
             }
             state.last_outbox_flush_ts = now;
         }
@@ -736,11 +745,8 @@ pub async fn daemon_tick(
         let tunnel_ok = match crate::vps_deploy::load_tunnel_client_config(profile) {
             Some(cfg) => {
                 // Short timeout: during a blackout we want a quick verdict.
-                crate::dnstunnel::probe_tunnel_live(
-                    &cfg,
-                    std::time::Duration::from_millis(1500),
-                )
-                .await
+                crate::dnstunnel::probe_tunnel_live(&cfg, std::time::Duration::from_millis(1500))
+                    .await
             }
             None => false,
         };
@@ -1153,9 +1159,15 @@ mod tests {
         // Never backed up → due immediately.
         state.last_backup_ts = 0;
         let mut log_lines = Vec::new();
-        run_self_maintenance(&profile, &mut state, false, &mut |l| log_lines.push(l.to_string())).await;
+        run_self_maintenance(&profile, &mut state, false, &mut |l| {
+            log_lines.push(l.to_string())
+        })
+        .await;
 
-        assert!(state.last_backup_ts > 0, "backup timestamp should be recorded");
+        assert!(
+            state.last_backup_ts > 0,
+            "backup timestamp should be recorded"
+        );
         assert!(
             crate::backup::list_backups().len() >= 1,
             "a backup file should exist"
@@ -1174,7 +1186,10 @@ mod tests {
         let profile = crate::store::profiles::create_profile("selfmaint2", "").unwrap();
         let mut state = DaemonState::default();
         let mut log_lines = Vec::new();
-        run_self_maintenance(&profile, &mut state, false, &mut |l| log_lines.push(l.to_string())).await;
+        run_self_maintenance(&profile, &mut state, false, &mut |l| {
+            log_lines.push(l.to_string())
+        })
+        .await;
         assert_eq!(state.last_backup_ts, 0, "disabled backup must not run");
         assert!(crate::backup::list_backups().is_empty());
     }
@@ -1720,9 +1735,7 @@ mod tests {
             state.account_state,
             crate::account_state::AccountState::Active
         );
-        assert!(log_lines
-            .iter()
-            .any(|l| l.contains("token-auto-rotated")));
+        assert!(log_lines.iter().any(|l| l.contains("token-auto-rotated")));
         assert_eq!(sleep, backoff_reset());
     }
 
@@ -1767,11 +1780,10 @@ mod tests {
         // A second tick must NOT re-notify (guard works).
         let mut log_lines2 = Vec::new();
         state.last_account_poll_ts = crate::store::now_ts() as i64;
-        let sleep2 =
-            daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
-                log_lines2.push(l.to_string());
-            })
-            .await;
+        let sleep2 = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
+            log_lines2.push(l.to_string());
+        })
+        .await;
         assert_eq!(sleep2, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
         assert!(!log_lines2
             .iter()

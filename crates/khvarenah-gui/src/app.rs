@@ -35,17 +35,19 @@ enum View {
     CleanIps,
     Tools,
     Settings,
+    Autonomy,
 }
 
 impl View {
-    /// The six-item sidebar, in order.
-    const ALL: [View; 6] = [
+    /// The seven-item sidebar, in order.
+    const ALL: [View; 7] = [
         View::DeployScan,
         View::Profiles,
         View::Tokens,
         View::CleanIps,
         View::Tools,
         View::Settings,
+        View::Autonomy,
     ];
 
     fn label(self) -> &'static str {
@@ -56,6 +58,7 @@ impl View {
             View::CleanIps => "Clean IPs",
             View::Tools => "Tools",
             View::Settings => "Settings",
+            View::Autonomy => "Autonomy",
         }
     }
 }
@@ -293,9 +296,7 @@ impl KhvarenahApp {
                 .beacon
                 .as_ref()
                 .map(|b| match b.failover_kind {
-                    khvarenah_core::remote_beacon::BeaconKind::Telegram => {
-                        "Telegram".to_string()
-                    }
+                    khvarenah_core::remote_beacon::BeaconKind::Telegram => "Telegram".to_string(),
                     khvarenah_core::remote_beacon::BeaconKind::GenericWebhook => {
                         "Webhook".to_string()
                     }
@@ -428,9 +429,11 @@ impl KhvarenahApp {
         match khvarenah_core::store::profiles::save_profile(&p) {
             Ok(()) => {
                 self.auto_rotate_note = if self.auto_rotate_enabled {
-                    "Auto token-rotation ON — blocked tokens swap to a backup automatically.".to_string()
+                    "Auto token-rotation ON — blocked tokens swap to a backup automatically."
+                        .to_string()
                 } else {
-                    "Auto token-rotation OFF — blocked accounts need a manual token recover.".to_string()
+                    "Auto token-rotation OFF — blocked accounts need a manual token recover."
+                        .to_string()
                 };
             }
             Err(e) => self.auto_rotate_note = e.brief(),
@@ -471,7 +474,14 @@ impl KhvarenahApp {
         match khvarenah_core::store::profiles::save_profile(&p) {
             Ok(()) => {
                 self.mutation_note = if self.mutation_enabled {
-                    format!("Signature rotation ON — every {interval}s ({}).", if self.mutation_rotate_path { "uuid + path" } else { "uuid only" })
+                    format!(
+                        "Signature rotation ON — every {interval}s ({}).",
+                        if self.mutation_rotate_path {
+                            "uuid + path"
+                        } else {
+                            "uuid only"
+                        }
+                    )
                 } else {
                     "Signature rotation OFF.".to_string()
                 };
@@ -1152,6 +1162,7 @@ impl KhvarenahApp {
                     View::CleanIps => self.cleanip_panel(ui, p),
                     View::Tools => self.tools_panel(ui, p),
                     View::Settings => self.settings_panel(ui, p),
+                    View::Autonomy => self.autonomy_panel(ui, p),
                 }
             });
         });
@@ -1710,16 +1721,10 @@ impl KhvarenahApp {
         });
         ui.add_space(6.0);
         ui.separator();
-        ui.colored_label(
-            GOLD,
-            "Failover channel (used when the primary is blocked)",
-        );
+        ui.colored_label(GOLD, "Failover channel (used when the primary is blocked)");
         ui.label("Telegram is sometimes blocked in Iran — if the primary channel");
         ui.label("fails, alerts auto-route to this backup. Configure it once here.");
-        ui.checkbox(
-            &mut self.beacon_failover_enabled,
-            "Enable failover channel",
-        );
+        ui.checkbox(&mut self.beacon_failover_enabled, "Enable failover channel");
         if self.beacon_failover_enabled {
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("beacon_fo_ch")
@@ -2098,22 +2103,120 @@ impl KhvarenahApp {
         if show.is_empty() {
             ui.label("Journal is empty — events appear after the daemon records blackout/rescue transitions.");
         } else {
-            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                for e in &show {
-                    let label = match e.kind {
-                        khvarenah_core::journal::JournalKind::NetworkDown => "⬇ network-down",
-                        khvarenah_core::journal::JournalKind::NetworkUp => "⬆ network-up",
-                        khvarenah_core::journal::JournalKind::RescueAttempt => "🔧 rescue",
-                        khvarenah_core::journal::JournalKind::CycleFailed => "❌ cycle-failed",
-                        khvarenah_core::journal::JournalKind::AccountBlocked => "⛔ account-blocked",
-                        khvarenah_core::journal::JournalKind::TokenRecovered => "🔑 token-recovered",
-                        khvarenah_core::journal::JournalKind::OutboxFlushed => "📤 outbox-flushed",
-                        khvarenah_core::journal::JournalKind::BackupWritten => "💾 backup-written",
-                        khvarenah_core::journal::JournalKind::MutationPerformed => "🔁 signature-rotated",
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .show(ui, |ui| {
+                    for e in &show {
+                        let label = match e.kind {
+                            khvarenah_core::journal::JournalKind::NetworkDown => "⬇ network-down",
+                            khvarenah_core::journal::JournalKind::NetworkUp => "⬆ network-up",
+                            khvarenah_core::journal::JournalKind::RescueAttempt => "🔧 rescue",
+                            khvarenah_core::journal::JournalKind::CycleFailed => "❌ cycle-failed",
+                            khvarenah_core::journal::JournalKind::AccountBlocked => {
+                                "⛔ account-blocked"
+                            }
+                            khvarenah_core::journal::JournalKind::TokenRecovered => {
+                                "🔑 token-recovered"
+                            }
+                            khvarenah_core::journal::JournalKind::OutboxFlushed => {
+                                "📤 outbox-flushed"
+                            }
+                            khvarenah_core::journal::JournalKind::BackupWritten => {
+                                "💾 backup-written"
+                            }
+                            khvarenah_core::journal::JournalKind::MutationPerformed => {
+                                "🔁 signature-rotated"
+                            }
+                        };
+                        ui.label(format!("{label} — {} (t={})", e.detail, e.ts));
+                    }
+                });
+        }
+    }
+
+    /// The hands-off readiness panel. Lists the same safeguards as the CLI
+    /// `khvarenah autopilot autonomy` audit, color-coded, with one-click config
+    /// fixes for the toggles the app can apply itself (auto-backup, signature
+    /// rotation). Items that need user-supplied input (DNS tunnel deploy, a
+    /// second token) show the exact command instead — the app never fabricates
+    /// credentials.
+    fn autonomy_panel(&mut self, ui: &mut egui::Ui, p: &khvarenah_core::store::profiles::Profile) {
+        use khvarenah_core::autonomy::{CheckStatus, FixAction};
+
+        ui.heading(egui::RichText::new("Autonomy").color(GOLD));
+        ui.label("Hands-off readiness — what still needs you, and what the app can fix itself.");
+
+        let report = khvarenah_core::autonomy::run_audit(p);
+
+        // One-click config fixes the app can apply directly. The audit is
+        // re-run at the top of this panel every frame, so the status line
+        // below automatically reflects any fix applied this frame.
+        for item in &report.items {
+            if let Some(fix) = item.fix_action {
+                ui.horizontal(|ui| {
+                    let color = match item.status {
+                        CheckStatus::Ok => egui::Color32::from_rgb(90, 200, 120),
+                        CheckStatus::Action => egui::Color32::from_rgb(230, 160, 60),
+                        CheckStatus::Manual => egui::Color32::from_rgb(220, 120, 120),
+                        CheckStatus::Info => egui::Color32::from_rgb(160, 160, 170),
                     };
-                    ui.label(format!("{label} — {} (t={})", e.detail, e.ts));
+                    ui.colored_label(color, format!("[{}] {}", item.status.label(), item.title));
+                    ui.label(&item.detail);
+                    if ui.button("Enable").clicked() {
+                        match fix {
+                            FixAction::EnableBackupAutoSync => {
+                                self.backup_auto_enabled = true;
+                                if self.backup_auto_interval == 0 {
+                                    self.backup_auto_interval = 3600;
+                                }
+                                if self.backup_auto_keep == 0 {
+                                    self.backup_auto_keep = 5;
+                                }
+                                self.save_backup_auto();
+                            }
+                            FixAction::EnableSignatureMutation => {
+                                self.mutation_enabled = true;
+                                if self.mutation_interval == 0 {
+                                    self.mutation_interval = 86400;
+                                }
+                                self.save_mutation();
+                            }
+                        }
+                    }
+                });
+            } else {
+                let color = match item.status {
+                    CheckStatus::Ok => egui::Color32::from_rgb(90, 200, 120),
+                    CheckStatus::Action => egui::Color32::from_rgb(230, 160, 60),
+                    CheckStatus::Manual => egui::Color32::from_rgb(220, 120, 120),
+                    CheckStatus::Info => egui::Color32::from_rgb(160, 160, 170),
+                };
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, format!("[{}] {}", item.status.label(), item.title));
+                    ui.label(&item.detail);
+                });
+                if !item.fix.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("    → {}", item.fix))
+                            .color(egui::Color32::from_rgb(120, 140, 180)),
+                    );
                 }
-            });
+            }
+        }
+
+        // Status line.
+        ui.add_space(8.0);
+        ui.separator();
+        if report.needs_action() {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 160, 60),
+                "⚠ Not fully hands-off yet — complete the ACTION items above. Each is a one-time step.",
+            );
+        } else {
+            ui.colored_label(
+                egui::Color32::from_rgb(90, 200, 120),
+                "✓ All autonomous safeguards armed — the app runs hands-off.",
+            );
         }
     }
 }
