@@ -33,6 +33,7 @@ rcgen = { version = "0.13", optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
+filetime.workspace = true
 # rcgen is used by the health.rs mock-TLS test helpers and the mock worker.
 # It must be present for `cargo test` (no feature flags in CI), so it lives
 # in dev-dependencies; the `dev-mock` feature's optional dep is a superset

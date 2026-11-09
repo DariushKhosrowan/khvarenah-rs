@@ -1405,6 +1405,37 @@ async fn daemon_loop(cfg: dastyab_core::daemon::DaemonConfig) -> Result<(), CFEr
                 }
             }
         }
+
+        // Scheduled auto-backup: snapshot the profile on a schedule so there is
+        // always a recent restorable copy under ~/.dastyab/backups/ (crash /
+        // blackout / seized-machine resilience). Runs even when the network is
+        // down or the account is suspended — local disk work only.
+        {
+            let pcfg = dastyab_core::store::profiles::load_profile(&active_profile);
+            let bak = pcfg.config.backup_autosync.clone();
+            let now_bak = dastyab_core::store::now_ts() as i64;
+            match dastyab_core::backup_autosync::run_autosync_if_due(
+                &bak,
+                &active_profile,
+                state.last_backup_ts,
+                now_bak,
+            ) {
+                Ok(Some(path)) => {
+                    state.last_backup_ts = now_bak;
+                    daemon_log_append(
+                        &cfg.log_path,
+                        &log_line("INFO", &format!("auto-backup written: {}", path.display())),
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    daemon_log_append(
+                        &cfg.log_path,
+                        &log_line("WARN", &format!("auto-backup failed: {}", e.brief())),
+                    );
+                }
+            }
+        }
         // Worker-dead + rescue-gave-up → notify (rate-limited). Track the
         // persisted rescue outcome to avoid re-notifying every cycle.
         let current_rescue = dastyab_core::store::profiles::load_profile(&active_profile)
