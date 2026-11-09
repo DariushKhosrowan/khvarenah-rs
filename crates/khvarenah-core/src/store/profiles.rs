@@ -184,6 +184,13 @@ pub struct ProfileConfig {
     /// no manual `khvarenah token recover` step. Default on.
     #[serde(default = "default_auto_rotate_on_blocked")]
     pub auto_rotate_on_blocked: bool,
+    /// Daemon poll cadence (seconds) while the network is fully down (total
+    /// blackout). 0 = system default (`daemon::NETWORK_DOWN_SLEEP_SECS`, 60).
+    /// A shorter value makes the daemon re-probe for a restored path sooner
+    /// after a blackout; a longer value conserves battery/CPU during a long
+    /// outage. Configurable in-app (GUI Settings / CLI `config timeouts`).
+    #[serde(default)]
+    pub network_down_sleep_secs: u64,
 }
 
 fn default_auto_rotate_on_blocked() -> bool {
@@ -230,6 +237,17 @@ pub fn effective_max_backoff_secs(c: &ProfileConfig) -> u64 {
     }
 }
 
+/// Effective daemon poll cadence (seconds) while the network is fully down.
+/// A zero/absent value falls back to the system default
+/// (`daemon::NETWORK_DOWN_SLEEP_SECS`, 60).
+pub fn effective_network_down_sleep_secs(c: &ProfileConfig) -> u64 {
+    if c.network_down_sleep_secs > 0 {
+        c.network_down_sleep_secs
+    } else {
+        crate::daemon::NETWORK_DOWN_SLEEP_SECS
+    }
+}
+
 impl Default for ProfileConfig {
     fn default() -> Self {
         Self {
@@ -264,6 +282,7 @@ impl Default for ProfileConfig {
             deep_timeout_secs: 0,
             max_backoff_secs: 0,
             auto_rotate_on_blocked: true,
+            network_down_sleep_secs: 0,
         }
     }
 }
@@ -1286,5 +1305,21 @@ mod tests {
                 "rotated-to profile's failure marker must be cleared"
             );
         });
+    }
+
+    #[test]
+    fn effective_network_down_sleep_defaults_to_system() {
+        let cfg = ProfileConfig::default();
+        assert_eq!(
+            effective_network_down_sleep_secs(&cfg),
+            crate::daemon::NETWORK_DOWN_SLEEP_SECS
+        );
+    }
+
+    #[test]
+    fn effective_network_down_sleep_uses_configured() {
+        let mut cfg = ProfileConfig::default();
+        cfg.network_down_sleep_secs = 15;
+        assert_eq!(effective_network_down_sleep_secs(&cfg), 15);
     }
 }
