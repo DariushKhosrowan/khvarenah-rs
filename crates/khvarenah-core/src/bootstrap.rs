@@ -268,6 +268,12 @@ pub fn ensure_daemon_installed(
             },
             &unit,
         );
+        // Enable loginctl linger so the --user daemon starts at boot *before*
+        // any graphical login. Together with Wants=network-online.target this
+        // is what makes protection survive a total-blackout reboot with no
+        // human logged into the box. Best-effort: if loginctl refuses, the
+        // unit still autostarts on login.
+        crate::daemon::enable_linger();
     }
     Ok(outcome)
 }

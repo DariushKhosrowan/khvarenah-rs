@@ -359,7 +359,7 @@ pub fn log_line(tag: &str, body: &str) -> String {
 /// `profile` is the profile the daemon should manage.
 pub fn systemd_unit(binary: &Path, profile: &str) -> String {
     format!(
-        "[Unit]\nDescription=Khvarenah protection daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={} daemon start --profile {} --foreground\nRestart=always\nRestartSec=30\nRuntimeMaxSec=1800\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Khvarenah protection daemon\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={} daemon start --profile {} --foreground\nRestart=always\nRestartSec=30\nRuntimeMaxSec=1800\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=default.target\n",
         binary.display(),
         profile
     )
@@ -383,6 +383,73 @@ pub fn systemctl_user(action: &str, unit_name: &str) -> std::io::Result<bool> {
         .args(systemctl_user_argv(action, unit_name))
         .output()?;
     Ok(outp.status.success())
+}
+
+/// Best-effort enable of loginctl "linger" for the calling user. With linger
+/// on, the per-user systemd manager (and therefore our `--user` daemon unit)
+/// starts at boot *before* any graphical login — the key to surviving a
+/// total-blackout reboot without a human logged into the box. Pure extra
+/// resilience: if `loginctl` is missing or refused, this returns false and
+/// the caller may degrade gracefully (the unit still autostarts on login).
+pub fn enable_linger() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let Some(user) = std::env::var("USER").ok() else {
+        return false;
+    };
+    if user.is_empty() {
+        return false;
+    }
+    std::process::Command::new("loginctl")
+        .arg("enable-linger")
+        .arg(&user)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Whether loginctl linger is currently enabled for the calling user. Returns
+/// `None` when the platform/user can't be determined (non-Linux, no USER env,
+/// or `loginctl` unavailable).
+pub fn is_linger_enabled() -> Option<bool> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let user = std::env::var("USER").ok()?;
+    if user.is_empty() {
+        return None;
+    }
+    let outp = std::process::Command::new("loginctl")
+        .args(["show-user", &user, "-p", "Linger", "--value"])
+        .output()
+        .ok()?;
+    Some(parse_linger(&outp.stdout))
+}
+
+/// Parse the `loginctl show-user … -p Linger --value` stdout into a bool.
+/// loginctl prints "yes" or "no" (with a trailing newline).
+fn parse_linger(bytes: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(bytes);
+    s.trim().eq_ignore_ascii_case("yes")
+}
+
+#[cfg(test)]
+mod linger_tests {
+    use super::parse_linger;
+
+    #[test]
+    fn parses_yes_no_and_weird_whitespace() {
+    #[test]
+    fn parses_yes_no_and_weird_whitespace() {
+        assert!(parse_linger(b"yes\n"));
+        assert!(parse_linger(b"yes"));
+        assert!(parse_linger(b" YES \n"));
+        assert!(!parse_linger(b"no\n"));
+        assert!(!parse_linger(b""));
+        assert!(!parse_linger(b"nonsense"));
+    }
+}
 }
 
 /// Result of a network-liveness probe: whether the network is up at all, plus
@@ -1154,6 +1221,10 @@ mod tests {
         assert!(unit.contains("RuntimeMaxSec=1800"));
         assert!(unit.contains("RestartSec=30"));
         assert!(unit.contains("WantedBy=default.target"));
+        // Pull network-online.target so the daemon waits for the network at
+        // boot before starting (survives a boot-before-login autostart).
+        assert!(unit.contains("Wants=network-online.target"));
+        assert!(unit.contains("After=network-online.target"));
         // Must NOT auto-run systemctl (privilege escalation is user's call).
         assert!(!unit.contains("systemctl"));
     }
