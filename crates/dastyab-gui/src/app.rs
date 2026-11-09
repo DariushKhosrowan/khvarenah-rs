@@ -1780,6 +1780,42 @@ impl DastYabApp {
                     .font(egui::TextStyle::Monospace),
             );
         }
+
+        // ── Blackout resilience journal ──────────────────────────────
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading(egui::RichText::new("Blackout / rescue journal").color(GOLD));
+        let pending = dastyab_core::journal::pending_drain(&self.profile_id);
+        if !pending.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "⚠ {} unresolved intent(s) — see CLI `dastyab journal pending`",
+                    pending.len()
+                ))
+                .color(egui::Color32::from_rgb(220, 140, 60)),
+            );
+        } else {
+            ui.label("No unresolved intents.");
+        }
+        let show = dastyab_core::journal::recent(&self.profile_id, 10);
+        if show.is_empty() {
+            ui.label("Journal is empty — events appear after the daemon records blackout/rescue transitions.");
+        } else {
+            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                for e in &show {
+                    let label = match e.kind {
+                        dastyab_core::journal::JournalKind::NetworkDown => "⬇ network-down",
+                        dastyab_core::journal::JournalKind::NetworkUp => "⬆ network-up",
+                        dastyab_core::journal::JournalKind::RescueAttempt => "🔧 rescue",
+                        dastyab_core::journal::JournalKind::CycleFailed => "❌ cycle-failed",
+                        dastyab_core::journal::JournalKind::AccountBlocked => "⛔ account-blocked",
+                        dastyab_core::journal::JournalKind::TokenRecovered => "🔑 token-recovered",
+                        dastyab_core::journal::JournalKind::OutboxFlushed => "📤 outbox-flushed",
+                    };
+                    ui.label(format!("{label} — {} (t={})", e.detail, e.ts));
+                }
+            });
+        }
     }
 }
 
