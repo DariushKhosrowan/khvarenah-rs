@@ -142,6 +142,12 @@ enum Command {
         #[command(subcommand)]
         action: BackupAction,
     },
+    /// Configure scheduled worker-signature rotation (anti-DPI moving target).
+    /// The daemon redeploys the worker with a fresh UUID/path on the interval.
+    Mutation {
+        #[command(subcommand)]
+        action: MutationAction,
+    },
     /// Show usage analytics for the active account's workers.
     Analytics,
     /// Run network diagnostics against endpoints.
@@ -519,6 +525,24 @@ enum BackupAction {
         /// How many newest backups to keep (default 7).
         #[arg(long)]
         keep: Option<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MutationAction {
+    /// Show current scheduled-rotation config.
+    Status,
+    /// Configure scheduled worker-signature rotation.
+    Configure {
+        /// Disable rotation (default enables).
+        #[arg(long)]
+        disable: bool,
+        /// Interval between rotations in seconds (default 86400 = 24h).
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Also rotate the worker URL path (default true).
+        #[arg(long)]
+        no_path: bool,
     },
 }
 
