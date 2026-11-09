@@ -1524,8 +1524,18 @@ impl DastYabApp {
         // Write the unit (idempotent) and enable+start it.
         match dastyab_core::bootstrap::ensure_daemon_installed(&exe, &pid, true) {
             Ok(_outcome) => {
-                self.daemon_note =
-                    "Daemon installed and enabled (systemd --user, restarts on boot).".to_string();
+                // Report whether the daemon will survive a reboot *before*
+                // login (loginctl linger). This is the resilience property the
+                // user cares about: a total-blackout reboot with nobody logged
+                // in must still come back with protection running.
+                let linger = match dastyab_core::daemon::is_linger_enabled() {
+                    Some(true) => "boot autostart enabled (starts before login).",
+                    Some(false) => "boot autostart not active — daemon starts at login only.",
+                    None => "boot autostart unknown (loginctl unavailable).",
+                };
+                self.daemon_note = format!(
+                    "Daemon installed and enabled (systemd --user, restarts on boot). {linger}"
+                );
             }
             Err(e) => {
                 self.daemon_note = format!("Daemon install failed: {}", e.brief());
@@ -1609,13 +1619,21 @@ impl DastYabApp {
         } else {
             String::new()
         };
+        // Boot autostart (loginctl linger): does the daemon come back after a
+        // reboot *before* login? This is the blackout-reboot survivability bit.
+        let boot = match dastyab_core::daemon::is_linger_enabled() {
+            Some(true) => ", boot autostart=on".to_string(),
+            Some(false) => ", boot autostart=off (login only)".to_string(),
+            None => String::new(),
+        };
         format!(
-            "Daemon {} · last cycle {}{}{}{}",
+            "Daemon {} · last cycle {}{}{}{}{}",
             if running { "RUNNING" } else { "STOPPED" },
             up,
             stre,
             survival,
-            tier
+            tier,
+            boot
         )
     }
 

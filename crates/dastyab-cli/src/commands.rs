@@ -1841,6 +1841,11 @@ async fn cmd_daemon(profile: &str, action: DaemonAction) -> Result<(), CFError> 
                     since
                 );
             }
+            match is_linger_enabled() {
+                Some(true) => println!("  boot autostart: yes (loginctl linger — starts before login)"),
+                Some(false) => println!("  boot autostart: no (allow linger; daemon starts at login only)"),
+                None => println!("  boot autostart: unknown (loginctl unavailable)"),
+            }
             Ok(())
         }
         DaemonAction::InstallSystemd => {
@@ -1880,6 +1885,23 @@ async fn cmd_daemon(profile: &str, action: DaemonAction) -> Result<(), CFError> 
                         format!("systemctl not available? Run manually: systemctl --user enable --now {unit_name}"),
                     ));
                 }
+            }
+            // Enable loginctl linger so the --user daemon starts at boot before
+            // any login (survives a total-blackout reboot with no human at the
+            // box). Report the outcome honestly — it's best-effort on systems
+            // where loginctl is unavailable/refused.
+            let linger = dastyab_core::daemon::enable_linger();
+            let linger_state = match dastyab_core::daemon::is_linger_enabled() {
+                Some(true) => "enabled".to_string(),
+                Some(false) => "disabled".to_string(),
+                None => "unknown (loginctl unavailable)".to_string(),
+            };
+            if linger {
+                println!("Boot autostart enabled (loginctl linger): daemon will start at boot, before login.");
+            } else {
+                println!(
+                    "Note: could not enable boot autostart (loginctl linger). Current state: {linger_state}. The daemon will still start at your next login."
+                );
             }
             Ok(())
         }
