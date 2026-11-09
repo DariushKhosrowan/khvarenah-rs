@@ -84,6 +84,9 @@ pub struct DaemonState {
     /// Last blackout survival plan label (set when network goes down).
     #[serde(default)]
     pub survival_plan: String,
+    /// Last epoch-seconds the daemon checked for an auto-update.
+    #[serde(default)]
+    pub last_update_check_ts: i64,
 }
 
 fn default_interval() -> u64 {
@@ -103,6 +106,7 @@ impl Default for DaemonState {
             account_state: crate::account_state::AccountState::Active,
             last_account_poll_ts: 0,
             survival_plan: String::new(),
+            last_update_check_ts: 0,
         }
     }
 }

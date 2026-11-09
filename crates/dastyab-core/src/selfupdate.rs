@@ -14,6 +14,9 @@ pub const REPO: &str = "dastyab";
 /// GitHub API base.
 pub const GITHUB_API: &str = "https://api.github.com";
 
+/// How often the daemon checks for an auto-update (seconds). 24h.
+pub const AUTO_UPDATE_INTERVAL_SECS: u64 = 86400;
+
 const RELEASE_LATEST: &str =
     "https://api.github.com/repos/DariushKhosrowan/dastyab/releases/latest";
 
@@ -265,6 +268,109 @@ pub async fn apply_update(timeout: std::time::Duration) -> Result<String, CFErro
     ))
 }
 
+/// Result of an auto-update attempt from the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    /// Already on the latest version.
+    UpToDate,
+    /// A new binary was downloaded and atomically swapped over the running
+    /// executable. The process should re-exec itself to run the new version.
+    Updated { tag: String },
+    /// The download or swap failed (caller decides whether to log/ignore).
+    Failed(String),
+}
+
+/// Daemon-facing auto-update: if a newer release exists, download it and
+/// atomically replace the currently-running executable with the new binary.
+///
+/// On Unix this uses `rename(2)`, which succeeds even while the old binary is
+/// still executing (the old inode stays open until the process exits). The
+/// caller (daemon loop) then re-execs itself to pick up the new version.
+pub async fn ensure_updated_with_swap(
+    timeout: std::time::Duration,
+) -> Result<UpdateOutcome, CFError> {
+    let (available, tag) = update_available(timeout).await?;
+    if !available {
+        return Ok(UpdateOutcome::UpToDate);
+    }
+    let tag = tag.unwrap_or_default();
+
+    let rel = latest_release(timeout).await?;
+    let asset = current_platform_asset(&rel.assets).ok_or_else(|| {
+        CFError::new(
+            "Updater error",
+            "No binary asset matches this platform.",
+            "The release may not ship a binary for your OS/arch.",
+        )
+    })?;
+
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent("dastyab-selfupdate")
+        .build()
+        .map_err(|e| CFError::new("Updater error", format!("{e}"), "Internal error."))?;
+
+    // Download to a temp path next to the running binary.
+    let exe = std::env::current_exe().map_err(|e| {
+        CFError::new("Updater error", e.to_string(), "Cannot locate the binary.")
+    })?;
+    let tmp = exe.with_extension("new-tmp");
+    let urls: [&str; 2] = [&asset.api_url, &asset.url];
+    let mut body = None;
+    for u in &urls {
+        if u.is_empty() {
+            continue;
+        }
+        let resp = if u.starts_with("https://api.github.com") {
+            let mut req = client.get(*u).header("Accept", "application/octet-stream");
+            if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+                if !token.is_empty() {
+                    req = req.header("Authorization", format!("Bearer {token}"));
+                }
+            }
+            req.send().await
+        } else {
+            client.get(*u).send().await
+        };
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                body = Some(r.bytes().await.map_err(|e| {
+                    CFError::new("Updater error", format!("{e}"), "Incomplete download.")
+                })?);
+                break;
+            }
+            Ok(r) => {
+                eprintln!("[updater] download from {u} returned HTTP {}", r.status());
+            }
+            Err(e) => {
+                eprintln!("[updater] download from {u} failed: {e}");
+            }
+        }
+    }
+    let body = body.ok_or_else(|| {
+        CFError::new(
+            "Updater error",
+            "All download endpoints failed.",
+            "The asset may not exist, or the network blocks GitHub downloads.",
+        )
+    })?;
+
+    if let Err(e) = std::fs::write(&tmp, &body) {
+        return Ok(UpdateOutcome::Failed(format!("write temp binary failed: {e}")));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+    }
+    // Atomic swap. On Unix, rename over a running binary's path is allowed.
+    if let Err(e) = std::fs::rename(&tmp, &exe) {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(UpdateOutcome::Failed(format!("binary swap failed: {e}")));
+    }
+    Ok(UpdateOutcome::Updated { tag })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +407,27 @@ mod tests {
         let picked = current_platform_asset(&assets);
         assert!(picked.is_some());
         assert_eq!(picked.unwrap().url, "u1");
+    }
+
+    #[test]
+    fn update_outcome_discriminants() {
+        assert_eq!(UpdateOutcome::UpToDate, UpdateOutcome::UpToDate);
+        assert_eq!(
+            UpdateOutcome::Updated { tag: "v1".into() },
+            UpdateOutcome::Updated { tag: "v1".into() }
+        );
+        assert_ne!(
+            UpdateOutcome::Updated { tag: "v1".into() },
+            UpdateOutcome::Updated { tag: "v2".into() }
+        );
+        assert_eq!(
+            UpdateOutcome::Failed("x".into()),
+            UpdateOutcome::Failed("x".into())
+        );
+    }
+
+    #[test]
+    fn auto_update_interval_is_sane() {
+        assert_eq!(AUTO_UPDATE_INTERVAL_SECS, 86400);
     }
 }
