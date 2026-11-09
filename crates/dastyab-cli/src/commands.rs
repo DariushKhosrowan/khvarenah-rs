@@ -2728,34 +2728,97 @@ fn cmd_journal(profile: &str, action: crate::JournalAction) -> Result<(), CFErro
 /// This is a thin wrapper over `dastyab_core::autonomy::run_audit` so the
 /// CLI and the GUI report the *identical* safeguard status.
 async fn cmd_autonomy(profile: &str, action: crate::AutonomyAction) -> Result<(), CFError> {
-    use dastyab_core::autonomy::CheckStatus;
+    use dastyab_core::autonomy::{apply_fix, CheckStatus, FixAction};
 
-    let _ = action; // only Audit today
-    let p = dastyab_core::store::profiles::load_profile(profile);
-    let report = dastyab_core::autonomy::run_audit(&p);
+    match action {
+        crate::AutonomyAction::Audit => {
+            let p = dastyab_core::store::profiles::load_profile(profile);
+            let report = dastyab_core::autonomy::run_audit(&p);
 
-    println!("Automation audit for profile '{profile}':");
-    for item in &report.items {
-        println!("  [{}] {}", item.status.label(), item.title);
-        if !item.detail.is_empty() {
-            println!("        {}", item.detail);
+            println!("Automation audit for profile '{profile}':");
+            for item in &report.items {
+                println!("  [{}] {}", item.status.label(), item.title);
+                if !item.detail.is_empty() {
+                    println!("        {}", item.detail);
+                }
+                // Only actionable items carry a "→ next step" line; OK/INFO rows
+                // are already resolved and don't need one.
+                if item.status == CheckStatus::Action && !item.fix.is_empty() {
+                    println!("        → {}", item.fix);
+                }
+            }
+
+            println!();
+            if report.needs_action() {
+                println!(
+                    "Not fully hands-off yet — complete the ACTION items above (each is a one-time step)."
+                );
+                std::process::exit(1);
+            } else {
+                println!("All autonomous safeguards armed — the app runs hands-off.");
+                Ok(())
+            }
         }
-        // Only actionable items carry a "→ next step" line; OK/INFO rows
-        // are already resolved and don't need one.
-        if item.status == CheckStatus::Action && !item.fix.is_empty() {
-            println!("        → {}", item.fix);
-        }
-    }
+        crate::AutonomyAction::Fix { what } => {
+            let mut p = dastyab_core::store::profiles::load_profile(profile);
+            // Decide which fixes to attempt.
+            let fixes: Vec<FixAction> = match what {
+                crate::FixWhat::Backup => vec![FixAction::EnableBackupAutoSync],
+                crate::FixWhat::Mutation => vec![FixAction::EnableSignatureMutation],
+                crate::FixWhat::All => {
+                    // Apply every config-only fix the audit currently flags.
+                    let report = dastyab_core::autonomy::run_audit(&p);
+                    report
+                        .items
+                        .iter()
+                        .filter(|i| i.status == CheckStatus::Action)
+                        .filter_map(|i| i.fix_action)
+                        .collect()
+                }
+            };
 
-    println!();
-    if report.needs_action() {
-        println!(
-            "Not fully hands-off yet — complete the ACTION items above (each is a one-time step)."
-        );
-        std::process::exit(1);
-    } else {
-        println!("All autonomous safeguards armed — the app runs hands-off.");
-        Ok(())
+            let mut applied = Vec::new();
+            for fix in fixes {
+                match apply_fix(&mut p, fix) {
+                    Ok(f) => applied.push(f),
+                    Err(e) => println!("  ! could not apply {fix:?}: {}", e.brief()),
+                }
+            }
+            dastyab_core::store::profiles::save_profile(&p)?;
+
+            if applied.is_empty() {
+                println!("No config-only ACTION items to apply — you are already set or the remaining items need credentials (see below).");
+            } else {
+                println!("Applied {} config fix(es):", applied.len());
+                for f in &applied {
+                    println!("  ✓ {}", match f {
+                        FixAction::EnableBackupAutoSync => "scheduled auto-backup enabled",
+                        FixAction::EnableSignatureMutation => "worker-signature rotation enabled",
+                        FixAction::EnableDaemon => "daemon (apply via `dastyab up`)",
+                    });
+                }
+            }
+
+            // Re-run the audit so the persist is verified by the authority.
+            println!();
+            let report = dastyab_core::autonomy::run_audit(&p);
+            println!("Automation audit for profile '{profile}' (after fix):");
+            for item in &report.items {
+                println!("  [{}] {}", item.status.label(), item.title);
+                if item.status == CheckStatus::Action && !item.fix.is_empty() {
+                    println!("        → {}", item.fix);
+                }
+            }
+            if report.needs_action() {
+                println!();
+                println!("Still not fully hands-off — remaining ACTION items need credentials or setup (see above).");
+                std::process::exit(1);
+            } else {
+                println!();
+                println!("All autonomous safeguards armed — the app runs hands-off.");
+                Ok(())
+            }
+        }
     }
 }
 
