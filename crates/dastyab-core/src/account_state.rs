@@ -78,23 +78,48 @@ pub const ACCOUNT_POLL_INTERVAL_SECS: u64 = 900; // 15 min
 /// * `accounts_err` — the error returned by `GET /accounts`, if any.
 ///
 /// Returns the account state. Order of checks matters:
-/// 1. If the token verify failed with a non-9109 error → TokenInvalid.
+/// 1. If the token verify failed at the HTTP level (carries a status code) →
+///    TokenInvalid. A transport/network verify failure (no status: reset,
+///    timeout, TLS) → Unknown — it is NOT proof the token is bad.
 /// 2. If the accounts call failed with 9109 / "deactivated" → Suspended.
 /// 3. If either call failed for a network reason → Unknown.
 /// 4. Otherwise → Active.
-pub fn classify_verify_response(verify_ok: bool, accounts_err: Option<&CFError>) -> AccountState {
-    if !verify_ok {
-        // Token-level failure. 9109 from verify is still a token problem
-        // (malformed/rejected token), not an account deactivation — the
-        // account-level 9109 only surfaces on /accounts.
-        return AccountState::TokenInvalid {
-            since: crate::store::now_ts() as i64,
-        };
+pub fn classify_verify_response(
+    verify_err: Option<&CFError>,
+    accounts_err: Option<&CFError>,
+) -> AccountState {
+    // Clue 1: token verification. Only an HTTP-level rejection — one that
+    // carries a status code (a genuine 401/403/9109 from Cloudflare) —
+    // proves the token is bad. A transport-level failure (no HTTP status:
+    // connection reset, TLS error, timeout) is NOT proof the token is
+    // invalid — it's usually a filtering/blackout blip on the path to
+    // api.cloudflare.com and must not freeze the daemon for hours in a
+    // TokenInvalid wait state.
+    if let Some(err) = verify_err {
+        if err.status.is_some() {
+            return AccountState::TokenInvalid {
+                since: crate::store::now_ts() as i64,
+            };
+        }
+        // Transport-level verify failure → Unknown (not a blocker).
     }
 
     match accounts_err {
-        None => AccountState::Active,
+        None => {
+            if verify_err.is_some() {
+                // Verify failed for a network reason; accounts didn't report a
+                // distinct error either. We can't confirm the token is good →
+                // Unknown (don't block cycles).
+                AccountState::Unknown
+            } else {
+                AccountState::Active
+            }
+        }
         Some(err) => {
+            if err.status.is_none() {
+                // Network failure reaching /accounts → Unknown.
+                return AccountState::Unknown;
+            }
             let msg = format!("{} {}", err.title, err.detail).to_lowercase();
             let code_is_9109 = err.code == Some(9109);
             let says_deactivated = msg.contains("9109") || msg.contains("deactivated");
@@ -173,13 +198,19 @@ pub async fn probe_account_state(profile_id: &str) -> AccountState {
 
     let client = crate::cf::Client::new(&token);
 
-    // Clue 1: is the token itself valid?
-    let verify_ok = client.verify_token().await.is_ok();
+    // Clue 1: is the token itself valid? Keep the error so a *network*-level
+    // failure (api.cloudflare.com unreachable mid-blackout) is not mistaken
+    // for a genuinely invalid token.
+    let verify_res = client.verify_token().await;
+    let verify_err = match &verify_res {
+        Ok(_) => None,
+        Err(e) => Some(e.clone()),
+    };
 
     // Clue 2: is the account reachable? 9109 / "deactivated" → Suspended.
     let accounts_err = client.list_accounts().await.err();
 
-    classify_verify_response(verify_ok, accounts_err.as_ref())
+    classify_verify_response(verify_err.as_ref(), accounts_err.as_ref())
 }
 
 /// Injectable account-state probe for cycle-level gating. Mirrors the
@@ -224,46 +255,65 @@ pub fn account_gate_verdict(state: &AccountState) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    fn err_with_code(code: Option<u32>, title: &str, detail: &str) -> CFError {
+    fn err_with_status(status: u16, code: Option<u32>, title: &str, detail: &str) -> CFError {
         let mut e = CFError::new(title, detail, "");
+        e.status = Some(status);
         e.code = code;
         e
     }
 
+    fn network_err() -> CFError {
+        CFError::new("Network error", "connection reset", "")
+    }
+
     #[test]
     fn classify_9109_is_suspended() {
-        let err = err_with_code(Some(9109), "Invalid API token", "User was deactivated");
-        let st = classify_verify_response(true, Some(&err));
+        let err = err_with_status(403, Some(9109), "Invalid API token", "User was deactivated");
+        let st = classify_verify_response(None, Some(&err));
         assert!(matches!(st, AccountState::Suspended { .. }));
         assert!(st.blocks_cycle());
     }
 
     #[test]
     fn classify_deactivated_string_is_suspended_even_without_code() {
-        let err = err_with_code(None, "Error", "User was deactivated");
-        let st = classify_verify_response(true, Some(&err));
+        let err = err_with_status(400, None, "Error", "User was deactivated");
+        let st = classify_verify_response(None, Some(&err));
         assert!(matches!(st, AccountState::Suspended { .. }));
     }
 
     #[test]
     fn classify_token_403_is_invalid() {
-        let err = err_with_code(Some(403), "Forbidden", "Invalid API token");
-        let st = classify_verify_response(false, Some(&err));
+        let err = err_with_status(403, Some(403), "Forbidden", "Invalid API token");
+        let st = classify_verify_response(Some(&err), None);
         assert!(matches!(st, AccountState::TokenInvalid { .. }));
         assert!(st.blocks_cycle());
     }
 
     #[test]
     fn classify_network_is_unknown() {
-        let err = err_with_code(None, "network", "connection reset");
-        let st = classify_verify_response(true, Some(&err));
+        let err = network_err();
+        let st = classify_verify_response(None, Some(&err));
+        assert!(matches!(st, AccountState::Unknown));
+        assert!(!st.blocks_cycle());
+    }
+
+    /// Regression for the live blackout bug: a *transport*-level failure on
+    /// the token verify (api.cloudflare.com unreachable mid-blackout) MUST NOT
+    /// be classified as `TokenInvalid` — that froze the daemon for hours even
+    /// though the stored token was valid (Cloudflare verified it active). A
+    /// network blip should yield `Unknown` (non-blocking), never a hard
+    /// token-invalid wait state.
+    #[test]
+    fn classify_verify_transport_failure_is_unknown_not_tokeninvalid() {
+        let err = network_err();
+        let st = classify_verify_response(Some(&err), None);
         assert!(matches!(st, AccountState::Unknown));
         assert!(!st.blocks_cycle());
     }
 
     #[test]
     fn classify_all_ok_is_active() {
-        let st = classify_verify_response(true, None);
+        let st = classify_verify_response(None, None);
         assert_eq!(st, AccountState::Active);
         assert!(!st.blocks_cycle());
     }
