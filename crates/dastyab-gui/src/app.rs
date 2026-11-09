@@ -143,6 +143,9 @@ pub struct DastYabApp {
     pub deep_timeout_s: u64,
     pub max_backoff_s: u64,
     pub timeouts_note: String,
+    // automatic token rotation on account-blocked (default on)
+    pub auto_rotate_enabled: bool,
+    pub auto_rotate_note: String,
     // scheduled auto-backup (dormant → now wired into the daemon)
     pub backup_auto_enabled: bool,
     pub backup_auto_interval: u64,
@@ -326,6 +329,8 @@ impl DastYabApp {
             deep_timeout_s: profile.config.deep_timeout_secs,
             max_backoff_s: profile.config.max_backoff_secs,
             timeouts_note: String::new(),
+            auto_rotate_enabled: profile.config.auto_rotate_on_blocked,
+            auto_rotate_note: String::new(),
             backup_auto_enabled: profile.config.backup_autosync.enabled,
             backup_auto_interval: if profile.config.backup_autosync.interval_secs > 0 {
                 profile.config.backup_autosync.interval_secs
@@ -410,6 +415,22 @@ impl DastYabApp {
         match dastyab_core::store::profiles::save_profile(&p) {
             Ok(()) => self.timeouts_note = "Protection pacing saved to profile.".to_string(),
             Err(e) => self.timeouts_note = e.brief(),
+        }
+    }
+
+    /// Persist the automatic token-rotation toggle (account-blocked recovery).
+    fn save_auto_rotate(&mut self) {
+        let mut p = dastyab_core::store::profiles::load_profile(&self.profile_id);
+        p.config.auto_rotate_on_blocked = self.auto_rotate_enabled;
+        match dastyab_core::store::profiles::save_profile(&p) {
+            Ok(()) => {
+                self.auto_rotate_note = if self.auto_rotate_enabled {
+                    "Auto token-rotation ON — blocked tokens swap to a backup automatically.".to_string()
+                } else {
+                    "Auto token-rotation OFF — blocked accounts need a manual token recover.".to_string()
+                };
+            }
+            Err(e) => self.auto_rotate_note = e.brief(),
         }
     }
 
@@ -1836,6 +1857,23 @@ impl DastYabApp {
         ui.label("1800s). Lower 'Max backoff' so a long blackout re-rotates faster.");
         if !self.timeouts_note.is_empty() {
             ui.colored_label(GOLD, &self.timeouts_note);
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut self.auto_rotate_enabled,
+                "auto-rotate to a backup token when the active one is blocked",
+            );
+            if ui.button("Save auto-rotate").clicked() {
+                self.save_auto_rotate();
+            }
+        });
+        ui.label("When Cloudflare blocks/invalidates the active token, the app verifies your");
+        ui.label("other saved tokens and swaps to the first working one automatically — no manual");
+        ui.label("`dastyab token recover` step. The daemon holds cycles until it can rotate.");
+        if !self.auto_rotate_note.is_empty() {
+            ui.colored_label(GOLD, &self.auto_rotate_note);
         }
 
         ui.add_space(10.0);

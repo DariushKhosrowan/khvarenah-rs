@@ -439,6 +439,9 @@ pub trait CycleRunner: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>>;
 }
 
+/// The result of an automatic token rotation: `(old_label, new_label)`.
+pub type RotationOutcome = (String, String);
+
 /// Abstraction over the account-status probe so the loop is testable. Returns
 /// the current account state without blocking on the full cycle.
 pub trait AccountProbe: Send + Sync {
@@ -446,6 +449,17 @@ pub trait AccountProbe: Send + Sync {
         &self,
         profile: &str,
     ) -> Pin<Box<dyn Future<Output = crate::account_state::AccountState> + Send + '_>>;
+
+    /// Attempt automatic token rotation when the active token is blocked.
+    /// Returns `Some((from, to))` when another stored token verified and was
+    /// made active, `None` when nothing rotated. Default: no-op — tests and
+    /// probes that don't implement rotation simply skip it.
+    fn try_rotate(
+        &self,
+        _profile: &str,
+    ) -> Pin<Box<dyn Future<Output = Option<RotationOutcome>> + Send + '_>> {
+        Box::pin(async move { None })
+    }
 }
 
 /// Real account probe backed by the Cloudflare API.
@@ -458,6 +472,27 @@ impl AccountProbe for RealAccountProbe {
     ) -> Pin<Box<dyn Future<Output = crate::account_state::AccountState> + Send + '_>> {
         let profile = profile.to_string();
         Box::pin(async move { crate::account_state::probe_account_state(&profile).await })
+    }
+
+    fn try_rotate(
+        &self,
+        profile: &str,
+    ) -> Pin<Box<dyn Future<Output = Option<(String, String)>> + Send + '_>> {
+        let profile = profile.to_string();
+        Box::pin(async move {
+            let p = crate::store::profiles::load_profile(&profile);
+            if !p.config.auto_rotate_on_blocked {
+                return None;
+            }
+            crate::token_rotate::try_auto_rotate(&profile, |tok| {
+                let tok = tok.to_string();
+                Box::pin(async move {
+                    crate::cf::Client::new(&tok).verify_token().await.is_ok()
+                })
+            })
+            .await
+            .unwrap_or(None)
+        })
     }
 }
 
@@ -676,7 +711,24 @@ pub async fn daemon_tick(
     // comes back — no manual daemon restart required.
     let now = crate::store::now_ts() as i64;
     if state.account_state.blocks_cycle() {
-        if crate::account_state::should_poll_account(state.last_account_poll_ts, now) {
+        // Automatic token rotation: before waiting/polling, check whether a
+        // *different* stored token works and, if so, swap to it. This closes
+        // the manual `dastyab token recover` step — protection resumes
+        // automatically. Configurable via auto_rotate_on_blocked (default on).
+        if let Some((from, to)) = acct.try_rotate(profile).await {
+            state.account_state = crate::account_state::AccountState::Active;
+            state.last_account_poll_ts = now;
+            log(&log_line(
+                "INFO",
+                &format!("account=token-auto-rotated {from}→{to}, resuming cycle"),
+            ));
+            let _ = crate::remote_beacon::maybe_emit(
+                profile,
+                &crate::remote_beacon::BeaconEvent::TokenAutoRotated { from, to },
+                crate::diagnose::Locale::En,
+            )
+            .await;
+        } else if crate::account_state::should_poll_account(state.last_account_poll_ts, now) {
             let st = acct.probe_account(profile).await;
             state.last_account_poll_ts = now;
             let still_blocked = st.blocks_cycle();
@@ -1154,11 +1206,14 @@ mod tests {
     /// A scripted account probe for daemon_tick tests.
     struct FakeAccountProbe {
         state: crate::account_state::AccountState,
+        /// Optional scripted rotation outcome (from, to).
+        rotate: Option<(String, String)>,
     }
     impl Default for FakeAccountProbe {
         fn default() -> Self {
             Self {
                 state: crate::account_state::AccountState::Active,
+                rotate: None,
             }
         }
     }
@@ -1169,6 +1224,13 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = crate::account_state::AccountState> + Send + '_>> {
             let st = self.state.clone();
             Box::pin(async move { st })
+        }
+        fn try_rotate(
+            &self,
+            _profile: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<(String, String)>> + Send + '_>> {
+            let r = self.rotate.clone();
+            Box::pin(async move { r })
         }
     }
 
@@ -1468,6 +1530,7 @@ mod tests {
         let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
             state: crate::account_state::AccountState::Suspended { since: 1 },
+            rotate: None,
         };
         let cycle = FakeCycle::new(true);
         let mut log_lines = Vec::new();
@@ -1484,6 +1547,40 @@ mod tests {
         assert!(log_lines.iter().any(|l| l.contains("waiting")));
     }
 
+    /// When the account is blocked but another stored token can take over, the
+    /// daemon must rotate automatically and resume the cycle — closing the
+    /// manual `dastyab token recover` step.
+    #[tokio::test]
+    async fn test_daemon_auto_rotates_token_and_resumes_cycle() {
+        let _home = daemon_home();
+        let profile = "default";
+        let mut state = DaemonState::default();
+        state.account_state = crate::account_state::AccountState::TokenInvalid { since: 1 };
+        state.last_account_poll_ts = crate::store::now_ts() as i64; // inside window
+        let mut probe = FakeProbe::new(true);
+        // Scripted rotation: backup token takes over.
+        let acct = FakeAccountProbe {
+            state: crate::account_state::AccountState::TokenInvalid { since: 1 },
+            rotate: Some(("primary".to_string(), "backup".to_string())),
+        };
+        let cycle = FakeCycle::new(true);
+        let mut log_lines = Vec::new();
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
+            log_lines.push(l.to_string());
+        })
+        .await;
+        // Rotated → state cleared → cycle ran → normal reset interval.
+        assert_eq!(cycle.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.account_state,
+            crate::account_state::AccountState::Active
+        );
+        assert!(log_lines
+            .iter()
+            .any(|l| l.contains("token-auto-rotated")));
+        assert_eq!(sleep, backoff_reset());
+    }
+
     /// When a suspended account is reactivated, the daemon must notice on the
     /// next poll and run the cycle again — no manual restart.
     #[tokio::test]
@@ -1497,6 +1594,7 @@ mod tests {
         let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
             state: crate::account_state::AccountState::Active,
+            rotate: None,
         };
         let cycle = FakeCycle::new(true);
         let mut log_lines = Vec::new();
@@ -1526,6 +1624,7 @@ mod tests {
         let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
             state: crate::account_state::AccountState::TokenInvalid { since: 1 },
+            rotate: None,
         };
         let cycle = FakeCycle::new(true);
         let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |_| {}).await;
@@ -1545,6 +1644,7 @@ mod tests {
         let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
             state: crate::account_state::AccountState::Suspended { since: 1 },
+            rotate: None,
         };
         let cycle = FakeCycle::new(true);
         let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |_| {}).await;

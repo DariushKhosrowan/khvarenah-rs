@@ -233,6 +233,10 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
                 if c.protection_enabled { "ON" } else { "OFF" }
             );
             println!(
+                "  auto token-rotate on blocked : {}",
+                if c.auto_rotate_on_blocked { "ON" } else { "OFF" }
+            );
+            println!(
                 "  beacon notifications         : {}",
                 if c.beacon.as_ref().is_some_and(|b| b.enabled) {
                     "ON"

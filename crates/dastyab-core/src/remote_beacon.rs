@@ -32,6 +32,9 @@ pub enum BeaconEventKind {
     DailySummary,
     ConfigMutated,
     AccountBlocked,
+    /// The daemon automatically rotated to another stored token because the
+    /// active one was blocked/invalid (no manual `token recover` needed).
+    TokenAutoRotated,
     NetworkDown,
     NetworkRestored,
 }
@@ -59,6 +62,12 @@ pub enum BeaconEvent {
         state: String,
         since: i64,
     },
+    /// The daemon automatically rotated to another stored token (the active
+    /// one was blocked/invalid). Carries the old and new token labels.
+    TokenAutoRotated {
+        from: String,
+        to: String,
+    },
     NetworkDown {
         survival: String,
     },
@@ -76,6 +85,7 @@ impl BeaconEvent {
             BeaconEvent::DailySummary { .. } => BeaconEventKind::DailySummary,
             BeaconEvent::ConfigMutated { .. } => BeaconEventKind::ConfigMutated,
             BeaconEvent::AccountBlocked { .. } => BeaconEventKind::AccountBlocked,
+            BeaconEvent::TokenAutoRotated { .. } => BeaconEventKind::TokenAutoRotated,
             BeaconEvent::NetworkDown { .. } => BeaconEventKind::NetworkDown,
             BeaconEvent::NetworkRestored => BeaconEventKind::NetworkRestored,
         }
@@ -272,6 +282,16 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
         (BeaconEvent::AccountBlocked { state, .. }, _) => {
             format!(
                 "⛔ Account blocked ({state}) — run `dastyab token recover <label> <token>` to replace the token and auto-resume protection"
+            )
+        }
+        (BeaconEvent::TokenAutoRotated { from, to }, crate::diagnose::Locale::Fa) => {
+            format!(
+                "🔁 توکن به‌طور خودکار چرخید: {from} ← {to} — حفاظت بدون دخالت ادامه می‌یابد"
+            )
+        }
+        (BeaconEvent::TokenAutoRotated { from, to }, _) => {
+            format!(
+                "🔁 Token auto-rotated: {from} → {to} — protection resumed with no manual step"
             )
         }
         (BeaconEvent::NetworkDown { survival }, crate::diagnose::Locale::Fa) => {
@@ -603,6 +623,22 @@ mod tests {
             fa.contains("token recover"),
             "fa should carry the recovery action: {fa}"
         );
+    }
+
+    #[test]
+    fn test_format_message_token_auto_rotated_en_and_fa() {
+        let ev = BeaconEvent::TokenAutoRotated {
+            from: "primary".into(),
+            to: "backup".into(),
+        };
+        let en = format_message(&ev, crate::diagnose::Locale::En);
+        assert!(en.contains("primary"), "en={en}");
+        assert!(en.contains("backup"), "en={en}");
+        assert!(en.contains("auto-rotated"));
+        let fa = format_message(&ev, crate::diagnose::Locale::Fa);
+        assert!(fa.contains("primary"), "fa={fa}");
+        assert!(fa.contains("backup"), "fa={fa}");
+        assert!(fa.contains("خودکار"));
     }
 
     #[test]

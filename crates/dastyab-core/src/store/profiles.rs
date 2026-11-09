@@ -179,6 +179,15 @@ pub struct ProfileConfig {
     /// protection for hours.
     #[serde(default)]
     pub max_backoff_secs: u64,
+    /// When the active Cloudflare token is blocked/invalid, automatically
+    /// verify the other stored tokens and swap to the first working one —
+    /// no manual `dastyab token recover` step. Default on.
+    #[serde(default = "default_auto_rotate_on_blocked")]
+    pub auto_rotate_on_blocked: bool,
+}
+
+fn default_auto_rotate_on_blocked() -> bool {
+    true
 }
 
 fn default_light_interval() -> u64 {
@@ -254,6 +263,7 @@ impl Default for ProfileConfig {
             light_timeout_secs: 0,
             deep_timeout_secs: 0,
             max_backoff_secs: 0,
+            auto_rotate_on_blocked: true,
         }
     }
 }
