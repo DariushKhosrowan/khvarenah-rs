@@ -237,6 +237,14 @@ enum Command {
         #[command(subcommand)]
         action: BundleAction,
     },
+    /// Inspect / tune the per-profile blackout-resilience knobs (monitor
+    /// light/deep phase budgets and the daemon backoff ceiling). Everything
+    /// the daemon uses to pace its fight against censorship lives here, so it
+    /// can be tuned from the app rather than compiled in.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Zero-touch bootstrap: detect a token, create/use a profile, deploy a
     /// worker if needed, discover clean IPs, write the user bundle, and
     /// install the systemd unit — all in one command.
@@ -367,6 +375,27 @@ pub enum JournalAction {
     Pending,
     /// Clear the journal.
     Clear,
+}
+
+/// Per-profile blackout-resilience knob actions.
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Show the effective (resolved) monitor budgets and backoff ceiling, plus
+    /// the raw configured values and the system defaults behind them.
+    Show,
+    /// Set the monitor phase budgets and the daemon backoff ceiling. Only the
+    /// flags you pass are changed; 0 / omitted keeps the system default.
+    Timeouts {
+        /// Monitor LIGHT-phase budget in seconds (WS-gate sweep). 0 = default 120.
+        #[arg(long, default_value_t = 0)]
+        light: u64,
+        /// Monitor DEEP-phase (discovery+E2E) budget in seconds. 0 = default 600.
+        #[arg(long, default_value_t = 0)]
+        deep: u64,
+        /// Daemon backoff ceiling in seconds. 0 = default 21600 (6h).
+        #[arg(long, default_value_t = 0)]
+        max_backoff: u64,
+    },
 }
 
 #[derive(Subcommand)]
