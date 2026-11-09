@@ -2876,7 +2876,7 @@ mod tests {
         // Seed a ledger (so fallback+reseed are attempted), manual seeds,
         // and a token label so redeploy is tried too.
         let ep = sample_clean_endpoint("1.1.1.1", 443, true);
-        write_ledger(&id, &[ep]);
+        let _ = write_ledger(&id, &[ep]);
         crate::cf::ips::import_manual_seeds(&id, "8.8.8.8").unwrap();
         crate::store::profiles::add_token(&id, "tok", "x").unwrap();
         crate::store::profiles::set_active_token(&id, "tok").unwrap();
@@ -2904,7 +2904,7 @@ mod tests {
         let _home = rescue_home();
         let id = make_profile();
         let ep = sample_clean_endpoint("1.1.1.1", 443, true);
-        write_ledger(&id, &[ep]);
+        let _ = write_ledger(&id, &[ep]);
 
         // Fallback pool has no alive alternate, but the reseed cycle returns
         // verified endpoints → recovery on the 2nd step.
@@ -2932,7 +2932,7 @@ mod tests {
         let _home = rescue_home();
         let id = make_profile();
         let ep = sample_clean_endpoint("1.1.1.1", 443, true);
-        write_ledger(&id, &[ep]);
+        let _ = write_ledger(&id, &[ep]);
         crate::cf::ips::import_manual_seeds(&id, "8.8.8.8").unwrap();
 
         // Fallback dead, ledger reseed empty, manual reseed succeeds.
@@ -2963,7 +2963,7 @@ mod tests {
         let _home = rescue_home();
         let id = make_profile();
         let ep = sample_clean_endpoint("1.1.1.1", 443, true);
-        write_ledger(&id, &[ep]);
+        let _ = write_ledger(&id, &[ep]);
         crate::cf::ips::import_manual_seeds(&id, "8.8.8.8").unwrap();
         crate::store::profiles::add_token(&id, "tok", "x").unwrap();
         crate::store::profiles::set_active_token(&id, "tok").unwrap();
@@ -2996,7 +2996,7 @@ mod tests {
         let _home = rescue_home();
         let id = make_profile();
         let ep = sample_clean_endpoint("1.1.1.1", 443, true);
-        write_ledger(&id, &[ep]);
+        let _ = write_ledger(&id, &[ep]);
         crate::store::profiles::add_token(&id, "tok", "x").unwrap();
         crate::store::profiles::set_active_token(&id, "tok").unwrap();
 
