@@ -38,6 +38,7 @@ pub mod account_state;
 pub mod analytics;
 pub mod autopilot;
 pub mod backup;
+pub mod backup_autosync;
 pub mod blackout;
 pub mod blackout_bridge;
 pub mod bootstrap;

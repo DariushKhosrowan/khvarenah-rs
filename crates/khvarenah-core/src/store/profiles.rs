@@ -151,6 +151,9 @@ pub struct ProfileConfig {
     /// Scheduled config mutation settings (worker signature rotation).
     #[serde(default)]
     pub mutation: crate::config_mutation::MutationConfig,
+    /// Scheduled profile auto-backup settings (crash/blackout resilience).
+    #[serde(default)]
+    pub backup_autosync: crate::backup_autosync::BackupAutoSyncConfig,
     /// UNIX epoch seconds of the last config mutation.
     #[serde(default)]
     pub last_mutation_ts: i64,
@@ -189,6 +192,7 @@ impl Default for ProfileConfig {
             strategy_last_rotated_ts: 0,
             beacon: None,
             mutation: crate::config_mutation::MutationConfig::default(),
+            backup_autosync: crate::backup_autosync::BackupAutoSyncConfig::default(),
             last_mutation_ts: 0,
             worker_set: crate::multi_worker::WorkerSet::default(),
         }

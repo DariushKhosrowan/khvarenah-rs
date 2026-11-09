@@ -87,6 +87,9 @@ pub struct DaemonState {
     /// Last epoch-seconds the daemon checked for an auto-update.
     #[serde(default)]
     pub last_update_check_ts: i64,
+    /// Last epoch-seconds an auto-backup was written (if enabled).
+    #[serde(default)]
+    pub last_backup_ts: i64,
 }
 
 fn default_interval() -> u64 {
@@ -107,6 +110,7 @@ impl Default for DaemonState {
             last_account_poll_ts: 0,
             survival_plan: String::new(),
             last_update_check_ts: 0,
+            last_backup_ts: 0,
         }
     }
 }
