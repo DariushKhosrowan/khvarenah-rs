@@ -147,6 +147,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::MultiWorker { action } => cmd_multi_worker(&profile, action).await,
         Command::Journal { action } => cmd_journal(&profile, action),
         Command::Autonomy { action } => cmd_autonomy(&profile, action).await,
+        Command::Onboard { action } => cmd_onboard(&profile, action),
     }
 }
 
@@ -2162,6 +2163,39 @@ async fn cmd_up(profile_override: Option<String>) -> Result<(), CFError> {
     let code = diag.failure.as_ref().map(|f| f.exit_code()).unwrap_or(1);
     eprintln!("  Exit code: {code}");
     std::process::exit(code);
+}
+
+/// `khvarenah onboard status` — offline report of which setup steps are done.
+fn cmd_onboard(profile: &str, action: crate::OnboardAction) -> Result<(), CFError> {
+    use khvarenah_core::bootstrap::{onboarding_status, OnboardingStep};
+    match action {
+        crate::OnboardAction::Status { profile: p } => {
+            let pid = p.as_deref().unwrap_or(profile);
+            let done = onboarding_status(Some(pid));
+            let all = [
+                OnboardingStep::Token,
+                OnboardingStep::Worker,
+                OnboardingStep::Bundle,
+                OnboardingStep::DaemonInstalled,
+                OnboardingStep::DaemonRunning,
+            ];
+            println!("Onboarding status — profile '{pid}':");
+            for step in all {
+                let mark = if done.contains(&step) { "✓" } else { "·" };
+                println!("  {mark} {}", step.label());
+            }
+            let remaining = all.iter().filter(|s| !done.contains(s)).count();
+            println!();
+            if remaining == 0 {
+                println!("All setup steps complete — protection is live.");
+            } else {
+                println!(
+                    "{remaining} step(s) remaining. Run `khvarenah up` to complete them automatically."
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `khvarenah sni-spoof …` — SNI allowlist scanner.

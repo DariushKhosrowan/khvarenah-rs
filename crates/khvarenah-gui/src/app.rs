@@ -1171,6 +1171,49 @@ impl KhvarenahApp {
     fn deploy_panel(&mut self, ui: &mut egui::Ui, p: &khvarenah_core::store::profiles::Profile) {
         ui.heading(egui::RichText::new("Deploy & Clean-IP").color(GOLD));
 
+        // ---- Onboarding checklist (compact "am I set up?" summary) ----
+        // Mirrors `khvarenah onboard status`: offline, reads local state only.
+        ui.add_space(4.0);
+        let steps = khvarenah_core::bootstrap::onboarding_status(Some(&self.profile_id));
+        let all = [
+            khvarenah_core::bootstrap::OnboardingStep::Token,
+            khvarenah_core::bootstrap::OnboardingStep::Worker,
+            khvarenah_core::bootstrap::OnboardingStep::Bundle,
+            khvarenah_core::bootstrap::OnboardingStep::DaemonInstalled,
+            khvarenah_core::bootstrap::OnboardingStep::DaemonRunning,
+        ];
+        let remaining = all.iter().filter(|s| !steps.contains(s)).count();
+        let ok_green = egui::Color32::from_rgb(90, 210, 120);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Setup status:")
+                    .color(GOLD_DIM)
+                    .strong(),
+            );
+            if remaining == 0 {
+                ui.label(
+                    egui::RichText::new("✓ complete — protection live").color(ok_green),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{remaining}/{} step(s) pending — run `khvarenah up`",
+                        all.len()
+                    ))
+                    .color(GOLD),
+                );
+            }
+            if ui.button("⟳").on_hover_text("Refresh setup status").clicked() {
+                self.state.reload_pending = true;
+            }
+        });
+        for step in all {
+            let mark = if steps.contains(&step) { "✓" } else { "·" };
+            let color = if steps.contains(&step) { ok_green } else { GOLD_DIM };
+            ui.label(egui::RichText::new(format!("  {mark} {}", step.label())).color(color));
+        }
+        ui.separator();
+
         // ---- Autopilot toggle (the product) ----
         ui.add_space(4.0);
         ui.horizontal(|ui| {

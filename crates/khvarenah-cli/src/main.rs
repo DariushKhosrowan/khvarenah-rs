@@ -294,6 +294,23 @@ enum Command {
         #[command(subcommand)]
         action: AutonomyAction,
     },
+    /// Onboarding status: report which setup steps (token, worker, bundle,
+    /// daemon installed/running) are already complete. Offline — reads local
+    /// state only, never the network.
+    Onboard {
+        #[command(subcommand)]
+        action: OnboardAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OnboardAction {
+    /// Show which onboarding steps are done and which remain.
+    Status {
+        /// Profile id to inspect (default: active profile).
+        #[arg(long)]
+        profile: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

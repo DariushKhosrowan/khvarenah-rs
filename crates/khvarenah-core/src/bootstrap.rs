@@ -606,6 +606,89 @@ pub async fn up_with_diagnosis(profile_id_override: Option<&str>) -> DiagnosisRe
     diag::success_result(elapsed(&started))
 }
 
+/// A single setup step in the one-command onboarding flow. Each step maps to
+/// the concrete on-disk state the app produces, so the status probe is pure
+/// (no network) and can be rendered anywhere — CLI, GUI, or a wizard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingStep {
+    /// A Cloudflare API token is stored on the active/`default` profile.
+    Token,
+    /// A worker has been deployed (a vless config exists in history).
+    Worker,
+    /// The user bundle (`active.vless` / `active.png`) has been written.
+    Bundle,
+    /// The systemd user unit exists on disk.
+    DaemonInstalled,
+    /// The daemon is currently running (pid alive).
+    DaemonRunning,
+}
+
+impl OnboardingStep {
+    /// Human label for the step (no protocol jargon).
+    pub fn label(&self) -> &'static str {
+        match self {
+            OnboardingStep::Token => "Cloudflare token configured",
+            OnboardingStep::Worker => "Worker deployed",
+            OnboardingStep::Bundle => "VPN profile written (active.vless)",
+            OnboardingStep::DaemonInstalled => "Background protection installed",
+            OnboardingStep::DaemonRunning => "Background protection running",
+        }
+    }
+}
+
+/// Check which onboarding steps are already done for `profile_id` (or the
+/// active/`default` profile if `None`). Pure and offline: each check reads the
+/// local store / disk, never the network.
+pub fn onboarding_status(profile_id: Option<&str>) -> Vec<OnboardingStep> {
+    let pid = match profile_id {
+        Some(id) => id.to_string(),
+        None => {
+            let active = profiles::get_active_profile();
+            if active.is_empty() {
+                "default".to_string()
+            } else {
+                active
+            }
+        }
+    };
+
+    let mut done = Vec::new();
+
+    // 1 — token (any stored on the profile).
+    let p = profiles::load_profile(&pid);
+    if !p.tokens.is_empty() {
+        done.push(OnboardingStep::Token);
+    }
+
+    // 2 — worker: a vless from a non-clean-IP history record.
+    if crate::autopilot::base_vless(&pid).is_ok() {
+        done.push(OnboardingStep::Worker);
+    }
+
+    // 3 — bundle: active.vless present.
+    if let Ok(dir) = crate::cleanip::user_config_dir(&pid) {
+        if dir.join("active.vless").exists() {
+            done.push(OnboardingStep::Bundle);
+        }
+    }
+
+    // 4 — daemon unit installed.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
+    let unit = std::path::PathBuf::from(&home)
+        .join(".config/systemd/user")
+        .join("khvarenah-daemon.service");
+    if unit.exists() {
+        done.push(OnboardingStep::DaemonInstalled);
+        // 5 — daemon running (pid file alive).
+        let cfg = crate::daemon::DaemonConfig::new(&pid);
+        if crate::daemon::is_daemon_running(&cfg.pid_file) {
+            done.push(OnboardingStep::DaemonRunning);
+        }
+    }
+
+    done
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,6 +798,68 @@ mod tests {
         // Second call → already installed.
         let outcome2 = ensure_daemon_installed(&bin, "default", false).unwrap();
         assert_eq!(outcome2, DaemonInstallOutcome::AlreadyInstalled);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_onboarding_status_empty_profile_has_no_steps() {
+        let _guard = env_lock().lock().unwrap();
+        let tmp = temp_mem();
+        // Isolate HOME so the systemd-unit check (step 4) is hermetic — the
+        // real dev machine has ~/.config/systemd/user/khvarenah-daemon.service.
+        let home = tmp.join("home");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let id = profiles::create_profile("fresh", "").unwrap();
+        let done = onboarding_status(Some(&id));
+        assert!(done.is_empty(), "fresh profile should have no steps: {done:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_onboarding_status_token_step_appears_after_add() {
+        let _guard = env_lock().lock().unwrap();
+        let tmp = temp_mem();
+        let home = tmp.join("home");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let id = profiles::create_profile("tok", "").unwrap();
+        profiles::add_token(&id, "t", "tok-abc").unwrap();
+        let done = onboarding_status(Some(&id));
+        assert!(done.contains(&OnboardingStep::Token), "got: {done:?}");
+        assert!(!done.contains(&OnboardingStep::Worker));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_onboarding_status_bundle_step_after_bundle_write() {
+        let _guard = env_lock().lock().unwrap();
+        let tmp = temp_mem();
+        let home = tmp.join("home");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let id = profiles::create_profile("bundle", "").unwrap();
+        // Seed a vless in history so the worker step registers, then write the
+        // bundle's active.vless into the per-profile config dir.
+        let vless = "vless://uuid@host:443?encryption=none&security=tls&sni=host&type=ws&path=/abc#k";
+        let mut p = profiles::load_profile(&id);
+        p.history.push(profiles::VlessRecord {
+            link: vless.to_string(),
+            clean_ip: false,
+            ..Default::default()
+        });
+        profiles::save_profile(&p).unwrap();
+        let dir = crate::cleanip::user_config_dir(&id).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("active.vless"), "vless://x").unwrap();
+
+        let done = onboarding_status(Some(&id));
+        assert!(done.contains(&OnboardingStep::Worker), "got: {done:?}");
+        assert!(done.contains(&OnboardingStep::Bundle), "got: {done:?}");
+        assert!(!done.contains(&OnboardingStep::DaemonInstalled));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

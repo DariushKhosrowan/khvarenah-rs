@@ -88,6 +88,26 @@ pub struct DiagnosisResult {
     pub elapsed_ms: u64,
 }
 
+impl std::fmt::Display for DiagnosisResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.ok {
+            write!(
+                f,
+                "✓ Setup complete (stage: {}, {:.1}s). {}",
+                self.stage_reached,
+                self.elapsed_ms as f64 / 1000.0,
+                self.recommended_action
+            )
+        } else {
+            write!(
+                f,
+                "✗ Setup did not complete (stage: {}). {} Recommended: {}",
+                self.stage_reached, self.plain_message, self.recommended_action
+            )
+        }
+    }
+}
+
 /// Terms that must never appear in a plain_message.
 pub const INTERNAL_TERMS: [&str; 9] = [
     "ws",
@@ -498,5 +518,24 @@ mod tests {
         // both variants are constructible (guards against a future refactor).
         let _en = crate::diagnose::Locale::En;
         let _fa = crate::diagnose::Locale::Fa;
+    }
+
+    #[test]
+    fn test_diagnosis_result_display_success() {
+        let r = success_result(1234);
+        let s = r.to_string();
+        assert!(s.contains("✓ Setup complete"), "got: {s}");
+        // Success path never surfaces a failure message.
+        assert!(!s.contains("✗"));
+        assert!(s.contains("1.2s"));
+    }
+
+    #[test]
+    fn test_diagnosis_result_display_failure() {
+        let r = diagnose(&UpFailure::NoTokenFound, 5000);
+        let s = r.to_string();
+        assert!(s.contains("✗ Setup did not complete"), "got: {s}");
+        assert!(s.contains("No Cloudflare token was found"));
+        assert!(s.contains("Recommended:"));
     }
 }
