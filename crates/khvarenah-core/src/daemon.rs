@@ -213,6 +213,33 @@ pub fn backoff_next(current: u64, max: u64) -> u64 {
     next.min(max).max(current)
 }
 
+/// Cap for backoff when the failure was a *cycle timeout* (deep discovery
+/// exceeded its budget on a slow/censored network) rather than a hard,
+/// persistent failure (worker dead, account suspended, token invalid). A
+/// timeout is transient — the network path can clear at any moment — so we
+/// must not let the daemon back off all the way to the 6h max, which would
+/// leave protection stale for hours after connectivity actually returns. One
+/// hour is enough breathing room for a genuinely slow deep pass while still
+/// keeping recovery prompt.
+pub const TIMEOUT_BACKOFF_CAP_SECS: u64 = 3600;
+
+/// True when failure error `e` is a cycle-timeout class failure. The guarded
+/// monitor/run cycles return a `CFError` titled "Cycle timeout" (with a stage
+/// in the detail) when the light or deep phase exceeds its budget.
+pub fn is_cycle_timeout(e: &CFError) -> bool {
+    e.title.eq_ignore_ascii_case("Cycle timeout")
+}
+
+/// Pure: compute the backoff interval for a failure, applying the lower cap
+/// for the transient timeout class. Otherwise identical to `backoff_next`.
+pub fn backoff_for_failure(current: u64, max: u64, e: &CFError) -> u64 {
+    if is_cycle_timeout(e) {
+        backoff_next(current, max.min(TIMEOUT_BACKOFF_CAP_SECS))
+    } else {
+        backoff_next(current, max)
+    }
+}
+
 /// Pure: backoff reset value (the initial interval).
 pub fn backoff_reset() -> u64 {
     DEFAULT_INITIAL_INTERVAL_SECS
@@ -616,7 +643,7 @@ pub async fn daemon_tick(
             Err(e) => {
                 state.failure_streak += 1;
                 state.current_interval_secs =
-                    backoff_next(state.current_interval_secs, DEFAULT_MAX_INTERVAL_SECS);
+                    backoff_for_failure(state.current_interval_secs, DEFAULT_MAX_INTERVAL_SECS, &e);
                 log(&log_line(
                     "WARN",
                     &format!(
@@ -649,7 +676,7 @@ pub async fn daemon_tick(
             Err(e) => {
                 state.failure_streak += 1;
                 state.current_interval_secs =
-                    backoff_next(state.current_interval_secs, DEFAULT_MAX_INTERVAL_SECS);
+                    backoff_for_failure(state.current_interval_secs, DEFAULT_MAX_INTERVAL_SECS, &e);
                 log(&log_line(
                     "WARN",
                     &format!(
@@ -682,6 +709,37 @@ mod tests {
         assert_eq!(backoff_next(900, 21600), 3600);
         assert_eq!(backoff_next(3600, 21600), 21600);
         assert_eq!(backoff_next(21600, 21600), 21600);
+    }
+
+    #[test]
+    fn timeout_backoff_caps_at_one_hour() {
+        let timeout_err = CFError::new("Cycle timeout", "stuck in DeepCheck", "");
+        // Non-timeout failures still climb to the 6h max.
+        let hard_err = CFError::new("Worker offline", "dead", "");
+        assert_eq!(
+            backoff_for_failure(3600, 21600, &hard_err),
+            21600,
+            "hard failures keep the 6h cap"
+        );
+        // Timeout failures cap at 1h even on repeat.
+        assert_eq!(
+            backoff_for_failure(3600, 21600, &timeout_err),
+            3600,
+            "timeout backs off only to 1h"
+        );
+        assert_eq!(
+            backoff_for_failure(3600, 21600, &timeout_err),
+            3600,
+            "timeout stays capped at 1h"
+        );
+    }
+
+    #[test]
+    fn is_cycle_timeout_matches_title_case_insensitively() {
+        assert!(is_cycle_timeout(&CFError::new("Cycle timeout", "", "")));
+        assert!(is_cycle_timeout(&CFError::new("cycle timeout", "", "")));
+        assert!(!is_cycle_timeout(&CFError::new("Worker offline", "", "")));
+        assert!(!is_cycle_timeout(&CFError::new("Network error", "", "")));
     }
 
     #[test]
