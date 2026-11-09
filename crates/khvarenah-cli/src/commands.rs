@@ -1685,7 +1685,26 @@ async fn cmd_daemon(profile: &str, action: DaemonAction) -> Result<(), CFError> 
                 CFError::new("Daemon", e.to_string(), "Cannot write the systemd unit.")
             })?;
             println!("Wrote {}.", unit.display());
-            println!("Enable with: systemctl --user enable --now khvarenah-daemon.service");
+            // Close the last manual step: `systemctl --user enable --now` is a
+            // per-user operation (no root), so run it and report the real result.
+            let unit_name = "khvarenah-daemon.service";
+            match khvarenah_core::daemon::systemctl_user("enable --now", unit_name) {
+                Ok(true) => println!("Enabled and started {unit_name}."),
+                Ok(false) => {
+                    return Err(CFError::new(
+                        "Daemon",
+                        "systemctl --user enable --now returned a non-zero status".to_string(),
+                        format!("The unit file is written; run it manually: systemctl --user enable --now {unit_name}"),
+                    ));
+                }
+                Err(e) => {
+                    return Err(CFError::new(
+                        "Daemon",
+                        e.to_string(),
+                        format!("systemctl not available? Run manually: systemctl --user enable --now {unit_name}"),
+                    ));
+                }
+            }
             Ok(())
         }
         DaemonAction::Reset => {
