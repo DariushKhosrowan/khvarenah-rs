@@ -285,6 +285,15 @@ enum Command {
         #[command(subcommand)]
         action: JournalAction,
     },
+    /// Automation self-audit: verify every autonomous safeguard is armed
+    /// (daemon running, boot-before-login autostart, auto token-rotation with
+    /// ≥2 tokens, scheduled auto-backup, signature rotation, DNS tunnel).
+    /// One command tells you whether the app is fully hands-off or which
+    /// single step still needs a human.
+    Autonomy {
+        #[command(subcommand)]
+        action: AutonomyAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -401,6 +410,16 @@ pub enum ConfigAction {
         #[arg(long, default_value_t = 0)]
         network_down_sleep: u64,
     },
+}
+
+/// Automation self-audit actions.
+#[derive(Subcommand)]
+pub enum AutonomyAction {
+    /// Audit all autonomous safeguards and report, per item, whether it is
+    /// armed (OK), needs a one-time setup (ACTION), or is a manual requirement
+    /// (MANUAL). Exit code 0 when everything is hands-off, 1 otherwise — so
+    /// it is scriptable for a remote check.
+    Audit,
 }
 
 #[derive(Subcommand)]
