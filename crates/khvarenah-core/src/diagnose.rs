@@ -212,6 +212,7 @@ mod tests {
             e2e_fail_by_stage: HashMap::new(),
             ws_failure_histogram: HashMap::new(),
             failure_by_sni: HashMap::new(),
+            success_by_profile: HashMap::new(),
             cancelled_early: false,
             e2e_enabled: true,
         }
