@@ -94,6 +94,12 @@ pub struct DaemonState {
     /// Last epoch-seconds an auto-backup was written (if enabled).
     #[serde(default)]
     pub last_backup_ts: i64,
+    /// Last profile-dir mtime (epoch seconds) the daemon saw. When the profile
+    /// config/token/state dir changes (e.g. Settings edited in the GUI), the
+    /// daemon logs a config-reload notice and resets its interval so new
+    /// settings apply without a manual restart.
+    #[serde(default)]
+    pub last_profile_mtime: i64,
 }
 
 fn default_interval() -> u64 {
@@ -116,6 +122,7 @@ impl Default for DaemonState {
             network_tier: String::new(),
             last_update_check_ts: 0,
             last_backup_ts: 0,
+            last_profile_mtime: 0,
         }
     }
 }

@@ -22,11 +22,14 @@
 //! testable without touching the network.
 
 use crate::error::CFError;
+use std::future::Future;
+use std::pin::Pin;
 
 /// Persisted account state (serde-default so old configs load cleanly).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum AccountState {
     /// No suspension/invalid-state detected — the daemon should run cycles.
+    #[default]
     Active,
     /// Account is deactivated (CF 9109). Store when we entered the wait.
     Suspended { since: i64 },
@@ -34,12 +37,6 @@ pub enum AccountState {
     TokenInvalid { since: i64 },
     /// We could not determine the state (network error / unknown response).
     Unknown,
-}
-
-impl Default for AccountState {
-    fn default() -> Self {
-        AccountState::Active
-    }
 }
 
 impl AccountState {
@@ -166,18 +163,50 @@ pub async fn probe_account_state(profile_id: &str) -> AccountState {
     let client = crate::cf::Client::new(&token);
 
     // Clue 1: is the token itself valid?
-    let verify_ok = match client.verify_token().await {
-        Ok(_) => true,
-        Err(_) => false,
-    };
+    let verify_ok = client.verify_token().await.is_ok();
 
     // Clue 2: is the account reachable? 9109 / "deactivated" → Suspended.
-    let accounts_err = match client.list_accounts().await {
-        Ok(_) => None,
-        Err(e) => Some(e),
-    };
+    let accounts_err = client.list_accounts().await.err();
 
     classify_verify_response(verify_ok, accounts_err.as_ref())
+}
+
+/// Injectable account-state probe for cycle-level gating. Mirrors the
+/// `WorkerHealthProbe`/`EndpointProvider` pattern so `AutopilotEngine` cycles
+/// (monitor / run_cycle) can skip scanning a suspended/invalid account without
+/// burning probe budget. `RealAccountStateProbe` is the production impl; tests
+/// inject a scripted state.
+pub trait AccountStateProbe: Send + Sync {
+    fn probe<'a>(
+        &'a self,
+        profile: &'a str,
+    ) -> Pin<Box<dyn Future<Output = AccountState> + Send + 'a>>;
+}
+
+/// Production account probe: hits Cloudflare's API for the profile's token.
+#[derive(Default)]
+pub struct RealAccountStateProbe;
+
+impl AccountStateProbe for RealAccountStateProbe {
+    fn probe<'a>(
+        &'a self,
+        profile: &'a str,
+    ) -> Pin<Box<dyn Future<Output = AccountState> + Send + 'a>> {
+        let profile = profile.to_string();
+        Box::pin(async move { probe_account_state(&profile).await })
+    }
+}
+
+/// A pure gate helper: given the probed account state, decide whether a cycle
+/// should run. Returns `Some(label)` when the cycle must be skipped (account
+/// blocks cycles) and `None` when it may proceed. Kept as a tiny free fn so
+/// both the monitor and run_cycle gates share one decision rule.
+pub fn account_gate_verdict(state: &AccountState) -> Option<&'static str> {
+    if state.blocks_cycle() {
+        Some(state.label())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +271,19 @@ mod tests {
         assert_eq!(s.label(), "suspended");
         assert_eq!(s.since(), Some(42));
         assert_eq!(AccountState::Active.label(), "active");
-        assert_eq!(AccountState::Active.since(), None);
+        assert_eq!(AccountState::TokenInvalid { since: 1 }.label(), "token-invalid");
+        assert_eq!(AccountState::Unknown.label(), "unknown");
+    }
+
+    #[test]
+    fn gate_verdict_blocks_only_suspended_and_invalid() {
+        let s = AccountState::Suspended { since: 0 };
+        assert_eq!(account_gate_verdict(&s), Some("suspended"));
+        let t = AccountState::TokenInvalid { since: 0 };
+        assert_eq!(account_gate_verdict(&t), Some("token-invalid"));
+        assert_eq!(account_gate_verdict(&AccountState::Active), None);
+        // Unknown is NOT a blocker — treat as proceed (the daemon surfaces a
+        // real blocker via its own probe/classification).
+        assert_eq!(account_gate_verdict(&AccountState::Unknown), None);
     }
 }
