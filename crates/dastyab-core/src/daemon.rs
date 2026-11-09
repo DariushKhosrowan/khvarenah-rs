@@ -484,6 +484,84 @@ impl CycleRunner for RealCycleRunner {
     }
 }
 
+/// Periodic self-maintenance, run at the top of every daemon tick:
+///
+/// 1. **Scheduled auto-backup** — if `backup_autosync.enabled`, export the
+///    profile to a JSON backup each interval and trim to `keep`. This is local
+///    disk work, so it runs unconditionally — even during a total blackout the
+///    app keeps a fresh recoverable copy of its own configuration.
+/// 2. **Scheduled worker-signature rotation** — if `mutation.enabled`, redeploy
+///    the worker with a fresh UUID/path each interval (moving target against
+///    stateful DPI). This needs the Cloudflare API, so it only runs when the
+///    network is up.
+///
+/// Both were previously dormant features (config structs existed but nothing
+/// called them). This is what makes the daemon fully automatic — no manual
+/// backup, no manual redeploy.
+async fn run_self_maintenance(
+    profile: &str,
+    state: &mut DaemonState,
+    net_up: bool,
+    log: &mut dyn FnMut(&str),
+) {
+    let now = crate::store::now_ts() as i64;
+    let p = crate::store::profiles::load_profile(profile);
+
+    // 1. Scheduled auto-backup (local — safe even during a blackout).
+    match crate::backup_autosync::run_autosync_if_due(
+        &p.config.backup_autosync,
+        profile,
+        state.last_backup_ts,
+        now,
+    ) {
+        Ok(Some(path)) => {
+            state.last_backup_ts = now;
+            let _ = crate::journal::append(
+                profile,
+                crate::journal::JournalKind::BackupWritten,
+                &path.display().to_string(),
+            );
+            log(&log_line("INFO", &format!("auto-backup written → {}", path.display())));
+            let _ = crate::store::profiles::save_profile(&p);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            log(&log_line("WARN", &format!("auto-backup failed: {}", e.brief())));
+        }
+    }
+
+    // 2. Scheduled worker-signature rotation. Only when the network is up
+    // (CF API redeploy requires connectivity). The liveness probe has already
+    // run in `daemon_tick` and its result is passed in as `net_up`.
+    if net_up {
+        match crate::config_mutation::run_mutation_if_due::<crate::autopilot::RealMutationPeer>(
+            profile, &crate::autopilot::RealMutationPeer,
+        )
+        .await
+        {
+            Ok(Some(outcome)) => {
+                state.last_cycle_ts = now;
+                let _ = crate::journal::append(
+                    profile,
+                    crate::journal::JournalKind::MutationPerformed,
+                    &format!("uuid={} path={}", outcome.new_uuid, outcome.new_path),
+                );
+                log(&log_line(
+                    "INFO",
+                    &format!("signature rotated → uuid={}", outcome.new_uuid),
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log(&log_line(
+                    "WARN",
+                    &format!("signature rotation failed: {}", e.brief()),
+                ));
+            }
+        }
+    }
+}
+
 /// Run one iteration of the daemon loop. Returns the number of seconds to
 /// sleep before the next iteration. Pure-ish: all side effects go through
 /// `probe`, `acct`, `cycle`, and the logger callback, so it is fully unit-testable.
@@ -500,6 +578,12 @@ pub async fn daemon_tick(
     let status = probe.liveness().await;
     let net_up = status.up;
     state.network_tier = status.tier_label();
+
+    // a. Periodic self-maintenance: scheduled auto-backup (always — local,
+    // safe even during a blackout) and worker-signature rotation (only when
+    // the network is confirmed up, since it needs the CF API). These were
+    // dormant features; this is what makes the app fully automatic.
+    run_self_maintenance(profile, state, net_up, log).await;
 
     // Per-profile blackout-resilience knobs (0 on each = system default):
     // monitor light/deep phase budgets + the backoff ceiling. On a degraded
@@ -846,6 +930,47 @@ mod tests {
         // From 300 with a 900 max, escalation is capped at 900 (not 3600).
         assert_eq!(state.current_interval_secs, 900);
         assert_eq!(sleep, 900);
+    }
+
+    /// Scheduled auto-backup (when enabled + due) writes a backup and records
+    /// the timestamp, even with no network (it is local disk work).
+    #[tokio::test]
+    async fn run_self_maintenance_writes_backup_when_due() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("selfmaint", "").unwrap();
+        let mut p = crate::store::profiles::load_profile(&profile);
+        p.config.backup_autosync.enabled = true;
+        p.config.backup_autosync.interval_secs = 1;
+        crate::store::profiles::save_profile(&p).unwrap();
+
+        let mut state = DaemonState::default();
+        // Never backed up → due immediately.
+        state.last_backup_ts = 0;
+        let mut log_lines = Vec::new();
+        run_self_maintenance(&profile, &mut state, false, &mut |l| log_lines.push(l.to_string())).await;
+
+        assert!(state.last_backup_ts > 0, "backup timestamp should be recorded");
+        assert!(
+            crate::backup::list_backups().len() >= 1,
+            "a backup file should exist"
+        );
+        assert!(
+            log_lines.iter().any(|l| l.contains("auto-backup")),
+            "log should mention auto-backup: {:?}",
+            log_lines
+        );
+    }
+
+    /// When auto-backup is disabled, nothing is written and the timestamp stays.
+    #[tokio::test]
+    async fn run_self_maintenance_skips_backup_when_disabled() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("selfmaint2", "").unwrap();
+        let mut state = DaemonState::default();
+        let mut log_lines = Vec::new();
+        run_self_maintenance(&profile, &mut state, false, &mut |l| log_lines.push(l.to_string())).await;
+        assert_eq!(state.last_backup_ts, 0, "disabled backup must not run");
+        assert!(crate::backup::list_backups().is_empty());
     }
 
     #[test]
