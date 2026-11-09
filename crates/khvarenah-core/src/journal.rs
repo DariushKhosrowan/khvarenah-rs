@@ -43,6 +43,10 @@ pub enum JournalKind {
     TokenRecovered,
     /// The beacon outbox was flushed (detail = "# alerts").
     OutboxFlushed,
+    /// A scheduled auto-backup was written (detail = backup path).
+    BackupWritten,
+    /// A scheduled worker-signature rotation ran (detail = new uuid/path).
+    MutationPerformed,
 }
 
 /// One durable journal entry.

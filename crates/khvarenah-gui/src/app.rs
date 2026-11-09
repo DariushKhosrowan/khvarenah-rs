@@ -143,6 +143,16 @@ pub struct KhvarenahApp {
     pub deep_timeout_s: u64,
     pub max_backoff_s: u64,
     pub timeouts_note: String,
+    // scheduled auto-backup (dormant → now wired into the daemon)
+    pub backup_auto_enabled: bool,
+    pub backup_auto_interval: u64,
+    pub backup_auto_keep: usize,
+    pub backup_auto_note: String,
+    // scheduled worker-signature rotation (dormant → now wired into daemon)
+    pub mutation_enabled: bool,
+    pub mutation_interval: u64,
+    pub mutation_rotate_path: bool,
+    pub mutation_note: String,
 }
 
 /// What to do when the open dialog submits.
@@ -316,6 +326,26 @@ impl KhvarenahApp {
             deep_timeout_s: profile.config.deep_timeout_secs,
             max_backoff_s: profile.config.max_backoff_secs,
             timeouts_note: String::new(),
+            backup_auto_enabled: profile.config.backup_autosync.enabled,
+            backup_auto_interval: if profile.config.backup_autosync.interval_secs > 0 {
+                profile.config.backup_autosync.interval_secs
+            } else {
+                khvarenah_core::backup_autosync::AUTOSYNC_INTERVAL_SECS
+            },
+            backup_auto_keep: if profile.config.backup_autosync.keep > 0 {
+                profile.config.backup_autosync.keep
+            } else {
+                khvarenah_core::backup_autosync::AUTOSYNC_KEEP
+            },
+            backup_auto_note: String::new(),
+            mutation_enabled: profile.config.mutation.enabled,
+            mutation_interval: if profile.config.mutation.interval_secs > 0 {
+                profile.config.mutation.interval_secs
+            } else {
+                86400
+            },
+            mutation_rotate_path: profile.config.mutation.rotate_path,
+            mutation_note: String::new(),
             hz_token: String::new(),
             hz_location: "nbg1".to_string(),
             hz_server_type: "cx22".to_string(),
@@ -380,6 +410,49 @@ impl KhvarenahApp {
         match khvarenah_core::store::profiles::save_profile(&p) {
             Ok(()) => self.timeouts_note = "Protection pacing saved to profile.".to_string(),
             Err(e) => self.timeouts_note = e.brief(),
+        }
+    }
+
+    /// Persist the scheduled auto-backup config. The daemon runs this every
+    /// tick (local disk work — even during a blackout), so enabling it here
+    /// fully removes the manual backup step.
+    fn save_backup_auto(&mut self) {
+        let mut p = khvarenah_core::store::profiles::load_profile(&self.profile_id);
+        let interval = self.backup_auto_interval.max(60);
+        let keep = self.backup_auto_keep.max(1);
+        p.config.backup_autosync.enabled = self.backup_auto_enabled;
+        p.config.backup_autosync.interval_secs = interval;
+        p.config.backup_autosync.keep = keep;
+        match khvarenah_core::store::profiles::save_profile(&p) {
+            Ok(()) => {
+                self.backup_auto_note = if self.backup_auto_enabled {
+                    format!("Auto-backup ON — every {interval}s, keeping {keep} copies.")
+                } else {
+                    "Auto-backup OFF.".to_string()
+                };
+            }
+            Err(e) => self.backup_auto_note = format!("Save failed: {}", e.brief()),
+        }
+    }
+
+    /// Persist the scheduled worker-signature rotation config. The daemon runs
+    /// this when the network is up (CF API redeploy), so enabling it here makes
+    /// the app a moving target against stateful DPI with zero manual steps.
+    fn save_mutation(&mut self) {
+        let mut p = khvarenah_core::store::profiles::load_profile(&self.profile_id);
+        let interval = self.mutation_interval.max(3600);
+        p.config.mutation.enabled = self.mutation_enabled;
+        p.config.mutation.interval_secs = interval;
+        p.config.mutation.rotate_path = self.mutation_rotate_path;
+        match khvarenah_core::store::profiles::save_profile(&p) {
+            Ok(()) => {
+                self.mutation_note = if self.mutation_enabled {
+                    format!("Signature rotation ON — every {interval}s ({}).", if self.mutation_rotate_path { "uuid + path" } else { "uuid only" })
+                } else {
+                    "Signature rotation OFF.".to_string()
+                };
+            }
+            Err(e) => self.mutation_note = format!("Save failed: {}", e.brief()),
         }
     }
 
@@ -1792,6 +1865,39 @@ impl KhvarenahApp {
 
         ui.add_space(10.0);
         ui.separator();
+        ui.heading(egui::RichText::new("Scheduled self-maintenance").color(GOLD));
+        ui.label("These run automatically in the daemon — no manual steps. Set them");
+        ui.label("once here and the app keeps itself backed up and hard to fingerprint.");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.backup_auto_enabled, "auto-backup");
+            ui.label("every");
+            ui.add(egui::DragValue::new(&mut self.backup_auto_interval).range(60..=604800));
+            ui.label("s, keep");
+            ui.add(egui::DragValue::new(&mut self.backup_auto_keep).range(1..=100));
+            ui.label("copies");
+            if ui.button("Save backup").clicked() {
+                self.save_backup_auto();
+            }
+        });
+        if !self.backup_auto_note.is_empty() {
+            ui.colored_label(GOLD, &self.backup_auto_note);
+        }
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.mutation_enabled, "rotate worker signature");
+            ui.label("every");
+            ui.add(egui::DragValue::new(&mut self.mutation_interval).range(3600..=604800));
+            ui.label("s");
+            ui.checkbox(&mut self.mutation_rotate_path, "path too");
+            if ui.button("Save rotation").clicked() {
+                self.save_mutation();
+            }
+        });
+        if !self.mutation_note.is_empty() {
+            ui.colored_label(GOLD, &self.mutation_note);
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
         ui.heading(egui::RichText::new("Zero-touch Hetzner VPS").color(GOLD));
         ui.label("No VPS yet? Paste a Hetzner Cloud API token and the app provisions");
         ui.label("a server, then deploys the DNS tunnel to it. (Read/write token.)");
@@ -1941,6 +2047,8 @@ impl KhvarenahApp {
                         khvarenah_core::journal::JournalKind::AccountBlocked => "⛔ account-blocked",
                         khvarenah_core::journal::JournalKind::TokenRecovered => "🔑 token-recovered",
                         khvarenah_core::journal::JournalKind::OutboxFlushed => "📤 outbox-flushed",
+                        khvarenah_core::journal::JournalKind::BackupWritten => "💾 backup-written",
+                        khvarenah_core::journal::JournalKind::MutationPerformed => "🔁 signature-rotated",
                     };
                     ui.label(format!("{label} — {} (t={})", e.detail, e.ts));
                 }

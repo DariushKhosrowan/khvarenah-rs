@@ -2507,6 +2507,8 @@ fn kind_label(k: khvarenah_core::journal::JournalKind) -> &'static str {
         JournalKind::AccountBlocked => "account-blocked",
         JournalKind::TokenRecovered => "token-recovered",
         JournalKind::OutboxFlushed => "outbox-flushed",
+        JournalKind::BackupWritten => "backup-written",
+        JournalKind::MutationPerformed => "signature-rotated",
     }
 }
 
