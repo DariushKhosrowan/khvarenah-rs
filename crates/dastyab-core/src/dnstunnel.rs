@@ -221,7 +221,9 @@ pub async fn probe_tunnel_live(
         return false;
     }
     let mut buf = [0u8; 512];
-    tokio::time::timeout(timeout, sock.recv(&mut buf)).await.is_ok()
+    tokio::time::timeout(timeout, sock.recv(&mut buf))
+        .await
+        .is_ok()
 }
 
 #[cfg(test)]

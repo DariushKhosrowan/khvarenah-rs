@@ -297,7 +297,15 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
         ) => {
             format!("🔄 Worker signature rotated: {old_worker} → {new_worker}")
         }
-        (BeaconEvent::AccountBlocked { state, auto_rotate_enabled, stored_tokens, .. }, crate::diagnose::Locale::Fa) => {
+        (
+            BeaconEvent::AccountBlocked {
+                state,
+                auto_rotate_enabled,
+                stored_tokens,
+                ..
+            },
+            crate::diagnose::Locale::Fa,
+        ) => {
             if *auto_rotate_enabled && *stored_tokens >= 2 {
                 format!(
                     "⛔ حساب مسدود شد ({state}) — {stored_tokens} توکن ذخیره‌شده است؛ چرخش خودکار فعال است و در چند لحظه تلاش می‌کند توکن سالم جایگزین کند"
@@ -313,14 +321,25 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
             }
         }
         (
-            BeaconEvent::AccountBlockedRotationExhausted { state, stored_tokens },
+            BeaconEvent::AccountBlockedRotationExhausted {
+                state,
+                stored_tokens,
+            },
             crate::diagnose::Locale::Fa,
         ) => {
             format!(
                 "⛔ حساب مسدود شد ({state}) — چرخش خودکار هر {stored_tokens} توکن ذخیره‌شده را آزمایش کرد و هیچ‌کدام تأیید نشد؛ با «dastyab token recover <label> <token>» توکن جدید اضافه کنید"
             )
         }
-        (BeaconEvent::AccountBlocked { state, auto_rotate_enabled, stored_tokens, .. }, _) => {
+        (
+            BeaconEvent::AccountBlocked {
+                state,
+                auto_rotate_enabled,
+                stored_tokens,
+                ..
+            },
+            _,
+        ) => {
             if *auto_rotate_enabled && *stored_tokens >= 2 {
                 format!(
                     "⛔ Account blocked ({state}) — {stored_tokens} tokens stored; auto-rotation is ON and will try to swap to a working token in moments"
@@ -335,20 +354,22 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
                 )
             }
         }
-        (BeaconEvent::AccountBlockedRotationExhausted { state, stored_tokens }, _) => {
+        (
+            BeaconEvent::AccountBlockedRotationExhausted {
+                state,
+                stored_tokens,
+            },
+            _,
+        ) => {
             format!(
                 "⛔ Account blocked ({state}) — auto-rotation tried all {stored_tokens} stored tokens and none verified; run `dastyab token recover <label> <token>` to add a fresh token and auto-resume"
             )
         }
         (BeaconEvent::TokenAutoRotated { from, to }, crate::diagnose::Locale::Fa) => {
-            format!(
-                "🔁 توکن به‌طور خودکار چرخید: {from} ← {to} — حفاظت بدون دخالت ادامه می‌یابد"
-            )
+            format!("🔁 توکن به‌طور خودکار چرخید: {from} ← {to} — حفاظت بدون دخالت ادامه می‌یابد")
         }
         (BeaconEvent::TokenAutoRotated { from, to }, _) => {
-            format!(
-                "🔁 Token auto-rotated: {from} → {to} — protection resumed with no manual step"
-            )
+            format!("🔁 Token auto-rotated: {from} → {to} — protection resumed with no manual step")
         }
         (BeaconEvent::NetworkDown { survival }, crate::diagnose::Locale::Fa) => {
             format!("🌑 شبکه قطع شد ({survival}) — حفاظت صبر می‌کند و هنگام بازگشت شبکه به‌طور خودکار ادامه می‌یابد")
@@ -359,7 +380,9 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
         (BeaconEvent::NetworkRestored, crate::diagnose::Locale::Fa) => {
             "✅ شبکه بازگشت — حفاظت خودکار از سر گرفته شد".to_string()
         }
-        (BeaconEvent::NetworkRestored, _) => "✅ Network restored — protection auto-resumed".to_string(),
+        (BeaconEvent::NetworkRestored, _) => {
+            "✅ Network restored — protection auto-resumed".to_string()
+        }
     }
 }
 
@@ -487,7 +510,11 @@ pub async fn send_with_failover(config: &BeaconConfig, message: &str) -> Result<
         }
     }
     Err(last_err.unwrap_or_else(|| {
-        CFError::new("Beacon", "no channel configured", "Enable notifications first.")
+        CFError::new(
+            "Beacon",
+            "no channel configured",
+            "Enable notifications first.",
+        )
     }))
 }
 
@@ -920,7 +947,11 @@ mod tests {
     fn failover_disabled_means_no_failover_chain() {
         let cfg = base_cfg(); // failover_enabled = false
         assert!(failover_config(&cfg).is_none());
-        assert_eq!(delivery_order(&cfg).len(), 1, "primary only when failover off");
+        assert_eq!(
+            delivery_order(&cfg).len(),
+            1,
+            "primary only when failover off"
+        );
     }
 
     #[test]
@@ -1004,13 +1035,19 @@ mod tests {
     #[test]
     fn network_event_kinds_map_to_own_rate_limit_class() {
         assert_eq!(
-            BeaconEvent::NetworkDown { survival: "x".into() }.kind(),
+            BeaconEvent::NetworkDown {
+                survival: "x".into()
+            }
+            .kind(),
             BeaconEventKind::NetworkDown
         );
         assert_eq!(
             BeaconEvent::NetworkRestored.kind(),
             BeaconEventKind::NetworkRestored
         );
-        assert_ne!(BeaconEventKind::NetworkDown, BeaconEventKind::NetworkRestored);
+        assert_ne!(
+            BeaconEventKind::NetworkDown,
+            BeaconEventKind::NetworkRestored
+        );
     }
 }
