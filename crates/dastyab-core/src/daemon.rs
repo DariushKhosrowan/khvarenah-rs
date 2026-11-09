@@ -781,11 +781,16 @@ pub async fn daemon_tick(
                 // Notify remotely on the transition into the blocked state (the
                 // daemon holds cycles silently; the user should be told why).
                 if !was_blocked {
+                    let p = crate::store::profiles::load_profile(profile);
+                    let stored_tokens = p.tokens.len();
+                    let auto_rotate_enabled = p.config.auto_rotate_on_blocked;
                     let _ = crate::remote_beacon::maybe_emit(
                         profile,
                         &crate::remote_beacon::BeaconEvent::AccountBlocked {
                             state: state.account_state.label().to_string(),
                             since: crate::store::now_ts() as i64,
+                            auto_rotate_enabled,
+                            stored_tokens,
                         },
                         crate::diagnose::Locale::En,
                     )
