@@ -1074,6 +1074,36 @@ impl Default for MonitorTimeouts {
     }
 }
 
+/// Absolute ceiling for an auto-extended deep budget (seconds). A degraded
+/// network gets up to 30 minutes for one deep pass before we consider it truly
+/// hung — past that, aborting and backing off is the honest call.
+pub const HARD_DEEP_TIME_CAP_SECS: u64 = 1800;
+
+/// Build the monitor's hard phase budgets from a profile config. Explicit user
+/// tuning (0 = system default) is respected for both phases. When `degraded`
+/// is true (the daemon's network tier is worse than Direct — DoH/DoT/DNS
+/// tunnel during a partial blackout), the DEEP budget is extended 2× so a
+/// slow-but-progressing censored pass is not aborted at the default 600s —
+/// capped at [`HARD_DEEP_TIME_CAP_SECS`] so a genuinely hung network still
+/// fails fast instead of stalling a whole backoff cycle.
+pub fn monitor_timeouts_from_config(
+    cfg: &crate::store::profiles::ProfileConfig,
+    degraded: bool,
+) -> MonitorTimeouts {
+    let base_deep = crate::store::profiles::effective_deep_timeout_secs(cfg);
+    let deep = if degraded {
+        base_deep.saturating_mul(2).min(HARD_DEEP_TIME_CAP_SECS)
+    } else {
+        base_deep
+    };
+    MonitorTimeouts {
+        light: std::time::Duration::from_secs(
+            crate::store::profiles::effective_light_timeout_secs(cfg),
+        ),
+        deep: std::time::Duration::from_secs(deep.max(1)),
+    }
+}
+
 /// Outcome of the monitor's LIGHT phase.
 #[derive(Debug, Clone)]
 pub enum LightOutcome {
@@ -3679,6 +3709,36 @@ mod tests {
             cfg_dir.display()
         );
         assert!(cfg_dir.join("fallbacks.txt").exists());
+    }
+
+    /// The tier-aware monitor budget builder: default config keeps system
+    /// defaults; a degraded tier (DoH/DoT/DNS tunnel) doubles the deep budget
+    /// (capped at 1800s) so a slow-but-progressing censored pass isn't aborted
+    /// at 600s; explicit user tuning is honored.
+    #[test]
+    fn monitor_timeouts_from_config_respects_tier_and_user() {
+        let cfg = crate::store::profiles::ProfileConfig::default();
+        let normal = monitor_timeouts_from_config(&cfg, false);
+        assert_eq!(normal.light.as_secs(), 120);
+        assert_eq!(normal.deep.as_secs(), 600);
+
+        // Degraded tier doubles the deep budget (600 → 1200).
+        let degraded = monitor_timeouts_from_config(&cfg, true);
+        assert_eq!(degraded.deep.as_secs(), 1200);
+
+        // Explicit user deep budget overrides, and degraded still doubles then
+        // caps at HARD_DEEP_TIME_CAP_SECS (1800).
+        let mut user = cfg;
+        user.deep_timeout_secs = 1000;
+        let u = monitor_timeouts_from_config(&user, false);
+        assert_eq!(u.deep.as_secs(), 1000);
+        let ud = monitor_timeouts_from_config(&user, true);
+        assert_eq!(ud.deep.as_secs(), 1800); // 2000 capped → 1800
+
+        // Explicit light budget is honored directly.
+        user.light_timeout_secs = 30;
+        let ul = monitor_timeouts_from_config(&user, false);
+        assert_eq!(ul.light.as_secs(), 30);
     }
 
     /// ACCEPTANCE (the round's deliverable): a slow deep discovery that runs

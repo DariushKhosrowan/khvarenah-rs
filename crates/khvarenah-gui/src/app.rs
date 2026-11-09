@@ -133,6 +133,11 @@ pub struct KhvarenahApp {
     pub drill_output: String,
     // protection daemon control
     pub daemon_note: String,
+    // blackout-resilience pacing (per-profile, 0 = system default)
+    pub light_timeout_s: u64,
+    pub deep_timeout_s: u64,
+    pub max_backoff_s: u64,
+    pub timeouts_note: String,
 }
 
 /// What to do when the open dialog submits.
@@ -271,6 +276,10 @@ impl KhvarenahApp {
             desync_note: String::new(),
             drill_output: String::new(),
             daemon_note: String::new(),
+            light_timeout_s: profile.config.light_timeout_secs,
+            deep_timeout_s: profile.config.deep_timeout_secs,
+            max_backoff_s: profile.config.max_backoff_secs,
+            timeouts_note: String::new(),
             hz_token: String::new(),
             hz_location: "nbg1".to_string(),
             hz_server_type: "cx22".to_string(),
@@ -321,6 +330,20 @@ impl KhvarenahApp {
         khvarenah_core::stealth::set_enabled(self.stealth_enabled);
         if let Err(e) = save_config(&self.profile_id, &cfg) {
             self.note = e.brief();
+        }
+    }
+
+    /// Persist blackout-resilience pacing (monitor light/deep budgets + the
+    /// backoff ceiling). 0 on each field means "system default". The daemon
+    /// reads these every tick, so changes apply without a restart.
+    fn save_timeouts(&mut self) {
+        let mut p = khvarenah_core::store::profiles::load_profile(&self.profile_id);
+        p.config.light_timeout_secs = self.light_timeout_s;
+        p.config.deep_timeout_secs = self.deep_timeout_s;
+        p.config.max_backoff_secs = self.max_backoff_s;
+        match khvarenah_core::store::profiles::save_profile(&p) {
+            Ok(()) => self.timeouts_note = "Protection pacing saved to profile.".to_string(),
+            Err(e) => self.timeouts_note = e.brief(),
         }
     }
 
@@ -1593,6 +1616,30 @@ impl KhvarenahApp {
         });
         if !self.daemon_note.is_empty() {
             ui.colored_label(GOLD, &self.daemon_note);
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading(egui::RichText::new("Protection pacing / blackout").color(GOLD));
+        ui.label("Tune how the daemon behaves on a slow or partially-blocked network.");
+        ui.label("0 = system default. The daemon reads these every tick — no restart.");
+        ui.horizontal(|ui| {
+            ui.label("Light check (s):");
+            ui.add(egui::DragValue::new(&mut self.light_timeout_s).range(0..=3600));
+            ui.label("Deep check (s):");
+            ui.add(egui::DragValue::new(&mut self.deep_timeout_s).range(0..=3600));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Max backoff (s):");
+            ui.add(egui::DragValue::new(&mut self.max_backoff_s).range(0..=86400));
+            if ui.button("Save pacing").clicked() {
+                self.save_timeouts();
+            }
+        });
+        ui.label("On a degraded tier the deep budget is auto-extended 2× (capped at");
+        ui.label("1800s). Lower 'Max backoff' so a long blackout re-rotates faster.");
+        if !self.timeouts_note.is_empty() {
+            ui.colored_label(GOLD, &self.timeouts_note);
         }
 
         ui.add_space(10.0);

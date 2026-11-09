@@ -1017,9 +1017,9 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                 khvarenah_core::autopilot::DiscoveryParams::default(),
                 std::time::Duration::from_secs(300),
             );
-            let summary = engine
-                .monitor_cycle_guarded(khvarenah_core::autopilot::MonitorTimeouts::default())
-                .await?;
+            let cfg = khvarenah_core::store::profiles::load_profile(profile).config;
+            let timeouts = khvarenah_core::autopilot::monitor_timeouts_from_config(&cfg, false);
+            let summary = engine.monitor_cycle_guarded(timeouts).await?;
             println!("{}", summary.note);
             Ok(())
         }
