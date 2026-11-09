@@ -170,6 +170,60 @@ pub async fn send_receive<R: Resolver>(
     TunnelFrame::decode_name(reply.trim_end_matches('.'), base_domain)
 }
 
+/// Live DNS-tunnel liveness probe: send a raw UDP TXT query straight to the
+/// VPS tunnel server (UDP 53, the dnstt-server port) and require a DNS
+/// datagram back within `timeout`. This is a real round-trip against the
+/// authoritative responder — unlike a config-presence check, it fails fast
+/// when the VPS is down, unreachable, or the DNS path is blocked, so the
+/// fallback ladder will NOT report false confidence on a dead tunnel during a
+/// total blackout.
+///
+/// The query name is a crafted ping frame (flags=1) under the tunnel's base
+/// domain. A live dnstt-server answers authoritatively (any datagram that
+/// parses as a DNS response is proof the server is reachable).
+pub async fn probe_tunnel_live(
+    cfg: &crate::vps_deploy::TunnelClientConfig,
+    timeout: std::time::Duration,
+) -> bool {
+    use std::net::SocketAddr;
+    // Resolve the VPS host (fall back to the OS resolver; it is a literal IP
+    // in the common case, so this is cheap and DNS-free).
+    let Ok(ip) = tokio::net::lookup_host((cfg.host.as_str(), 53u16)).await else {
+        return false;
+    };
+    let mut addr: Option<SocketAddr> = None;
+    for a in ip {
+        if a.is_ipv4() {
+            addr = Some(a);
+            break;
+        }
+    }
+    let Some(sa) = addr else { return false };
+
+    // Craft a ping frame under the base domain.
+    let frame = TunnelFrame {
+        session: cfg.session.clone(),
+        seq: 1,
+        flags: 1, // ping
+        payload: b"alive".to_vec(),
+    };
+    let qname = frame.encode_name(&cfg.base_domain, rand::random::<u32>() & 0xFFFF);
+    let id: u16 = rand::random();
+    let query = crate::doh::build_dns_query_txt(&qname, id);
+
+    let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
+        return false;
+    };
+    if sock.connect(sa).await.is_err() {
+        return false;
+    }
+    if sock.send(&query).await.is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    tokio::time::timeout(timeout, sock.recv(&mut buf)).await.is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

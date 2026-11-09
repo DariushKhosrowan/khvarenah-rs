@@ -275,14 +275,30 @@ async fn probe_dot() -> ProbeVerdict {
 }
 
 async fn probe_tunnel(profile: &str) -> ProbeVerdict {
-    if crate::vps_deploy::is_dns_tunnel_configured(profile) {
-        // Honest scope: we verify configuration presence, not a live server
-        // round-trip (that would require a live authoritative responder).
-        ProbeVerdict::up("dns-tunnel configured")
-    } else {
-        ProbeVerdict::down("no tunnel configured")
+    match crate::vps_deploy::load_tunnel_client_config(profile) {
+        None => ProbeVerdict::down("no tunnel configured"),
+        Some(cfg) => {
+            // Live round-trip against the authoritative tunnel server. This
+            // replaces the old "config presence only" check, so a dead /
+            // unreachable VPS no longer reports a false "tunnel up" during a
+            // total blackout. Timeout is short — the tunnel is a last-resort
+            // tier, so a slow answer is treated as down.
+            if crate::dnstunnel::probe_tunnel_live(
+                &cfg,
+                std::time::Duration::from_millis(TUNNEL_PROBE_TIMEOUT_MS),
+            )
+            .await
+            {
+                ProbeVerdict::up("dns-tunnel live")
+            } else {
+                ProbeVerdict::down("dns-tunnel unreachable")
+            }
+        }
     }
 }
+
+/// Timeout for the live DNS-tunnel round-trip probe.
+const TUNNEL_PROBE_TIMEOUT_MS: u64 = 2500;
 
 /// Real ladder probe wiring the four tiers to their actual transports. Borrows
 /// a profile id and the DoH resolver (both owned by the caller / daemon).
