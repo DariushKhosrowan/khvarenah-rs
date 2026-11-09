@@ -76,6 +76,7 @@ pub mod status;
 pub mod stealth;
 pub mod store;
 pub mod tls;
+pub mod token_rotate;
 pub mod vless;
 pub mod vps_deploy;
 pub mod vps_provision;
