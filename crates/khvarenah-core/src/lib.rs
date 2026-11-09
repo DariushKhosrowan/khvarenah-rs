@@ -34,6 +34,7 @@
 #[cfg(feature = "dev-mock")]
 pub mod mock_worker;
 
+pub mod account_state;
 pub mod analytics;
 pub mod autopilot;
 pub mod backup;

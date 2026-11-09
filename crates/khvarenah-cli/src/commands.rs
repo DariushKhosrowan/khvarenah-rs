@@ -255,6 +255,11 @@ fn cmd_health(profile: &str, json: bool) -> Result<(), CFError> {
         }
     );
     println!("  worker:       {}", beacon.worker_health);
+    let dstate = khvarenah_core::daemon::load_daemon_state(profile);
+    println!("  account:      {}", dstate.account_state.label());
+    if let Some(since) = dstate.account_state.since() {
+        println!("  account since: {} (waiting for reactivation)", since);
+    }
     println!(
         "  active:       {}",
         beacon.active_endpoint.as_deref().unwrap_or("-")
@@ -1246,6 +1251,7 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
     save_daemon_state(&cfg.profile, &state)?;
 
     let probe = RealNetworkProbe(khvarenah_core::doh::DohResolver::new());
+    let acct = RealAccountProbe;
     let cycle = RealCycleRunner;
     let mut interval = cfg.initial_interval_secs;
     // The profile the daemon is currently driving. Cross-worker failover may
@@ -1306,7 +1312,7 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
             }
         }
 
-        let sleep = daemon_tick(&active_profile, &mut state, &probe, &cycle, &mut |line| {
+        let sleep = daemon_tick(&active_profile, &mut state, &probe, &acct, &cycle, &mut |line| {
             daemon_log_append(&cfg.log_path, line)
         })
         .await;
@@ -1411,6 +1417,10 @@ async fn cmd_daemon(profile: &str, action: DaemonAction) -> Result<(), CFError> 
             println!("  failure streak: {}", state.failure_streak);
             println!("  current interval: {}s", state.current_interval_secs);
             println!("  network was down: {}", state.network_was_down);
+            println!("  account: {}", state.account_state.label());
+            if let Some(since) = state.account_state.since() {
+                println!("  account blocked since: {} (waiting for reactivation)", since);
+            }
             Ok(())
         }
         DaemonAction::InstallSystemd => {

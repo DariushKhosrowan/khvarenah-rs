@@ -1,0 +1,247 @@
+//! Account-level state machine for the daemon: detect and wait out a
+//! Cloudflare account suspension (CF error 9109 "User was deactivated") or a
+//! token-invalid state, and automatically resume when the account is restored.
+//!
+//! ## Why this exists
+//!
+//! The daemon's cycle runner assumes the account/token is fine and just burns
+//! backoff cycles when it is not. The single largest remaining *silent* manual
+//! step is: the user reactivates their CF account, then must remember to
+//! restart the daemon. This module lets the daemon notice the suspension on its
+//! own, enter a low-cost wait state, poll at a fixed interval, and resume the
+//! moment the account is back.
+//!
+//! ## Key distinction (verified against live evidence)
+//!
+//! CF error **9109 "User was deactivated"** is an *account-level* blocker
+//! (`GET /accounts` fails), distinct from a token-invalid 403 from
+//! `/user/tokens/verify`. We must not classify a deactivated account as a
+//! malformed token, and vice-versa. See `rounds-11-13` references.
+//!
+//! The classifier is pure (`classify_verify_response`) so every branch is unit
+//! testable without touching the network.
+
+use crate::error::CFError;
+
+/// Persisted account state (serde-default so old configs load cleanly).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AccountState {
+    /// No suspension/invalid-state detected — the daemon should run cycles.
+    Active,
+    /// Account is deactivated (CF 9109). Store when we entered the wait.
+    Suspended { since: i64 },
+    /// Token is invalid/rejected (403), not an account-level blocker.
+    TokenInvalid { since: i64 },
+    /// We could not determine the state (network error / unknown response).
+    Unknown,
+}
+
+impl Default for AccountState {
+    fn default() -> Self {
+        AccountState::Active
+    }
+}
+
+impl AccountState {
+    /// Whether the daemon should skip cycles in this state.
+    pub fn blocks_cycle(&self) -> bool {
+        matches!(
+            self,
+            AccountState::Suspended { .. } | AccountState::TokenInvalid { .. }
+        )
+    }
+
+    /// A short human-readable label (used by CLI/` daemon status` and GUI).
+    pub fn label(&self) -> &'static str {
+        match self {
+            AccountState::Active => "active",
+            AccountState::Suspended { .. } => "suspended",
+            AccountState::TokenInvalid { .. } => "token-invalid",
+            AccountState::Unknown => "unknown",
+        }
+    }
+
+    /// `since` timestamp (epoch seconds) if this state carries one.
+    pub fn since(&self) -> Option<i64> {
+        match self {
+            AccountState::Suspended { since } | AccountState::TokenInvalid { since } => {
+                Some(*since)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// How often the daemon re-checks account status while in a wait state.
+pub const ACCOUNT_POLL_INTERVAL_SECS: u64 = 900; // 15 min
+
+/// Pure classifier over the two clues we can get from Cloudflare.
+///
+/// * `verify_ok` — did `GET /user/tokens/verify` succeed (200 → token valid)?
+/// * `accounts_err` — the error returned by `GET /accounts`, if any.
+///
+/// Returns the account state. Order of checks matters:
+/// 1. If the token verify failed with a non-9109 error → TokenInvalid.
+/// 2. If the accounts call failed with 9109 / "deactivated" → Suspended.
+/// 3. If either call failed for a network reason → Unknown.
+/// 4. Otherwise → Active.
+pub fn classify_verify_response(verify_ok: bool, accounts_err: Option<&CFError>) -> AccountState {
+    if !verify_ok {
+        // Token-level failure. 9109 from verify is still a token problem
+        // (malformed/rejected token), not an account deactivation — the
+        // account-level 9109 only surfaces on /accounts.
+        return AccountState::TokenInvalid { since: crate::store::now_ts() as i64 };
+    }
+
+    match accounts_err {
+        None => AccountState::Active,
+        Some(err) => {
+            let msg = format!("{} {}", err.title, err.detail).to_lowercase();
+            let code_is_9109 = err.code == Some(9109);
+            let says_deactivated = msg.contains("9109") || msg.contains("deactivated");
+            if code_is_9109 || says_deactivated {
+                AccountState::Suspended { since: crate::store::now_ts() as i64 }
+            } else {
+                // Some other /accounts failure — not a verdict we can trust to
+                // block cycles, but it's not a clean Active either.
+                AccountState::Unknown
+            }
+        }
+    }
+}
+
+/// True when `now` is at least `ACCOUNT_POLL_INTERVAL_SECS` after `last_poll`.
+pub fn should_poll_account(last_poll_ts: i64, now: i64) -> bool {
+    now - last_poll_ts >= ACCOUNT_POLL_INTERVAL_SECS as i64
+}
+
+/// A pure decision returned by the account gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountGate {
+    /// Account is fine — proceed with the cycle.
+    Proceed,
+    /// Account is suspended/invalid — skip the cycle, poll again later.
+    SkipStillBlocked,
+    /// We couldn't determine account state — skip rather than burn budget.
+    SkipUnknown,
+}
+
+impl AccountGate {
+    pub fn is_proceed(&self) -> bool {
+        matches!(self, AccountGate::Proceed)
+    }
+}
+
+/// Check whether a cached profile dir mtime changed since `last_mtime`.
+/// Returns true when the profile dir (config/token/state) was modified.
+pub fn profile_mtime_changed(profile_id: &str, last_mtime: i64) -> Result<bool, CFError> {
+    let dir = crate::store::profiles::profile_dir(profile_id);
+    let meta = std::fs::metadata(&dir).map_err(|e| {
+        CFError::new("Storage", format!("Cannot stat {}: {e}", dir.display()), "")
+    })?;
+    let mtime = meta
+        .modified()
+        .map_err(|e| CFError::new("Storage", format!("mtime: {e}"), ""))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(mtime != last_mtime)
+}
+
+/// Probe the real account state using Cloudflare's API for the given profile
+/// (uses the profile's active token). Pure classification happens in
+/// [`classify_verify_response`]; this only gathers the two clues.
+pub async fn probe_account_state(profile_id: &str) -> AccountState {
+    // Fetch the active token for the profile.
+    let token = match crate::store::profiles::get_active_token(profile_id) {
+        Ok(Some(tok)) => tok,
+        Ok(None) => {
+            // No token → nothing to verify. Treat as Unknown rather than
+            // blocking the daemon (a token may be added later on).
+            return AccountState::Unknown;
+        }
+        Err(_) => return AccountState::Unknown,
+    };
+
+    let client = crate::cf::Client::new(&token);
+
+    // Clue 1: is the token itself valid?
+    let verify_ok = match client.verify_token().await {
+        Ok(_) => true,
+        Err(_) => false,
+    };
+
+    // Clue 2: is the account reachable? 9109 / "deactivated" → Suspended.
+    let accounts_err = match client.list_accounts().await {
+        Ok(_) => None,
+        Err(e) => Some(e),
+    };
+
+    classify_verify_response(verify_ok, accounts_err.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err_with_code(code: Option<u32>, title: &str, detail: &str) -> CFError {
+        let mut e = CFError::new(title, detail, "");
+        e.code = code;
+        e
+    }
+
+    #[test]
+    fn classify_9109_is_suspended() {
+        let err = err_with_code(Some(9109), "Invalid API token", "User was deactivated");
+        let st = classify_verify_response(true, Some(&err));
+        assert!(matches!(st, AccountState::Suspended { .. }));
+        assert!(st.blocks_cycle());
+    }
+
+    #[test]
+    fn classify_deactivated_string_is_suspended_even_without_code() {
+        let err = err_with_code(None, "Error", "User was deactivated");
+        let st = classify_verify_response(true, Some(&err));
+        assert!(matches!(st, AccountState::Suspended { .. }));
+    }
+
+    #[test]
+    fn classify_token_403_is_invalid() {
+        let err = err_with_code(Some(403), "Forbidden", "Invalid API token");
+        let st = classify_verify_response(false, Some(&err));
+        assert!(matches!(st, AccountState::TokenInvalid { .. }));
+        assert!(st.blocks_cycle());
+    }
+
+    #[test]
+    fn classify_network_is_unknown() {
+        let err = err_with_code(None, "network", "connection reset");
+        let st = classify_verify_response(true, Some(&err));
+        assert!(matches!(st, AccountState::Unknown));
+        assert!(!st.blocks_cycle());
+    }
+
+    #[test]
+    fn classify_all_ok_is_active() {
+        let st = classify_verify_response(true, None);
+        assert_eq!(st, AccountState::Active);
+        assert!(!st.blocks_cycle());
+    }
+
+    #[test]
+    fn should_poll_at_interval() {
+        let t0 = 1_000_000i64;
+        assert!(!should_poll_account(t0, t0 + 899));
+        assert!(should_poll_account(t0, t0 + 900));
+        assert!(should_poll_account(t0, t0 + 5000));
+    }
+
+    #[test]
+    fn label_and_since_are_truthful() {
+        let s = AccountState::Suspended { since: 42 };
+        assert_eq!(s.label(), "suspended");
+        assert_eq!(s.since(), Some(42));
+        assert_eq!(AccountState::Active.label(), "active");
+        assert_eq!(AccountState::Active.since(), None);
+    }
+}

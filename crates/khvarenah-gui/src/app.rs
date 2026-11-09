@@ -704,6 +704,21 @@ impl KhvarenahApp {
         });
         ui.add_space(4.0);
         ui.label(egui::RichText::new(&self.autopilot_status).color(TEXT));
+        // Account-level notice (daemon state): if the CF account is
+        // suspended/invalid, surface it inline so the user knows the
+        // daemon is waiting — not broken.
+        let dstate = khvarenah_core::daemon::load_daemon_state(&self.profile_id);
+        if dstate.account_state.blocks_cycle() {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "⚠ Account {} — daemon is waiting (polling every 15 min). Reactivate at dash.cloudflare.com."
+                    , dstate.account_state.label()
+                ))
+                .color(GOLD)
+                .heading(),
+            );
+        }
         // User-facing bundle quick actions.
         if let Ok(dir) = khvarenah_core::cleanip::user_config_dir(&self.profile_id) {
             ui.horizontal(|ui| {
