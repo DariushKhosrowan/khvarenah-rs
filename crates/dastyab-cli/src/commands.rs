@@ -107,6 +107,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::Routes { action } => routes(profile, action).await,
         Command::Export { format, output } => export_cmd(profile, &format, output).await,
         Command::Backup { action } => backup(profile, action),
+        Command::Mutation { action } => cmd_mutation(profile, action),
         Command::Analytics => analytics(profile).await,
         Command::Diag { endpoints } => diag(&endpoints).await,
         Command::Security => security_audit(),
@@ -808,6 +809,48 @@ fn backup(profile: String, action: BackupAction) -> Result<(), CFError> {
                 dastyab_core::backup::backup_dir().display()
             );
             println!("  (daemon snapshots the profile on this schedule; run `daemon status` to see last backup)");
+        }
+    }
+    Ok(())
+}
+
+/// Configure / show the scheduled worker-signature rotation (anti-DPI moving
+/// target). The daemon redeploys the worker with a fresh UUID/path on the
+/// interval, so enabling this here removes the manual redeploy step.
+fn cmd_mutation(profile: String, action: crate::MutationAction) -> Result<(), CFError> {
+    use dastyab_core::store::profiles::{load_profile, save_profile};
+    match action {
+        crate::MutationAction::Status => {
+            let p = load_profile(&profile);
+            let c = &p.config.mutation;
+            println!(
+                "Signature rotation: enabled={} interval={}s rotate_path={}",
+                c.enabled, c.interval_secs, c.rotate_path
+            );
+            println!("  (daemon rotates on this schedule when the network is up)");
+        }
+        crate::MutationAction::Configure {
+            disable,
+            interval,
+            no_path,
+        } => {
+            let mut p = load_profile(&profile);
+            p.config.mutation.enabled = !disable;
+            if let Some(i) = interval {
+                p.config.mutation.interval_secs = i.max(3600);
+            }
+            if no_path {
+                p.config.mutation.rotate_path = false;
+            } else if !disable {
+                p.config.mutation.rotate_path = true;
+            }
+            let c = &p.config.mutation;
+            save_profile(&p)?;
+            println!(
+                "✓ Signature rotation: enabled={} interval={}s rotate_path={}",
+                c.enabled, c.interval_secs, c.rotate_path
+            );
+            println!("  (daemon redeploys the worker with a fresh UUID on this schedule)");
         }
     }
     Ok(())
