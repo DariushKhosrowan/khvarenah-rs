@@ -1105,6 +1105,36 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                                 }
                             );
                         }
+                        // Success-side stratification: which ClientHello profile ×
+                        // SNI layer actually got accepted probes. A profile with
+                        // few/zero successes while others succeed is a blacklisted
+                        // fingerprint — rotate it / enable desync.
+                        if !diag.success_by_profile.is_empty() {
+                            println!("\n  ClientHello-profile successes (profile × SNI layer):");
+                            let mut rows: Vec<_> = diag.success_by_profile.iter().collect();
+                            rows.sort_by(|a, b| b.1.cmp(a.1));
+                            for ((profile, layer), count) in rows {
+                                println!("    {profile:?} × {layer:?}: {count}");
+                            }
+                            let total_success: u32 = diag.success_by_profile.values().sum();
+                            let min_count = diag.success_by_profile.values().min().copied().unwrap_or(0);
+                            if total_success > 0 {
+                                let low = diag
+                                    .success_by_profile
+                                    .iter()
+                                    .filter(|(_, c)| **c < total_success / 2)
+                                    .map(|((p, _), _)| format!("{:?}", p))
+                                    .collect::<Vec<_>>();
+                                if !low.is_empty() {
+                                    println!(
+                                        "  Note: profile(s) with below-median success: {} — consider rotating away from a blacklisted fingerprint.",
+                                        low.join(", ")
+                                    );
+                                } else if min_count > 0 {
+                                    println!("  Note: all profiles have success ≥ median; fingerprint spread looks healthy.");
+                                }
+                            }
+                        }
                     }
                 } else {
                     println!("  (no last-diagnostics file for profile {profile})");
