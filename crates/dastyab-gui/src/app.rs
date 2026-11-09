@@ -123,6 +123,12 @@ pub struct DastYabApp {
     // multi-worker parallel redundancy config
     pub mw_count: usize,
     pub mw_note: String,
+    // anti-DPI TCP desync fragmenter config
+    pub desync_enabled: bool,
+    pub desync_min: usize,
+    pub desync_max: usize,
+    pub desync_delay_us: u64,
+    pub desync_note: String,
 }
 
 /// What to do when the open dialog submits.
@@ -251,6 +257,11 @@ impl DastYabApp {
             vps_port: 22,
             vps_domain: String::new(),
             vps_note: String::new(),
+            desync_enabled: profile.config.desync.enabled,
+            desync_min: profile.config.desync.min_fragment,
+            desync_max: profile.config.desync.max_fragment,
+            desync_delay_us: profile.config.desync.inter_fragment_delay_us,
+            desync_note: String::new(),
             hz_token: String::new(),
             hz_location: "nbg1".to_string(),
             hz_server_type: "cx22".to_string(),
@@ -301,6 +312,29 @@ impl DastYabApp {
         dastyab_core::stealth::set_enabled(self.stealth_enabled);
         if let Err(e) = save_config(&self.profile_id, &cfg) {
             self.note = e.brief();
+        }
+    }
+
+    /// Persist the anti-DPI desync fragmenter config (loads the current profile
+    /// config so every other field is preserved).
+    fn save_desync(&mut self) {
+        let mut p = dastyab_core::store::profiles::load_profile(&self.profile_id);
+        let min = self.desync_min.max(1);
+        p.config.desync.enabled = self.desync_enabled;
+        p.config.desync.min_fragment = min;
+        p.config.desync.max_fragment = self.desync_max.max(min);
+        p.config.desync.inter_fragment_delay_us = self.desync_delay_us;
+        match dastyab_core::store::profiles::save_profile(&p) {
+            Ok(()) => {
+                dastyab_core::desync::apply_from_profile(&self.profile_id);
+                self.desync_note = if self.desync_enabled {
+                    "Desync fragmentation ON. Next scan will write WS upgrades as irregular segments."
+                        .to_string()
+                } else {
+                    "Desync fragmentation OFF.".to_string()
+                };
+            }
+            Err(e) => self.desync_note = format!("Save failed: {}", e.brief()),
         }
     }
 
@@ -1361,6 +1395,31 @@ impl DastYabApp {
         });
         if !self.vps_note.is_empty() {
             ui.colored_label(GOLD, &self.vps_note);
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading(egui::RichText::new("Anti-DPI desync").color(GOLD));
+        ui.label("Stateful DPI can reassemble the WS-upgrade request and reset the");
+        ui.label("connection. Writing it as irregular segments makes that impossible.");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.desync_enabled, "fragment WS-upgrade writes");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Min fragment (B):");
+            ui.add(egui::DragValue::new(&mut self.desync_min).range(1..=512));
+            ui.label("Max fragment (B):");
+            ui.add(egui::DragValue::new(&mut self.desync_max).range(1..=1024));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Inter-fragment delay (us):");
+            ui.add(egui::DragValue::new(&mut self.desync_delay_us).range(0..=100000));
+            if ui.button("Save desync config").clicked() {
+                self.save_desync();
+            }
+        });
+        if !self.desync_note.is_empty() {
+            ui.colored_label(GOLD, &self.desync_note);
         }
 
         ui.add_space(10.0);

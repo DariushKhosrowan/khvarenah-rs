@@ -160,6 +160,9 @@ pub struct ProfileConfig {
     /// Multi-worker parallel redundancy set (round 19).
     #[serde(default)]
     pub worker_set: crate::multi_worker::WorkerSet,
+    /// Anti-DPI TCP desync fragmenter (round 21). Disabled by default.
+    #[serde(default)]
+    pub desync: crate::desync::DesyncConfig,
 }
 
 fn default_light_interval() -> u64 {
@@ -195,6 +198,7 @@ impl Default for ProfileConfig {
             backup_autosync: crate::backup_autosync::BackupAutoSyncConfig::default(),
             last_mutation_ts: 0,
             worker_set: crate::multi_worker::WorkerSet::default(),
+            desync: crate::desync::DesyncConfig::default(),
         }
     }
 }

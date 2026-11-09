@@ -395,6 +395,8 @@ async fn discover_native(
     params: &DiscoveryParams,
     profile_id: &str,
 ) -> Result<Vec<CleanEndpoint>, CFError> {
+    // Apply the profile's anti-DPI desync config for this discovery cycle.
+    crate::desync::apply_from_profile(profile_id);
     let target = crate::health::derive_ws_target(vless);
     let sni = target.sni.clone();
     let path = target.path.clone();
@@ -1200,6 +1202,8 @@ impl AutopilotEngine {
         params: &DiscoveryParams,
     ) -> Result<(Vec<CleanEndpoint>, CycleSummary), CFError> {
         use crate::cycle_guard::{mark_stage, CycleStage};
+        // Apply the profile's anti-DPI desync config for this cycle.
+        crate::desync::apply_from_profile(&self.profile_id);
         // Stage markers let a guarded (timed-out) cycle report where it hung.
         mark_stage(&self.profile_id, CycleStage::Reconcile)?;
         // Self-heal the user-facing bundle against the ledger first (never
@@ -2909,6 +2913,10 @@ mod tests {
         assert_eq!(p.config.last_redeploy_ts, 0);
         assert_eq!(p.config.last_rescue_attempt_ts, 0);
         assert!(p.config.last_rescue_outcome.is_none());
+        // The desync field also migrates (serde-default → disabled).
+        assert!(!p.config.desync.enabled);
+        assert!(p.config.desync.min_fragment > 0);
+        assert!(p.config.desync.max_fragment > 0);
     }
 
     /// A scripted peer for the rescue chain (no network).
