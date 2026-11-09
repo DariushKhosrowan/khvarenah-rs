@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::{is_daemon_running, is_linger_enabled, DaemonConfig};
+use crate::error::CFError;
 use crate::store::profiles::Profile;
 
 /// Readiness of a single safeguard.
@@ -65,6 +66,40 @@ pub struct CheckItem {
     pub fix: String,
     /// Machine hint for a one-click config fix, when applicable.
     pub fix_action: Option<FixAction>,
+}
+
+/// Apply a config-only fix to a profile in place. Mirrors the GUI's
+/// one-click toggles so the same state is reachable headlessly from the CLI
+/// (scriptable). Returns the fix applied; a no-op if already satisfied.
+///
+/// `EnableDaemon` is intentionally NOT handled here — it needs the current
+/// executable path and network/systemd interaction (see `bootstrap`).
+pub fn apply_fix(profile: &mut Profile, fix: FixAction) -> Result<FixAction, CFError> {
+    match fix {
+        FixAction::EnableBackupAutoSync => {
+            profile.config.backup_autosync.enabled = true;
+            if profile.config.backup_autosync.interval_secs == 0 {
+                profile.config.backup_autosync.interval_secs = 3600;
+            }
+            if profile.config.backup_autosync.keep == 0 {
+                profile.config.backup_autosync.keep = 5;
+            }
+        }
+        FixAction::EnableSignatureMutation => {
+            profile.config.mutation.enabled = true;
+            if profile.config.mutation.interval_secs == 0 {
+                profile.config.mutation.interval_secs = 86400;
+            }
+        }
+        FixAction::EnableDaemon => {
+            return Err(CFError::new(
+                "EnableDaemon unsupported in apply_fix",
+                "This fix requires bootstrap::ensure_daemon_installed",
+                "Run `khvarenah up` or use the GUI Autonomy panel.",
+            ));
+        }
+    }
+    Ok(fix)
 }
 
 /// The full readiness report for a profile.
@@ -324,6 +359,39 @@ mod tests {
         assert_eq!(backup.fix_action, None);
         let mutation = r.items.iter().find(|i| i.code == "mutation").unwrap();
         assert_eq!(mutation.status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn apply_fix_enables_backup_and_mutation() {
+        let mut p = fresh_profile();
+        assert!(!p.config.backup_autosync.enabled);
+        assert!(!p.config.mutation.enabled);
+
+        apply_fix(&mut p, FixAction::EnableBackupAutoSync).unwrap();
+        assert!(p.config.backup_autosync.enabled);
+        // Preserves the existing (default) interval/keep rather than clobbering
+        // a user-configured schedule.
+        assert_eq!(p.config.backup_autosync.interval_secs, 86400);
+        assert_eq!(p.config.backup_autosync.keep, 7);
+
+        apply_fix(&mut p, FixAction::EnableSignatureMutation).unwrap();
+        assert!(p.config.mutation.enabled);
+        assert_eq!(p.config.mutation.interval_secs, 86400);
+
+        // Audit now reports both config fixes as OK (other safeguards like the
+        // daemon/token may still need action on a fresh profile, so check the
+        // specific items, not the whole report).
+        let r = run_audit(&p);
+        let backup = r.items.iter().find(|i| i.code == "backup").unwrap();
+        assert_eq!(backup.status, CheckStatus::Ok);
+        let mutation = r.items.iter().find(|i| i.code == "mutation").unwrap();
+        assert_eq!(mutation.status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn apply_fix_daemon_returns_error() {
+        let mut p = fresh_profile();
+        assert!(apply_fix(&mut p, FixAction::EnableDaemon).is_err());
     }
 
     #[test]

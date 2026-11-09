@@ -437,6 +437,25 @@ pub enum AutonomyAction {
     /// (MANUAL). Exit code 0 when everything is hands-off, 1 otherwise — so
     /// it is scriptable for a remote check.
     Audit,
+    /// Apply a config-only safeguard fix directly (no human input needed):
+    /// `backup` enables scheduled auto-backup, `mutation` enables worker-
+    /// signature rotation. Prints the re-run audit afterwards and exits 0
+    /// when all config ACTION items are cleared.
+    Fix {
+        /// Which config-only fix to apply.
+        #[arg()]
+        what: FixWhat,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone)]
+pub enum FixWhat {
+    /// Enable scheduled auto-backup (daily snapshots, keep 5).
+    Backup,
+    /// Enable worker-signature rotation (anti-DPI moving target, daily).
+    Mutation,
+    /// Apply every config-only fix that resolves an ACTION item.
+    All,
 }
 
 #[derive(Subcommand)]
