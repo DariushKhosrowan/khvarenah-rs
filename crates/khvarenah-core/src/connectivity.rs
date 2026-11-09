@@ -137,6 +137,42 @@ impl<P: Probe> FallbackLadder<P> {
         self.current
     }
 
+    /// Probe an arbitrary tier without mutating ladder state. Used to verify a
+    /// tier we just descended to (e.g. the daemon's liveness probe deciding
+    /// whether the network is up after a descend).
+    pub async fn probe_tier(&self, tier: Tier) -> ProbeVerdict {
+        self.probe.probe(tier).await
+    }
+
+    /// Network-liveness query backed by ladder state. Polls the current tier and
+    /// descends (statefully) when it fails; if a lower tier works we report it
+    /// as the surviving tier. When the current tier is dead and nothing lower
+    /// works, it sweeps the whole ladder best-first so a recovered higher tier is
+    /// adopted again. Returns `(up, best_reachable_tier)`.
+    pub async fn liveness_status(&mut self) -> (bool, Option<Tier>) {
+        // 1. Current tier still healthy?
+        if self.poll().await {
+            return (true, Some(self.current));
+        }
+        // 2. We may have descended — does the new current tier actually work?
+        if self.probe_tier(self.current).await.ok {
+            return (true, Some(self.current));
+        }
+        // 3. Full sweep best-first (climb back to any recovered higher tier, or
+        //    accept a lower one). Adopt the first working tier found.
+        for tier in TIER_ORDER.iter().copied() {
+            if tier == self.current {
+                continue;
+            }
+            if self.probe_tier(tier).await.ok {
+                self.current = tier;
+                self.fails_in_row = 0;
+                return (true, Some(tier));
+            }
+        }
+        (false, None)
+    }
+
     /// Probe the current tier. Returns true if it still works; if it has
     /// failed `max_fails` times in a row, descend one step and return false.
     pub async fn poll(&mut self) -> bool {
@@ -265,6 +301,31 @@ impl Probe for RealLadderProbe<'_> {
             Tier::DnsTunnel => {
                 let profile = self.profile;
                 Box::pin(async move { probe_tunnel(profile).await })
+            }
+        }
+    }
+}
+
+/// Owned variant of `RealLadderProbe` with no borrows — used by the daemon to
+/// hold a persistent, stateful `FallbackLadder` across ticks. Owns the profile
+/// id and the DoH resolver so the ladder can live as long as the daemon.
+pub struct OwnedLadderProbe {
+    pub profile: String,
+    pub resolver: crate::doh::DohResolver,
+}
+
+impl Probe for OwnedLadderProbe {
+    fn probe(&self, tier: Tier) -> Pin<Box<dyn Future<Output = ProbeVerdict> + Send + '_>> {
+        match tier {
+            Tier::Direct => Box::pin(async move { probe_direct().await }),
+            Tier::DoH => {
+                let resolver = &self.resolver;
+                Box::pin(async move { probe_doh(resolver).await })
+            }
+            Tier::DoT => Box::pin(async move { probe_dot().await }),
+            Tier::DnsTunnel => {
+                let profile = self.profile.clone();
+                Box::pin(async move { probe_tunnel(&profile).await })
             }
         }
     }
