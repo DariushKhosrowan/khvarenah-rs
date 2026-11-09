@@ -48,6 +48,8 @@ pub enum FixAction {
     EnableBackupAutoSync,
     /// Turn on worker-signature rotation (`mutation.enabled`).
     EnableSignatureMutation,
+    /// Install + start the systemd daemon with boot-before-login linger.
+    EnableDaemon,
 }
 
 /// One row of the autonomy checklist.
@@ -92,6 +94,11 @@ pub fn run_audit(profile: &Profile) -> AutonomyReport {
     // 1. Daemon running (protection / self-heal).
     let cfg = DaemonConfig::new(&profile.meta.id);
     let running = is_daemon_running(&cfg.pid_file);
+    let daemon_fix = if running {
+        None
+    } else {
+        Some(FixAction::EnableDaemon)
+    };
     items.push(CheckItem {
         code: "daemon".into(),
         status: if running {
@@ -106,7 +113,7 @@ pub fn run_audit(profile: &Profile) -> AutonomyReport {
             "no protection loop running — nothing self-heals".into()
         },
         fix: "`khvarenah daemon install-systemd` + `daemon start`, or `khvarenah up`".into(),
-        fix_action: None,
+        fix_action: daemon_fix,
     });
 
     // 2. Boot-before-login autostart (loginctl linger) — survives blackout reboot.
@@ -288,7 +295,7 @@ mod tests {
             .items
             .iter()
             .any(|i| i.code == "token_rotate" && i.status == CheckStatus::Action));
-        // backup + mutation are config-only fixes the GUI can apply.
+        // backup + mutation are config/one-click fixes the GUI can apply.
         let backup = r.items.iter().find(|i| i.code == "backup").unwrap();
         assert_eq!(backup.fix_action, Some(FixAction::EnableBackupAutoSync));
         let mutation = r.items.iter().find(|i| i.code == "mutation").unwrap();
@@ -296,6 +303,9 @@ mod tests {
             mutation.fix_action,
             Some(FixAction::EnableSignatureMutation)
         );
+        // The daemon check is environment-dependent (real pid file), so we only
+        // assert it *exists* here — not its status.
+        assert!(r.items.iter().any(|i| i.code == "daemon"));
     }
 
     #[test]
