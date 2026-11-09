@@ -1484,6 +1484,22 @@ async fn daemon_loop(cfg: dastyab_core::daemon::DaemonConfig) -> Result<(), CFEr
         .await;
         save_daemon_state(&active_profile, &state)?;
 
+        // Flush the beacon outbox: any alert queued during a blackout /
+        // blocked channel is delivered now that we reached a cycle (network is
+        // up). Best-effort — never fail the loop.
+        {
+            let flushed = dastyab_core::remote_beacon::flush_outbox(&active_profile).await;
+            if flushed > 0 {
+                daemon_log_append(
+                    &cfg.log_path,
+                    &log_line(
+                        "INFO",
+                        &format!("beacon outbox flushed {flushed} queued alert(s)"),
+                    ),
+                );
+            }
+        }
+
         // Profile config hot-reload (round 22): if the profile dir mtime
         // changed since we last looked (Settings edited, token/state files
         // updated), log a reload notice and reset the interval so the new
@@ -2081,10 +2097,13 @@ async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CF
             }
             println!("  target:       {}", cfg.chat_id_or_url);
             println!("  rate limit:   {}s/event class", cfg.rate_limit_secs);
+            let queued = dastyab_core::remote_beacon::load_outbox(profile).len();
+            println!("  outbox:       {} queued alert(s) awaiting delivery", queued);
             println!("  ---");
             println!("  configure:   dastyab beacon telegram <token> <chat-id>");
             println!("               dastyab beacon webhook <url>");
             println!("  enable:      dastyab beacon enable");
+            println!("  flush:       dastyab beacon flush  (deliver queued alerts now)");
             Ok(())
         }
         crate::BeaconAction::Enable => {
@@ -2145,6 +2164,19 @@ async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CF
             let msg = "✅ DastYab test notification — protection is working.";
             dastyab_core::remote_beacon::send(&cfg, msg).await?;
             println!("Test message sent.");
+            Ok(())
+        }
+        crate::BeaconAction::Flush => {
+            let queued = dastyab_core::remote_beacon::load_outbox(profile).len();
+            if queued == 0 {
+                println!("Outbox is empty — nothing to flush.");
+                return Ok(());
+            }
+            let sent = dastyab_core::remote_beacon::flush_outbox(profile).await;
+            let remaining = dastyab_core::remote_beacon::load_outbox(profile).len();
+            println!(
+                "Flushed {sent}/{queued} queued alert(s); {remaining} still queued."
+            );
             Ok(())
         }
     }

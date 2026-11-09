@@ -36,6 +36,8 @@ pub struct GuiState {
     pub tokens: Vec<TokenSummary>,
     /// Label of the profile's active token (for deploy/scan + stroke).
     pub active_token_label: Option<String>,
+    /// Number of undelivered beacon alerts (outbox) for the active profile.
+    pub beacon_outbox: usize,
     /// Set when a background mutation completes; the next frame calls reload.
     pub reload_pending: bool,
 }
@@ -74,6 +76,8 @@ impl GuiState {
             .collect();
 
         self.active_token_label = get_active_token(&active).unwrap_or(None);
+
+        self.beacon_outbox = dastyab_core::remote_beacon::load_outbox(&active).len();
 
         self.reload_pending = false;
     }
