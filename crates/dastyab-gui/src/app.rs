@@ -129,6 +129,8 @@ pub struct DastYabApp {
     pub desync_max: usize,
     pub desync_delay_us: u64,
     pub desync_note: String,
+    // blackout drill output (self-test of the fallback ladder)
+    pub drill_output: String,
     // protection daemon control
     pub daemon_note: String,
 }
@@ -264,6 +266,7 @@ impl DastYabApp {
             desync_max: profile.config.desync.max_fragment,
             desync_delay_us: profile.config.desync.inter_fragment_delay_us,
             desync_note: String::new(),
+            drill_output: String::new(),
             daemon_note: String::new(),
             hz_token: String::new(),
             hz_location: "nbg1".to_string(),
@@ -698,6 +701,8 @@ impl DastYabApp {
                         self.autopilot_status = summary.clone();
                         self.autopilot_on = true;
                         self.refresh_diagnostics();
+                    } else if task == "blackout-drill" {
+                        self.drill_output = summary.clone();
                     } else {
                         self.note = format!("✓ {task}: {summary}");
                     }
@@ -1333,6 +1338,35 @@ impl DastYabApp {
         }
     }
 
+    /// Run the blackout self-test: probe each fallback-ladder rung
+    /// (Direct → DoH → DoT → DNS tunnel) with the real transports and render a
+    /// per-tier verdict. This is the GUI twin of `dastyab drill`.
+    fn run_blackout_drill(&mut self) {
+        let pid = self.profile_id.clone();
+        let tx = self.tx.clone();
+        let tx2 = tx.clone();
+        bridge::spawn("blackout-drill", tx, async move {
+            use dastyab_core::connectivity::{drill_all_tiers, RealLadderProbe};
+            let resolver = dastyab_core::doh::DohResolver::new();
+            let report = drill_all_tiers(RealLadderProbe { profile: &pid, resolver: &resolver }).await;
+            let mut out = String::from("Blackout drill — fallback ladder (top-down):\n");
+            let mut survivors = 0;
+            for (tier, verdict) in report {
+                let mark = if verdict.ok { "OK" } else { "FAIL" };
+                out.push_str(&format!("  {mark}  {}  {}\n", tier.label(), verdict.note));
+                if verdict.ok {
+                    survivors += 1;
+                }
+            }
+            out.push_str(&format!("{survivors} of 4 tiers reachable."));
+            let _ = tx2.send(crate::bridge::UiEvent::Done {
+                task: "blackout-drill".to_string(),
+                summary: out,
+            });
+            Ok::<String, CFError>("blackout-drill done".to_string())
+        });
+    }
+
     /// Refresh the daemon status line in the Blackout settings section.
     fn daemon_status_line(&self) -> String {
         let cfg = dastyab_core::daemon::DaemonConfig::new(&self.profile_id);
@@ -1459,6 +1493,22 @@ impl DastYabApp {
         });
         if !self.vps_note.is_empty() {
             ui.colored_label(GOLD, &self.vps_note);
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("🏥 Blackout self-test").clicked() {
+                self.run_blackout_drill();
+            }
+        });
+        if !self.drill_output.is_empty() {
+            ui.add(
+                egui::TextEdit::multiline(&mut self.drill_output)
+                    .desired_rows(6)
+                    .desired_width(420.0)
+                    .font(egui::TextStyle::Monospace)
+                    .interactive(false),
+            );
         }
 
         ui.add_space(10.0);
