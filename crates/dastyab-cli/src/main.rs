@@ -265,6 +265,12 @@ enum Command {
         #[command(subcommand)]
         action: MultiWorkerAction,
     },
+    /// Durable daemon journal: blackout/rescue/outbox events recorded across
+    /// crashes and restarts. The blackout-resilience audit trail.
+    Journal {
+        #[command(subcommand)]
+        action: JournalAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -340,6 +346,21 @@ pub enum MultiWorkerAction {
         #[arg()]
         name: String,
     },
+}
+
+/// Durable daemon journal actions.
+#[derive(Subcommand)]
+pub enum JournalAction {
+    /// Show the most recent journal entries (newest first).
+    Show {
+        /// Number of entries to print (default 20).
+        #[arg(long, default_value_t = 20)]
+        n: usize,
+    },
+    /// Show only unresolved intents (e.g. a blackout that never saw a restore).
+    Pending,
+    /// Clear the journal.
+    Clear,
 }
 
 #[derive(Subcommand)]

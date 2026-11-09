@@ -143,6 +143,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::SniSpoof { action } => cmd_sni_spoof(&profile, action).await,
         Command::DnsTunnel { action } => cmd_dns_tunnel(&profile, action).await,
         Command::MultiWorker { action } => cmd_multi_worker(&profile, action).await,
+        Command::Journal { action } => cmd_journal(&profile, action),
     }
 }
 
@@ -2459,6 +2460,61 @@ async fn cmd_multi_worker(profile: &str, action: crate::MultiWorkerAction) -> Re
             Ok(())
         }
     }
+}
+
+/// Show / drain / clear the durable daemon journal.
+fn cmd_journal(profile: &str, action: crate::JournalAction) -> Result<(), CFError> {
+    match action {
+        crate::JournalAction::Show { n } => {
+            let entries = dastyab_core::journal::recent(profile, n);
+            if entries.is_empty() {
+                println!("Journal is empty for profile '{profile}'.");
+                return Ok(());
+            }
+            println!("Journal for profile '{profile}' (newest first):");
+            for e in &entries {
+                println!("  [{}] {} — {}", fmt_ts(e.ts), kind_label(e.kind), e.detail);
+            }
+            Ok(())
+        }
+        crate::JournalAction::Pending => {
+            let pending = dastyab_core::journal::pending_drain(profile);
+            if pending.is_empty() {
+                println!("No unresolved intents for profile '{profile}'.");
+                return Ok(());
+            }
+            println!("Unresolved intents for profile '{profile}':");
+            for e in &pending {
+                println!("  [{}] {} — {}", fmt_ts(e.ts), kind_label(e.kind), e.detail);
+            }
+            Ok(())
+        }
+        crate::JournalAction::Clear => {
+            dastyab_core::journal::clear(profile)?;
+            println!("Journal cleared for profile '{profile}'.");
+            Ok(())
+        }
+    }
+}
+
+fn kind_label(k: dastyab_core::journal::JournalKind) -> &'static str {
+    use dastyab_core::journal::JournalKind;
+    match k {
+        JournalKind::NetworkDown => "network-down",
+        JournalKind::NetworkUp => "network-up",
+        JournalKind::RescueAttempt => "rescue",
+        JournalKind::CycleFailed => "cycle-failed",
+        JournalKind::AccountBlocked => "account-blocked",
+        JournalKind::TokenRecovered => "token-recovered",
+        JournalKind::OutboxFlushed => "outbox-flushed",
+    }
+}
+
+fn fmt_ts(ts: i64) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = write!(out, "{ts}");
+    out
 }
 
 #[cfg(test)]

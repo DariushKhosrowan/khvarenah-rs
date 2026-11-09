@@ -2190,6 +2190,11 @@ pub async fn rescue_from_failure(
             cfg.last_redeploy_ts,
             Some("recovered".into()),
         )?;
+        let _ = crate::journal::append(
+            profile_id,
+            crate::journal::JournalKind::RescueAttempt,
+            "recovered",
+        );
         return Ok(chain);
     }
     chain.attempts.push(RescueAttempt {
@@ -2220,6 +2225,11 @@ pub async fn rescue_from_failure(
                 cfg.last_redeploy_ts,
                 Some("recovered".into()),
             )?;
+            let _ = crate::journal::append(
+                profile_id,
+                crate::journal::JournalKind::RescueAttempt,
+                "recovered",
+            );
             return Ok(chain);
         }
         Ok((_, summary)) => {
@@ -2273,6 +2283,11 @@ pub async fn rescue_from_failure(
                     cfg.last_redeploy_ts,
                     Some("recovered".into()),
                 )?;
+                let _ = crate::journal::append(
+                    profile_id,
+                    crate::journal::JournalKind::RescueAttempt,
+                    "recovered",
+                );
                 return Ok(chain);
             }
             Ok((_, summary)) => {
@@ -2328,6 +2343,11 @@ pub async fn rescue_from_failure(
                             now,
                             Some("recovered".into()),
                         )?;
+                        let _ = crate::journal::append(
+                            profile_id,
+                            crate::journal::JournalKind::RescueAttempt,
+                            "recovered",
+                        );
                         return Ok(chain);
                     }
                     Ok((_, summary)) => {
@@ -2365,6 +2385,11 @@ pub async fn rescue_from_failure(
         }
         // Record the redeploy attempt timestamp regardless of outcome.
         crate::store::profiles::save_rescue_meta(profile_id, now, now, Some("gave_up".into()))?;
+        let _ = crate::journal::append(
+            profile_id,
+            crate::journal::JournalKind::RescueAttempt,
+            "gave_up",
+        );
     }
 
     // Step 5 — FailoverWorkerSet. Before giving up on the whole profile, try
@@ -2469,6 +2494,11 @@ pub async fn rescue_from_failure(
         cfg.last_redeploy_ts,
         Some("gave_up".into()),
     )?;
+    let _ = crate::journal::append(
+        profile_id,
+        crate::journal::JournalKind::RescueAttempt,
+        "gave_up",
+    );
     Ok(chain)
 }
 
