@@ -240,6 +240,11 @@ enum Command {
         #[command(subcommand)]
         action: DnsTunnelAction,
     },
+    /// Multi-worker parallel redundancy (deploy/probe/failover a worker set).
+    MultiWorker {
+        #[command(subcommand)]
+        action: MultiWorkerAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -293,6 +298,27 @@ pub enum DnsTunnelAction {
         /// VPS TCP port (SSH).
         #[arg(long, default_value_t = 22)]
         port: u16,
+    },
+}
+
+/// Multi-worker parallel redundancy actions.
+#[derive(Subcommand)]
+pub enum MultiWorkerAction {
+    /// Ensure the profile has `count` deployed workers (parallel deploy).
+    Deploy {
+        /// Number of workers to maintain (default 2, max 3).
+        #[arg(long, default_value_t = 2)]
+        count: usize,
+    },
+    /// List the worker set with their health.
+    Status,
+    /// Probe all workers and fail over to the healthiest alive one.
+    Failover,
+    /// Force the active worker selection to a specific worker name.
+    SetActive {
+        /// Worker name to make active.
+        #[arg()]
+        name: String,
     },
 }
 

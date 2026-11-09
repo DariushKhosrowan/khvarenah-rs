@@ -136,6 +136,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::Beacon { action } => cmd_beacon(&profile, action).await,
         Command::SniSpoof { action } => cmd_sni_spoof(&profile, action).await,
         Command::DnsTunnel { action } => cmd_dns_tunnel(&profile, action).await,
+        Command::MultiWorker { action } => cmd_multi_worker(&profile, action).await,
     }
 }
 
@@ -2071,6 +2072,86 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
             } else {
                 println!("Deploy completed but the tunnel service did not report active. Check the VPS manually.");
             }
+            Ok(())
+        }
+    }
+}
+
+/// Multi-worker parallel redundancy CLI surface.
+async fn cmd_multi_worker(profile: &str, action: crate::MultiWorkerAction) -> Result<(), CFError> {
+    use khvarenah_core::multi_worker::{RealWorkerPeer, WorkerSet};
+    match action {
+        crate::MultiWorkerAction::Status => {
+            let set: WorkerSet = khvarenah_core::store::profiles::load_profile(profile).config.worker_set;
+            if set.is_empty() {
+                println!(
+                    "No worker set configured for profile '{profile}'. Run: khvarenah multi-worker deploy --count 2"
+                );
+                return Ok(());
+            }
+            println!("Worker set for profile '{profile}':");
+            for w in &set.workers {
+                let marker = if w.active { "*" } else { " " };
+                println!(
+                    "  {marker} {} (host: {}, uuid: …{})",
+                    w.name,
+                    w.host,
+                    w.uuid.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>()
+                );
+            }
+            println!("(active worker marked with *)");
+            Ok(())
+        }
+        crate::MultiWorkerAction::Deploy { count } => {
+            let p = khvarenah_core::store::profiles::load_profile(profile);
+            let acc_id = if p.config.active_account.is_empty() {
+                return Err(CFError::new(
+                    "multi-worker",
+                    "No active account.",
+                    "Run `khvarenah up` or set an active account first.",
+                ));
+            } else {
+                p.config.active_account.clone()
+            };
+            let peer = RealWorkerPeer;
+            println!("Deploying up to {count} workers in parallel...");
+            let set = khvarenah_core::multi_worker::deploy_worker_in_parallel(
+                &peer,
+                profile,
+                &acc_id,
+                "",
+                count.max(1),
+            )
+            .await?;
+            println!("Worker set now holds {} worker(s):", set.len());
+            for w in &set.workers {
+                println!("  - {} ({})", w.name, w.host);
+            }
+            Ok(())
+        }
+        crate::MultiWorkerAction::Failover => {
+            let peer = RealWorkerPeer;
+            let changed = khvarenah_core::multi_worker::failover_worker_set(&peer, profile).await?;
+            let set: WorkerSet = khvarenah_core::store::profiles::load_profile(profile).config.worker_set;
+            if changed {
+                println!("Failover: switched active worker to '{}'.", set.active_worker().map(|w| w.name.as_str()).unwrap_or("none"));
+            } else {
+                println!("Failover: active worker unchanged ('{}').", set.active_worker().map(|w| w.name.as_str()).unwrap_or("none"));
+            }
+            Ok(())
+        }
+        crate::MultiWorkerAction::SetActive { name } => {
+            let mut p = khvarenah_core::store::profiles::load_profile(profile);
+            if p.config.worker_set.get(&name).is_none() {
+                return Err(CFError::new(
+                    "multi-worker",
+                    format!("Worker '{name}' not in the set."),
+                    "List workers with `khvarenah multi-worker status`.",
+                ));
+            }
+            p.config.worker_set.set_active(&name);
+            khvarenah_core::store::profiles::save_profile(&p)?;
+            println!("Active worker set to '{name}'.");
             Ok(())
         }
     }

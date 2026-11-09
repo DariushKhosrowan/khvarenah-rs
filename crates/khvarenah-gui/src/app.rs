@@ -120,6 +120,9 @@ pub struct KhvarenahApp {
     pub hz_token: String,
     pub hz_location: String,
     pub hz_server_type: String,
+    // multi-worker parallel redundancy config
+    pub mw_count: usize,
+    pub mw_note: String,
 }
 
 /// What to do when the open dialog submits.
@@ -251,6 +254,8 @@ impl KhvarenahApp {
             hz_token: String::new(),
             hz_location: "nbg1".to_string(),
             hz_server_type: "cx22".to_string(),
+            mw_count: 2,
+            mw_note: String::new(),
             view: View::DeployScan,
         };
         app.refresh_diagnostics();
@@ -515,6 +520,59 @@ impl KhvarenahApp {
                 }
             }
             Ok::<String, CFError>("hz-provision done".to_string())
+        });
+    }
+
+    /// Deploy/maintain the multi-worker redundancy set from inside the app.
+    fn deploy_multi_worker(&mut self) {
+        let count = self.mw_count.clamp(1, 3);
+        let pid = self.profile_id.clone();
+        let tx = self.tx.clone();
+        self.running.push("multi-worker".to_string());
+        self.mw_note = format!("Deploying up to {count} workers…");
+        let tx2 = tx.clone();
+        bridge::spawn("multi-worker", tx.clone(), async move {
+            let p = khvarenah_core::store::profiles::load_profile(&pid);
+            let acc_id = if p.config.active_account.is_empty() {
+                None
+            } else {
+                Some(p.config.active_account.clone())
+            };
+            let result = match acc_id {
+                Some(acc) => {
+                    let peer = khvarenah_core::multi_worker::RealWorkerPeer;
+                    khvarenah_core::multi_worker::deploy_worker_in_parallel(
+                        &peer, &pid, &acc, "", count,
+                    )
+                    .await
+                }
+                None => Err(CFError::new(
+                    "multi-worker",
+                    "No active account for this profile.",
+                    "Run `khvarenah up` or set an active account first.",
+                )),
+            };
+            match result {
+                Ok(set) => {
+                    let list = set
+                        .workers
+                        .iter()
+                        .map(|w| w.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = tx2.send(crate::bridge::UiEvent::Log {
+                        task: "multi-worker".to_string(),
+                        line: format!("[multi-worker] set now: {list}"),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
+                        task: "multi-worker".to_string(),
+                        error: CFError::new("multi-worker", e.brief(), "Check the active token/account."),
+                    });
+                }
+            }
+            Ok::<String, CFError>("multi-worker done".to_string())
         });
     }
 
@@ -1322,6 +1380,22 @@ impl KhvarenahApp {
         });
         if ui.button("Provision VPS + deploy tunnel").clicked() {
             self.provision_vps_tunnel();
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading(egui::RichText::new("Multi-worker redundancy").color(GOLD));
+        ui.label("Deploy several workers in parallel so one worker dying doesn't");
+        ui.label("kill your tunnel. The daemon auto-fails-over to a healthy standby.");
+        ui.horizontal(|ui| {
+            ui.label("Workers to keep:");
+            ui.add(egui::DragValue::new(&mut self.mw_count).range(1..=3));
+            if ui.button("Deploy / maintain worker set").clicked() {
+                self.deploy_multi_worker();
+            }
+        });
+        if !self.mw_note.is_empty() {
+            ui.colored_label(GOLD, &self.mw_note);
         }
     }
 

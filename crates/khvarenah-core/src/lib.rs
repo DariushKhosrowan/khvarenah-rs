@@ -47,6 +47,7 @@ pub mod cleanip;
 pub mod connectivity;
 pub mod cycle_guard;
 pub mod config_mutation;
+pub mod multi_worker;
 pub mod daemon;
 pub mod diagnose;
 pub mod diagnostics;
