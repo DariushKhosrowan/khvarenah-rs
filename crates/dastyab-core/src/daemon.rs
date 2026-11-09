@@ -557,6 +557,18 @@ pub async fn daemon_tick(
                 crate::journal::JournalKind::NetworkDown,
                 plan.label(),
             );
+            // Notify remotely that the network went dark. During a total
+            // blackout this send fails and the alert is queued to the durable
+            // outbox, delivered automatically when the network returns — so
+            // the user learns about the blackout even if it has already ended.
+            let _ = crate::remote_beacon::maybe_emit(
+                profile,
+                &crate::remote_beacon::BeaconEvent::NetworkDown {
+                    survival: plan.label().to_string(),
+                },
+                crate::diagnose::Locale::En,
+            )
+            .await;
         }
         return NETWORK_DOWN_SLEEP_SECS;
     }
@@ -643,6 +655,12 @@ pub async fn daemon_tick(
         // current (possibly backed-off) interval for the *next* failure.
         state.network_was_down = false;
         let _ = crate::journal::append(profile, crate::journal::JournalKind::NetworkUp, "");
+        let _ = crate::remote_beacon::maybe_emit(
+            profile,
+            &crate::remote_beacon::BeaconEvent::NetworkRestored,
+            crate::diagnose::Locale::En,
+        )
+        .await;
         // Still run a cycle now.
         state.last_cycle_ts = crate::store::now_ts() as i64;
         match cycle.run_cycle(profile, false, timeouts).await {
