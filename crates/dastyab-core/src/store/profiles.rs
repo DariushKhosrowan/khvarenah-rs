@@ -163,10 +163,62 @@ pub struct ProfileConfig {
     /// Anti-DPI TCP desync fragmenter (round 21). Disabled by default.
     #[serde(default)]
     pub desync: crate::desync::DesyncConfig,
+    /// Monitor LIGHT-phase budget in seconds (WS-gate sweep). 0 = system default
+    /// (`cycle_guard::MONITOR_TIMEOUT_SECS`, 120). Configurable in-app so a
+    /// degraded network can use a tighter budget and fail fast.
+    #[serde(default)]
+    pub light_timeout_secs: u64,
+    /// Monitor DEEP-phase (discovery+E2E) budget in seconds. 0 = system default
+    /// (`cycle_guard::DISCOVERY_TIMEOUT_SECS`, 600). On a degraded tier the
+    /// daemon also auto-caps this (see `effective_deep_timeout_from_tier`).
+    #[serde(default)]
+    pub deep_timeout_secs: u64,
+    /// Daemon backoff ceiling in seconds. 0 = system default
+    /// (`daemon::DEFAULT_MAX_INTERVAL_SECS`, 21600 = 6h). Lower it to make the
+    /// daemon re-rotate faster during a long blackout instead of pausing
+    /// protection for hours.
+    #[serde(default)]
+    pub max_backoff_secs: u64,
 }
 
 fn default_light_interval() -> u64 {
     300
+}
+
+/// Effective monitor light-phase budget (seconds) for a profile config. A
+/// zero/absent value falls back to the system default
+/// (`cycle_guard::MONITOR_TIMEOUT_SECS`). Configured in-app (GUI Settings /
+/// CLI `timeouts`).
+pub fn effective_light_timeout_secs(c: &ProfileConfig) -> u64 {
+    if c.light_timeout_secs > 0 {
+        c.light_timeout_secs
+    } else {
+        crate::cycle_guard::MONITOR_TIMEOUT_SECS
+    }
+}
+
+/// Effective monitor deep-phase budget (seconds) for a profile config. A
+/// zero/absent value falls back to the system default
+/// (`cycle_guard::DISCOVERY_TIMEOUT_SECS`). The daemon further auto-caps this
+/// on degraded tiers (see `autopilot::effective_deep_timeout_from_tier`).
+pub fn effective_deep_timeout_secs(c: &ProfileConfig) -> u64 {
+    if c.deep_timeout_secs > 0 {
+        c.deep_timeout_secs
+    } else {
+        crate::cycle_guard::DISCOVERY_TIMEOUT_SECS
+    }
+}
+
+/// Effective daemon backoff ceiling (seconds) for a profile config. A
+/// zero/absent value falls back to the system default
+/// (`daemon::DEFAULT_MAX_INTERVAL_SECS`, 6h). Lowering this makes the daemon
+/// re-rotate faster during a long blackout.
+pub fn effective_max_backoff_secs(c: &ProfileConfig) -> u64 {
+    if c.max_backoff_secs > 0 {
+        c.max_backoff_secs
+    } else {
+        crate::daemon::DEFAULT_MAX_INTERVAL_SECS
+    }
 }
 
 impl Default for ProfileConfig {
@@ -199,6 +251,9 @@ impl Default for ProfileConfig {
             last_mutation_ts: 0,
             worker_set: crate::multi_worker::WorkerSet::default(),
             desync: crate::desync::DesyncConfig::default(),
+            light_timeout_secs: 0,
+            deep_timeout_secs: 0,
+            max_backoff_secs: 0,
         }
     }
 }
@@ -915,6 +970,48 @@ mod tests {
             add_token(&id, "cf-main", "secret-token").unwrap();
             let p2 = load_profile(&id);
             assert_eq!(p2.tokens.get("cf-main").unwrap().token, "secret-token");
+        });
+    }
+
+    /// New blackout-resilience config fields must default to 0 (= system
+    /// default) and survive a save/load round-trip against an OLD config that
+    /// predates them (serde-default migration).
+    #[test]
+    fn profile_config_migrates_new_timeout_fields() {
+        with_home(|| {
+            let id = create_profile("cfg", "").unwrap();
+            // Simulate an old config file without the new fields.
+            let dir = profile_dir(&id);
+            crate::store::write_json(
+                &dir.join("config.json"),
+                &serde_json::json!({
+                    "scan_count": 42,
+                    "protection_enabled": true,
+                }),
+            )
+            .unwrap();
+            let mut p = load_profile(&id);
+            assert_eq!(p.config.scan_count, 42);
+            assert!(p.config.protection_enabled);
+            // New fields default to 0 → effective = system default.
+            assert_eq!(p.config.light_timeout_secs, 0);
+            assert_eq!(p.config.deep_timeout_secs, 0);
+            assert_eq!(p.config.max_backoff_secs, 0);
+            assert_eq!(
+                effective_light_timeout_secs(&p.config),
+                crate::cycle_guard::MONITOR_TIMEOUT_SECS
+            );
+            assert_eq!(
+                effective_deep_timeout_secs(&p.config),
+                crate::cycle_guard::DISCOVERY_TIMEOUT_SECS
+            );
+            assert_eq!(effective_max_backoff_secs(&p.config), 21600);
+            // Setting a value persists and is honored.
+            p.config.deep_timeout_secs = 900;
+            save_profile(&p).unwrap();
+            let p2 = load_profile(&id);
+            assert_eq!(p2.config.deep_timeout_secs, 900);
+            assert_eq!(effective_deep_timeout_secs(&p2.config), 900);
         });
     }
 

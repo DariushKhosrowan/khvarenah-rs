@@ -239,8 +239,7 @@ pub fn backoff_for_failure(current: u64, max: u64, e: &CFError) -> u64 {
         // daemon that escalated before this fix — or during a long partial
         // blackout — converges back to prompt recovery instead of lingering at
         // 6h).
-        backoff_next(current, max.min(TIMEOUT_BACKOFF_CAP_SECS))
-            .min(TIMEOUT_BACKOFF_CAP_SECS)
+        backoff_next(current, max.min(TIMEOUT_BACKOFF_CAP_SECS)).min(TIMEOUT_BACKOFF_CAP_SECS)
     } else {
         backoff_next(current, max)
     }
@@ -441,6 +440,7 @@ pub trait CycleRunner: Send + Sync {
         &self,
         profile: &str,
         follow: bool,
+        timeouts: crate::autopilot::MonitorTimeouts,
     ) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>>;
 }
 
@@ -474,6 +474,7 @@ impl CycleRunner for RealCycleRunner {
         &self,
         profile: &str,
         _follow: bool,
+        timeouts: crate::autopilot::MonitorTimeouts,
     ) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>> {
         let profile = profile.to_string();
         Box::pin(async move {
@@ -483,10 +484,7 @@ impl CycleRunner for RealCycleRunner {
                 params,
                 std::time::Duration::from_secs(DEFAULT_INITIAL_INTERVAL_SECS),
             );
-            engine
-                .monitor_cycle_guarded(crate::autopilot::MonitorTimeouts::default())
-                .await
-                .map(|_| ())
+            engine.monitor_cycle_guarded(timeouts).await.map(|_| ())
         })
     }
 }
@@ -507,6 +505,19 @@ pub async fn daemon_tick(
     let status = probe.liveness().await;
     let net_up = status.up;
     state.network_tier = status.tier_label();
+
+    // Per-profile blackout-resilience knobs (0 on each = system default):
+    // monitor light/deep phase budgets + the backoff ceiling. On a degraded
+    // tier (worse than Direct — partial blackout) the deep budget is
+    // auto-extended so a slow-but-progressing censored pass isn't aborted at
+    // the default 600s.
+    let cfg = crate::store::profiles::load_profile(profile).config;
+    let max_backoff = crate::store::profiles::effective_max_backoff_secs(&cfg);
+    let degraded = status
+        .tier
+        .map(|t| t != crate::connectivity::Tier::Direct)
+        .unwrap_or(false);
+    let timeouts = crate::autopilot::monitor_timeouts_from_config(&cfg, degraded);
 
     // Auto-flush the beacon outbox whenever the network is up. Alerts queued
     // during a blackout (or a blocked channel) are delivered as soon as the
@@ -632,7 +643,7 @@ pub async fn daemon_tick(
         state.network_was_down = false;
         // Still run a cycle now.
         state.last_cycle_ts = crate::store::now_ts() as i64;
-        match cycle.run_cycle(profile, false).await {
+        match cycle.run_cycle(profile, false, timeouts).await {
             Ok(()) => {
                 state.failure_streak = 0;
                 state.current_interval_secs = backoff_reset();
@@ -649,7 +660,7 @@ pub async fn daemon_tick(
             Err(e) => {
                 state.failure_streak += 1;
                 state.current_interval_secs =
-                    backoff_for_failure(state.current_interval_secs, DEFAULT_MAX_INTERVAL_SECS, &e);
+                    backoff_for_failure(state.current_interval_secs, max_backoff, &e);
                 log(&log_line(
                     "WARN",
                     &format!(
@@ -665,7 +676,7 @@ pub async fn daemon_tick(
     } else {
         // Normal cycle.
         state.last_cycle_ts = crate::store::now_ts() as i64;
-        match cycle.run_cycle(profile, false).await {
+        match cycle.run_cycle(profile, false, timeouts).await {
             Ok(()) => {
                 state.failure_streak = 0;
                 state.current_interval_secs = backoff_reset();
@@ -682,7 +693,7 @@ pub async fn daemon_tick(
             Err(e) => {
                 state.failure_streak += 1;
                 state.current_interval_secs =
-                    backoff_for_failure(state.current_interval_secs, DEFAULT_MAX_INTERVAL_SECS, &e);
+                    backoff_for_failure(state.current_interval_secs, max_backoff, &e);
                 log(&log_line(
                     "WARN",
                     &format!(
@@ -758,6 +769,63 @@ mod tests {
     #[test]
     fn backoff_reset_returns_initial() {
         assert_eq!(backoff_reset(), DEFAULT_INITIAL_INTERVAL_SECS);
+    }
+
+    /// A user-configured backoff ceiling must cap the escalation table. This is
+    /// the blackout-resilience knob: lower it so a long blackout re-rotates
+    /// and re-probes faster instead of pausing protection for 6h.
+    #[test]
+    fn backoff_for_failure_honors_configured_max() {
+        let err = CFError::new("Worker offline", "gone", "");
+        // Default max 6h keeps the table.
+        assert_eq!(backoff_for_failure(3600, 21600, &err), 21600);
+        // A 900s max caps the escalation step at 900 (300 → 900, not 3600).
+        assert_eq!(backoff_for_failure(300, 900, &err), 900);
+        // Once at the cap, further failures stay pinned at the cap.
+        assert_eq!(backoff_for_failure(900, 900, &err), 900);
+    }
+
+    /// `effective_max_backoff_secs` falls back to the 6h default when absent.
+    #[test]
+    fn effective_max_backoff_defaults_to_six_hours() {
+        let cfg = crate::store::profiles::ProfileConfig::default();
+        assert_eq!(
+            crate::store::profiles::effective_max_backoff_secs(&cfg),
+            DEFAULT_MAX_INTERVAL_SECS
+        );
+        let mut cfg = cfg;
+        cfg.max_backoff_secs = 900;
+        assert_eq!(
+            crate::store::profiles::effective_max_backoff_secs(&cfg),
+            900
+        );
+    }
+
+    /// The daemon reads per-profile timeouts + backoff ceiling each tick.
+    #[tokio::test]
+    async fn daemon_tick_uses_configured_backoff_ceiling() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("cfgtest", "").unwrap();
+        // Configure a tight 900s backoff ceiling on the profile.
+        let mut p = crate::store::profiles::load_profile(&profile);
+        p.config.max_backoff_secs = 900;
+        crate::store::profiles::save_profile(&p).unwrap();
+
+        let mut state = DaemonState::default();
+        // Start at the initial interval so the next failure escalates through
+        // the configured ceiling.
+        state.current_interval_secs = DEFAULT_INITIAL_INTERVAL_SECS;
+        let probe = FakeProbe::new(true);
+        let cycle = FakeCycle::new(false); // always fails → escalates backoff
+        let acct = FakeAccountProbe::default();
+        let mut log_lines = Vec::new();
+        let sleep = daemon_tick(&profile, &mut state, &probe, &acct, &cycle, &mut |l| {
+            log_lines.push(l.to_string())
+        })
+        .await;
+        // From 300 with a 900 max, escalation is capped at 900 (not 3600).
+        assert_eq!(state.current_interval_secs, 900);
+        assert_eq!(sleep, 900);
     }
 
     #[test]
@@ -911,6 +979,7 @@ mod tests {
             &self,
             _profile: &str,
             _follow: bool,
+            _timeouts: crate::autopilot::MonitorTimeouts,
         ) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let ok = self.ok;
