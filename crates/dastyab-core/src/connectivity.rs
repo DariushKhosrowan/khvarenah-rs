@@ -271,6 +271,21 @@ impl Probe for RealLadderProbe<'_> {
     }
 }
 
+/// Blackout drill: probe every rung of the fallback ladder top-down once and
+/// report which ones currently survive. This is the app's self-test for
+/// resilience — a user can run it to verify what would survive a partial or
+/// total blackout WITHOUT disconnecting. Pure (generic over `Probe`) so tests
+/// can script verdicts and the CLI can drive the real transports.
+pub async fn drill_all_tiers<P: Probe>(probe: P) -> Vec<(Tier, ProbeVerdict)> {
+    let order = [Tier::Direct, Tier::DoH, Tier::DoT, Tier::DnsTunnel];
+    let mut out = Vec::with_capacity(order.len());
+    for tier in order {
+        let verdict = probe.probe(tier).await;
+        out.push((tier, verdict));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +378,27 @@ mod tests {
         let verdict = probe_tunnel("no-such-profile").await;
         assert!(!verdict.ok);
         assert!(verdict.note.contains("no tunnel"));
+    }
+
+    /// The blackout drill probes every tier top-down and reports each verdict,
+    /// so the user sees exactly which rung would survive a blackout.
+    #[tokio::test]
+    async fn drill_reports_all_four_tiers_in_order() {
+        let mut results = HashMap::new();
+        results.insert(Tier::Direct, ProbeVerdict::down("poisoned"));
+        results.insert(Tier::DoH, ProbeVerdict::up("doh ok"));
+        results.insert(Tier::DoT, ProbeVerdict::down("dot tls reset"));
+        results.insert(Tier::DnsTunnel, ProbeVerdict::up("tunnel configured"));
+        let report = drill_all_tiers(ScriptedProbe { results }).await;
+        assert_eq!(report.len(), 4);
+        // Order is top-down: Direct, DoH, DoT, DnsTunnel.
+        assert_eq!(report[0].0, Tier::Direct);
+        assert!(!report[0].1.ok);
+        assert_eq!(report[1].0, Tier::DoH);
+        assert!(report[1].1.ok);
+        assert_eq!(report[2].0, Tier::DoT);
+        assert!(!report[2].1.ok);
+        assert_eq!(report[3].0, Tier::DnsTunnel);
+        assert!(report[3].1.ok);
     }
 }

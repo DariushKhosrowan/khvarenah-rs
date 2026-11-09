@@ -240,6 +240,10 @@ enum Command {
         #[arg(long)]
         profile: Option<String>,
     },
+    /// Blackout drill: probe every rung of the fallback ladder (Direct → DoH
+    /// → DoT → DNS tunnel) once and report which would survive a blackout.
+    /// A self-test that verifies resilience without disconnecting.
+    Drill,
     /// Remote push notifications (Telegram or webhook).
     Beacon {
         #[command(subcommand)]
