@@ -189,7 +189,7 @@ pub async fn deploy_worker_in_parallel<P: WorkerPeer>(
 ) -> Result<WorkerSet, CFError> {
     let mut set = profiles::load_profile(profile_id).config.worker_set;
     let _ = subdomain; // RealWorkerPeer resolves the subdomain itself.
-    // Base name derived from the account (matches bootstrap/redeploy).
+                       // Base name derived from the account (matches bootstrap/redeploy).
     let base = crate::worker::worker_name_from_account(Some(account_id));
     let need = workers_to_deploy(set.len(), desired);
 
@@ -205,7 +205,10 @@ pub async fn deploy_worker_in_parallel<P: WorkerPeer>(
         let name = worker_name_variant(&base, next_index);
         next_index += 1;
         let uuid = crate::worker::generate_uuid();
-        let host = match peer.deploy_worker(profile_id, account_id, &name, &uuid).await {
+        let host = match peer
+            .deploy_worker(profile_id, account_id, &name, &uuid)
+            .await
+        {
             Ok(h) => h,
             Err(_) => continue, // skip workers that fail to deploy
         };
@@ -254,7 +257,12 @@ pub async fn probe_worker_set<P: WorkerPeer>(peer: &P, set: &WorkerSet) -> Vec<S
     // Map hosts back to names.
     healthy
         .iter()
-        .filter_map(|h| set.workers.iter().find(|w| &w.host == h).map(|w| w.name.clone()))
+        .filter_map(|h| {
+            set.workers
+                .iter()
+                .find(|w| &w.host == h)
+                .map(|w| w.name.clone())
+        })
         .collect()
 }
 
@@ -292,8 +300,9 @@ impl WorkerPeer for RealWorkerPeer {
     ) -> Result<String, CFError> {
         let label = profiles::get_active_token(profile_id)?;
         let token = match label {
-            Some(l) => profiles::get_token(profile_id, &l)?
-                .ok_or_else(|| CFError::new("Redeploy", "Active token not found.", "Re-add the token."))?,
+            Some(l) => profiles::get_token(profile_id, &l)?.ok_or_else(|| {
+                CFError::new("Redeploy", "Active token not found.", "Re-add the token.")
+            })?,
             None => {
                 return Err(CFError::new(
                     "Redeploy",
@@ -459,7 +468,14 @@ mod tests {
         let changed = failover_worker_set(&peer, &id).await.unwrap();
         assert!(changed);
         let saved = peer.saved.lock().unwrap();
-        assert_eq!(saved.as_ref().unwrap().active_worker().map(|w| w.name.as_str()), Some("b"));
+        assert_eq!(
+            saved
+                .as_ref()
+                .unwrap()
+                .active_worker()
+                .map(|w| w.name.as_str()),
+            Some("b")
+        );
     }
 
     #[tokio::test]
@@ -490,7 +506,9 @@ mod tests {
             deploy_ok: true,
             saved: std::sync::Mutex::new(None),
         };
-        let set = deploy_worker_in_parallel(&peer, &id, "acc", "", 2).await.unwrap();
+        let set = deploy_worker_in_parallel(&peer, &id, "acc", "", 2)
+            .await
+            .unwrap();
         assert_eq!(set.len(), 2);
         // First deployed worker becomes active. Base name derives from the
         // account ("acc" -> safe name "acc"), so the variants are acc-0, acc-1.

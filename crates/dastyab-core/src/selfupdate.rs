@@ -311,9 +311,8 @@ pub async fn ensure_updated_with_swap(
         .map_err(|e| CFError::new("Updater error", format!("{e}"), "Internal error."))?;
 
     // Download to a temp path next to the running binary.
-    let exe = std::env::current_exe().map_err(|e| {
-        CFError::new("Updater error", e.to_string(), "Cannot locate the binary.")
-    })?;
+    let exe = std::env::current_exe()
+        .map_err(|e| CFError::new("Updater error", e.to_string(), "Cannot locate the binary."))?;
     let tmp = exe.with_extension("new-tmp");
     let urls: [&str; 2] = [&asset.api_url, &asset.url];
     let mut body = None;
@@ -356,7 +355,9 @@ pub async fn ensure_updated_with_swap(
     })?;
 
     if let Err(e) = std::fs::write(&tmp, &body) {
-        return Ok(UpdateOutcome::Failed(format!("write temp binary failed: {e}")));
+        return Ok(UpdateOutcome::Failed(format!(
+            "write temp binary failed: {e}"
+        )));
     }
     #[cfg(unix)]
     {

@@ -87,7 +87,9 @@ pub fn classify_verify_response(verify_ok: bool, accounts_err: Option<&CFError>)
         // Token-level failure. 9109 from verify is still a token problem
         // (malformed/rejected token), not an account deactivation — the
         // account-level 9109 only surfaces on /accounts.
-        return AccountState::TokenInvalid { since: crate::store::now_ts() as i64 };
+        return AccountState::TokenInvalid {
+            since: crate::store::now_ts() as i64,
+        };
     }
 
     match accounts_err {
@@ -97,7 +99,9 @@ pub fn classify_verify_response(verify_ok: bool, accounts_err: Option<&CFError>)
             let code_is_9109 = err.code == Some(9109);
             let says_deactivated = msg.contains("9109") || msg.contains("deactivated");
             if code_is_9109 || says_deactivated {
-                AccountState::Suspended { since: crate::store::now_ts() as i64 }
+                AccountState::Suspended {
+                    since: crate::store::now_ts() as i64,
+                }
             } else {
                 // Some other /accounts failure — not a verdict we can trust to
                 // block cycles, but it's not a clean Active either.
@@ -133,9 +137,8 @@ impl AccountGate {
 /// Returns true when the profile dir (config/token/state) was modified.
 pub fn profile_mtime_changed(profile_id: &str, last_mtime: i64) -> Result<bool, CFError> {
     let dir = crate::store::profiles::profile_dir(profile_id);
-    let meta = std::fs::metadata(&dir).map_err(|e| {
-        CFError::new("Storage", format!("Cannot stat {}: {e}", dir.display()), "")
-    })?;
+    let meta = std::fs::metadata(&dir)
+        .map_err(|e| CFError::new("Storage", format!("Cannot stat {}: {e}", dir.display()), ""))?;
     let mtime = meta
         .modified()
         .map_err(|e| CFError::new("Storage", format!("mtime: {e}"), ""))?
@@ -279,7 +282,10 @@ mod tests {
         assert_eq!(s.label(), "suspended");
         assert_eq!(s.since(), Some(42));
         assert_eq!(AccountState::Active.label(), "active");
-        assert_eq!(AccountState::TokenInvalid { since: 1 }.label(), "token-invalid");
+        assert_eq!(
+            AccountState::TokenInvalid { since: 1 }.label(),
+            "token-invalid"
+        );
         assert_eq!(AccountState::Unknown.label(), "unknown");
     }
 
@@ -304,9 +310,7 @@ mod tests {
     /// resolves it to the real secret.
     #[test]
     fn active_token_label_resolves_to_secret() {
-        use crate::store::profiles::{
-            add_token, get_active_token, get_token, set_active_token,
-        };
+        use crate::store::profiles::{add_token, get_active_token, get_token, set_active_token};
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!(

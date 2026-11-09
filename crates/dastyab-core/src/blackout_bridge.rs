@@ -64,9 +64,15 @@ impl SurvivalPlan {
         match self {
             SurvivalPlan::Normal => "all paths up",
             SurvivalPlan::DnsHijackedUseDoh => "system DNS hijacked — DoH/DoT still working",
-            SurvivalPlan::DnsHijackedNoTunnel => "system DNS hijacked — consider deploying a DNS tunnel for deep blackouts",
-            SurvivalPlan::TotalBlackoutTunnelAvailable => "total blackout — using DNS tunnel fallback",
-            SurvivalPlan::TotalBlackoutNoTunnel => "total blackout — no tunnel configured, waiting for a path",
+            SurvivalPlan::DnsHijackedNoTunnel => {
+                "system DNS hijacked — consider deploying a DNS tunnel for deep blackouts"
+            }
+            SurvivalPlan::TotalBlackoutTunnelAvailable => {
+                "total blackout — using DNS tunnel fallback"
+            }
+            SurvivalPlan::TotalBlackoutNoTunnel => {
+                "total blackout — no tunnel configured, waiting for a path"
+            }
         }
     }
 }
@@ -77,7 +83,10 @@ mod tests {
 
     #[test]
     fn normal_state_is_plan_normal_even_with_tunnel() {
-        assert_eq!(SurvivalPlan::from_state(NetworkState::Normal, true), SurvivalPlan::Normal);
+        assert_eq!(
+            SurvivalPlan::from_state(NetworkState::Normal, true),
+            SurvivalPlan::Normal
+        );
         assert!(!SurvivalPlan::from_state(NetworkState::Normal, true).uses_tunnel());
     }
 

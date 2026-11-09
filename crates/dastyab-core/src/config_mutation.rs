@@ -98,8 +98,11 @@ pub fn generate_new_path(rng: &mut impl rand::Rng) -> String {
 #[allow(async_fn_in_trait)]
 pub trait MutationPeer: Send + Sync {
     /// Re-deploy the worker and rotate the UUID. Returns the new UUID.
-    async fn redeploy_with_new_uuid(&self, profile_id: &str, new_uuid: &str)
-        -> Result<String, CFError>;
+    async fn redeploy_with_new_uuid(
+        &self,
+        profile_id: &str,
+        new_uuid: &str,
+    ) -> Result<String, CFError>;
 }
 
 /// Persist the mutation metadata + rotate the saved VLESS record's UUID/path.
@@ -166,9 +169,7 @@ pub async fn run_mutation_if_due<M: MutationPeer>(
     };
 
     // Redeploy with the new UUID (this is the actual signature rotation).
-    let deployed_uuid = peer
-        .redeploy_with_new_uuid(profile_id, &new_uuid)
-        .await?;
+    let deployed_uuid = peer.redeploy_with_new_uuid(profile_id, &new_uuid).await?;
 
     let outcome = persist_mutation(profile_id, "/", &new_path, &deployed_uuid)?;
     Ok(Some(outcome))
@@ -201,7 +202,10 @@ mod tests {
 
     #[test]
     fn should_mutate_disabled() {
-        let cfg = MutationConfig { enabled: false, ..Default::default() };
+        let cfg = MutationConfig {
+            enabled: false,
+            ..Default::default()
+        };
         assert!(!should_mutate(&cfg, 0, i64::MAX));
     }
 
@@ -210,12 +214,18 @@ mod tests {
         let mut rng = rand::thread_rng();
         let p = generate_new_path(&mut rng);
         assert_eq!(p.len(), 12);
-        assert!(p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(p
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
     }
 
     #[test]
     fn should_mutate_zero_interval_is_safe() {
-        let cfg = MutationConfig { enabled: true, interval_secs: 0, ..Default::default() };
+        let cfg = MutationConfig {
+            enabled: true,
+            interval_secs: 0,
+            ..Default::default()
+        };
         assert!(!should_mutate(&cfg, 0, 100000));
     }
 

@@ -87,7 +87,9 @@ pub struct WsProbe {
 /// Which SNI layer a WS probe ran under. Worker = the worker hostname;
 /// GenericCf = the benign `www.cloudflare.com` SNI (used to bypass
 /// `*.workers.dev` SNI blocking while keeping the worker as the Host header).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum SniLayer {
     #[default]
     Worker,

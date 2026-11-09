@@ -140,9 +140,12 @@ pub async fn probe_ws_upgrade(
 
     // 2 — Send the WS upgrade request.
     let req = upgrade_request(sni, path);
-    if tokio::time::timeout(Duration::from_millis(timeout_ms), tls.write_all(req.as_bytes()))
-        .await
-        .is_err()
+    if tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        tls.write_all(req.as_bytes()),
+    )
+    .await
+    .is_err()
     {
         return WsUpgradeResult::upgrade_timeout(elapsed(), path);
     }
@@ -156,14 +159,11 @@ pub async fn probe_ws_upgrade(
         Ok(Ok(n)) => {
             let head = String::from_utf8_lossy(&buf[..n]);
             // Parse "HTTP/1.1 400 ..." or "HTTP/1.1 101 ...".
-            let status = head
-                .lines()
-                .next()
-                .and_then(|line| {
-                    let mut parts = line.split_whitespace();
-                    let _http = parts.next()?;
-                    parts.next()?.parse::<u16>().ok()
-                });
+            let status = head.lines().next().and_then(|line| {
+                let mut parts = line.split_whitespace();
+                let _http = parts.next()?;
+                parts.next()?.parse::<u16>().ok()
+            });
             match status {
                 Some(code) => WsUpgradeResult::http(elapsed(), code, path),
                 None => WsUpgradeResult::upgrade_reset(elapsed(), path),
@@ -201,7 +201,10 @@ mod tests {
         let key = rcgen::KeyPair::generate().unwrap();
         let params = rcgen::CertificateParams::new(vec!["mock.test".to_string()]).unwrap();
         let cert = params.self_signed(&key).unwrap();
-        rcgen::CertifiedKey { cert, key_pair: key }
+        rcgen::CertifiedKey {
+            cert,
+            key_pair: key,
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -252,10 +255,8 @@ mod tests {
         let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(key.key_pair.serialize_der().into());
         let signing_key =
             rustls::crypto::aws_lc_rs::sign::any_supported_type(&key_der).expect("signing key");
-        let certified_key = std::sync::Arc::new(rustls::sign::CertifiedKey::new(
-            vec![cert_der],
-            signing_key,
-        ));
+        let certified_key =
+            std::sync::Arc::new(rustls::sign::CertifiedKey::new(vec![cert_der], signing_key));
         let resolver = CertResolver {
             certified_key,
             required: None,

@@ -17,10 +17,10 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::bootstrap_diagnose::DiagnosisResult;
 use crate::error::CFError;
 use crate::store;
 use crate::store::profiles;
-use crate::bootstrap_diagnose::DiagnosisResult;
 
 /// Where the token came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,9 +253,8 @@ pub fn ensure_daemon_installed(
         DaemonInstallOutcome::AlreadyInstalled
     } else {
         let contents = crate::daemon::systemd_unit(binary_path, profile_id);
-        std::fs::write(&unit, contents).map_err(|e| {
-            CFError::new("Daemon", e.to_string(), "Cannot write the systemd unit.")
-        })?;
+        std::fs::write(&unit, contents)
+            .map_err(|e| CFError::new("Daemon", e.to_string(), "Cannot write the systemd unit."))?;
         DaemonInstallOutcome::Installed
     };
     if auto_enable {
@@ -275,7 +274,10 @@ pub fn ensure_daemon_installed(
 
 /// Run a `systemctl --user` command. Returns the command's stdout/status.
 fn systemctl_user(action: &str, unit: &Path) -> std::io::Result<std::process::Output> {
-    let unit_name = unit.file_name().and_then(|s| s.to_str()).unwrap_or("dastyab-daemon.service");
+    let unit_name = unit
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("dastyab-daemon.service");
     std::process::Command::new("systemctl")
         .arg("--user")
         .args(action.split_whitespace())
@@ -413,19 +415,17 @@ pub async fn up_with_diagnosis(profile_id_override: Option<&str>) -> DiagnosisRe
 
     // 3 — ensure token is stored + active (part of token stage)
     let token_store_ok = match &detected.source {
-        TokenSource::ExistingProfile(_) => {
-            match profiles::get_active_token(&profile_id) {
-                Ok(Some(_)) => true,
-                _ => {
-                    let p = profiles::load_profile(&profile_id);
-                    if let Some(l) = p.tokens.keys().next() {
-                        profiles::set_active_token(&profile_id, l).is_ok()
-                    } else {
-                        false
-                    }
+        TokenSource::ExistingProfile(_) => match profiles::get_active_token(&profile_id) {
+            Ok(Some(_)) => true,
+            _ => {
+                let p = profiles::load_profile(&profile_id);
+                if let Some(l) = p.tokens.keys().next() {
+                    profiles::set_active_token(&profile_id, l).is_ok()
+                } else {
+                    false
                 }
             }
-        }
+        },
         _ => {
             let p = profiles::load_profile(&profile_id);
             let existing = p.tokens.values().find(|e| e.token == detected.token);
@@ -530,7 +530,9 @@ pub async fn up_with_diagnosis(profile_id_override: Option<&str>) -> DiagnosisRe
                 .map(|d| diag::ws_histogram_top(&d.ws_failure_histogram))
                 .unwrap_or_else(|| "Unknown".into());
             return diag::diagnose(
-                &UpFailure::DiscoveryCandidatesButNoWs { ws_histogram_top: hist },
+                &UpFailure::DiscoveryCandidatesButNoWs {
+                    ws_histogram_top: hist,
+                },
                 elapsed(&started),
             );
         }
@@ -587,7 +589,9 @@ pub async fn up_with_diagnosis(profile_id_override: Option<&str>) -> DiagnosisRe
         Ok(_) => {}
         Err(e) => {
             return diag::diagnose(
-                &UpFailure::DaemonStartFailed { reason: e.to_string() },
+                &UpFailure::DaemonStartFailed {
+                    reason: e.to_string(),
+                },
                 elapsed(&started),
             );
         }
@@ -604,10 +608,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!(
-            "kvrvn-boot-{}-{n}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kvrvn-boot-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         crate::store::set_mem_dir_override(tmp.join(".dastyab"));
         tmp
@@ -665,7 +666,10 @@ mod tests {
         std::fs::create_dir_all(store::mem_dir()).unwrap();
         std::fs::write(store::mem_dir().join("token.txt"), "file-token-abc").unwrap();
         let d = detect_token();
-        assert_eq!(d.source, TokenSource::File(store::mem_dir().join("token.txt")));
+        assert_eq!(
+            d.source,
+            TokenSource::File(store::mem_dir().join("token.txt"))
+        );
         assert_eq!(d.token, "file-token-abc");
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -690,10 +694,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!(
-            "kvrvn-daemon-{}-{n}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kvrvn-daemon-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         // Isolate HOME so the systemd unit lands in the temp dir, not the real

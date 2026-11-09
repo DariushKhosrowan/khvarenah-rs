@@ -374,7 +374,11 @@ pub fn sni_verdict(
 /// Convenience: compute the verdict straight from a `PipelineDiagnostics`.
 pub fn verdict_from_diagnostics(d: &PipelineDiagnostics) -> SniVerdict {
     use crate::health::{SniLayer, WsFailureReason};
-    let tls = |l| *d.failure_by_sni.get(&(l, WsFailureReason::TlsAlert)).unwrap_or(&0);
+    let tls = |l| {
+        *d.failure_by_sni
+            .get(&(l, WsFailureReason::TlsAlert))
+            .unwrap_or(&0)
+    };
     let worker_tls = tls(SniLayer::Worker);
     let generic_tls = tls(SniLayer::GenericCf);
     let dead_route = [
@@ -472,8 +476,9 @@ pub async fn pipeline_scan(
     let e2e_fail: Arc<Mutex<HashMap<E2eFailureStage, u32>>> = Arc::new(Mutex::new(HashMap::new()));
     let ws_fail: Arc<Mutex<HashMap<crate::health::WsFailureReason, u32>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let ws_fail_sni: Arc<Mutex<HashMap<(crate::health::SniLayer, crate::health::WsFailureReason), u32>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let ws_fail_sni: Arc<
+        Mutex<HashMap<(crate::health::SniLayer, crate::health::WsFailureReason), u32>>,
+    > = Arc::new(Mutex::new(HashMap::new()));
     let results: Arc<Mutex<Vec<CleanEndpoint>>> = Arc::new(Mutex::new(Vec::new()));
     let candidates = Arc::new(candidates);
     let phase1 = Arc::new(phase1);
@@ -1234,7 +1239,10 @@ mod tests {
         .unwrap();
         let m = &res.diagnostics.failure_by_sni;
         let worker_tls = *m
-            .get(&(crate::health::SniLayer::Worker, crate::health::WsFailureReason::TlsAlert))
+            .get(&(
+                crate::health::SniLayer::Worker,
+                crate::health::WsFailureReason::TlsAlert,
+            ))
             .unwrap_or(&0);
         let generic_404 = *m
             .get(&(
@@ -1279,11 +1287,20 @@ mod tests {
     fn verdict_from_diagnostics_maps_stratified_map() {
         use crate::health::{SniLayer, WsFailureReason};
         let mut d = PipelineDiagnostics::default();
-        d.failure_by_sni.insert((SniLayer::Worker, WsFailureReason::TlsAlert), 4);
-        d.failure_by_sni.insert((SniLayer::GenericCf, WsFailureReason::TlsAlert), 4);
-        assert_eq!(super::verdict_from_diagnostics(&d), super::SniVerdict::ClientHelloBlocked);
+        d.failure_by_sni
+            .insert((SniLayer::Worker, WsFailureReason::TlsAlert), 4);
+        d.failure_by_sni
+            .insert((SniLayer::GenericCf, WsFailureReason::TlsAlert), 4);
+        assert_eq!(
+            super::verdict_from_diagnostics(&d),
+            super::SniVerdict::ClientHelloBlocked
+        );
         d.failure_by_sni.clear();
-        d.failure_by_sni.insert((SniLayer::Worker, WsFailureReason::DeadRoute), 9);
-        assert_eq!(super::verdict_from_diagnostics(&d), super::SniVerdict::WorkerRouteDead);
+        d.failure_by_sni
+            .insert((SniLayer::Worker, WsFailureReason::DeadRoute), 9);
+        assert_eq!(
+            super::verdict_from_diagnostics(&d),
+            super::SniVerdict::WorkerRouteDead
+        );
     }
 }

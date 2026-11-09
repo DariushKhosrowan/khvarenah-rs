@@ -30,6 +30,10 @@ pub const NETWORK_DOWN_SLEEP_SECS: u64 = 60;
 pub const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 /// Number of rotated log generations kept.
 pub const LOG_GENERATIONS: u32 = 3;
+/// Minimum seconds between automatic beacon-outbox flush attempts while the
+/// network is up (we do not want to hammer the Telegram/webhook transport on
+/// every cycle — only periodically, plus immediately after a blackout ends).
+pub const OUTBOX_FLUSH_INTERVAL_SECS: i64 = 300;
 
 /// Daemon configuration.
 #[derive(Debug, Clone)]
@@ -100,6 +104,11 @@ pub struct DaemonState {
     /// settings apply without a manual restart.
     #[serde(default)]
     pub last_profile_mtime: i64,
+    /// Last epoch-seconds the daemon auto-flushed the beacon outbox. Used to
+    /// rate-limit outbox flush attempts when the network is up (alerts queued
+    /// during a blackout are delivered on restore, then periodically).
+    #[serde(default)]
+    pub last_outbox_flush_ts: i64,
 }
 
 fn default_interval() -> u64 {
@@ -123,8 +132,19 @@ impl Default for DaemonState {
             last_update_check_ts: 0,
             last_backup_ts: 0,
             last_profile_mtime: 0,
+            last_outbox_flush_ts: 0,
         }
     }
+}
+
+/// Pure: whether it is time to attempt an outbox flush, given the last flush
+/// epoch and the current epoch. Returns true when we have never flushed or the
+/// interval has elapsed. `interval` is in seconds and must be positive.
+pub fn should_flush_outbox(last: i64, now: i64, interval: i64) -> bool {
+    if interval <= 0 {
+        return true;
+    }
+    now - last >= interval
 }
 
 /// Path to a profile's daemon-state file.
@@ -455,6 +475,23 @@ pub async fn daemon_tick(
     let net_up = status.up;
     state.network_tier = status.tier_label();
 
+    // Auto-flush the beacon outbox whenever the network is up. Alerts queued
+    // during a blackout (or a blocked channel) are delivered as soon as the
+    // network returns — immediately on restore, then rate-limited so we don't
+    // hammer the Telegram/webhook transport every cycle.
+    if net_up {
+        let now = crate::store::now_ts() as i64;
+        let force = state.network_was_down;
+        if force || should_flush_outbox(state.last_outbox_flush_ts, now, OUTBOX_FLUSH_INTERVAL_SECS)
+        {
+            let n = crate::remote_beacon::flush_outbox(profile).await;
+            if n > 0 {
+                log(&log_line("INFO", &format!("outbox flushed {} alert(s)", n)));
+            }
+            state.last_outbox_flush_ts = now;
+        }
+    }
+
     if !net_up {
         // c. Network down → skip cycle, don't burn rescue budget. Compute the
         // blackout survival plan so the daemon / beacon knows whether a DNS
@@ -530,7 +567,10 @@ pub async fn daemon_tick(
                 state.account_state = st;
                 log(&log_line(
                     "WARN",
-                    &format!("account now {} — blocking cycles", state.account_state.label()),
+                    &format!(
+                        "account now {} — blocking cycles",
+                        state.account_state.label()
+                    ),
                 ));
                 // Notify remotely on the transition into the blocked state (the
                 // daemon holds cycles silently; the user should be told why).
@@ -650,6 +690,18 @@ mod tests {
     }
 
     #[test]
+    fn should_flush_outbox_timing() {
+        // Never flushed → flush now.
+        assert!(should_flush_outbox(0, 1000, 300));
+        // Before the interval elapses → wait.
+        assert!(!should_flush_outbox(800, 1000, 300));
+        // Exactly at the interval boundary → flush.
+        assert!(should_flush_outbox(700, 1000, 300));
+        // Non-positive interval → always flush.
+        assert!(should_flush_outbox(999, 1000, 0));
+    }
+
+    #[test]
     fn daemon_state_migrates_without_fields() {
         let _home = daemon_home();
         let profile = crate::store::profiles::create_profile("rl", "").unwrap();
@@ -716,7 +768,10 @@ mod tests {
     #[test]
     fn systemctl_user_argv_is_user_scoped_enable_now() {
         let argv = systemctl_user_argv("enable --now", "dastyab-daemon.service");
-        assert_eq!(argv, vec!["--user", "enable --now", "dastyab-daemon.service"]);
+        assert_eq!(
+            argv,
+            vec!["--user", "enable --now", "dastyab-daemon.service"]
+        );
         let argv_start = systemctl_user_argv("start", "dastyab-daemon.service");
         assert_eq!(argv_start[0], "--user");
         assert_eq!(argv_start[1], "start");
@@ -880,7 +935,9 @@ mod tests {
         assert_eq!(sleep, NETWORK_DOWN_SLEEP_SECS);
         // No tunnel configured for the test profile → blackout-no-tunnel plan.
         assert_eq!(state.survival_plan, "total-blackout");
-        assert!(log_lines.iter().any(|l| l.contains("survival=total-blackout")));
+        assert!(log_lines
+            .iter()
+            .any(|l| l.contains("survival=total-blackout")));
     }
 
     /// The ladder-backed probe reports the best reachable tier; the daemon must
@@ -896,15 +953,7 @@ mod tests {
         let cycle = FakeCycle::new(true);
         let acct = FakeAccountProbe::default();
 
-        let sleep = daemon_tick(
-            profile,
-            &mut state,
-            &probe,
-            &acct,
-            &cycle,
-            &mut |_l| {},
-        )
-        .await;
+        let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |_l| {}).await;
         // Up via DoH + a healthy cycle → success, interval reset, tier recorded.
         assert_eq!(sleep, DEFAULT_INITIAL_INTERVAL_SECS);
         assert_eq!(cycle.calls.load(Ordering::SeqCst), 1);
@@ -936,6 +985,52 @@ mod tests {
         assert!(log_lines.iter().any(|l| l.contains("network=restored")));
         assert_eq!(state.failure_streak, 0);
         assert_eq!(state.current_interval_secs, DEFAULT_INITIAL_INTERVAL_SECS);
+    }
+
+    /// When the network is up the daemon auto-flushes the beacon outbox (so
+    /// alerts queued during a blackout get delivered without a manual step),
+    /// then rate-limits repeat flushes to once per interval.
+    #[tokio::test]
+    async fn test_daemon_flushes_outbox_when_network_up() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("default", "").unwrap();
+        let mut state = DaemonState::default();
+        let probe = FakeProbe::new(true);
+        let cycle = FakeCycle::new(true);
+        let acct = FakeAccountProbe::default();
+
+        let sleep = daemon_tick(&profile, &mut state, &probe, &acct, &cycle, &mut |_l| {}).await;
+        assert_eq!(sleep, DEFAULT_INITIAL_INTERVAL_SECS);
+        // The automatic flush attempt ran (beacon disabled on this profile →
+        // noop, but the attempt is recorded).
+        assert!(state.last_outbox_flush_ts > 0);
+
+        // A second tick within the interval must NOT re-flush.
+        let before = state.last_outbox_flush_ts;
+        let _sleep2 = daemon_tick(&profile, &mut state, &probe, &acct, &cycle, &mut |_l| {}).await;
+        assert_eq!(state.last_outbox_flush_ts, before);
+    }
+
+    /// A blackout restore forces an immediate outbox flush regardless of the
+    /// rate-limit gate — that is the exact moment queued alerts must go out.
+    #[tokio::test]
+    async fn test_daemon_flushes_outbox_immediately_on_restore() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("default", "").unwrap();
+        let mut state = DaemonState {
+            network_was_down: true, // was down
+            ..Default::default()
+        };
+        let probe = FakeProbe::new(true); // now up
+        let cycle = FakeCycle::new(true);
+        let acct = FakeAccountProbe::default();
+
+        let sleep = daemon_tick(&profile, &mut state, &probe, &acct, &cycle, &mut |_l| {}).await;
+        assert_eq!(sleep, 0, "must cycle immediately on restore");
+        assert!(
+            state.last_outbox_flush_ts > 0,
+            "restore forces an outbox flush"
+        );
     }
 
     /// Backoff grows on consecutive failures, and does NOT reset just because
@@ -1049,14 +1144,21 @@ mod tests {
         state.account_state = crate::account_state::AccountState::Suspended { since: 1 };
         state.last_account_poll_ts = crate::store::now_ts() as i64; // inside window
         let probe = FakeProbe::new(true);
-        let acct = FakeAccountProbe { state: crate::account_state::AccountState::Suspended { since: 1 } };
+        let acct = FakeAccountProbe {
+            state: crate::account_state::AccountState::Suspended { since: 1 },
+        };
         let cycle = FakeCycle::new(true);
         let mut log_lines = Vec::new();
         let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string());
-        }).await;
+        })
+        .await;
         assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
-        assert_eq!(cycle.calls.load(Ordering::SeqCst), 0, "no cycle while suspended");
+        assert_eq!(
+            cycle.calls.load(Ordering::SeqCst),
+            0,
+            "no cycle while suspended"
+        );
         assert!(log_lines.iter().any(|l| l.contains("waiting")));
     }
 
@@ -1071,15 +1173,21 @@ mod tests {
         // Advance the poll window so a re-probe actually happens.
         state.last_account_poll_ts = (crate::store::now_ts() as i64) - 2000;
         let probe = FakeProbe::new(true);
-        let acct = FakeAccountProbe { state: crate::account_state::AccountState::Active };
+        let acct = FakeAccountProbe {
+            state: crate::account_state::AccountState::Active,
+        };
         let cycle = FakeCycle::new(true);
         let mut log_lines = Vec::new();
         let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |l| {
             log_lines.push(l.to_string());
-        }).await;
+        })
+        .await;
         // Restored → cycle ran (calls becomes 1) and we advance normally.
         assert_eq!(cycle.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(state.account_state, crate::account_state::AccountState::Active);
+        assert_eq!(
+            state.account_state,
+            crate::account_state::AccountState::Active
+        );
         assert!(log_lines.iter().any(|l| l.contains("restored")));
         // sleep is the normal reset interval (a cycle succeeded).
         assert_eq!(sleep, backoff_reset());
@@ -1094,7 +1202,9 @@ mod tests {
         state.account_state = crate::account_state::AccountState::TokenInvalid { since: 1 };
         state.last_account_poll_ts = crate::store::now_ts() as i64;
         let probe = FakeProbe::new(true);
-        let acct = FakeAccountProbe { state: crate::account_state::AccountState::TokenInvalid { since: 1 } };
+        let acct = FakeAccountProbe {
+            state: crate::account_state::AccountState::TokenInvalid { since: 1 },
+        };
         let cycle = FakeCycle::new(true);
         let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |_| {}).await;
         assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
@@ -1111,7 +1221,9 @@ mod tests {
         state.account_state = crate::account_state::AccountState::Active;
         state.last_account_poll_ts = (crate::store::now_ts() as i64) - 2000;
         let probe = FakeProbe::new(true);
-        let acct = FakeAccountProbe { state: crate::account_state::AccountState::Suspended { since: 1 } };
+        let acct = FakeAccountProbe {
+            state: crate::account_state::AccountState::Suspended { since: 1 },
+        };
         let cycle = FakeCycle::new(true);
         let sleep = daemon_tick(profile, &mut state, &probe, &acct, &cycle, &mut |_| {}).await;
         assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
@@ -1136,7 +1248,10 @@ mod tests {
 
         let after = load_daemon_state(profile);
         assert!(!after.account_state.blocks_cycle());
-        assert_eq!(after.account_state, crate::account_state::AccountState::Active);
+        assert_eq!(
+            after.account_state,
+            crate::account_state::AccountState::Active
+        );
         assert_eq!(after.last_account_poll_ts, 0, "forces immediate re-probe");
     }
 
@@ -1150,5 +1265,4 @@ mod tests {
         let cleared = crate::daemon::clear_account_blocked(profile).unwrap();
         assert!(!cleared);
     }
-
 }

@@ -139,7 +139,10 @@ mod tests {
 
     impl Sink {
         fn new() -> Self {
-            Self { buf: Vec::new(), flushes: 0 }
+            Self {
+                buf: Vec::new(),
+                flushes: 0,
+            }
         }
     }
 
@@ -193,7 +196,10 @@ mod tests {
         let cfg = cfg_on();
         let plan = fragment_plan(400, rng, &cfg);
         // It must actually fragment (the point of the feature).
-        assert!(plan.len() > 1, "expected fragmentation for a 400-byte write");
+        assert!(
+            plan.len() > 1,
+            "expected fragmentation for a 400-byte write"
+        );
         for (i, f) in plan.iter().enumerate() {
             assert!(f >= &1, "fragment {f} empty");
             assert!(f <= &cfg.max_fragment, "fragment {f} exceeds max");
@@ -219,19 +225,34 @@ mod tests {
         write_fragmented(&mut sink, &data, &DesyncConfig::default())
             .await
             .unwrap();
-        assert_eq!(sink.buf, data, "disabled path must deliver identical bytes in one write");
-        assert_eq!(sink.flushes, 1, "disabled path must flush exactly once (single segment)");
+        assert_eq!(
+            sink.buf, data,
+            "disabled path must deliver identical bytes in one write"
+        );
+        assert_eq!(
+            sink.flushes, 1,
+            "disabled path must flush exactly once (single segment)"
+        );
     }
 
     #[tokio::test]
     async fn test_write_fragmented_enabled_sends_exact_bytes() {
         let mut sink = Sink::new();
-        let data = b"GET /api/abcdefghijkl HTTP/1.1\r\nHost: x.workers.dev\r\nUpgrade: websocket\r\n\r\n".to_vec();
+        let data =
+            b"GET /api/abcdefghijkl HTTP/1.1\r\nHost: x.workers.dev\r\nUpgrade: websocket\r\n\r\n"
+                .to_vec();
         let cfg = cfg_on();
         write_fragmented(&mut sink, &data, &cfg).await.unwrap();
-        assert_eq!(sink.buf, data, "fragmented write must deliver the identical byte stream");
+        assert_eq!(
+            sink.buf, data,
+            "fragmented write must deliver the identical byte stream"
+        );
         // The whole point: the request must leave as MULTIPLE segments.
-        assert!(sink.flushes > 1, "desync must flush per-fragment, got {} flushes", sink.flushes);
+        assert!(
+            sink.flushes > 1,
+            "desync must flush per-fragment, got {} flushes",
+            sink.flushes
+        );
     }
 
     // Concrete low-level blocker: the WS probe's single-segment write is the
