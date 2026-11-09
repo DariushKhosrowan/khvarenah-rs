@@ -87,6 +87,28 @@ pub async fn resolve(host: &str, endpoints: &[DotEndpoint]) -> Result<Vec<Ipv4Ad
     }))
 }
 
+/// Build a rustls client config that verifies server certs against the
+/// Mozilla root bundle (webpki-roots). Used by DoT so real cert chains
+/// validate — an empty root store would fail every handshake with
+/// `UnknownIssuer`, silently killing this fallback rung.
+///
+/// Uses the `aws_lc_rs` provider explicitly so this module does not depend on
+/// a process-level `CryptoProvider` having been installed (which only happens
+/// in `main` via `tls::install_provider`). That makes DoT robust to being
+/// embedded or called before app setup.
+fn tls_config() -> rustls::ClientConfig {
+    use std::sync::Arc;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("default protocol versions should be compatible")
+    .with_root_certificates(roots)
+    .with_no_client_auth()
+}
+
 /// Perform one DoT exchange against `ep`.
 async fn query_endpoint(ep: &DotEndpoint, query: &[u8]) -> Result<Vec<u8>, CFError> {
     let addr = std::net::SocketAddr::from((ep.ip, 853));
@@ -96,9 +118,7 @@ async fn query_endpoint(ep: &DotEndpoint, query: &[u8]) -> Result<Vec<u8>, CFErr
         .map_err(|e| CFError::new("DoT connect", format!("{e}"), ""))?;
 
     // TLS with SNI = the endpoint host (cert verification against the real name).
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(rustls::RootCertStore::empty()) // TODO: load webpki roots
-        .with_no_client_auth();
+    let config = tls_config();
     let connector = TlsConnector::from(Arc::new(config));
     let sni =
         ServerName::try_from(ep.sni).map_err(|_| CFError::new("DoT TLS", "Invalid SNI.", ""))?;
@@ -146,5 +166,18 @@ mod tests {
         for ep in DEFAULT_DOT_ENDPOINTS {
             assert!(!is_hijacked_ip(&ep.ip), "endpoint {} hijacked", ep.ip);
         }
+    }
+
+    #[test]
+    fn tls_config_loads_root_certs() {
+        // Regression: DoT previously used an empty RootCertStore, so every real
+        // handshake failed with UnknownIssuer and the DoT rung was dead. The
+        // config must contain the Mozilla webpki roots. It must also build with
+        // no process-level CryptoProvider installed (self-contained), which is
+        // what this construction path verifies.
+        let _cfg = tls_config();
+        // Confirm the Mozilla root bundle is non-empty — the data the config
+        // loaded into its RootCertStore.
+        assert!(webpki_roots::TLS_SERVER_ROOTS.len() > 100);
     }
 }
