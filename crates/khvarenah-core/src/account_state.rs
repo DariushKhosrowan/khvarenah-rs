@@ -149,14 +149,22 @@ pub fn profile_mtime_changed(profile_id: &str, last_mtime: i64) -> Result<bool, 
 /// (uses the profile's active token). Pure classification happens in
 /// [`classify_verify_response`]; this only gathers the two clues.
 pub async fn probe_account_state(profile_id: &str) -> AccountState {
-    // Fetch the active token for the profile.
-    let token = match crate::store::profiles::get_active_token(profile_id) {
-        Ok(Some(tok)) => tok,
+    // Fetch the active token label for the profile, then resolve it to the
+    // actual token string. `get_active_token` returns the *label* (e.g.
+    // "default"), not the secret — passing the label to `Client::new` would
+    // make Cloudflare validate the literal string "default" and always fail.
+    let label = match crate::store::profiles::get_active_token(profile_id) {
+        Ok(Some(l)) => l,
         Ok(None) => {
             // No token → nothing to verify. Treat as Unknown rather than
             // blocking the daemon (a token may be added later on).
             return AccountState::Unknown;
         }
+        Err(_) => return AccountState::Unknown,
+    };
+    let token = match crate::store::profiles::get_token(profile_id, &label) {
+        Ok(Some(tok)) => tok,
+        Ok(None) => return AccountState::Unknown,
         Err(_) => return AccountState::Unknown,
     };
 
@@ -285,5 +293,45 @@ mod tests {
         // Unknown is NOT a blocker — treat as proceed (the daemon surfaces a
         // real blocker via its own probe/classification).
         assert_eq!(account_gate_verdict(&AccountState::Unknown), None);
+    }
+
+    /// Regression for the round-23 bug: `probe_account_state` must resolve the
+    /// active token *label* to the actual secret via `get_token`. Previously
+    /// it passed the label string ("default") straight to `Client::new`, which
+    /// made Cloudflare validate the literal text and report the account as
+    /// token-invalid even with a valid stored token. This test pins the
+    /// contract that `get_active_token` returns a label and `get_token`
+    /// resolves it to the real secret.
+    #[test]
+    fn active_token_label_resolves_to_secret() {
+        use crate::store::profiles::{
+            add_token, get_active_token, get_token, set_active_token,
+        };
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "kvrvn-accstate-resolve-{}-{}",
+            std::process::id(),
+            crate::store::now_ts()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        crate::store::set_mem_dir_override(tmp.clone());
+
+        let id = crate::store::profiles::create_profile("t", "").unwrap();
+        add_token(&id, "default", "cfut_REAL_SECRET_TOKEN_1234567890abcdef").unwrap();
+        set_active_token(&id, "default").unwrap();
+
+        // get_active_token returns the LABEL, not the secret.
+        let label = get_active_token(&id).unwrap().expect("label present");
+        assert_eq!(label, "default");
+
+        // get_token resolves the label to the actual secret.
+        let secret = get_token(&id, &label).unwrap().expect("secret present");
+        assert_eq!(secret, "cfut_REAL_SECRET_TOKEN_1234567890abcdef");
+        // The secret must NEVER equal the label string.
+        assert_ne!(secret, label);
+
+        crate::store::set_mem_dir_override(std::path::PathBuf::new());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
