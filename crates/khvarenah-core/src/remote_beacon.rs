@@ -32,6 +32,8 @@ pub enum BeaconEventKind {
     DailySummary,
     ConfigMutated,
     AccountBlocked,
+    NetworkDown,
+    NetworkRestored,
 }
 
 /// A concrete event ready to be formatted + sent.
@@ -57,6 +59,10 @@ pub enum BeaconEvent {
         state: String,
         since: i64,
     },
+    NetworkDown {
+        survival: String,
+    },
+    NetworkRestored,
 }
 
 impl BeaconEvent {
@@ -70,6 +76,8 @@ impl BeaconEvent {
             BeaconEvent::DailySummary { .. } => BeaconEventKind::DailySummary,
             BeaconEvent::ConfigMutated { .. } => BeaconEventKind::ConfigMutated,
             BeaconEvent::AccountBlocked { .. } => BeaconEventKind::AccountBlocked,
+            BeaconEvent::NetworkDown { .. } => BeaconEventKind::NetworkDown,
+            BeaconEvent::NetworkRestored => BeaconEventKind::NetworkRestored,
         }
     }
 }
@@ -266,6 +274,16 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
                 "⛔ Account blocked ({state}) — run `khvarenah token recover <label> <token>` to replace the token and auto-resume protection"
             )
         }
+        (BeaconEvent::NetworkDown { survival }, crate::diagnose::Locale::Fa) => {
+            format!("🌑 شبکه قطع شد ({survival}) — حفاظت صبر می‌کند و هنگام بازگشت شبکه به‌طور خودکار ادامه می‌یابد")
+        }
+        (BeaconEvent::NetworkDown { survival }, _) => {
+            format!("🌑 Network down ({survival}) — protection holding; will auto-resume when the network returns")
+        }
+        (BeaconEvent::NetworkRestored, crate::diagnose::Locale::Fa) => {
+            "✅ شبکه بازگشت — حفاظت خودکار از سر گرفته شد".to_string()
+        }
+        (BeaconEvent::NetworkRestored, _) => "✅ Network restored — protection auto-resumed".to_string(),
     }
 }
 
@@ -824,5 +842,45 @@ mod tests {
         // The secondary must never again try to fail over (no infinite loop).
         assert!(!fc.failover_enabled);
         assert_eq!(delivery_order(&fc).len(), 1);
+    }
+
+    #[test]
+    fn network_down_event_formats_survival_plan() {
+        let en = format_message(
+            &BeaconEvent::NetworkDown {
+                survival: "total-blackout".into(),
+            },
+            crate::diagnose::Locale::En,
+        );
+        assert!(en.contains("Network down"));
+        assert!(en.contains("total-blackout"));
+        let fa = format_message(
+            &BeaconEvent::NetworkDown {
+                survival: "dns-hijacked".into(),
+            },
+            crate::diagnose::Locale::Fa,
+        );
+        assert!(fa.contains("شبکه"));
+    }
+
+    #[test]
+    fn network_restored_event_formats() {
+        let en = format_message(&BeaconEvent::NetworkRestored, crate::diagnose::Locale::En);
+        assert!(en.contains("Network restored"));
+        let fa = format_message(&BeaconEvent::NetworkRestored, crate::diagnose::Locale::Fa);
+        assert!(fa.contains("شبکه"));
+    }
+
+    #[test]
+    fn network_event_kinds_map_to_own_rate_limit_class() {
+        assert_eq!(
+            BeaconEvent::NetworkDown { survival: "x".into() }.kind(),
+            BeaconEventKind::NetworkDown
+        );
+        assert_eq!(
+            BeaconEvent::NetworkRestored.kind(),
+            BeaconEventKind::NetworkRestored
+        );
+        assert_ne!(BeaconEventKind::NetworkDown, BeaconEventKind::NetworkRestored);
     }
 }
