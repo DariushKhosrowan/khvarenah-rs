@@ -489,11 +489,25 @@ pub async fn daemon_tick(
             let st = acct.probe_account(profile).await;
             state.last_account_poll_ts = now;
             if st.blocks_cycle() {
+                let was_blocked = state.account_state.blocks_cycle();
                 state.account_state = st;
                 log(&log_line(
                     "WARN",
                     &format!("account now {} — blocking cycles", state.account_state.label()),
                 ));
+                // Notify remotely on the transition into the blocked state (the
+                // daemon holds cycles silently; the user should be told why).
+                if !was_blocked {
+                    let _ = crate::remote_beacon::maybe_emit(
+                        profile,
+                        &crate::remote_beacon::BeaconEvent::AccountBlocked {
+                            state: state.account_state.label().to_string(),
+                            since: crate::store::now_ts() as i64,
+                        },
+                        crate::diagnose::Locale::En,
+                    )
+                    .await;
+                }
                 return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
             }
             state.account_state = st;

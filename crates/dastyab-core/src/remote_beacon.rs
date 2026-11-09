@@ -31,6 +31,7 @@ pub enum BeaconEventKind {
     RescueRecovered,
     DailySummary,
     ConfigMutated,
+    AccountBlocked,
 }
 
 /// A concrete event ready to be formatted + sent.
@@ -43,6 +44,7 @@ pub enum BeaconEvent {
     RescueRecovered,
     DailySummary { cycles: u32, uptime_pct: f32 },
     ConfigMutated { old_worker: String, new_worker: String },
+    AccountBlocked { state: String, since: i64 },
 }
 
 impl BeaconEvent {
@@ -55,6 +57,7 @@ impl BeaconEvent {
             BeaconEvent::RescueRecovered => BeaconEventKind::RescueRecovered,
             BeaconEvent::DailySummary { .. } => BeaconEventKind::DailySummary,
             BeaconEvent::ConfigMutated { .. } => BeaconEventKind::ConfigMutated,
+            BeaconEvent::AccountBlocked { .. } => BeaconEventKind::AccountBlocked,
         }
     }
 }
@@ -173,6 +176,12 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
         }
         (BeaconEvent::ConfigMutated { old_worker, new_worker }, _) => {
             format!("🔄 Worker signature rotated: {old_worker} → {new_worker}")
+        }
+        (BeaconEvent::AccountBlocked { state, .. }, crate::diagnose::Locale::Fa) => {
+            format!("⛔ حساب مسدود شد ({state}) — در انتظار فعالسازی مجدد")
+        }
+        (BeaconEvent::AccountBlocked { state, .. }, _) => {
+            format!("⛔ Account blocked ({state}) — holding cycles until reactivation")
         }
     }
 }
@@ -364,6 +373,20 @@ mod tests {
         assert!(msg.contains("42"));
         // 99.5 formats with `:.0` → rounds to "100".
         assert!(msg.contains("100"));
+    }
+
+    #[test]
+    fn test_format_message_account_blocked_en_and_fa() {
+        let ev = BeaconEvent::AccountBlocked {
+            state: "token-invalid".into(),
+            since: 1234,
+        };
+        let en = format_message(&ev, crate::diagnose::Locale::En);
+        assert!(en.contains("token-invalid"), "en={en}");
+        assert!(en.contains("Account blocked"));
+        let fa = format_message(&ev, crate::diagnose::Locale::Fa);
+        assert!(fa.contains("token-invalid"), "fa={fa}");
+        assert!(fa.contains("حساب"));
     }
 
     #[test]
