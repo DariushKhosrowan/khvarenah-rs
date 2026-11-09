@@ -749,11 +749,7 @@ fn backup(profile: String, action: BackupAction) -> Result<(), CFError> {
             use dastyab_core::store::profiles::{load_profile, save_profile};
             let mut p = load_profile(&profile);
             let mut cfg = p.config.backup_autosync.clone();
-            if disable {
-                cfg.enabled = false;
-            } else {
-                cfg.enabled = true;
-            }
+            cfg.enabled = !disable;
             if let Some(i) = interval {
                 cfg.interval_secs = i;
             }
