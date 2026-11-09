@@ -1944,13 +1944,13 @@ impl<'a> RescuePeer for RealRescuePeer<'a> {
 
     fn redeploy_worker(&self) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>> {
         let profile_id = self.profile_id.to_string();
-        Box::pin(async move { redeploy_worker_core(&profile_id).await })
+        Box::pin(async move { redeploy_worker_core(&profile_id, None).await })
     }
 }
 
 /// Redeploy this profile's worker using the active token + built-in preset
 /// worker JS. Rate-limiting is handled by the caller (via `last_redeploy_ts`).
-async fn redeploy_worker_core(profile_id: &str) -> Result<(), CFError> {
+async fn redeploy_worker_core(profile_id: &str, override_uuid: Option<&str>) -> Result<(), CFError> {
     let label = match crate::store::profiles::get_active_token(profile_id)? {
         Some(l) => l,
         None => {
@@ -1994,7 +1994,35 @@ async fn redeploy_worker_core(profile_id: &str) -> Result<(), CFError> {
     client
         .deploy_script(&acc_id, &worker_name, js, "2026-07-01", 2)
         .await?;
+    // Rotate the UUID var (fresh signature). New UUID comes from the caller
+    // (mutation) or is generated fresh (rescue redeploy).
+    let uuid = match override_uuid {
+        Some(u) => u.to_string(),
+        None => crate::worker::generate_uuid(),
+    };
+    client
+        .set_vars(
+            &acc_id,
+            &worker_name,
+            serde_json::Map::from_iter([("UUID".into(), serde_json::json!(uuid))]),
+        )
+        .await?;
     Ok(())
+}
+
+/// Real mutation peer: redeploys the worker and rotates the UUID via the CF
+/// API (reuses the same deploy mechanics as the rescue chain).
+pub struct RealMutationPeer;
+
+impl crate::config_mutation::MutationPeer for RealMutationPeer {
+    async fn redeploy_with_new_uuid(
+        &self,
+        profile_id: &str,
+        new_uuid: &str,
+    ) -> Result<String, CFError> {
+        redeploy_worker_core(profile_id, Some(new_uuid)).await?;
+        Ok(new_uuid.to_string())
+    }
 }
 
 /// Run the full four-step rescue chain. Returns the detailed chain; the caller

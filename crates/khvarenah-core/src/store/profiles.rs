@@ -148,6 +148,12 @@ pub struct ProfileConfig {
     /// disabled (default). Kept as an `Option` so old configs migrate cleanly.
     #[serde(default)]
     pub beacon: Option<crate::remote_beacon::BeaconConfig>,
+    /// Scheduled config mutation settings (worker signature rotation).
+    #[serde(default)]
+    pub mutation: crate::config_mutation::MutationConfig,
+    /// UNIX epoch seconds of the last config mutation.
+    #[serde(default)]
+    pub last_mutation_ts: i64,
 }
 
 fn default_light_interval() -> u64 {
@@ -179,6 +185,8 @@ impl Default for ProfileConfig {
             strategy_cycles_since_rotation: 0,
             strategy_last_rotated_ts: 0,
             beacon: None,
+            mutation: crate::config_mutation::MutationConfig::default(),
+            last_mutation_ts: 0,
         }
     }
 }

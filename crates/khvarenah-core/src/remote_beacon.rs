@@ -30,6 +30,7 @@ pub enum BeaconEventKind {
     FailoverSwitched,
     RescueRecovered,
     DailySummary,
+    ConfigMutated,
 }
 
 /// A concrete event ready to be formatted + sent.
@@ -41,6 +42,7 @@ pub enum BeaconEvent {
     FailoverSwitched { from: String, to: String },
     RescueRecovered,
     DailySummary { cycles: u32, uptime_pct: f32 },
+    ConfigMutated { old_worker: String, new_worker: String },
 }
 
 impl BeaconEvent {
@@ -52,6 +54,7 @@ impl BeaconEvent {
             BeaconEvent::FailoverSwitched { .. } => BeaconEventKind::FailoverSwitched,
             BeaconEvent::RescueRecovered => BeaconEventKind::RescueRecovered,
             BeaconEvent::DailySummary { .. } => BeaconEventKind::DailySummary,
+            BeaconEvent::ConfigMutated { .. } => BeaconEventKind::ConfigMutated,
         }
     }
 }
@@ -164,6 +167,12 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
         ) => format!("📊 خلاصه روزانه: {cycles} چرخه، {uptime_pct:.0}٪ آپ‌تایم"),
         (BeaconEvent::DailySummary { cycles, uptime_pct }, _) => {
             format!("📊 Daily summary: {cycles} cycles, {uptime_pct:.0}% uptime")
+        }
+        (BeaconEvent::ConfigMutated { old_worker, new_worker }, crate::diagnose::Locale::Fa) => {
+            format!("🔄 امضای کارگر چرخید: {old_worker} ← {new_worker}")
+        }
+        (BeaconEvent::ConfigMutated { old_worker, new_worker }, _) => {
+            format!("🔄 Worker signature rotated: {old_worker} → {new_worker}")
         }
     }
 }

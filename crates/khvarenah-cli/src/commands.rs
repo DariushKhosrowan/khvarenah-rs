@@ -1317,6 +1317,33 @@ async fn daemon_loop(cfg: khvarenah_core::daemon::DaemonConfig) -> Result<(), CF
         })
         .await;
         save_daemon_state(&active_profile, &state)?;
+        // Scheduled config mutation: rotate the worker signature on a schedule
+        // (only when the account is active — never mutate a blocked account).
+        if !state.account_state.blocks_cycle() {
+            let peer = khvarenah_core::autopilot::RealMutationPeer;
+            match khvarenah_core::config_mutation::run_mutation_if_due(&active_profile, &peer).await {
+                Ok(Some(outcome)) => {
+                    let line = log_line(
+                        "INFO",
+                        &format!("config mutation applied: {} -> {}", outcome.old_path, outcome.new_path),
+                    );
+                    daemon_log_append(&cfg.log_path, &line);
+                    let _ = khvarenah_core::remote_beacon::maybe_emit(
+                        &active_profile,
+                        &khvarenah_core::remote_beacon::BeaconEvent::ConfigMutated {
+                            old_worker: outcome.old_uuid,
+                            new_worker: outcome.new_uuid,
+                        },
+                        khvarenah_core::diagnose::Locale::En,
+                    ).await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let line = log_line("WARN", &format!("config mutation skipped: {}", e.brief()));
+                    daemon_log_append(&cfg.log_path, &line);
+                }
+            }
+        }
         // Worker-dead + rescue-gave-up → notify (rate-limited). Track the
         // persisted rescue outcome to avoid re-notifying every cycle.
         let current_rescue = khvarenah_core::store::profiles::load_profile(&active_profile)
