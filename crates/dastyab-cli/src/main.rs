@@ -463,6 +463,19 @@ enum BackupAction {
     },
     /// List existing backups.
     List,
+    /// Configure scheduled auto-backup (daemon snapshots the profile to
+    /// ~/.dastyab/backups/ on an interval, trimming to a keep-count).
+    Autosync {
+        /// Enable (default) or disable scheduled auto-backup.
+        #[arg(long)]
+        disable: bool,
+        /// Interval between auto-backups in seconds (default 86400 = 24h).
+        #[arg(long)]
+        interval: Option<u64>,
+        /// How many newest backups to keep (default 7).
+        #[arg(long)]
+        keep: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
