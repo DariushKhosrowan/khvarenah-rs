@@ -71,6 +71,15 @@ enum Command {
         #[arg()]
         token: String,
     },
+    /// Add a token, verify it against Cloudflare, set it active, and clear a
+    /// blocked daemon account state so protection resumes immediately (guided
+    /// token recovery — no restart).
+    TokenRecover {
+        #[arg()]
+        label: String,
+        #[arg()]
+        token: String,
+    },
     /// List tokens (masked).
     TokenList,
     /// Remove a token.

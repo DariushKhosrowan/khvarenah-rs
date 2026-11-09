@@ -7,7 +7,8 @@ use khvarenah_core::export::{render, ExportFormat};
 use khvarenah_core::scanner::{scan_many, scan_once, ScanParams};
 use khvarenah_core::store::profiles::{
     add_token, create_profile, delete_profile, export_profile, import_profile, list_profiles,
-    load_profile, migrate_legacy, remember_clean_ip, remember_vless, rename_profile, VlessRecord,
+    load_profile, migrate_legacy, remember_clean_ip, remember_vless, rename_profile,
+    set_active_token, VlessRecord,
 };
 use khvarenah_core::vless::VlessProfile;
 use khvarenah_core::worker::{
@@ -64,6 +65,9 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             add_token(&profile, &label, &token)?;
             println!("Token '{label}' saved to profile '{profile}'");
             Ok(())
+        }
+        Command::TokenRecover { label, token } => {
+            token_recover(&profile, &label, &token).await
         }
         Command::TokenList => {
             let p = load_profile(&profile);
@@ -339,6 +343,37 @@ async fn verify(profile: String) -> Result<(), CFError> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// Guided token recovery: add a new token, verify it against Cloudflare, set
+/// it as the active token, and clear any blocked daemon account state so
+/// protection resumes immediately — no daemon restart needed. This closes the
+/// last manual step for a token-invalid/suspended account.
+async fn token_recover(profile: &str, label: &str, token: &str) -> Result<(), CFError> {
+    // 1. Save the token.
+    add_token(profile, label, token)?;
+    // 2. Verify it against Cloudflare.
+    let client = Client::new(token.trim());
+    let res = match client.verify_token().await {
+        Ok(r) => r,
+        Err(e) => {
+            // Verification failed — roll back the saved token so we don't leave
+            // a broken token that shadows a working one.
+            let _ = khvarenah_core::store::profiles::remove_token(profile, label);
+            return Err(e);
+        }
+    };
+    println!("Token '{label}' verified. status={} id={}", res.status, res.id);
+    // 3. Set it active.
+    set_active_token(profile, label)?;
+    // 4. Clear any blocked daemon account state so cycles resume immediately.
+    let cleared = khvarenah_core::daemon::clear_account_blocked(profile)?;
+    if cleared {
+        println!("Daemon account state cleared — protection will resume on the next tick.");
+    } else {
+        println!("Daemon was not blocked; token already active.");
+    }
+    Ok(())
 }
 
 async fn accounts(profile: String) -> Result<(), CFError> {

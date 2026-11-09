@@ -164,6 +164,23 @@ pub fn reset_daemon_state(profile: &str) -> Result<Option<(u32, u64)>, CFError> 
     Ok(Some((old_streak, old_interval)))
 }
 
+/// Clear a blocked account state so the daemon resumes immediately (used by
+/// the guided token-recovery flow after a fresh token verifies). Resets
+/// `account_state` to Active and forces an immediate re-probe on the next
+/// tick. Returns `Ok(true)` if a blocked state was cleared, `Ok(false)` if the
+/// daemon was already unblocked, and `Err` on persist failure.
+pub fn clear_account_blocked(profile: &str) -> Result<bool, CFError> {
+    let mut state = load_daemon_state(profile);
+    if !state.account_state.blocks_cycle() {
+        return Ok(false);
+    }
+    state.account_state = crate::account_state::AccountState::Active;
+    // Force an immediate re-probe on the next tick.
+    state.last_account_poll_ts = 0;
+    save_daemon_state(profile, &state)?;
+    Ok(true)
+}
+
 /// Pure: compute the next backoff interval. Follows the escalation table
 /// 300 → 900 → 3600 → 21600 (5min → 15min → 1h → 6h), capped at `max`.
 pub fn backoff_next(current: u64, max: u64) -> u64 {
@@ -1070,6 +1087,38 @@ mod tests {
         assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
         assert_eq!(cycle.calls.load(Ordering::SeqCst), 0);
         assert!(state.account_state.blocks_cycle());
+    }
+
+    /// `clear_account_blocked` resets a blocked daemon state to Active and
+    /// forces an immediate re-probe, so protection resumes without a restart
+    /// after a guided token recovery.
+    #[tokio::test]
+    async fn test_clear_account_blocked_resets_blocked_state() {
+        let _home = daemon_home();
+        let profile = "default";
+        let mut state = DaemonState::default();
+        state.account_state = crate::account_state::AccountState::TokenInvalid { since: 1 };
+        state.last_account_poll_ts = (crate::store::now_ts() as i64) - 100;
+        save_daemon_state(profile, &state).unwrap();
+
+        let cleared = crate::daemon::clear_account_blocked(profile).unwrap();
+        assert!(cleared, "blocked state should be cleared");
+
+        let after = load_daemon_state(profile);
+        assert!(!after.account_state.blocks_cycle());
+        assert_eq!(after.account_state, crate::account_state::AccountState::Active);
+        assert_eq!(after.last_account_poll_ts, 0, "forces immediate re-probe");
+    }
+
+    /// Clearing an already-unblocked daemon is a no-op (returns false).
+    #[tokio::test]
+    async fn test_clear_account_blocked_noop_when_active() {
+        let _home = daemon_home();
+        let profile = "default";
+        let state = DaemonState::default(); // Active
+        save_daemon_state(profile, &state).unwrap();
+        let cleared = crate::daemon::clear_account_blocked(profile).unwrap();
+        assert!(!cleared);
     }
 
 }
