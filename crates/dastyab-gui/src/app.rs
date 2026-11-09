@@ -2181,6 +2181,33 @@ impl DastYabApp {
                                 }
                                 self.save_mutation();
                             }
+                            FixAction::EnableDaemon => {
+                                // One-click install+start of the systemd
+                                // daemon with boot-before-login linger.
+                                let exe = std::env::current_exe()
+                                    .unwrap_or_else(|_| "/home/amir/.local/bin/dastyab".into());
+                                match dastyab_core::bootstrap::ensure_daemon_installed(
+                                    &exe,
+                                    &self.profile_id,
+                                    true,
+                                ) {
+                                    Ok(outcome) => {
+                                        let status_txt = match outcome {
+                                            dastyab_core::bootstrap::DaemonInstallOutcome::Installed => {
+                                                "installed and started"
+                                            }
+                                            dastyab_core::bootstrap::DaemonInstallOutcome::AlreadyInstalled => {
+                                                "started (already installed)"
+                                            }
+                                        };
+                                        self.daemon_note =
+                                            format!("Daemon {status_txt} — boot autostart armed.");
+                                    }
+                                    Err(e) => {
+                                        self.daemon_note = format!("Daemon install failed: {}", e.brief());
+                                    }
+                                }
+                            }
                         }
                     }
                 });
