@@ -80,7 +80,7 @@ pub mod vps_provision;
 pub mod worker;
 
 pub use blackout::NetworkState;
-pub use connectivity::{FallbackLadder, Probe, ProbeVerdict, Tier, TierChange};
+pub use connectivity::{FallbackLadder, Probe, ProbeVerdict, RealLadderProbe, Tier, TierChange};
 pub use doh::DohResolver;
 pub use dot::DotEndpoint;
 pub use error::CFError;

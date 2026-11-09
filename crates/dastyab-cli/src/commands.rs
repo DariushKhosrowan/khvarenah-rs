@@ -1335,7 +1335,7 @@ async fn daemon_loop(cfg: dastyab_core::daemon::DaemonConfig) -> Result<(), CFEr
     state.started_at = dastyab_core::store::now_ts() as i64;
     save_daemon_state(&cfg.profile, &state)?;
 
-    let probe = RealNetworkProbe(dastyab_core::doh::DohResolver::new());
+    let probe = RealNetworkProbe::new(&cfg.profile);
     let acct = RealAccountProbe;
     let cycle = RealCycleRunner;
     let mut interval = cfg.initial_interval_secs;
