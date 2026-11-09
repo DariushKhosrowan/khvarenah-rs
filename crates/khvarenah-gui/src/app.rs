@@ -1797,6 +1797,13 @@ impl KhvarenahApp {
         } else {
             ui.label("No unresolved intents.");
         }
+        ui.horizontal(|ui| {
+            if ui.button("Clear journal").clicked() {
+                if khvarenah_core::journal::clear(&self.profile_id).is_ok() {
+                    ui.label("Cleared.");
+                }
+            }
+        });
         let show = khvarenah_core::journal::recent(&self.profile_id, 10);
         if show.is_empty() {
             ui.label("Journal is empty — events appear after the daemon records blackout/rescue transitions.");
