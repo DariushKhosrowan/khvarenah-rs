@@ -313,6 +313,13 @@ pub struct PipelineDiagnostics {
     /// tells Cause A (DPI TLS reset — `TlsAlert` dominant) from Cause B
     /// (dead worker route — `DeadRoute`/`HttpStatus` 404/421 dominant).
     pub ws_failure_histogram: HashMap<crate::health::WsFailureReason, u32>,
+    /// Failure reasons stratified by which SNI layer each probe ran under.
+    /// Key = (SniLayer, WsFailureReason). Answers the A-vs-B question per
+    /// layer: worker-only `TlsAlert` → SNI blocking; `TlsAlert` on BOTH layers
+    /// → ClientHello / cipher-suite blocking; `DeadRoute`/404/421 on worker →
+    /// dead route.
+    #[serde(default)]
+    pub failure_by_sni: HashMap<(crate::health::SniLayer, crate::health::WsFailureReason), u32>,
     /// True when we early-exited at target_n.
     pub cancelled_early: bool,
     /// False when E2E was skipped (no direct IP available).
@@ -324,6 +331,62 @@ pub struct PipelineResult {
     pub verified: Vec<CleanEndpoint>,
     pub diagnostics: PipelineDiagnostics,
     pub elapsed_ms: u64,
+}
+
+/// Verdict on the DPI/worker cause, derived from the SNI-stratified failure
+/// histogram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SniVerdict {
+    /// TlsAlert on the worker SNI only → the worker hostname's SNI is being
+    /// blocked (use the Generic-CF SNI strategy).
+    WorkerSniBlocked,
+    /// TlsAlert on BOTH SNI layers → ClientHello / cipher-suite fingerprint
+    /// blocking (rotate ClientHello profile / desync).
+    ClientHelloBlocked,
+    /// DeadRoute / HTTP 404/421 on the worker SNI → dead worker route
+    /// (redeploy / new path).
+    WorkerRouteDead,
+    /// Not enough stratified data to say.
+    Unknown,
+}
+
+/// Pure verdict from the stratified failure map. `worker_only_tls_alert`
+/// counts `(Worker, TlsAlert)`; `both_layers_tls_alert` is true when both
+/// layers have non-zero TlsAlert. `worker_dead_route` counts `DeadRoute` +
+/// `HttpStatus(404)` + `HttpStatus(421)` on the worker SNI.
+pub fn sni_verdict(
+    worker_only_tls_alert: u32,
+    both_layers_tls_alert: bool,
+    worker_dead_route: u32,
+) -> SniVerdict {
+    if worker_dead_route > 0 && !both_layers_tls_alert {
+        return SniVerdict::WorkerRouteDead;
+    }
+    if both_layers_tls_alert {
+        return SniVerdict::ClientHelloBlocked;
+    }
+    if worker_only_tls_alert > 0 {
+        return SniVerdict::WorkerSniBlocked;
+    }
+    SniVerdict::Unknown
+}
+
+/// Convenience: compute the verdict straight from a `PipelineDiagnostics`.
+pub fn verdict_from_diagnostics(d: &PipelineDiagnostics) -> SniVerdict {
+    use crate::health::{SniLayer, WsFailureReason};
+    let tls = |l| *d.failure_by_sni.get(&(l, WsFailureReason::TlsAlert)).unwrap_or(&0);
+    let worker_tls = tls(SniLayer::Worker);
+    let generic_tls = tls(SniLayer::GenericCf);
+    let dead_route = [
+        WsFailureReason::DeadRoute,
+        WsFailureReason::HttpStatus(404),
+        WsFailureReason::HttpStatus(421),
+        WsFailureReason::HttpStatus(403),
+    ]
+    .iter()
+    .map(|r| *d.failure_by_sni.get(&(SniLayer::Worker, *r)).unwrap_or(&0))
+    .sum::<u32>();
+    sni_verdict(worker_tls, worker_tls > 0 && generic_tls > 0, dead_route)
 }
 
 /// 7-dimension gate score mirroring `health::quality_score`, computed from the
@@ -408,6 +471,8 @@ pub async fn pipeline_scan(
     let e2e_pass_c = Arc::new(AtomicUsize::new(0));
     let e2e_fail: Arc<Mutex<HashMap<E2eFailureStage, u32>>> = Arc::new(Mutex::new(HashMap::new()));
     let ws_fail: Arc<Mutex<HashMap<crate::health::WsFailureReason, u32>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let ws_fail_sni: Arc<Mutex<HashMap<(crate::health::SniLayer, crate::health::WsFailureReason), u32>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let results: Arc<Mutex<Vec<CleanEndpoint>>> = Arc::new(Mutex::new(Vec::new()));
     let candidates = Arc::new(candidates);
@@ -514,6 +579,7 @@ pub async fn pipeline_scan(
         let phase2_pass_c = phase2_pass.clone();
         let gated_c = gated.clone();
         let ws_fail_c = ws_fail.clone();
+        let ws_fail_sni_c = ws_fail_sni.clone();
         let done_c = done.clone();
         let sni = sni.to_string();
         let path = path.to_string();
@@ -533,6 +599,7 @@ pub async fn pipeline_scan(
                 let phase2_pass_c = phase2_pass_c.clone();
                 let gated_c = gated_c.clone();
                 let ws_fail_c = ws_fail_c.clone();
+                let ws_fail_sni_c = ws_fail_sni_c.clone();
                 let params2 = params;
                 handles.push(tokio::spawn(async move {
                     let _permit = permit;
@@ -541,12 +608,15 @@ pub async fn pipeline_scan(
                     // Only the first (accepted) probe on the happy path has a
                     // failure_reason; failed probes always carry one.
                     let mut fm = ws_fail_c.lock().unwrap();
+                    let mut fms = ws_fail_sni_c.lock().unwrap();
                     for p in &probes {
                         if let Some(reason) = p.failure_reason {
                             *fm.entry(reason).or_insert(0) += 1;
+                            let layer = crate::health::SniLayer::classify(&p.sni_used);
+                            *fms.entry((layer, reason)).or_insert(0) += 1;
                         }
                     }
-                    drop(fm);
+                    drop((fm, fms));
                     let accepted = probes.iter().find(|p| {
                         p.status == Some(101) && p.worker_bytes >= crate::health::MIN_WORKER_BYTES
                     });
@@ -634,6 +704,7 @@ pub async fn pipeline_scan(
         },
         e2e_fail_by_stage: e2e_fail.lock().unwrap().clone(),
         ws_failure_histogram: ws_fail.lock().unwrap().clone(),
+        failure_by_sni: ws_fail_sni.lock().unwrap().clone(),
         cancelled_early: done.load(Ordering::Relaxed),
         e2e_enabled,
     };
@@ -1109,5 +1180,110 @@ mod tests {
         );
         // The histogram should contain every failure bucket (no other reasons).
         assert_eq!(http404 + deadroute, h.values().sum::<u32>());
+    }
+
+    #[tokio::test]
+    async fn pipeline_stratifies_failures_by_sni_layer() {
+        let cands: Vec<String> = (0..12).map(|i| format!("candidate-{i}")).collect();
+        let p1 = phase1_ok(usize::MAX);
+        // Inject a worker-layer TlsAlert and a generic-CF-layer 404 so both
+        // layers appear in the stratified map.
+        let p2: Phase2Fn = Box::new(move |ip: &str, _sni, _path, _to| {
+            let n: usize = ip.trim_start_matches("candidate-").parse().unwrap_or(0);
+            let out = match n % 3 {
+                0 => vec![ws_accepted(443, 4096)],
+                1 => vec![WsProbe {
+                    failure_reason: Some(crate::health::WsFailureReason::TlsAlert),
+                    sni_used: "mock.workers.dev".to_string(),
+                    ..ws_rejected(443)
+                }],
+                _ => vec![WsProbe {
+                    failure_reason: Some(crate::health::WsFailureReason::HttpStatus(404)),
+                    sni_used: crate::health::GENERIC_CF_SNI.to_string(),
+                    ..ws_rejected(443)
+                }],
+            };
+            Box::pin(async move { out })
+        });
+        let e2e: E2eFn = Box::new(move |ip, _port, _vless, _t| {
+            let ip = ip.to_string();
+            Box::pin(async move {
+                crate::e2e::E2eResult {
+                    endpoint: format!("{ip}:443"),
+                    passed: true,
+                    failure_stage: None,
+                    verified_at: 0,
+                    tunnel_ip: Some("9.9.9.9".into()),
+                }
+            })
+        });
+        let res = pipeline_scan(
+            cands,
+            "sni.test",
+            "/ws",
+            "vless://x@y:443?security=tls&type=ws",
+            Some("1.1.1.1".into()),
+            PipelineParams::default(),
+            p1,
+            p2,
+            e2e,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let m = &res.diagnostics.failure_by_sni;
+        let worker_tls = *m
+            .get(&(crate::health::SniLayer::Worker, crate::health::WsFailureReason::TlsAlert))
+            .unwrap_or(&0);
+        let generic_404 = *m
+            .get(&(
+                crate::health::SniLayer::GenericCf,
+                crate::health::WsFailureReason::HttpStatus(404),
+            ))
+            .unwrap_or(&0);
+        assert!(worker_tls > 0, "expected worker-layer TlsAlert, got {m:?}");
+        assert!(generic_404 > 0, "expected generic-CF-layer 404, got {m:?}");
+    }
+
+    #[test]
+    fn sni_verdict_worker_only_tls_alert() {
+        assert_eq!(
+            super::sni_verdict(5, false, 0),
+            super::SniVerdict::WorkerSniBlocked
+        );
+    }
+
+    #[test]
+    fn sni_verdict_both_layers_tls_alert() {
+        assert_eq!(
+            super::sni_verdict(5, true, 0),
+            super::SniVerdict::ClientHelloBlocked
+        );
+    }
+
+    #[test]
+    fn sni_verdict_dead_route_wins_over_worker_alert() {
+        assert_eq!(
+            super::sni_verdict(2, false, 7),
+            super::SniVerdict::WorkerRouteDead
+        );
+    }
+
+    #[test]
+    fn sni_verdict_unknown_when_no_data() {
+        assert_eq!(super::sni_verdict(0, false, 0), super::SniVerdict::Unknown);
+    }
+
+    #[test]
+    fn verdict_from_diagnostics_maps_stratified_map() {
+        use crate::health::{SniLayer, WsFailureReason};
+        let mut d = PipelineDiagnostics::default();
+        d.failure_by_sni.insert((SniLayer::Worker, WsFailureReason::TlsAlert), 4);
+        d.failure_by_sni.insert((SniLayer::GenericCf, WsFailureReason::TlsAlert), 4);
+        assert_eq!(super::verdict_from_diagnostics(&d), super::SniVerdict::ClientHelloBlocked);
+        d.failure_by_sni.clear();
+        d.failure_by_sni.insert((SniLayer::Worker, WsFailureReason::DeadRoute), 9);
+        assert_eq!(super::verdict_from_diagnostics(&d), super::SniVerdict::WorkerRouteDead);
     }
 }

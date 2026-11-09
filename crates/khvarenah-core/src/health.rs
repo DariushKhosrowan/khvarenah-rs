@@ -84,6 +84,27 @@ pub struct WsProbe {
     pub sni_used: String,
 }
 
+/// Which SNI layer a WS probe ran under. Worker = the worker hostname;
+/// GenericCf = the benign `www.cloudflare.com` SNI (used to bypass
+/// `*.workers.dev` SNI blocking while keeping the worker as the Host header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+pub enum SniLayer {
+    #[default]
+    Worker,
+    GenericCf,
+}
+
+impl SniLayer {
+    /// Classify an SNI string into a layer.
+    pub fn classify(sni: &str) -> Self {
+        if sni == GENERIC_CF_SNI {
+            SniLayer::GenericCf
+        } else {
+            SniLayer::Worker
+        }
+    }
+}
+
 /// Derived target for a WS probe: what to connect to and what to request.
 #[derive(Debug, Clone)]
 pub struct WsTarget {
