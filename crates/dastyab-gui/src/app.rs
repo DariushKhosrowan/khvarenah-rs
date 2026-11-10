@@ -295,6 +295,9 @@ pub enum PendingDialogAction {
     ResetSettings,
     /// Clear the blackout/rescue journal for the active profile.
     ClearJournal,
+    /// Restore a specific saved version of an artifact (dialog confirms the
+    /// destructive overwrite of the live file).
+    RestoreVersion(String, u64),
 }
 
 impl DastYabApp {
@@ -1447,6 +1450,26 @@ impl DastYabApp {
                                     self.note = "Journal cleared.".to_string();
                                 }
                                 Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::RestoreVersion(rel_path, unix)) => {
+                        if let DialogPayload::Confirm = payload {
+                            let dir =
+                                dastyab_core::store::profiles::profile_dir(&self.profile_id);
+                            let now = dastyab_core::store::now_ts() as u64;
+                            match dastyab_core::artifact_versions::restore_version(
+                                &dir,
+                                &rel_path,
+                                unix,
+                                now,
+                            ) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note =
+                                        format!("Restored {rel_path} from version {unix}.");
+                                }
+                                Err(e) => self.note = e.to_string(),
                             }
                         }
                     }

@@ -387,4 +387,109 @@ pub fn show(
                 }
             });
     });
+
+    // ── Saved versions drawer (per-artifact, integrity-flagged) ──────────
+    // Each artifact's version history is listed with a truthful corrupt flag
+    // sourced from the last integrity sweep (versioning_state.corrupt_versions).
+    // Corrupt versions are NOT offered for restore — the sweep only flags,
+    // never deletes, and restoring a corrupt snapshot would be a lying safe.
+    let summaries = dastyab_core::artifact_versions::list_versions_with_integrity(
+        &dastyab_core::store::profiles::profile_dir(&app.profile_id),
+    );
+    ui.add_space(8.0);
+    let corrupt_total: usize = summaries
+        .iter()
+        .map(|s| s.versions.iter().filter(|v| v.corrupt).count())
+        .sum();
+    let version_total: usize = summaries.iter().map(|s| s.versions.len()).sum();
+    section_card(ui, "Saved Versions", |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{version_total} versions across {} artifacts",
+                    summaries.len()
+                ))
+                .color(GOLD_DIM),
+            );
+            if corrupt_total > 0 {
+                ui.label(
+                    egui::RichText::new(format!("⚠ {corrupt_total} flagged corrupt"))
+                        .color(egui::Color32::from_rgb(220, 120, 90)),
+                );
+            }
+        });
+        ui.add_space(4.0);
+        if summaries.is_empty() {
+            ui.label(
+                egui::RichText::new("No saved versions yet — rewrite a file to snapshot a version.")
+                    .color(GOLD_DIM),
+            );
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(380.0)
+            .show(ui, |ui| {
+                for s in &summaries {
+                    egui::Frame::new()
+                        .fill(CARD)
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .corner_radius(6.0)
+                        .stroke(egui::Stroke::new(1.0, CARD_STROKE))
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(&s.artifact).color(TEXT).strong());
+                            for v in &s.versions {
+                                ui.horizontal(|ui| {
+                                    let mut label = format_ts(v.saved_unix as i64);
+                                    if v.corrupt {
+                                        label.push_str("  ⚠ corrupt");
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(label)
+                                            .color(if v.corrupt {
+                                                egui::Color32::from_rgb(220, 120, 90)
+                                            } else {
+                                                GOLD_DIM
+                                            })
+                                            .small(),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let restore = ui
+                                                .add_enabled(
+                                                    !v.corrupt,
+                                                    egui::Button::new("Restore"),
+                                                )
+                                                .on_hover_text(if v.corrupt {
+                                                    "Flagged corrupt by the integrity sweep — restore not offered to avoid a lying recovery."
+                                                } else {
+                                                    "Overwrite the live file with this saved version"
+                                                });
+                                            if restore.clicked() {
+                                                app.pending_action = Some(
+                                                    crate::app::PendingDialogAction::RestoreVersion(
+                                                        s.artifact.clone(),
+                                                        v.saved_unix,
+                                                    ),
+                                                );
+                                                app.dialog = Some(dialogs::confirm(
+                                                    "Restore version",
+                                                    format!(
+                                                        "Overwrite current {} with the version from {}?",
+                                                        s.artifact,
+                                                        format_ts(v.saved_unix as i64)
+                                                    ),
+                                                    true,
+                                                ));
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
+            });
+    });
 }
