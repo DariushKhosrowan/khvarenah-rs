@@ -2306,6 +2306,28 @@ impl KhvarenahApp {
                             .color(egui::Color32::from_rgb(120, 140, 180)),
                     );
                 }
+                // In-app actions for the two safeguards that need user-supplied
+                // input — open the *same* dialogs/panels the dedicated views
+                // use, so no safeguard forces a terminal step.
+                match item.code.as_str() {
+                    "token_rotate" if item.status == CheckStatus::Action => {
+                        if ui.button("➕ Add token in app").clicked() {
+                            self.pending_action = Some(PendingDialogAction::AddToken);
+                            self.dialog = Some(dialogs::prompt_two(
+                                "Add token",
+                                "Label (e.g. cf-main)",
+                                "Cloudflare API token",
+                                true,
+                            ));
+                        }
+                    }
+                    "tunnel" if item.status == CheckStatus::Action => {
+                        if ui.button("⚙ Configure DNS tunnel in app").clicked() {
+                            self.view = View::Settings;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 
