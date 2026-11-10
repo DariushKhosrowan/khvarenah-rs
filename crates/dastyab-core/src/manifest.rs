@@ -246,6 +246,52 @@ pub fn load_manifest(profile_id: &str) -> Option<ProfileManifest> {
     crate::store::read_opt(&manifest_path(profile_id))
 }
 
+/// Rebuild a profile's manifest from what is on disk, idempotently. Cheap
+/// (≤12 small files). Writes via `atomic_write` directly (not `write_json`)
+/// so it never re-triggers the store's manifest-refresh hook (no recursion).
+pub fn refresh_manifest_after_write(
+    profile_dir: &Path,
+    now_unix: u64,
+) -> Result<ProfileManifest, CFError> {
+    let profile_id = profile_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("default")
+        .to_string();
+    let mut entries = BTreeMap::new();
+    for kind in profile_artifact_kinds() {
+        let rel = kind.filename().to_string();
+        let p = profile_dir.join(&rel);
+        if let Some(e) = entry_for_path(&p) {
+            entries.insert(rel, e);
+        }
+    }
+    let manifest = ProfileManifest {
+        schema_version: 1,
+        profile_id,
+        created_unix: now_unix,
+        entries,
+    };
+    let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| {
+        CFError::new(
+            "Manifest error",
+            format!("Cannot serialize manifest: {e}"),
+            "Internal error.",
+        )
+    })?;
+    crate::store::atomic_write(&profile_dir.join("manifest.json"), &bytes)?;
+    Ok(manifest)
+}
+
+/// Ensure a profile has a manifest, creating one from disk if missing. Called
+/// on the first write of a new profile.
+pub fn ensure_manifest(profile_dir: &Path, now_unix: u64) -> Result<(), CFError> {
+    if !profile_dir.join("manifest.json").exists() {
+        refresh_manifest_after_write(profile_dir, now_unix)?;
+    }
+    Ok(())
+}
+
 /// Verify a profile against its manifest. When no manifest exists, returns a
 /// report with `has_manifest=false` and every tracked artifact flagged as
 /// `extra`-free but the whole profile `NoManifest`.
