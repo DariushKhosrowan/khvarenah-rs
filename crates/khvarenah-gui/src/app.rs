@@ -2170,6 +2170,9 @@ impl KhvarenahApp {
                             khvarenah_core::journal::JournalKind::MutationPerformed => {
                                 "🔁 signature-rotated"
                             }
+                            khvarenah_core::journal::JournalKind::DrillPerformed => {
+                                "🩺 blackout-self-test"
+                            }
                         };
                         ui.label(format!("{label} — {} (t={})", e.detail, e.ts));
                     }

@@ -67,6 +67,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             Ok(())
         }
         Command::TokenRecover { label, token } => token_recover(&profile, &label, &token).await,
+        Command::TokenEnsure { min } => token_ensure(&profile, min).await,
         Command::TokenList => {
             let p = load_profile(&profile);
             if p.tokens.is_empty() {
@@ -468,6 +469,56 @@ async fn token_recover(profile: &str, label: &str, token: &str) -> Result<(), CF
         println!("Daemon account state cleared — protection will resume on the next tick.");
     } else {
         println!("Daemon was not blocked; token already active.");
+    }
+    Ok(())
+}
+
+/// Ensure at least `min` tokens are stored, auto-creating a second one via
+/// the Cloudflare API when below the threshold. This closes the manual
+/// "create a token in the dashboard" step that was the only remaining barrier
+/// to fully automatic token-rotation.
+async fn token_ensure(profile: &str, min: usize) -> Result<(), CFError> {
+    use khvarenah_core::token_provision::ensure_minimum_tokens;
+
+    let p = load_profile(profile);
+    if p.tokens.len() >= min {
+        println!("Profile '{profile}' already has {} token(s); nothing to do.", p.tokens.len());
+        return Ok(());
+    }
+    // We mint the new token using the FIRST stored token's credentials.
+    let base = first_token(&p)?;
+    let client = Client::new(&base);
+    let account_id = client
+        .list_accounts()
+        .await?
+        .into_iter()
+        .next()
+        .map(|a| a.id)
+        .ok_or_else(|| {
+            CFError::new(
+                "token-ensure",
+                "no Cloudflare account accessible with the active token",
+                "Check the token's account permissions.",
+            )
+        })?;
+
+    // Real creator seam: bound the CF client's create_api_token.
+    let made = ensure_minimum_tokens(
+        profile,
+        min,
+        account_id,
+        move |acc: String, name: String| {
+            let c = Client::new(&base);
+            Box::pin(async move { c.create_api_token(&acc, &name).await })
+        },
+    )
+    .await?;
+
+    if made {
+        let now = load_profile(profile).tokens.len();
+        println!(
+            "Auto-created a rotation token via the Cloudflare API — profile now has {now} token(s). Auto-rotation is armed."
+        );
     }
     Ok(())
 }
@@ -2834,6 +2885,7 @@ fn kind_label(k: khvarenah_core::journal::JournalKind) -> &'static str {
         JournalKind::OutboxFlushed => "outbox-flushed",
         JournalKind::BackupWritten => "backup-written",
         JournalKind::MutationPerformed => "signature-rotated",
+        JournalKind::DrillPerformed => "blackout-self-test",
     }
 }
 

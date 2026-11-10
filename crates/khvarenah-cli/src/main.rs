@@ -80,6 +80,13 @@ enum Command {
         #[arg()]
         token: String,
     },
+    /// Ensure at least MIN tokens are stored, auto-creating a second one via
+    /// the Cloudflare API when below the threshold (removes the manual
+    /// "create a token in the dashboard" step that blocks auto-rotation).
+    TokenEnsure {
+        #[arg(long, default_value_t = 2)]
+        min: usize,
+    },
     /// List tokens (masked).
     TokenList,
     /// Remove a token.
