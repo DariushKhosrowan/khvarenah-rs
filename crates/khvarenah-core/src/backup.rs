@@ -142,6 +142,26 @@ pub fn profiles_overview() -> Vec<ProfileMeta> {
     list_profiles()
 }
 
+/// Delete a saved backup file by its path. Returns `Ok(true)` when the file
+/// was removed, `Ok(false)` when the path was not inside the backup directory
+/// or did not exist, and `Err` on an actual IO failure.
+pub fn delete_backup(path: &std::path::Path) -> Result<bool, CFError> {
+    // Guard: only ever delete files that live under our backup directory.
+    let dir = backup_dir();
+    if !path.starts_with(&dir) {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(CFError::new(
+            "Backup delete error",
+            format!("{e}"),
+            "Check file permissions.",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +169,22 @@ mod tests {
     #[test]
     fn human_size_uses_human_bytes() {
         assert!(human_size(0).contains("B"));
+    }
+
+    #[test]
+    fn delete_backup_removes_file_in_dir() {
+        use crate::store::set_mem_dir_override;
+        let tmp = tempfile::tempdir().unwrap();
+        set_mem_dir_override(tmp.path().join(".khvarenah"));
+        let path = export_profile_to_file("default", None).unwrap();
+        assert!(path.exists());
+        assert!(delete_backup(&path).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn delete_backup_refuses_outside_dir() {
+        let path = std::path::Path::new("/tmp/not-a-khvarenah-backup.json");
+        assert!(!delete_backup(path).unwrap());
     }
 }

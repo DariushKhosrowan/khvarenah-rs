@@ -160,9 +160,10 @@ impl CarrierRefresher {
         let body = serde_json::json!({ "flag": 6 });
         let raw: serde_json::Value = self.post_ctl_raw(&body)?;
         match raw.get("ping_ts") {
-            Some(serde_json::Value::String(s)) => s.parse::<u64>().map(Some).map_err(|e| {
-                RefreshError::Transport(format!("non-numeric ping_ts: {e}"))
-            }),
+            Some(serde_json::Value::String(s)) => s
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|e| RefreshError::Transport(format!("non-numeric ping_ts: {e}"))),
             Some(serde_json::Value::Null) | None => Ok(None),
             Some(other) => Err(RefreshError::Transport(format!(
                 "unexpected ping_ts type: {other}"
@@ -176,7 +177,8 @@ impl CarrierRefresher {
         flag: u32,
         req: &T,
     ) -> Result<R, RefreshError> {
-        let req_val = serde_json::to_value(req).map_err(|e| RefreshError::Transport(e.to_string()))?;
+        let req_val =
+            serde_json::to_value(req).map_err(|e| RefreshError::Transport(e.to_string()))?;
         let mut body = serde_json::Map::new();
         body.insert("flag".into(), serde_json::Value::from(flag));
         if let serde_json::Value::Object(m) = req_val {
@@ -215,9 +217,9 @@ impl CarrierRefresher {
                 resp.json::<serde_json::Value>()
                     .map_err(|e| RefreshError::Transport(format!("json: {e}")))
             });
-            handle.join().unwrap_or_else(|_| {
-                Err(RefreshError::Transport("worker thread panicked".into()))
-            })
+            handle
+                .join()
+                .unwrap_or_else(|_| Err(RefreshError::Transport("worker thread panicked".into())))
         })
     }
 
@@ -255,11 +257,14 @@ impl CarrierRefresher {
         });
         self.post_ctl_raw(&body)?;
         // Push succeeded → record the hash for this worker.
-        write_push_hash(&hash_path, PushHashRecord {
-            schema_version: 1,
-            worker_url: self.worker_url.clone(),
-            hash_hex: hex_str(&identity),
-        })?;
+        write_push_hash(
+            &hash_path,
+            PushHashRecord {
+                schema_version: 1,
+                worker_url: self.worker_url.clone(),
+                hash_hex: hex_str(&identity),
+            },
+        )?;
         Ok(PushOutcome::Pushed {
             endpoints: snapshot.endpoints.len(),
         })
@@ -319,10 +324,7 @@ fn load_push_hash(path: &std::path::Path) -> Option<PushHashRecord> {
 }
 
 /// Atomically persist a push-hash record (`.tmp` → rename).
-fn write_push_hash(
-    path: &std::path::Path,
-    rec: PushHashRecord,
-) -> Result<(), RefreshError> {
+fn write_push_hash(path: &std::path::Path, rec: PushHashRecord) -> Result<(), RefreshError> {
     let tmp = {
         let p = std::path::PathBuf::from(path);
         let mut os = p.into_os_string();
@@ -399,7 +401,8 @@ mod tests {
                         let mut iter = req.split("\r\n\r\n");
                         let _head = iter.next();
                         let body = iter.next().unwrap_or("");
-                        let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(body).unwrap_or_default();
                         log2.lock().unwrap().push(parsed.to_string());
                         let (status, payload) = responder(&parsed);
                         let out = serde_json::to_vec(&payload).unwrap();
@@ -424,7 +427,12 @@ mod tests {
 
     #[test]
     fn carrier_refresh_no_snapshot_returns_no_snapshot() {
-        let (url, _log) = mock_worker(|_| (200, serde_json::json!({ "snapshot": null, "server_generation": 0 })));
+        let (url, _log) = mock_worker(|_| {
+            (
+                200,
+                serde_json::json!({ "snapshot": null, "server_generation": 0 }),
+            )
+        });
         let (_dir, pool) = tmp_pool_with(&["a.example.com"], 1);
         let before = pool.load().unwrap();
         let outcome = refresher(&url).refresh_once(&pool, 2000).unwrap();
@@ -440,7 +448,10 @@ mod tests {
         let snap = snapshot_with(&["a.example.com"], 5);
         let (url, _log) = mock_worker(move |_| {
             let s = snap.clone();
-            (200, serde_json::json!({ "snapshot": s, "server_generation": 7 }))
+            (
+                200,
+                serde_json::json!({ "snapshot": s, "server_generation": 7 }),
+            )
         });
         let (_dir, pool) = tmp_pool_with(&["a.example.com"], 5);
         // Re-store with Remote provenance so merge is a true no-op.
@@ -453,7 +464,12 @@ mod tests {
 
         let before = pool.load().unwrap();
         let outcome = refresher(&url).refresh_once(&pool, 2000).unwrap();
-        assert!(matches!(outcome, RefreshOutcome::NotNewer { server_generation: 7 }));
+        assert!(matches!(
+            outcome,
+            RefreshOutcome::NotNewer {
+                server_generation: 7
+            }
+        ));
         let after = pool.load().unwrap();
         assert_eq!(after.generation, before.generation);
     }
@@ -463,7 +479,10 @@ mod tests {
         let snap = snapshot_with(&["a.example.com", "b.example.com"], 9);
         let (url, _log) = mock_worker(move |_| {
             let s = snap.clone();
-            (200, serde_json::json!({ "snapshot": s, "server_generation": 9 }))
+            (
+                200,
+                serde_json::json!({ "snapshot": s, "server_generation": 9 }),
+            )
         });
         let (_dir, pool) = tmp_pool_with(&["old.example.com"], 1);
         let outcome = refresher(&url).refresh_once(&pool, 2000).unwrap();
@@ -489,7 +508,10 @@ mod tests {
         snap.endpoints[0].host = "X.example.com".to_string();
         let (url, _log) = mock_worker(move |_| {
             let s = snap.clone();
-            (200, serde_json::json!({ "snapshot": s, "server_generation": 3 }))
+            (
+                200,
+                serde_json::json!({ "snapshot": s, "server_generation": 3 }),
+            )
         });
         let (_dir, pool) = tmp_pool_with(&["old.example.com"], 1);
         let err = refresher(&url).refresh_once(&pool, 2000).unwrap_err();
@@ -538,14 +560,21 @@ mod tests {
         let stored2 = stored.clone();
         let (url, _log) = mock_worker(move |body: &serde_json::Value| {
             if body["flag"] == 5 {
-                let snap: CarrierSnapshot = serde_json::from_value(body["snapshot"].clone()).unwrap();
+                let snap: CarrierSnapshot =
+                    serde_json::from_value(body["snapshot"].clone()).unwrap();
                 *stored2.lock().unwrap() = Some(snap);
                 (200, serde_json::json!({ "stored_generation": 1 }))
             } else {
                 let snap = stored2.lock().unwrap().clone();
                 match snap {
-                    Some(s) => (200, serde_json::json!({ "snapshot": s, "server_generation": 1 })),
-                    None => (200, serde_json::json!({ "snapshot": null, "server_generation": 0 })),
+                    Some(s) => (
+                        200,
+                        serde_json::json!({ "snapshot": s, "server_generation": 1 }),
+                    ),
+                    None => (
+                        200,
+                        serde_json::json!({ "snapshot": null, "server_generation": 0 }),
+                    ),
                 }
             }
         });
@@ -553,7 +582,12 @@ mod tests {
         refresher(&url).push_snapshot(&pool).unwrap();
         let before = pool.load().unwrap();
         let outcome = refresher(&url).refresh_once(&pool, 2000).unwrap();
-        assert!(matches!(outcome, RefreshOutcome::NotNewer { server_generation: 1 }));
+        assert!(matches!(
+            outcome,
+            RefreshOutcome::NotNewer {
+                server_generation: 1
+            }
+        ));
         let after = pool.load().unwrap();
         assert_eq!(after.generation, before.generation);
     }
@@ -579,7 +613,9 @@ mod tests {
         // Identical identity → skip; no new flag-5 request.
         assert!(matches!(
             r.push_snapshot_if_identity_changed(&pool).unwrap(),
-            PushOutcome::Skipped { reason: SkipReason::Unchanged }
+            PushOutcome::Skipped {
+                reason: SkipReason::Unchanged
+            }
         ));
         assert_eq!(log.lock().unwrap().len(), 1);
     }
@@ -635,7 +671,9 @@ mod tests {
         pool.store_atomic(&snap).unwrap();
         assert!(matches!(
             r.push_snapshot_if_identity_changed(&pool).unwrap(),
-            PushOutcome::Skipped { reason: SkipReason::Unchanged }
+            PushOutcome::Skipped {
+                reason: SkipReason::Unchanged
+            }
         ));
         assert_eq!(log.lock().unwrap().len(), 1);
     }
@@ -647,7 +685,9 @@ mod tests {
         let r = refresher(&url);
         assert!(matches!(
             r.push_snapshot_if_identity_changed(&pool).unwrap(),
-            PushOutcome::Skipped { reason: SkipReason::Empty }
+            PushOutcome::Skipped {
+                reason: SkipReason::Empty
+            }
         ));
         assert_eq!(log.lock().unwrap().len(), 0);
     }
@@ -706,9 +746,7 @@ mod tests {
 
     #[test]
     fn query_self_ping_returns_timestamp() {
-        let (url, _log) = mock_worker(|_| {
-            (200, serde_json::json!({ "ping_ts": "1700000000000" }))
-        });
+        let (url, _log) = mock_worker(|_| (200, serde_json::json!({ "ping_ts": "1700000000000" })));
         let ping = refresher(&url).query_self_ping().unwrap();
         assert_eq!(ping, Some(1700000000000u64));
     }

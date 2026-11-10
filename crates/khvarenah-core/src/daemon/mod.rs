@@ -20,11 +20,11 @@
 //! seam routes through (see [`blackout::decide_next_tier`]). It makes the
 //! daemon *know* when it is in a total blackout and fast-fail to the worker
 //! bootstrap + reselect carriers from the offline pool — no human.
+pub mod autonomy_schedule;
 pub mod blackout;
 pub mod blackout_drill;
 pub mod escalation;
 pub mod reselect;
-pub mod autonomy_schedule;
 
 use crate::error::CFError;
 use std::future::Future;
@@ -573,10 +573,15 @@ pub fn daemon_refresh_carriers(
     let refresher = crate::carrier_refresh::CarrierRefresher::new(worker_url, shared_secret);
     match refresher.refresh_once(&pool, now_unix)? {
         crate::carrier_refresh::RefreshOutcome::Updated(r) => {
-            log(&format!("carrier refresh: {} added, {} updated", r.added, r.updated));
+            log(&format!(
+                "carrier refresh: {} added, {} updated",
+                r.added, r.updated
+            ));
         }
         crate::carrier_refresh::RefreshOutcome::NotNewer { server_generation } => {
-            log(&format!("carrier refresh: not newer (server gen {server_generation})"));
+            log(&format!(
+                "carrier refresh: not newer (server gen {server_generation})"
+            ));
         }
         crate::carrier_refresh::RefreshOutcome::NoSnapshot => {
             log("carrier refresh: worker has no snapshot yet");
@@ -602,7 +607,8 @@ pub fn refresh_carriers_via_worker_tunnel(
     let crate::vps_deploy::TunnelMode::Worker = cfg.mode else {
         return Ok(());
     };
-    let (Some(url), Some(secret)) = (cfg.worker_url.as_deref(), cfg.shared_secret.as_deref()) else {
+    let (Some(url), Some(secret)) = (cfg.worker_url.as_deref(), cfg.shared_secret.as_deref())
+    else {
         return Ok(());
     };
     // Per-worker secret resolution: prefer the per-worker current secret over
@@ -628,12 +634,15 @@ pub fn push_carriers_via_worker_tunnel(
     let crate::vps_deploy::TunnelMode::Worker = cfg.mode else {
         return Ok(());
     };
-    let (Some(url), Some(secret)) = (cfg.worker_url.as_deref(), cfg.shared_secret.as_deref()) else {
+    let (Some(url), Some(secret)) = (cfg.worker_url.as_deref(), cfg.shared_secret.as_deref())
+    else {
         return Ok(());
     };
     let pcfg = crate::store::profiles::load_profile(profile).config;
     let resolved = crate::worker_tunnel::secret::resolve_worker_secret(&pcfg, url, secret);
-    let pool = crate::carrier_pool::open_profile_pool(&crate::store::profiles::load_profile(profile).config)?;
+    let pool = crate::carrier_pool::open_profile_pool(
+        &crate::store::profiles::load_profile(profile).config,
+    )?;
     let refresher = crate::carrier_refresh::CarrierRefresher::new(url, resolved.as_ref());
     match refresher.push_snapshot_if_identity_changed(&pool)? {
         crate::carrier_refresh::PushOutcome::Pushed { endpoints } => {
@@ -673,7 +682,11 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
                 let rt = tokio::runtime::Runtime::new()
                     .map_err(|e| CFError::new("cf-seam", format!("runtime: {e}"), ""))?;
                 rt.block_on(async move {
-                    let create = move |account_id: String, name: String| -> Pin<Box<dyn Future<Output = Result<String, CFError>> + Send>> {
+                    let create = move |account_id: String,
+                                       name: String|
+                          -> Pin<
+                        Box<dyn Future<Output = Result<String, CFError>> + Send>,
+                    > {
                         let token = token.clone();
                         Box::pin(async move {
                             let cf = crate::cf::Client::new(&token);
@@ -689,9 +702,9 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
                     .await
                 })
             });
-            handle.join().unwrap_or_else(|_| {
-                Err(CFError::new("cf-seam", "worker thread panicked", ""))
-            })
+            handle
+                .join()
+                .unwrap_or_else(|_| Err(CFError::new("cf-seam", "worker thread panicked", "")))
         })
     }
 
@@ -735,9 +748,9 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
                     .await
                 })
             });
-            handle.join().unwrap_or_else(|_| {
-                Err(CFError::new("cf-seam", "worker thread panicked", ""))
-            })
+            handle
+                .join()
+                .unwrap_or_else(|_| Err(CFError::new("cf-seam", "worker thread panicked", "")))
         })?;
 
         let mut prof2 = crate::store::profiles::load_profile(profile);
@@ -747,7 +760,12 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
             .get(worker_url)
             .and_then(|ws| ws.pending_secret.clone());
         let Some(pending_secret) = pending else {
-            return Ok(prof2.config.worker_secrets.get(worker_url).map(|w| w.version).unwrap_or(0));
+            return Ok(prof2
+                .config
+                .worker_secrets
+                .get(worker_url)
+                .map(|w| w.version)
+                .unwrap_or(0));
         };
         let refresher = crate::carrier_refresh::CarrierRefresher::new(worker_url, &pending_secret);
         if refresher.query_self_ping().is_ok() {
@@ -755,7 +773,12 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
         } else {
             crate::worker_tunnel::secret::clear_pending(&mut prof2.config, worker_url);
         }
-        let version = prof2.config.worker_secrets.get(worker_url).map(|w| w.version).unwrap_or(0);
+        let version = prof2
+            .config
+            .worker_secrets
+            .get(worker_url)
+            .map(|w| w.version)
+            .unwrap_or(0);
         crate::store::profiles::save_profile(&prof2)?;
         Ok(version)
     }
@@ -768,7 +791,11 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
         let seed = prof.config.active_account.clone();
         let opts = crate::worker_tunnel::WorkerTunnelDeployOpts {
             worker_name: None,
-            session_seed: if seed.is_empty() { "default-seed".into() } else { seed },
+            session_seed: if seed.is_empty() {
+                "default-seed".into()
+            } else {
+                seed
+            },
             compat_date: "2026-07-01".into(),
             retries: 2,
             vless_upstream: None,
@@ -791,9 +818,9 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
                     .await
                 })
             });
-            handle.join().unwrap_or_else(|_| {
-                Err(CFError::new("cf-seam", "worker thread panicked", ""))
-            })
+            handle
+                .join()
+                .unwrap_or_else(|_| Err(CFError::new("cf-seam", "worker thread panicked", "")))
         })?;
         Ok(())
     }
@@ -927,10 +954,7 @@ pub async fn run_autonomy_audit_with_seam(
 /// profile is not a Worker-mode tunnel, or when the worker has never pinged.
 /// Best-effort: any failure logs and returns `None` (callers treat non-`None`
 /// as the only signal worth surfacing).
-pub fn query_worker_self_ping(
-    profile: &str,
-    log: &mut dyn FnMut(&str),
-) -> Option<u64> {
+pub fn query_worker_self_ping(profile: &str, log: &mut dyn FnMut(&str)) -> Option<u64> {
     let cfg = crate::vps_deploy::load_tunnel_client_config(profile)?;
     let crate::vps_deploy::TunnelMode::Worker = cfg.mode else {
         return None;
@@ -1035,11 +1059,8 @@ pub fn exec_reselection(
         return None;
     }
     let opener = crate::daemon::reselect::RealTunnelOpener::new(profile);
-    let outcome = crate::daemon::reselect::exec_reselection_wrapper(
-        &candidates,
-        &opener,
-        max_concurrent,
-    );
+    let outcome =
+        crate::daemon::reselect::exec_reselection_wrapper(&candidates, &opener, max_concurrent);
     match outcome {
         Some(tunnel) => {
             let ep = &tunnel.endpoint;
@@ -1279,7 +1300,9 @@ async fn run_scheduled_drill(
         crate::journal::JournalKind::DrillPerformed,
         &format!("{survivors}/4 rungs up (best: {best_tier})"),
     );
-    log(&format!("blackout self-test: {survivors}/4 rungs up (best: {best_tier})"));
+    log(&format!(
+        "blackout self-test: {survivors}/4 rungs up (best: {best_tier})"
+    ));
 
     if survivors < DRILL_DEGRADED_THRESHOLD {
         // Alert + journal. During a blackout the send fails and the alert is
@@ -1334,7 +1357,11 @@ pub async fn daemon_tick(
         let token = crate::store::profiles::get_active_token(profile)
             .ok()
             .flatten()
-            .and_then(|l| crate::store::profiles::get_token(profile, &l).ok().flatten());
+            .and_then(|l| {
+                crate::store::profiles::get_token(profile, &l)
+                    .ok()
+                    .flatten()
+            });
         let account_id = if prof.config.active_account.is_empty() {
             None
         } else {
@@ -1388,7 +1415,10 @@ pub async fn daemon_tick(
         // not probe telemetry). The last-pushed hash gate makes this a no-op
         // most ticks. This is the counterpart to the blackout-side pull above.
         if let Err(e) = crate::daemon::push_carriers_via_worker_tunnel(profile, log) {
-            log(&log_line("WARN", &format!("carrier push to worker failed: {e}")));
+            log(&log_line(
+                "WARN",
+                &format!("carrier push to worker failed: {e}"),
+            ));
         }
         // Warm-up surface: query the worker's self-ping freshness once per 6h
         // (off the hot path) and record the last check so the Autonomy panel
@@ -1414,7 +1444,10 @@ pub async fn daemon_tick(
                         state.last_self_ping_ts = now;
                     }
                     None => {
-                        log(&log_line("INFO", "worker self-ping: none (no worker tunnel)"));
+                        log(&log_line(
+                            "INFO",
+                            "worker self-ping: none (no worker tunnel)",
+                        ));
                         state.last_self_ping_ts = now;
                     }
                 }
@@ -1480,7 +1513,10 @@ pub async fn daemon_tick(
         // effort: a failure just logs and the pool stays as-is.
         if tunnel_ok {
             if let Err(e) = crate::daemon::refresh_carriers_via_worker_tunnel(profile, log) {
-                log(&log_line("WARN", &format!("carrier refresh via worker failed: {e}")));
+                log(&log_line(
+                    "WARN",
+                    &format!("carrier refresh via worker failed: {e}"),
+                ));
             }
         }
         // Execute a carrier reselection: try worker-data endpoints (then
@@ -1502,8 +1538,7 @@ pub async fn daemon_tick(
                 )
                 .elapsed_secs(now),
             );
-            let pool =
-                crate::carrier_pool::open_profile_pool(&cfg_local).ok();
+            let pool = crate::carrier_pool::open_profile_pool(&cfg_local).ok();
             let data_count = pool
                 .as_ref()
                 .and_then(|p| {
@@ -2716,7 +2751,10 @@ mod tests {
         .await;
 
         // A fresh profile needs backup + mutation; both auto-apply.
-        assert!(applied >= 2, "expected backup+mutation toggles applied, got {applied}");
+        assert!(
+            applied >= 2,
+            "expected backup+mutation toggles applied, got {applied}"
+        );
         assert!(state.audit.last_run_unix > 0);
         assert!(state.audit.last_action_digest.is_some());
 

@@ -128,7 +128,8 @@ impl BlackoutController {
         }
 
         // 2. Refresh edge: worker recovered while in worker-tunnel/blackout.
-        if self.worker_was_down && inputs.worker_tunnel_ok
+        if self.worker_was_down
+            && inputs.worker_tunnel_ok
             && matches!(self.state, LinkState::WorkerTunnel | LinkState::Blackout)
         {
             self.worker_was_down = false;
@@ -339,12 +340,21 @@ mod tests {
     fn blackout_single_direct_fail_does_not_descend() {
         let mut ctl = BlackoutController::new();
         // t1: direct OK
-        assert_eq!(ctl.next(&inputs(true, true, true, true, 0, 0)), BlackoutAction::Hold);
+        assert_eq!(
+            ctl.next(&inputs(true, true, true, true, 0, 0)),
+            BlackoutAction::Hold
+        );
         // t2: direct down, rest up → single blip, still Direct
-        assert_eq!(ctl.next(&inputs(false, true, true, true, 0, 0)), BlackoutAction::Hold);
+        assert_eq!(
+            ctl.next(&inputs(false, true, true, true, 0, 0)),
+            BlackoutAction::Hold
+        );
         assert_eq!(ctl.state(), LinkState::Direct);
         // t3: direct OK again → still Direct, no descend
-        assert_eq!(ctl.next(&inputs(true, true, true, true, 0, 0)), BlackoutAction::Hold);
+        assert_eq!(
+            ctl.next(&inputs(true, true, true, true, 0, 0)),
+            BlackoutAction::Hold
+        );
         assert_eq!(ctl.state(), LinkState::Direct);
     }
 
@@ -359,7 +369,10 @@ mod tests {
         let act = ctl.next(&inputs(false, false, false, true, 1, 2));
         assert_eq!(
             act,
-            BlackoutAction::ReselectCarrier { kind: CarrierKind::WorkerData, n: 8 }
+            BlackoutAction::ReselectCarrier {
+                kind: CarrierKind::WorkerData,
+                n: 8
+            }
         );
     }
 
@@ -367,11 +380,17 @@ mod tests {
     fn blackout_all_down_with_pool_reselects_worker_data() {
         let mut ctl = BlackoutController::new();
         // First failure sets consecutive_fail=1 (Hold), second descends.
-        assert_eq!(ctl.next(&inputs(false, false, false, false, 0, 3)), BlackoutAction::Hold);
+        assert_eq!(
+            ctl.next(&inputs(false, false, false, false, 0, 3)),
+            BlackoutAction::Hold
+        );
         let act = ctl.next(&inputs(false, false, false, false, 0, 3));
         assert_eq!(
             act,
-            BlackoutAction::ReselectCarrier { kind: CarrierKind::WorkerData, n: 8 }
+            BlackoutAction::ReselectCarrier {
+                kind: CarrierKind::WorkerData,
+                n: 8
+            }
         );
         assert_eq!(ctl.state(), LinkState::Blackout);
     }
@@ -379,7 +398,10 @@ mod tests {
     #[test]
     fn blackout_all_down_empty_pool_holds() {
         let mut ctl = BlackoutController::new();
-        assert_eq!(ctl.next(&inputs(false, false, false, false, 0, 0)), BlackoutAction::Hold);
+        assert_eq!(
+            ctl.next(&inputs(false, false, false, false, 0, 0)),
+            BlackoutAction::Hold
+        );
         let act = ctl.next(&inputs(false, false, false, false, 0, 0));
         assert_eq!(act, BlackoutAction::Hold); // no panic on empty pool
         assert_eq!(ctl.state(), LinkState::Blackout);
@@ -420,7 +442,9 @@ mod tests {
         assert_eq!(eps.len(), 2);
         assert!(eps.iter().all(|e| e.kind == CarrierKind::WorkerData));
         // Non-reselect action → empty.
-        assert!(resolve_action(&BlackoutAction::Hold, &pool).unwrap().is_empty());
+        assert!(resolve_action(&BlackoutAction::Hold, &pool)
+            .unwrap()
+            .is_empty());
     }
 
     /// The daemon's tier-decision seam, tested end-to-end with synthetic
@@ -440,7 +464,10 @@ mod tests {
         let (action2, _next2, endpoints2) = decide_next_tier(&inputs, &mut ctl, &pool).unwrap();
         assert_eq!(
             action2,
-            BlackoutAction::ReselectCarrier { kind: CarrierKind::WorkerData, n: 8 }
+            BlackoutAction::ReselectCarrier {
+                kind: CarrierKind::WorkerData,
+                n: 8
+            }
         );
         assert_eq!(endpoints2.len(), 2);
     }

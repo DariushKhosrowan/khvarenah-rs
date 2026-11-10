@@ -24,7 +24,11 @@ use std::pin::Pin;
 
 /// Create a token via the Cloudflare API and return its plaintext value.
 /// (account_id, name) -> Result<token_value, CFError>.
-pub type CreateTokenFn<'a> = dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Result<String, crate::error::CFError>> + Send + 'a>> + 'a;
+pub type CreateTokenFn<'a> = dyn Fn(
+        String,
+        String,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::error::CFError>> + Send + 'a>>
+    + 'a;
 
 /// Ensure the profile stores at least `min` tokens. Returns `Ok(true)` if a
 /// new token was created and persisted, `Ok(false)` if no action was needed
@@ -40,7 +44,10 @@ pub async fn ensure_minimum_tokens<F>(
     create: F,
 ) -> Result<bool, crate::error::CFError>
 where
-    F: Fn(String, String) -> Pin<Box<dyn Future<Output = Result<String, crate::error::CFError>> + Send>>,
+    F: Fn(
+        String,
+        String,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::error::CFError>> + Send>>,
 {
     use crate::store::profiles::{add_token, load_profile};
 
@@ -50,16 +57,13 @@ where
     }
 
     // We need at least one existing token to authenticate the create call.
-    p.tokens
-        .values()
-        .next()
-        .ok_or_else(|| {
-            crate::error::CFError::new(
-                "token-provision",
-                "no token stored — cannot auto-create a second token",
-                "Add one token first: `khvarenah token add --label <name> --token <cf-token>`.",
-            )
-        })?;
+    p.tokens.values().next().ok_or_else(|| {
+        crate::error::CFError::new(
+            "token-provision",
+            "no token stored — cannot auto-create a second token",
+            "Add one token first: `khvarenah token add --label <name> --token <cf-token>`.",
+        )
+    })?;
 
     let name = format!("khvarenah-rot-{}", crate::store::profiles::now_ts());
     let value = create(account_id, name.clone()).await?;
@@ -78,9 +82,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::profiles::{add_token, load_profile, create_profile};
+    use crate::store::profiles::{add_token, create_profile, load_profile};
 
-    fn scripted_create(result: Result<String, crate::error::CFError>) -> impl Fn(String, String) -> Pin<Box<dyn Future<Output = Result<String, crate::error::CFError>> + Send>> {
+    fn scripted_create(
+        result: Result<String, crate::error::CFError>,
+    ) -> impl Fn(
+        String,
+        String,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::error::CFError>> + Send>> {
         move |_acc: String, _name: String| {
             let r = result.clone();
             Box::pin(async move { r })
@@ -97,27 +106,38 @@ mod tests {
     async fn creates_second_token_when_below_threshold() {
         let id = base_profile();
         assert_eq!(load_profile(&id).tokens.len(), 1);
-        let made = ensure_minimum_tokens(&id, 2, "acc-1".to_string(), scripted_create(Ok("tok-2".into())))
-            .await
-            .unwrap();
+        let made = ensure_minimum_tokens(
+            &id,
+            2,
+            "acc-1".to_string(),
+            scripted_create(Ok("tok-2".into())),
+        )
+        .await
+        .unwrap();
         assert!(made);
         assert_eq!(load_profile(&id).tokens.len(), 2);
-        assert!(
-            load_profile(&id)
-                .tokens
-                .keys()
-                .any(|k| k.starts_with("khvarenah-rot-"))
-        );
-        let stored = load_profile(&id).tokens.values().any(|t| t.token == "tok-2");
+        assert!(load_profile(&id)
+            .tokens
+            .keys()
+            .any(|k| k.starts_with("khvarenah-rot-")));
+        let stored = load_profile(&id)
+            .tokens
+            .values()
+            .any(|t| t.token == "tok-2");
         assert!(stored);
     }
 
     #[tokio::test]
     async fn noop_when_at_or_above_threshold() {
         let id = base_profile();
-        let made = ensure_minimum_tokens(&id, 1, "acc-1".to_string(), scripted_create(Ok("unused".into())))
-            .await
-            .unwrap();
+        let made = ensure_minimum_tokens(
+            &id,
+            1,
+            "acc-1".to_string(),
+            scripted_create(Ok("unused".into())),
+        )
+        .await
+        .unwrap();
         assert!(!made);
         assert_eq!(load_profile(&id).tokens.len(), 1);
     }
@@ -125,7 +145,8 @@ mod tests {
     #[tokio::test]
     async fn errors_when_no_base_token() {
         let id = create_profile("tokprov-none", "").unwrap();
-        let r = ensure_minimum_tokens(&id, 2, "acc-1".to_string(), scripted_create(Ok("x".into()))).await;
+        let r = ensure_minimum_tokens(&id, 2, "acc-1".to_string(), scripted_create(Ok("x".into())))
+            .await;
         assert!(r.is_err());
         assert!(r.unwrap_err().brief().contains("no token stored"));
     }
@@ -146,7 +167,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_empty_created_token() {
         let id = base_profile();
-        let r = ensure_minimum_tokens(&id, 2, "acc-1".to_string(), scripted_create(Ok("".into()))).await;
+        let r = ensure_minimum_tokens(&id, 2, "acc-1".to_string(), scripted_create(Ok("".into())))
+            .await;
         assert!(r.is_err());
     }
 }

@@ -282,7 +282,10 @@ async fn probe_tunnel(profile: &str) -> ProbeVerdict {
         Some(cfg) => {
             // Worker-hosted tunnel → HTTPS liveness probe (no raw UDP).
             if cfg.is_worker_mode() {
-                return probe_worker_tunnel_live(&cfg, std::time::Duration::from_millis(TUNNEL_PROBE_TIMEOUT_MS));
+                return probe_worker_tunnel_live(
+                    &cfg,
+                    std::time::Duration::from_millis(TUNNEL_PROBE_TIMEOUT_MS),
+                );
             }
             // Live round-trip against the authoritative tunnel server. This
             // replaces the old "config presence only" check, so a dead /
@@ -316,11 +319,8 @@ pub fn probe_worker_tunnel_live(
     let Some(secret) = &cfg.shared_secret else {
         return ProbeVerdict::down("worker tunnel missing secret");
     };
-    let resolver = crate::worker_tunnel::resolver::WorkerTunnelResolver::with_timeout(
-        url,
-        secret,
-        timeout,
-    );
+    let resolver =
+        crate::worker_tunnel::resolver::WorkerTunnelResolver::with_timeout(url, secret, timeout);
     let frame = crate::dnstunnel::TunnelFrame {
         session: cfg.session.clone(),
         seq: 1,
@@ -435,14 +435,18 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: TunnelClientConfig = serde_json::from_str(&json).unwrap();
         assert!(back.is_worker_mode());
-        assert_eq!(back.worker_url.as_deref(), Some("https://w.sub.workers.dev"));
+        assert_eq!(
+            back.worker_url.as_deref(),
+            Some("https://w.sub.workers.dev")
+        );
     }
 
     #[test]
     fn legacy_json_defaults_to_vps_mode() {
         use crate::vps_deploy::{TunnelClientConfig, TunnelMode};
         // Legacy config: no `mode` field → must deserialize as Vps.
-        let legacy = r#"{"host":"1.2.3.4","base_domain":"t.example.com","session":"s","resolver":"doh"}"#;
+        let legacy =
+            r#"{"host":"1.2.3.4","base_domain":"t.example.com","session":"s","resolver":"doh"}"#;
         let cfg: TunnelClientConfig = serde_json::from_str(legacy).unwrap();
         assert_eq!(cfg.mode, TunnelMode::Vps);
         assert!(!cfg.is_worker_mode());

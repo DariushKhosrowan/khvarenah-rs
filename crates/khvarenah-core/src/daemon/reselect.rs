@@ -108,21 +108,19 @@ pub fn execute_reselection_parallel(
             let tx = tx.clone();
             let next = &next;
             let done = &done;
-            s.spawn(move || {
-                loop {
-                    if done.load(Ordering::Relaxed) {
-                        break;
+            s.spawn(move || loop {
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= endpoints.len() {
+                    break;
+                }
+                if let Ok(t) = opener.open(&endpoints[i]) {
+                    if !done.swap(true, Ordering::Relaxed) {
+                        let _ = tx.send(t);
                     }
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= endpoints.len() {
-                        break;
-                    }
-                    if let Ok(t) = opener.open(&endpoints[i]) {
-                        if !done.swap(true, Ordering::Relaxed) {
-                            let _ = tx.send(t);
-                        }
-                        break;
-                    }
+                    break;
                 }
             });
         }
@@ -193,7 +191,9 @@ impl TunnelOpener for RealTunnelOpener<'_> {
             crate::carrier_pool::CarrierKind::WorkerData
             | crate::carrier_pool::CarrierKind::WorkerTunnel => {
                 let Some(cfg) = self.probe_config(ep) else {
-                    return Err(OpenError::Other("endpoint missing worker_url/upstream".into()));
+                    return Err(OpenError::Other(
+                        "endpoint missing worker_url/upstream".into(),
+                    ));
                 };
                 crate::connectivity::probe_worker_tunnel_live(&cfg, self.timeout).ok
             }
@@ -390,7 +390,11 @@ mod tests {
         // all fail → every candidate visited
         let opener = ScriptOpener::new(vec![false; 10]);
         assert!(execute_reselection_parallel(&eps, &opener, 2).is_none());
-        assert!(opener.max_active() <= 2, "max_active={}", opener.max_active());
+        assert!(
+            opener.max_active() <= 2,
+            "max_active={}",
+            opener.max_active()
+        );
     }
 
     /// The semantic heart of parallel reselection: fastest wins, even when it

@@ -357,9 +357,7 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
                 )
             } else {
                 let cmd = recovery_cmd(profile);
-                format!(
-                    "⛔ حساب مسدود شد ({state}) — چرخش خودکار خاموش است؛ «{cmd}» را اجرا کنید"
-                )
+                format!("⛔ حساب مسدود شد ({state}) — چرخش خودکار خاموش است؛ «{cmd}» را اجرا کنید")
             }
         }
         (
@@ -432,27 +430,35 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
         (BeaconEvent::NetworkRestored, _) => {
             "✅ Network restored — protection auto-resumed".to_string()
         }
-        (BeaconEvent::ResilienceDegraded { survivors, best_tier }, crate::diagnose::Locale::Fa) => {
+        (
+            BeaconEvent::ResilienceDegraded {
+                survivors,
+                best_tier,
+            },
+            crate::diagnose::Locale::Fa,
+        ) => {
             format!(
                 "⚠️ تست خودکار تاب‌آوری: فقط {survivors}/4 مسیر زنده‌اند (بهترین: {best_tier}) — کانال داده در قطعی کامل ممکن است در دسترس نباشد"
             )
         }
-        (BeaconEvent::ResilienceDegraded { survivors, best_tier }, _) => {
+        (
+            BeaconEvent::ResilienceDegraded {
+                survivors,
+                best_tier,
+            },
+            _,
+        ) => {
             format!(
                 "⚠️ Blackout self-test: only {survivors}/4 ladder rungs up (best: {best_tier}) — the data channel may not survive a total blackout"
             )
         }
         (BeaconEvent::AutonomyRegression { codes }, crate::diagnose::Locale::Fa) => {
             let list = codes.join("، ");
-            format!(
-                "🛠 ممیزی خودکار رگرسیون یافت: اقدامات معلق — {list}"
-            )
+            format!("🛠 ممیزی خودکار رگرسیون یافت: اقدامات معلق — {list}")
         }
         (BeaconEvent::AutonomyRegression { codes }, _) => {
             let list = codes.join(", ");
-            format!(
-                "🛠 Autonomy audit regression: action items still pending — {list}"
-            )
+            format!("🛠 Autonomy audit regression: action items still pending — {list}")
         }
     }
 }

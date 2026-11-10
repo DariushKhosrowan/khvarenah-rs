@@ -813,7 +813,10 @@ mod tests {
         }
         let id = profiles::create_profile("fresh", "").unwrap();
         let done = onboarding_status(Some(&id));
-        assert!(done.is_empty(), "fresh profile should have no steps: {done:?}");
+        assert!(
+            done.is_empty(),
+            "fresh profile should have no steps: {done:?}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -844,7 +847,8 @@ mod tests {
         let id = profiles::create_profile("bundle", "").unwrap();
         // Seed a vless in history so the worker step registers, then write the
         // bundle's active.vless into the per-profile config dir.
-        let vless = "vless://uuid@host:443?encryption=none&security=tls&sni=host&type=ws&path=/abc#k";
+        let vless =
+            "vless://uuid@host:443?encryption=none&security=tls&sni=host&type=ws&path=/abc#k";
         let mut p = profiles::load_profile(&id);
         p.history.push(profiles::VlessRecord {
             link: vless.to_string(),

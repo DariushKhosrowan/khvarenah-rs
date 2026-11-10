@@ -201,10 +201,8 @@ pub fn escalated_select(
     }
     // Fill from cooling endpoints not already selected, soonest-expiry first.
     let snap = pool.load()?;
-    let present: std::collections::HashSet<String> = available
-        .iter()
-        .map(CarrierPool::endpoint_id_hex)
-        .collect();
+    let present: std::collections::HashSet<String> =
+        available.iter().map(CarrierPool::endpoint_id_hex).collect();
     let mut cooling: Vec<(String, CarrierEndpoint)> = Vec::new();
     for e in snap.endpoints.iter().filter(|e| e.kind == kind) {
         let id = CarrierPool::endpoint_id_hex(e);

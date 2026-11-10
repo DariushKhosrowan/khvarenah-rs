@@ -8,9 +8,9 @@
 use crate::cf::Client;
 use crate::error::CFError;
 use crate::vps_deploy::TunnelMode;
-use crate::worker_tunnel::KHV_TUNNEL_BASE;
 use crate::worker_tunnel::bundle::{WORKER_CRON_SCHEDULE, WORKER_TUNNEL_JS};
 use crate::worker_tunnel::secret;
+use crate::worker_tunnel::KHV_TUNNEL_BASE;
 
 /// Options for a worker-tunnel deploy.
 #[derive(Debug, Clone)]
@@ -73,7 +73,11 @@ pub async fn deploy_worker_tunnel(
     // keeps talking on the current secret until the caller verifies + promotes.
     let mut profile = crate::store::profiles::load_profile(profile_id);
     let now = crate::store::now_ts() as u64;
-    let entry = profile.config.worker_secrets.entry(worker_url.clone()).or_default();
+    let entry = profile
+        .config
+        .worker_secrets
+        .entry(worker_url.clone())
+        .or_default();
     entry.worker_url = worker_url.clone();
     if entry.secret.is_empty() && entry.pending_secret.is_none() {
         entry.secret = secret::generate_secret();
@@ -246,16 +250,15 @@ mod tests {
                         // Capture the PATCH settings body (carries the vars JSON)
                         // and the PUT deploy multipart body (carries metadata with
                         // bindings) so tests can assert on both.
-                        let body_capture = if first_line.starts_with("PATCH")
-                            || first_line.starts_with("PUT")
-                        {
-                            // Start after the header terminator.
-                            buf.get(end..)
-                                .map(|b| String::from_utf8_lossy(b).to_string())
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
+                        let body_capture =
+                            if first_line.starts_with("PATCH") || first_line.starts_with("PUT") {
+                                // Start after the header terminator.
+                                buf.get(end..)
+                                    .map(|b| String::from_utf8_lossy(b).to_string())
+                                    .unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
                         {
                             let mut log = log2.lock().unwrap();
                             log.push(first_line.clone());
@@ -265,11 +268,15 @@ mod tests {
                         }
                         let body = if first_line.contains("/workers/subdomain") {
                             r#"{"success":true,"result":{"subdomain":"sub"}}"#
-                        } else if first_line.contains("/storage/kv/namespaces") && first_line.starts_with("GET") {
+                        } else if first_line.contains("/storage/kv/namespaces")
+                            && first_line.starts_with("GET")
+                        {
                             // List KV namespaces → empty on first call so the
                             // ensure path creates one.
                             r#"{"success":true,"result":[]}"#
-                        } else if first_line.contains("/storage/kv/namespaces") && first_line.starts_with("POST") {
+                        } else if first_line.contains("/storage/kv/namespaces")
+                            && first_line.starts_with("POST")
+                        {
                             // Create KV namespace → return a synthetic id.
                             r#"{"success":true,"result":{"id":"kv-ns-1","title":"khvarenah-carrier-snapshot"}}"#
                         } else {
@@ -304,7 +311,9 @@ mod tests {
     async fn test_deploy_worker_tunnel_auto_names_worker() {
         let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let res = deploy_worker_tunnel(&cf, "acc1", "p1", &opts()).await.unwrap();
+        let res = deploy_worker_tunnel(&cf, "acc1", "p1", &opts())
+            .await
+            .unwrap();
         assert!(res.worker_name.starts_with("khv-tun-"));
         // "khv-tun-" (8) + 8 hex chars from hex4(seed).
         assert_eq!(res.worker_name.len(), "khv-tun-".len() + 8);
@@ -314,7 +323,9 @@ mod tests {
     async fn test_deploy_worker_tunnel_persists_worker_mode_config() {
         let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let _ = deploy_worker_tunnel(&cf, "acc1", "p_worker_mode", &opts()).await.unwrap();
+        let _ = deploy_worker_tunnel(&cf, "acc1", "p_worker_mode", &opts())
+            .await
+            .unwrap();
         let cfg = crate::vps_deploy::load_tunnel_client_config("p_worker_mode").unwrap();
         assert_eq!(cfg.mode, TunnelMode::Worker);
         assert!(cfg.worker_url.is_some());
@@ -326,7 +337,9 @@ mod tests {
     async fn test_deploy_worker_tunnel_sets_session_secret_var() {
         let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let res = deploy_worker_tunnel(&cf, "acc1", "p_secvar", &opts()).await.unwrap();
+        let res = deploy_worker_tunnel(&cf, "acc1", "p_secvar", &opts())
+            .await
+            .unwrap();
         assert_eq!(res.shared_secret.len(), 32);
         // The per-worker secret is persisted in the profile config keyed by the
         // worker URL, and versioned at 1 on first deploy.
@@ -341,7 +354,9 @@ mod tests {
     async fn test_deploy_worker_tunnel_returns_workers_dev_url() {
         let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let res = deploy_worker_tunnel(&cf, "acc1", "p_url", &opts()).await.unwrap();
+        let res = deploy_worker_tunnel(&cf, "acc1", "p_url", &opts())
+            .await
+            .unwrap();
         assert!(res.worker_url.starts_with("https://"));
         assert!(res.worker_url.ends_with(".sub.workers.dev"));
         assert_eq!(res.subdomain, "sub");
@@ -353,9 +368,14 @@ mod tests {
         let cf = Client::with_base("tok", &base);
         let mut o = opts();
         o.vless_upstream = Some("203.0.113.10:443".into());
-        let _ = deploy_worker_tunnel(&cf, "acc1", "p_upstream", &o).await.unwrap();
+        let _ = deploy_worker_tunnel(&cf, "acc1", "p_upstream", &o)
+            .await
+            .unwrap();
         let cfg = crate::vps_deploy::load_tunnel_client_config("p_upstream").unwrap();
-        assert_eq!(cfg.worker_vless_upstream.as_deref(), Some("203.0.113.10:443"));
+        assert_eq!(
+            cfg.worker_vless_upstream.as_deref(),
+            Some("203.0.113.10:443")
+        );
         // The deploy PUT and set_vars requests must both carry the upstream.
         let log = log.lock().unwrap().join("\n");
         assert!(log.contains("KHV_VLESS_UPSTREAM"), "log: {log}");
@@ -365,7 +385,9 @@ mod tests {
     async fn test_deploy_worker_tunnel_ensures_and_binds_kv_namespace() {
         let (base, log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let _ = deploy_worker_tunnel(&cf, "acc1", "p_kv", &opts()).await.unwrap();
+        let _ = deploy_worker_tunnel(&cf, "acc1", "p_kv", &opts())
+            .await
+            .unwrap();
         let log = log.lock().unwrap().join("\n");
         // The KV list + create must both have happened (ensure path).
         assert!(log.contains("/storage/kv/namespaces"), "log: {log}");
@@ -380,7 +402,9 @@ mod tests {
     async fn test_deploy_worker_tunnel_includes_self_ping_cron_trigger() {
         let (base, log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let _ = deploy_worker_tunnel(&cf, "acc1", "p_cron", &opts()).await.unwrap();
+        let _ = deploy_worker_tunnel(&cf, "acc1", "p_cron", &opts())
+            .await
+            .unwrap();
         let log = log.lock().unwrap().join("\n");
         // The deploy PUT metadata must carry the self-ping cron trigger so the
         // worker is scheduled to ping itself every 6h (keeps it from being
@@ -400,7 +424,8 @@ mod tests {
                 use std::io::{Read, Write};
                 let mut buf = [0u8; 8192];
                 let _ = stream.read(&mut buf);
-                let body = r#"{"success":false,"errors":[{"code":9109,"message":"Invalid API Token"}]}"#;
+                let body =
+                    r#"{"success":false,"errors":[{"code":9109,"message":"Invalid API Token"}]}"#;
                 let resp = format!(
                     "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -410,7 +435,9 @@ mod tests {
         });
         let base = format!("http://{addr}");
         let cf = Client::with_base("tok", &base);
-        let err = deploy_worker_tunnel(&cf, "acc1", "p_err", &opts()).await.unwrap_err();
+        let err = deploy_worker_tunnel(&cf, "acc1", "p_err", &opts())
+            .await
+            .unwrap_err();
         assert_eq!(err.status, Some(403));
     }
 }
