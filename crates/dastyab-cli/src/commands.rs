@@ -120,6 +120,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::Doctor { json } => doctor_cmd(&profile, json),
         Command::Snapshots { action } => snapshots_cmd(&profile, action),
         Command::Workspace { action } => workspace_cmd(action),
+        Command::Versions { action } => versions_cmd(&profile, action),
         Command::Mutation { action } => cmd_mutation(profile, action),
         Command::Analytics => analytics(profile).await,
         Command::Diag { endpoints } => diag(&endpoints).await,
@@ -846,6 +847,57 @@ fn configs_cmd(profile: &str, action: crate::ConfigsAction) -> Result<(), CFErro
 
 fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `versions` subcommand — per-artifact version history (list/show/restore/prune).
+fn versions_cmd(profile: &str, action: crate::VersionsAction) -> Result<(), CFError> {
+    use dastyab_core::artifact_versions as av;
+    let dir = dastyab_core::store::profiles::profile_dir(profile);
+    match action {
+        crate::VersionsAction::List { artifact } => {
+            let versions = av::list_versions(&dir, &artifact).map_err(to_verr)?;
+            if versions.is_empty() {
+                println!("No saved versions for '{artifact}' in profile '{profile}'.");
+                return Ok(());
+            }
+            for v in &versions {
+                println!(
+                    "[{}] {artifact} sha256={} ({} bytes)",
+                    v.saved_unix, v.sha256, v.size
+                );
+            }
+            println!("{} version(s)", versions.len());
+            Ok(())
+        }
+        crate::VersionsAction::Show { artifact, unix } => {
+            let bytes = av::read_version_bytes(&dir, &artifact, unix).map_err(to_verr)?;
+            print!("{}", String::from_utf8_lossy(&bytes));
+            Ok(())
+        }
+        crate::VersionsAction::Restore { artifact, unix } => {
+            av::restore_version(
+                &dir,
+                &artifact,
+                unix,
+                dastyab_core::store::now_ts() as u64,
+            )
+            .map_err(to_verr)?;
+            println!("Restored '{artifact}' in profile '{profile}' to version {unix}");
+            Ok(())
+        }
+        crate::VersionsAction::Prune { artifact, keep } => {
+            let report = av::prune_versions(&dir, &artifact, keep).map_err(to_verr)?;
+            println!(
+                "Pruned '{artifact}' in profile '{profile}': kept {} version(s), removed {}",
+                report.kept, report.removed
+            );
+            Ok(())
+        }
+    }
+}
+
+fn to_verr(e: dastyab_core::artifact_versions::VersionError) -> CFError {
+    CFError::new("Version error", e.to_string(), "Check the artifact path and version timestamp.")
 }
 
 fn status(profile: &str) -> Result<(), CFError> {

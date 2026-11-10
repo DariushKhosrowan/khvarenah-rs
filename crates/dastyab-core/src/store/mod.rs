@@ -95,9 +95,65 @@ pub fn set_file_private(path: &Path) {
     }
 }
 
+// Re-entrancy guard: version-snapshot writes themselves go through
+// `atomic_write`, so we must not recursively snapshot those.
+std::thread_local! {
+    static IN_SNAPSHOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Split a path into (profile_dir, relative_path) when it lives inside a
+/// profile directory (…/profiles/<id>/<file>). Returns `None` otherwise.
+fn profile_rel_from_path(path: &Path) -> Option<(PathBuf, String)> {
+    let comps: Vec<&std::ffi::OsStr> = path.components().filter_map(|c| match c {
+        std::path::Component::Normal(s) => Some(s),
+        _ => None,
+    }).collect();
+    let idx = comps.iter().position(|c| *c == "profiles")?;
+    let after = &comps[idx + 1..];
+    if after.len() < 2 {
+        return None; // need at least <id>/<file>
+    }
+    let profile_dir: PathBuf = after[..after.len() - 1].iter().collect();
+    let rel = after.last()?.to_str()?.to_string();
+    Some((profile_dir, rel))
+}
+
+/// Best-effort pre-write snapshot: if `path` is a profile artifact being
+/// rewritten, save the previous bytes into the per-artifact version history so
+/// they can be restored later. Never fails the actual write (errors are
+/// swallowed — versioning is a safety net, not a gate).
+fn maybe_snapshot_before_write(path: &Path, bytes: &[u8]) {
+    if IN_SNAPSHOT.with(|c| c.get()) {
+        return;
+    }
+    let Some((profile_dir, rel)) = profile_rel_from_path(path) else {
+        return;
+    };
+    // Skip volatile/derived files — versioning them would be noise or recurse
+    // (the .versions payloads we are about to write live under a ".versions" dir).
+    if rel.starts_with(".dyb_tmp_")
+        || rel.starts_with('.')
+        || rel.contains(".versions")
+        || crate::manifest::is_runtime_excluded(&rel)
+        || rel == "manifest.json"
+        || rel == "ledger_hw.json"
+    {
+        return;
+    }
+    IN_SNAPSHOT.with(|c| c.set(true));
+    let _ = crate::artifact_versions::snapshot_before_write(
+        &profile_dir,
+        &rel,
+        bytes,
+        now_ts() as u64 * 1000,
+    );
+    IN_SNAPSHOT.with(|c| c.set(false));
+}
+
 /// Atomically write `bytes` to `path`:
 /// tempfile in the same directory → write → fsync → rename → fsync parent.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CFError> {
+    maybe_snapshot_before_write(path, bytes);
     let dir = path.parent().ok_or_else(|| {
         CFError::new(
             "Storage error",

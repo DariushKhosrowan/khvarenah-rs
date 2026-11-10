@@ -193,7 +193,7 @@ pub fn write_ledger_guarded<T: serde::Serialize>(
 }
 
 /// Read the record count of a ledger file (0 when missing/corrupt-not-JSON).
-fn read_ledger_count(path: &Path) -> u64 {
+pub(crate) fn read_ledger_count(path: &Path) -> u64 {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()

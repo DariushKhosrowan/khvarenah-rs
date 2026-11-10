@@ -197,6 +197,11 @@ enum Command {
         #[command(subcommand)]
         action: WorkspaceAction,
     },
+    /// Per-artifact version history (second-by-second recovery).
+    Versions {
+        #[command(subcommand)]
+        action: VersionsAction,
+    },
     /// Configure scheduled worker-signature rotation (anti-DPI moving target).
     /// The daemon redeploys the worker with a fresh UUID/path on the interval.
     Mutation {
@@ -383,6 +388,43 @@ pub enum ConfigsAction {
         id: u64,
         #[arg(long)]
         output: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum VersionsAction {
+    /// List saved versions of a profile artifact (newest first).
+    List {
+        /// Relative artifact filename within the profile dir (e.g. history.json).
+        #[arg()]
+        artifact: String,
+    },
+    /// Show one saved version's stored bytes.
+    Show {
+        /// Relative artifact filename.
+        #[arg()]
+        artifact: String,
+        /// The saved version's unix-millisecond timestamp.
+        #[arg()]
+        unix: u64,
+    },
+    /// Restore an artifact to a saved version (snapshots the current state first).
+    Restore {
+        /// Relative artifact filename.
+        #[arg()]
+        artifact: String,
+        /// The saved version's unix-millisecond timestamp.
+        #[arg()]
+        unix: u64,
+    },
+    /// Prune an artifact's version history down to the newest N.
+    Prune {
+        /// Relative artifact filename.
+        #[arg()]
+        artifact: String,
+        /// How many newest versions to keep.
+        #[arg(long, default_value_t = 20)]
+        keep: usize,
     },
 }
 
