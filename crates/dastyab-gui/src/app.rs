@@ -1952,36 +1952,43 @@ impl DastYabApp {
 
             ui.separator();
 
-            // Main content area.
-            ui.vertical(|ui| {
-                // active view name in gold, with glyph
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(self.view.glyph())
-                            .color(GOLD)
-                            .size(20.0),
-                    );
-                    ui.heading(
-                        egui::RichText::new(self.view.label())
-                            .color(GOLD)
-                            .size(22.0),
-                    );
+            // Main content area — wrapped in a vertical ScrollArea so every
+            // view (Settings, Tools, …) stays reachable when its content is
+            // taller than the window. The sidebar remains fixed.
+            egui::ScrollArea::vertical()
+                .id_salt("main-content-scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        // active view name in gold, with glyph
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(self.view.glyph())
+                                    .color(GOLD)
+                                    .size(20.0),
+                            );
+                            ui.heading(
+                                egui::RichText::new(self.view.label())
+                                    .color(GOLD)
+                                    .size(22.0),
+                            );
+                        });
+                        ui.separator();
+                        match self.view {
+                            View::Dashboard => self.dashboard_panel(ui, p),
+                            View::DeployScan => self.deploy_panel(ui, p),
+                            View::Profiles => self.profile_panel(ui, p),
+                            View::Tokens => self.token_panel(ui, p),
+                            View::CleanIps => self.cleanip_panel(ui, p),
+                            View::History => history::show(ui, self, p),
+                            View::Configs => self.configs_panel(ui),
+                            View::Log => self.log_panel(ui),
+                            View::Tools => self.tools_panel(ui, p),
+                            View::Settings => self.settings_panel(ui, p),
+                            View::Autonomy => self.autonomy_panel(ui, p),
+                        }
+                    });
                 });
-                ui.separator();
-                match self.view {
-                    View::Dashboard => self.dashboard_panel(ui, p),
-                    View::DeployScan => self.deploy_panel(ui, p),
-                    View::Profiles => self.profile_panel(ui, p),
-                    View::Tokens => self.token_panel(ui, p),
-                    View::CleanIps => self.cleanip_panel(ui, p),
-                    View::History => history::show(ui, self, p),
-                    View::Configs => self.configs_panel(ui),
-                    View::Log => self.log_panel(ui),
-                    View::Tools => self.tools_panel(ui, p),
-                    View::Settings => self.settings_panel(ui, p),
-                    View::Autonomy => self.autonomy_panel(ui, p),
-                }
-            });
         });
     }
 
