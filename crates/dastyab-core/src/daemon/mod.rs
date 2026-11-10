@@ -635,18 +635,36 @@ pub fn exec_reselection(
 ) -> Option<String> {
     let cfg = crate::store::profiles::load_profile(profile).config;
     let pool = crate::carrier_pool::open_profile_pool(&cfg).ok()?;
-    let candidates = pool.select(kind, n).ok()?;
+    let now = crate::store::now_ts() as u64;
+    // Use select_at so endpoints in failure-cooldown are skipped; only fall
+    // back to cooling endpoints when nothing else exists. This prevents a
+    // total-blackout reselect from re-dialing the same dead endpoint on every
+    // tick.
+    let candidates = pool.select_at(kind, n, now).ok()?;
     if candidates.is_empty() {
         log("reselect: pool has no candidates");
         return None;
     }
     let mut opener = crate::daemon::reselect::RealTunnelOpener::new(profile);
-    match crate::daemon::reselect::execute_reselection(&candidates, &mut opener) {
+    let outcome = crate::daemon::reselect::execute_reselection(&candidates, &mut opener);
+    match outcome {
         Some((ep, opened)) => {
             log(&format!("reselect: switched active tunnel to {} (tried {opened})", ep.host));
+            // Mark the winner a success (clears any cooldown); mark every
+            // later-tried candidate (which failed) as a failure so it backs
+            // off.
+            for c in candidates.iter().take(opened.saturating_sub(1)) {
+                let _ = pool.record_failure(c, now);
+            }
+            let _ = pool.record_success(&ep);
             Some(ep.host)
         }
         None => {
+            // Every candidate failed → cooldown all of them so the next tick
+            // tries fresh paths instead of the same dead ones.
+            for c in &candidates {
+                let _ = pool.record_failure(c, now);
+            }
             log("reselect: no candidate opened");
             None
         }
