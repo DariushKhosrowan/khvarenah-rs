@@ -628,15 +628,17 @@ pub fn push_carriers_via_worker_tunnel(
 }
 
 /// Execute a carrier reselection: select up to `n` endpoints of `kind` from
-/// the offline pool, open them in order via [`reselect::RealTunnelOpener`],
-/// and persist the first that works as the active tunnel. Returns the host of
-/// the winning endpoint, or `None` when nothing worked. This is what makes the
-/// blackout state machine's `ReselectCarrier` decision actually change the
-/// active tunnel (previously it was logged and discarded).
+/// the offline pool, open them (serially when `max_concurrent <= 1`, else in
+/// a bounded parallel pool) via [`reselect::RealTunnelOpener`], and persist the
+/// first that works as the active tunnel. Returns the host of the winning
+/// endpoint, or `None` when nothing worked. This is what makes the blackout
+/// state machine's `ReselectCarrier` decision actually change the active
+/// tunnel (previously it was logged and discarded).
 pub fn exec_reselection(
     profile: &str,
     kind: crate::carrier_pool::CarrierKind,
     n: usize,
+    max_concurrent: usize,
     log: &mut dyn FnMut(&str),
 ) -> Option<String> {
     let cfg = crate::store::profiles::load_profile(profile).config;
@@ -651,19 +653,25 @@ pub fn exec_reselection(
         log("reselect: pool has no candidates");
         return None;
     }
-    let mut opener = crate::daemon::reselect::RealTunnelOpener::new(profile);
-    let outcome = crate::daemon::reselect::execute_reselection(&candidates, &mut opener);
+    let opener = crate::daemon::reselect::RealTunnelOpener::new(profile);
+    let outcome = crate::daemon::reselect::exec_reselection_wrapper(
+        &candidates,
+        &opener,
+        max_concurrent,
+    );
     match outcome {
-        Some((ep, opened)) => {
-            log(&format!("reselect: switched active tunnel to {} (tried {opened})", ep.host));
-            // Mark the winner a success (clears any cooldown); mark every
-            // later-tried candidate (which failed) as a failure so it backs
-            // off.
-            for c in candidates.iter().take(opened.saturating_sub(1)) {
-                let _ = pool.record_failure(c, now);
+        Some(tunnel) => {
+            let ep = &tunnel.endpoint;
+            log(&format!("reselect: switched active tunnel to {}", ep.host));
+            // Bind the winning endpoint as the active tunnel, then mark it a
+            // success (clears any cooldown).
+            let bound = crate::daemon::reselect::bind_winner(profile, ep);
+            let _ = pool.record_success(ep);
+            if !bound {
+                // VPS tunnel needs no worker config write; still a success.
+                log("reselect: bound active tunnel (VPS)");
             }
-            let _ = pool.record_success(&ep);
-            Some(ep.host)
+            Some(ep.host.clone())
         }
         None => {
             // Every candidate failed → cooldown all of them so the next tick
@@ -984,6 +992,7 @@ pub async fn daemon_tick(
         // judged by a LIVE round-trip (probe_tunnel_live), not config
         // presence — so a dead/unreachable VPS reports the honest "no tunnel"
         // ceiling instead of a false "tunnel=yes".
+        let branch_start = crate::store::now_ts();
         let tunnel_ok = match crate::vps_deploy::load_tunnel_client_config(profile) {
             Some(cfg) => {
                 // Short timeout: during a blackout we want a quick verdict.
@@ -1077,6 +1086,7 @@ pub async fn daemon_tick(
                     profile,
                     crate::carrier_pool::CarrierKind::WorkerData,
                     reselect_n,
+                    plan.parallel_probes as usize,
                     log,
                 );
             } else {
@@ -1084,6 +1094,7 @@ pub async fn daemon_tick(
                     profile,
                     crate::carrier_pool::CarrierKind::WorkerTunnel,
                     reselect_n,
+                    plan.parallel_probes as usize,
                     log,
                 );
             }
@@ -1112,7 +1123,13 @@ pub async fn daemon_tick(
             )
             .elapsed_secs(now),
         );
-        let sleep = base_sleep.min(plan.probe_interval_secs).max(1);
+        // Sleep calc: target cycle = plan probe interval (the configured
+        // blackout poll is the ceiling). The reselection/thems already ate
+        // some wall-clock, so subtract the elapsed probe time so the actual
+        // cycle approximates the target rather than probe_time + target.
+        let target_cycle = base_sleep.min(plan.probe_interval_secs).max(1);
+        let probe_elapsed = (crate::store::now_ts() - branch_start).max(0.0) as u64;
+        let sleep = target_cycle.saturating_sub(probe_elapsed).max(1);
         return sleep;
     }
 
