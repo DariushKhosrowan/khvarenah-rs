@@ -799,6 +799,129 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
     }
 }
 
+/// Run the scheduled autonomy audit on this tick (if due) and auto-execute any
+/// ACTION-status item whose preconditions are met. Returns the number of fixes
+/// applied. Fires the `AutonomyRegression` beacon on a clean→dirty transition
+/// (never on repeated dirty→dirty, and never on the first ever audit).
+///
+/// The CF seam is injected so tests can script it; production passes the real
+/// [`RealCfSeam`]. When no seam is available (no resolvable active token +
+/// account), the CF-backed items (`token_rotate`, `worker_secret_rotate`,
+/// `tunnel`) are skipped while config-toggle items (`backup`, `mutation`) still
+/// auto-apply. This keeps first-run / empty-profile ticks hermetic — no network.
+pub async fn run_autonomy_audit_with_seam(
+    profile: &str,
+    state: &mut DaemonState,
+    net_up: bool,
+    seam: Option<&dyn crate::daemon::autonomy_schedule::CfApiSeam>,
+    log: &mut dyn FnMut(&str),
+) -> usize {
+    let now = crate::store::now_ts() as u64;
+    if !crate::daemon::autonomy_schedule::should_run_audit(state, now) {
+        return 0;
+    }
+
+    let prof = crate::store::profiles::load_profile(profile);
+    let report = crate::autonomy::run_audit(&prof);
+
+    let action_codes: Vec<String> = report
+        .items
+        .iter()
+        .filter(|i| i.status == crate::autonomy::CheckStatus::Action)
+        .map(|i| i.code.clone())
+        .collect();
+
+    let code_refs: Vec<&str> = action_codes.iter().map(|s| s.as_str()).collect();
+    let new_digest = crate::daemon::autonomy_schedule::action_digest(&code_refs);
+
+    // Regression beacon: clean→dirty only (first audit = no regress).
+    if crate::daemon::autonomy_schedule::regression_events(
+        state.audit.last_action_digest,
+        new_digest,
+    ) {
+        log(&log_line(
+            "WARN",
+            &format!(
+                "autonomy regression: {} action(s) still pending",
+                action_codes.len()
+            ),
+        ));
+        let _ = crate::remote_beacon::maybe_emit(
+            profile,
+            &crate::remote_beacon::BeaconEvent::AutonomyRegression {
+                codes: action_codes.clone(),
+            },
+            crate::diagnose::Locale::En,
+        )
+        .await;
+    }
+    state.audit.last_action_digest = Some(new_digest);
+    state.audit.last_run_unix = now;
+
+    // Auto-execute eligible items.
+    let mut cfg = prof.config.clone();
+    let mut applied = 0usize;
+
+    // Config-toggle items never touch the seam; give them a placeholder seam so
+    // the context always has a concrete `&dyn CfApiSeam` (execute_auto_fix only
+    // reaches the seam for CF-backed codes, which are gated below).
+    struct NoopSeam;
+    impl crate::daemon::autonomy_schedule::CfApiSeam for NoopSeam {
+        fn ensure_second_token(&self, _p: &str) -> Result<bool, CFError> {
+            Ok(false)
+        }
+        fn rotate_worker(&self, _p: &str) -> Result<u32, CFError> {
+            Ok(0)
+        }
+        fn ensure_dns_tunnel(&self, _p: &str) -> Result<(), CFError> {
+            Ok(())
+        }
+    }
+    let noop = NoopSeam;
+    let effective_seam: &dyn crate::daemon::autonomy_schedule::CfApiSeam = match seam {
+        Some(s) => s,
+        None => &noop,
+    };
+
+    for code in &action_codes {
+        let needs_seam = !matches!(code.as_str(), "backup" | "mutation");
+        if needs_seam && seam.is_none() {
+            continue;
+        }
+        if !crate::daemon::autonomy_schedule::auto_executable(code, &cfg, net_up, now) {
+            continue;
+        }
+        let mut ctx = crate::daemon::autonomy_schedule::AutonomyContext {
+            profile,
+            seam: effective_seam,
+            now_unix: now,
+            net_up,
+            cfg: &mut cfg,
+        };
+        match crate::daemon::autonomy_schedule::execute_auto_fix(code, &mut ctx) {
+            Ok(true) => {
+                applied += 1;
+                log(&log_line("INFO", &format!("auto-fixed audit item: {code}")));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // Leave the item pending; do not abort the rest of the pass.
+                log(&log_line(
+                    "WARN",
+                    &format!("auto-fix failed for {code}: {}", e.brief()),
+                ));
+            }
+        }
+    }
+
+    if applied > 0 {
+        let mut p = prof;
+        p.config = cfg;
+        let _ = crate::store::profiles::save_profile(&p);
+    }
+    applied
+}
+
 /// Query the deployed worker's last self-ping freshness (the `_ping` KV key
 /// written by the worker's cron `scheduled` handler). Returns `None` when the
 /// profile is not a Worker-mode tunnel, or when the worker has never pinged.
@@ -1200,6 +1323,32 @@ pub async fn daemon_tick(
     // the network is confirmed up, since it needs the CF API). These were
     // dormant features; this is what makes the app fully automatic.
     run_self_maintenance(profile, state, net_up, log).await;
+
+    // Scheduled autonomy audit with auto-execute (architect feature #3). Runs
+    // on the audit cadence (default 15 min) and auto-applies every ACTION item
+    // whose preconditions are met. CF-backed items rotate the worker secret /
+    // mint a second token; config toggles (backup, mutation) flip flags.
+    // Fire the AutonomyRegression beacon on a clean→dirty transition.
+    {
+        let prof = crate::store::profiles::load_profile(profile);
+        let token = crate::store::profiles::get_active_token(profile)
+            .ok()
+            .flatten()
+            .and_then(|l| crate::store::profiles::get_token(profile, &l).ok().flatten());
+        let account_id = if prof.config.active_account.is_empty() {
+            None
+        } else {
+            Some(prof.config.active_account.clone())
+        };
+        let seam = match (token, account_id) {
+            (Some(t), Some(a)) => Some(crate::daemon::RealCfSeam::new(t, a)),
+            _ => None,
+        };
+        let seam_ref = seam
+            .as_ref()
+            .map(|s| s as &dyn crate::daemon::autonomy_schedule::CfApiSeam);
+        crate::daemon::run_autonomy_audit_with_seam(profile, state, net_up, seam_ref, log).await;
+    }
 
     // Per-profile blackout-resilience knobs (0 on each = system default):
     // monitor light/deep phase budgets + the backoff ceiling. On a degraded
@@ -2529,5 +2678,85 @@ mod tests {
         save_daemon_state(profile, &state).unwrap();
         let cleared = crate::daemon::clear_account_blocked(profile).unwrap();
         assert!(!cleared);
+    }
+
+    /// The scheduled autonomy audit auto-applies the config-toggle ACTION items
+    /// (backup + mutation) on a due tick, even with no CF seam. The backend
+    /// profile config is persisted with the toggles flipped.
+    #[tokio::test]
+    async fn test_daemon_run_autonomy_audit_auto_applies_config_toggles() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("default", "").unwrap();
+        let mut state = DaemonState::default();
+        state.audit.last_run_unix = 0; // due
+
+        struct NoopSeam;
+        impl crate::daemon::autonomy_schedule::CfApiSeam for NoopSeam {
+            fn ensure_second_token(&self, _p: &str) -> Result<bool, CFError> {
+                Ok(true)
+            }
+            fn rotate_worker(&self, _p: &str) -> Result<u32, CFError> {
+                Ok(1)
+            }
+            fn ensure_dns_tunnel(&self, _p: &str) -> Result<(), CFError> {
+                Ok(())
+            }
+        }
+        let seam = NoopSeam;
+        let seam_ref: &dyn crate::daemon::autonomy_schedule::CfApiSeam = &seam;
+
+        let mut log_lines: Vec<String> = Vec::new();
+        let applied = crate::daemon::run_autonomy_audit_with_seam(
+            &profile,
+            &mut state,
+            true,
+            Some(seam_ref),
+            &mut |l| log_lines.push(l.to_string()),
+        )
+        .await;
+
+        // A fresh profile needs backup + mutation; both auto-apply.
+        assert!(applied >= 2, "expected backup+mutation toggles applied, got {applied}");
+        assert!(state.audit.last_run_unix > 0);
+        assert!(state.audit.last_action_digest.is_some());
+
+        // Backend config persisted.
+        let p = crate::store::profiles::load_profile(&profile);
+        assert!(p.config.backup_autosync.enabled);
+        assert!(p.config.mutation.enabled);
+    }
+
+    /// The same audit does NOT re-run inside the interval (no double-apply).
+    #[tokio::test]
+    async fn test_daemon_run_autonomy_audit_skips_within_interval() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("default", "").unwrap();
+        let mut state = DaemonState::default();
+        state.audit.last_run_unix = crate::store::now_ts() as u64; // just ran
+
+        struct NoopSeam;
+        impl crate::daemon::autonomy_schedule::CfApiSeam for NoopSeam {
+            fn ensure_second_token(&self, _p: &str) -> Result<bool, CFError> {
+                Ok(true)
+            }
+            fn rotate_worker(&self, _p: &str) -> Result<u32, CFError> {
+                Ok(1)
+            }
+            fn ensure_dns_tunnel(&self, _p: &str) -> Result<(), CFError> {
+                Ok(())
+            }
+        }
+        let seam = NoopSeam;
+        let seam_ref: &dyn crate::daemon::autonomy_schedule::CfApiSeam = &seam;
+
+        let applied = crate::daemon::run_autonomy_audit_with_seam(
+            &profile,
+            &mut state,
+            true,
+            Some(seam_ref),
+            &mut |_l| {},
+        )
+        .await;
+        assert_eq!(applied, 0, "no fixes when audit not due");
     }
 }
