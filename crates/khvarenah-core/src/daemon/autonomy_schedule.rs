@@ -332,4 +332,64 @@ mod tests {
         let applied = execute_auto_fix("not-a-code", &mut ctx).unwrap();
         assert!(!applied);
     }
+
+    #[test]
+    fn auto_executable_accepts_backup_and_mutation_toggles() {
+        let cfg = ProfileConfig::default();
+        assert!(auto_executable("backup", &cfg, false, 0));
+        assert!(auto_executable("mutation", &cfg, false, 0));
+    }
+
+    #[test]
+    fn execute_auto_fix_backup_turns_on_autosync() {
+        let seam = StubSeam {
+            rotated: std::cell::RefCell::new(false),
+            second_token: std::cell::RefCell::new(false),
+        };
+        let mut cfg = ProfileConfig::default();
+        assert!(!cfg.backup_autosync.enabled);
+        let mut ctx = AutonomyContext {
+            profile: "p",
+            seam: &seam,
+            now_unix: 100,
+            net_up: false,
+            cfg: &mut cfg,
+        };
+        let applied = execute_auto_fix("backup", &mut ctx).unwrap();
+        assert!(applied);
+        assert!(cfg.backup_autosync.enabled);
+        assert!(cfg.backup_autosync.interval_secs > 0);
+    }
+
+    #[test]
+    fn execute_auto_fix_mutation_turns_on_signature_rotation() {
+        let seam = StubSeam {
+            rotated: std::cell::RefCell::new(false),
+            second_token: std::cell::RefCell::new(false),
+        };
+        let mut cfg = ProfileConfig::default();
+        assert!(!cfg.mutation.enabled);
+        let mut ctx = AutonomyContext {
+            profile: "p",
+            seam: &seam,
+            now_unix: 100,
+            net_up: false,
+            cfg: &mut cfg,
+        };
+        let applied = execute_auto_fix("mutation", &mut ctx).unwrap();
+        assert!(applied);
+        assert!(cfg.mutation.enabled);
+        assert_eq!(cfg.mutation.interval_secs, 86400);
+    }
+
+    #[test]
+    fn audit_schedule_persists_across_restart() {
+        let mut s = state_with_audit(5000);
+        s.audit.last_action_digest = Some(action_digest(&["backup"]));
+        let json = serde_json::to_string(&s.audit).unwrap();
+        let back: AuditSchedule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_run_unix, 5000);
+        assert_eq!(back.last_action_digest, Some(action_digest(&["backup"])));
+        assert_eq!(back.interval_secs, AUDIT_INTERVAL_SECS);
+    }
 }
