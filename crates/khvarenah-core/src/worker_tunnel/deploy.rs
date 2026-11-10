@@ -24,6 +24,10 @@ pub struct WorkerTunnelDeployOpts {
     pub compat_date: String,
     /// Retry count for the deploy PUT.
     pub retries: u32,
+    /// Optional VLESS upstream host:port for the `/ws` data-plane dumb pipe.
+    /// `None` → control-plane only (flags 1/2/3); the `/ws` endpoint will reply
+    /// `500 no-upstream` until set.
+    pub vless_upstream: Option<String>,
 }
 
 /// Result of a successful worker-tunnel deploy.
@@ -82,6 +86,12 @@ pub async fn deploy_worker_tunnel(
         "KHV_TUNNEL_BASE".to_string(),
         serde_json::Value::String(KHV_TUNNEL_BASE.to_string()),
     );
+    if let Some(upstream) = &opts.vless_upstream {
+        vars.insert(
+            "KHV_VLESS_UPSTREAM".to_string(),
+            serde_json::Value::String(upstream.clone()),
+        );
+    }
     cf.set_vars(account_id, &worker_name, vars).await?;
 
     let worker_url = cf.workers_dev_url(account_id, &worker_name, &subdomain);
@@ -96,6 +106,7 @@ pub async fn deploy_worker_tunnel(
         worker_url: Some(worker_url.clone()),
         worker_name: Some(worker_name.clone()),
         shared_secret: Some(shared_secret.clone()),
+        worker_vless_upstream: opts.vless_upstream.clone(),
     };
     crate::vps_deploy::write_tunnel_client_config(profile_id, &cfg)?;
 
@@ -162,7 +173,16 @@ mod tests {
                         let n = stream.read(&mut buf).unwrap_or(0);
                         let req = String::from_utf8_lossy(&buf[..n]).to_string();
                         let first_line = req.lines().next().unwrap_or("").to_string();
+                        // Capture the PATCH settings body (carries the vars JSON).
+                        let body_capture = if first_line.starts_with("PATCH") {
+                            req.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
+                        } else {
+                            String::new()
+                        };
                         log.push(first_line.clone());
+                        if !body_capture.is_empty() {
+                            log.push(body_capture.trim_end().to_string());
+                        }
                         let body = if first_line.contains("/workers/subdomain") {
                             r#"{"success":true,"result":{"subdomain":"sub"}}"#
                         } else {
@@ -175,6 +195,9 @@ mod tests {
                         );
                         let _ = stream.write_all(resp.as_bytes());
                         let _ = stream.flush();
+                        // Flush the request log after every request so tests can read
+                        // it without waiting for the accept-loop to drain.
+                        let _ = std::fs::write("/tmp/kv_cf_mock_log.txt", log.join("\n"));
                     }
                     Err(_) => break,
                 }
@@ -191,6 +214,7 @@ mod tests {
             session_seed: "test-seed".into(),
             compat_date: "2026-07-01".into(),
             retries: 1,
+            vless_upstream: None,
         }
     }
 
@@ -233,6 +257,20 @@ mod tests {
         assert!(res.worker_url.starts_with("https://"));
         assert!(res.worker_url.ends_with(".sub.workers.dev"));
         assert_eq!(res.subdomain, "sub");
+    }
+
+    #[tokio::test]
+    async fn test_deploy_worker_tunnel_persists_vless_upstream() {
+        let base = mock_cf_server();
+        let cf = Client::with_base("tok", &base);
+        let mut o = opts();
+        o.vless_upstream = Some("203.0.113.10:443".into());
+        let _ = deploy_worker_tunnel(&cf, "acc1", "p_upstream", &o).await.unwrap();
+        let cfg = crate::vps_deploy::load_tunnel_client_config("p_upstream").unwrap();
+        assert_eq!(cfg.worker_vless_upstream.as_deref(), Some("203.0.113.10:443"));
+        // The deploy PUT and set_vars requests must both carry the upstream.
+        let log = std::fs::read_to_string("/tmp/kv_cf_mock_log.txt").unwrap_or_default();
+        assert!(log.contains("KHV_VLESS_UPSTREAM"), "log: {log}");
     }
 
     #[tokio::test]

@@ -631,6 +631,7 @@ impl KhvarenahApp {
             worker_url: None,
             worker_name: None,
             shared_secret: None,
+            worker_vless_upstream: None,
         };
         match khvarenah_core::vps_deploy::write_tunnel_client_config(&self.profile_id, &cfg) {
             Ok(()) => {
@@ -751,6 +752,7 @@ impl KhvarenahApp {
                 session_seed: format!("khv-gui-{}", pid),
                 compat_date: "2026-07-01".into(),
                 retries: 2,
+                vless_upstream: None,
             };
             match khvarenah_core::worker_tunnel::deploy_worker_tunnel(
                 &client,

@@ -430,6 +430,7 @@ mod tests {
             worker_url: Some("https://w.sub.workers.dev".into()),
             worker_name: Some("w".into()),
             shared_secret: Some("0123456789abcdef0123456789abcdef".into()),
+            worker_vless_upstream: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: TunnelClientConfig = serde_json::from_str(&json).unwrap();
@@ -459,6 +460,7 @@ mod tests {
             worker_url: None,
             worker_name: None,
             shared_secret: None,
+            worker_vless_upstream: None,
         };
         let v = probe_worker_tunnel_live(&cfg, std::time::Duration::from_millis(500));
         assert!(!v.ok);
@@ -485,6 +487,7 @@ mod tests {
                 worker_url: Some("http://127.0.0.1:1".into()),
                 worker_name: Some("w".into()),
                 shared_secret: Some("a".into()),
+                worker_vless_upstream: None,
             },
         )
         .unwrap();

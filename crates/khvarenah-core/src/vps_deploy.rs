@@ -159,6 +159,9 @@ pub struct TunnelClientConfig {
     /// Worker tunnel: shared-secret gate (X-Khvarenah-Session header).
     #[serde(default)]
     pub shared_secret: Option<String>,
+    /// Worker tunnel: configured VLESS upstream host:port (data-plane pipe).
+    #[serde(default)]
+    pub worker_vless_upstream: Option<String>,
 }
 
 impl Default for TunnelClientConfig {
@@ -172,6 +175,7 @@ impl Default for TunnelClientConfig {
             worker_url: None,
             worker_name: None,
             shared_secret: None,
+            worker_vless_upstream: None,
         }
     }
 }
@@ -434,6 +438,7 @@ WantedBy=multi-user.target
         worker_url: None,
         worker_name: None,
         shared_secret: None,
+        worker_vless_upstream: None,
     };
     write_tunnel_client_config(profile_id, &client)?;
     emit(DeployStep::ExportClientConfig, &mut completed);
@@ -572,6 +577,7 @@ mod tests {
             worker_url: None,
             worker_name: None,
             shared_secret: None,
+            worker_vless_upstream: None,
         };
         write_tunnel_client_config(&profile, &cfg).unwrap();
         let loaded = load_tunnel_client_config(&profile).unwrap();

@@ -2611,6 +2611,7 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
                 session_seed: seed,
                 compat_date,
                 retries: 2,
+                vless_upstream: None,
             };
             let res = khvarenah_core::worker_tunnel::deploy_worker_tunnel(
                 &client,
