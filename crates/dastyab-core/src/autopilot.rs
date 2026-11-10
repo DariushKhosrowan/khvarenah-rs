@@ -1005,6 +1005,23 @@ pub fn write_active_configs(
     let link = fronted.share_link();
     store::atomic_write(&dir.join("link.txt"), link.as_bytes())?;
 
+    // Record every render in the completeness ledger (durable, searchable,
+    // hash-verified) before writing the files, honoring a label + source.
+    {
+        use crate::generated_configs::ConfigSource;
+        let mut ledger = crate::generated_configs::load_generated_configs(profile_id);
+        let now = crate::store::now_ts() as u64;
+        ledger.push(now, crate::export::ExportFormat::ShareLink, ConfigSource::WorkerVless, Some(format!("active {}", ep.ip)), link.clone())?;
+        if let Ok(xray) = fronted.xray_client_json() {
+            ledger.push(now, crate::export::ExportFormat::V2rayN, ConfigSource::WorkerVless, Some(format!("active {}", ep.ip)), xray.clone())?;
+        }
+        if let Ok(sb) = crate::export::sing_box_json(&fronted) {
+            ledger.push(now, crate::export::ExportFormat::SingBox, ConfigSource::WorkerVless, Some(format!("active {}", ep.ip)), sb.clone())?;
+        }
+        ledger.push(now, crate::export::ExportFormat::Clash, ConfigSource::WorkerVless, Some(format!("active {}", ep.ip)), crate::export::clash_entry(&fronted))?;
+        crate::generated_configs::save_generated_configs(profile_id, &ledger)?;
+    }
+
     // v2rayN / xray JSON
     if let Ok(xray) = fronted.xray_client_json() {
         store::atomic_write(&dir.join("xray.json"), xray.as_bytes())?;

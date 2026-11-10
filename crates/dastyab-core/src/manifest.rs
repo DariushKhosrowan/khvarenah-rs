@@ -46,6 +46,8 @@ pub enum ArtifactKind {
     CleanIpMeta,
     /// `tunnel-client.json` — worker-tunnel client config.
     TunnelClient,
+    /// `generated_configs.json` — completeness ledger of every rendered config.
+    GeneratedConfigs,
     /// workspace-level: `carrier_pool.json`.
     CarrierPool,
     /// workspace-level: `active_profile` marker.
@@ -65,6 +67,7 @@ impl ArtifactKind {
             ArtifactKind::TokenHistory => "token history",
             ArtifactKind::CleanIpMeta => "clean-IP meta",
             ArtifactKind::TunnelClient => "tunnel client",
+            ArtifactKind::GeneratedConfigs => "generated configs",
             ArtifactKind::CarrierPool => "carrier pool",
             ArtifactKind::ActiveProfileMarker => "active profile marker",
         }
@@ -82,6 +85,7 @@ impl ArtifactKind {
             ArtifactKind::TokenHistory => "token_history.json",
             ArtifactKind::CleanIpMeta => "cleanip_meta.json",
             ArtifactKind::TunnelClient => "tunnel-client.json",
+            ArtifactKind::GeneratedConfigs => "generated_configs.json",
             ArtifactKind::CarrierPool => "carrier_pool.json",
             ArtifactKind::ActiveProfileMarker => "active_profile",
         }
@@ -188,6 +192,7 @@ pub fn profile_artifact_kinds() -> Vec<ArtifactKind> {
         ArtifactKind::TokenHistory,
         ArtifactKind::CleanIpMeta,
         ArtifactKind::TunnelClient,
+        ArtifactKind::GeneratedConfigs,
     ]
 }
 

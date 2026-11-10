@@ -18,7 +18,7 @@ use dastyab_core::CFError;
 use crate::bridge;
 use crate::dialogs::{self, Dialog, DialogPayload, DialogResult};
 use crate::state::GuiState;
-use crate::views::{cleanip, history, profiles, tokens};
+use crate::views::{cleanip, configs, history, profiles, tokens};
 
 // Royal-gold palette (dark #0a0705 bg per shell spec)
 pub const GOLD: egui::Color32 = egui::Color32::from_rgb(212, 175, 55);
@@ -39,6 +39,7 @@ enum View {
     Tokens,
     CleanIps,
     History,
+    Configs,
     Log,
     Tools,
     Settings,
@@ -46,14 +47,15 @@ enum View {
 }
 
 impl View {
-    /// The ten-item sidebar, in order.
-    const ALL: [View; 10] = [
+    /// The eleven-item sidebar, in order.
+    const ALL: [View; 11] = [
         View::Dashboard,
         View::DeployScan,
         View::Profiles,
         View::Tokens,
         View::CleanIps,
         View::History,
+        View::Configs,
         View::Log,
         View::Tools,
         View::Settings,
@@ -68,6 +70,7 @@ impl View {
             View::Tokens => "Tokens",
             View::CleanIps => "Clean IPs",
             View::History => "History",
+            View::Configs => "Configs",
             View::Log => "Log",
             View::Tools => "Tools",
             View::Settings => "Settings",
@@ -85,6 +88,7 @@ impl View {
             View::Tokens => "🔑",
             View::CleanIps => "🌐",
             View::History => "🕘",
+            View::Configs => "📄",
             View::Log => "📜",
             View::Tools => "🧰",
             View::Settings => "⚙",
@@ -159,6 +163,12 @@ pub struct DastYabApp {
     pub backups_search: String,
     /// Sort mode for the Saved Configs manager.
     pub backup_sort: BackupSort,
+    /// Live search filter for the generated-configs manager.
+    pub configs_search: String,
+    /// Format filter for the generated-configs manager (empty = all).
+    pub configs_fmt_filter: String,
+    /// Sort order for the generated-configs manager.
+    pub configs_sort: crate::views::configs::ConfigsSort,
     /// Kind filter for the token-history ledger (empty = all).
     pub token_history_filter: String,
     /// Auto-scroll the Log view to the newest line.
@@ -353,6 +363,9 @@ impl DastYabApp {
             cleanip_search: String::new(),
             cleanip_sort: crate::views::cleanip::CleanipSort::default(),
             backups_search: String::new(),
+            configs_search: String::new(),
+            configs_fmt_filter: String::new(),
+            configs_sort: crate::views::configs::ConfigsSort::Newest,
             new_profile_name: String::new(),
             scan_count: profile.config.scan_count.max(1),
             scan_workers: profile.config.scan_workers.max(1),
@@ -1527,9 +1540,9 @@ impl DastYabApp {
         } else if pressed(egui::Key::Num6) {
             Some(View::History)
         } else if pressed(egui::Key::Num7) {
-            Some(View::Log)
+            Some(View::Configs)
         } else if pressed(egui::Key::Num8) {
-            Some(View::Tools)
+            Some(View::Log)
         } else if pressed(egui::Key::Num9) {
             Some(View::Settings)
         } else if pressed(egui::Key::Num0) {
@@ -1897,6 +1910,7 @@ impl DastYabApp {
                     View::Tokens => self.token_panel(ui, p),
                     View::CleanIps => self.cleanip_panel(ui, p),
                     View::History => history::show(ui, self, p),
+                    View::Configs => self.configs_panel(ui),
                     View::Log => self.log_panel(ui),
                     View::Tools => self.tools_panel(ui, p),
                     View::Settings => self.settings_panel(ui, p),
@@ -2312,6 +2326,12 @@ impl DastYabApp {
                     ));
                 }
             }
+        }
+    }
+
+    fn configs_panel(&mut self, ui: &mut egui::Ui) {
+        if let Some(act) = configs::show(ui, self) {
+            configs::run_action(self, act);
         }
     }
 

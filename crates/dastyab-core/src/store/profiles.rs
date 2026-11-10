@@ -794,31 +794,60 @@ pub fn remember_account(
 
 /// Append a vless record (keeps newest-first order, capped at 500).
 pub fn remember_vless(id: &str, rec: VlessRecord) -> Result<(), CFError> {
+    let dir = profile_dir(id);
     let mut p = load_profile(id);
     p.history.insert(0, rec);
     if p.history.len() > 500 {
         p.history.truncate(500);
     }
-    save_profile(&p)
+    save_profile(&p)?;
+    // Track the history ledger's high-water mark so the doctor's append-only
+    // guard sees this append (and never flags a later legit growth).
+    let _ = crate::ledger_guard::note_ledger_state(
+        &dir,
+        crate::ledger_guard::LedgerKind::History,
+        p.history.len() as u64,
+        crate::store::now_ts() as u64,
+    );
+    Ok(())
 }
 
 /// Remove a single VlessRecord by its id. Returns `Ok(false)` when no record
 /// matched (a no-op). Used by the History view's per-item delete.
 pub fn remove_history_record(id: &str, rec_id: &str) -> Result<bool, CFError> {
+    let dir = profile_dir(id);
     let mut p = load_profile(id);
     let before = p.history.len();
     p.history.retain(|r| r.id != rec_id);
     let removed = p.history.len() != before;
     save_profile(&p)?;
+    if removed {
+        // Intentional removal: move the high-water down so the doctor does not
+        // flag a deliberate delete as corruption.
+        let _ = crate::ledger_guard::rebase_high_water(
+            &dir,
+            crate::ledger_guard::LedgerKind::History,
+            p.history.len() as u64,
+            crate::store::now_ts() as u64,
+        );
+    }
     Ok(removed)
 }
 
 /// Clear the entire config history (deploys + clean-IP records) for a profile.
 /// The journal is untouched — that is a separate stream.
 pub fn clear_history(id: &str) -> Result<(), CFError> {
+    let dir = profile_dir(id);
     let mut p = load_profile(id);
     p.history.clear();
-    save_profile(&p)
+    save_profile(&p)?;
+    let _ = crate::ledger_guard::rebase_high_water(
+        &dir,
+        crate::ledger_guard::LedgerKind::History,
+        0,
+        crate::store::now_ts() as u64,
+    );
+    Ok(())
 }
 
 /// Add a clean IP string (dedup, keep list ordered by insertion).
@@ -829,6 +858,7 @@ pub fn remember_clean_ip(id: &str, ip: &str) -> Result<(), CFError> {
 /// Add a clean IP string with a provenance source ("scan" | "import" |
 /// "manual"). Records first/last verified timestamps for the manager view.
 pub fn remember_clean_ip_with_source(id: &str, ip: &str, source: &str) -> Result<(), CFError> {
+    let dir = profile_dir(id);
     let mut p = load_profile(id);
     let ep = ip.trim().to_string();
     if ep.is_empty() {
@@ -852,7 +882,14 @@ pub fn remember_clean_ip_with_source(id: &str, ip: &str, source: &str) -> Result
             m.source = source.to_string();
         }
     }
-    save_profile(&p)
+    save_profile(&p)?;
+    let _ = crate::ledger_guard::note_ledger_state(
+        &dir,
+        crate::ledger_guard::LedgerKind::CleanIps,
+        p.clean_ips.len() as u64,
+        crate::store::now_ts() as u64,
+    );
+    Ok(())
 }
 
 fn parse_ip_port(ep: &str) -> u16 {
@@ -864,22 +901,39 @@ fn parse_ip_port(ep: &str) -> u16 {
 /// Remove a single saved clean IP. Returns `Ok(false)` when it was not
 /// present (a no-op). Used by the Clean IPs manager view.
 pub fn remove_clean_ip(id: &str, ip: &str) -> Result<bool, CFError> {
+    let dir = profile_dir(id);
     let mut p = load_profile(id);
     let before = p.clean_ips.len();
     p.clean_ips.retain(|x| x != ip);
     p.clean_ip_meta.remove(ip);
     let removed = p.clean_ips.len() != before;
     save_profile(&p)?;
+    if removed {
+        let _ = crate::ledger_guard::rebase_high_water(
+            &dir,
+            crate::ledger_guard::LedgerKind::CleanIps,
+            p.clean_ips.len() as u64,
+            crate::store::now_ts() as u64,
+        );
+    }
     Ok(removed)
 }
 
 /// Clear all saved clean IPs for a profile. Used by the Clean IPs manager's
 /// "clear all" action.
 pub fn clear_clean_ips(id: &str) -> Result<(), CFError> {
+    let dir = profile_dir(id);
     let mut p = load_profile(id);
     p.clean_ips.clear();
     p.clean_ip_meta.clear();
-    save_profile(&p)
+    save_profile(&p)?;
+    let _ = crate::ledger_guard::rebase_high_water(
+        &dir,
+        crate::ledger_guard::LedgerKind::CleanIps,
+        0,
+        crate::store::now_ts() as u64,
+    );
+    Ok(())
 }
 
 /// Record a token-lifecycle event on a profile (in-memory; caller saves).
@@ -904,9 +958,17 @@ fn push_token_event(p: &mut Profile, kind: &str, label: &str, note: &str) {
 /// Record a "verified" token event and persist it. Used by the GUI verify
 /// flow so the history ledger reflects real checks.
 pub fn record_token_verified(id: &str, label: &str, note: &str) -> Result<(), CFError> {
+    let dir = profile_dir(id);
     let mut p = load_profile(id);
     push_token_event(&mut p, "verified", label, note);
-    save_profile(&p)
+    save_profile(&p)?;
+    let _ = crate::ledger_guard::note_ledger_state(
+        &dir,
+        crate::ledger_guard::LedgerKind::TokenHistory,
+        p.token_history.len() as u64,
+        crate::store::now_ts() as u64,
+    );
+    Ok(())
 }
 
 /// The token-lifecycle ledger for a profile (newest first).
@@ -921,14 +983,23 @@ pub fn clean_ip_meta(id: &str) -> BTreeMap<String, CleanIpMeta> {
 
 /// Clear the token-lifecycle ledger for a profile.
 pub fn clear_token_history(id: &str) -> Result<(), CFError> {
+    let dir = profile_dir(id);
     let mut p = load_profile(id);
     p.token_history.clear();
-    save_profile(&p)
+    save_profile(&p)?;
+    let _ = crate::ledger_guard::rebase_high_water(
+        &dir,
+        crate::ledger_guard::LedgerKind::TokenHistory,
+        0,
+        crate::store::now_ts() as u64,
+    );
+    Ok(())
 }
 
 /// Remove a single event from the token-lifecycle ledger. Returns `Ok(true)`
 /// when the event was found and removed, `Ok(false)` when it was absent.
 pub fn remove_token_history_event(id: &str, event_id: &str) -> Result<bool, CFError> {
+    let dir = profile_dir(id);
     let mut p = load_profile(id);
     let before = p.token_history.len();
     p.token_history.retain(|e| e.id != event_id);
@@ -936,6 +1007,12 @@ pub fn remove_token_history_event(id: &str, event_id: &str) -> Result<bool, CFEr
         return Ok(false);
     }
     save_profile(&p)?;
+    let _ = crate::ledger_guard::rebase_high_water(
+        &dir,
+        crate::ledger_guard::LedgerKind::TokenHistory,
+        p.token_history.len() as u64,
+        crate::store::now_ts() as u64,
+    );
     Ok(true)
 }
 

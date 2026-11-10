@@ -8,9 +8,10 @@
 
 use crate::error::CFError;
 use crate::VlessProfile;
+use serde::{Deserialize, Serialize};
 
 /// All supported client export formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExportFormat {
     /// v2rayN / v2rayNG JSON (Xray-style outbound).
     V2rayN,

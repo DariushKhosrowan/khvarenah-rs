@@ -495,6 +495,11 @@ pub fn run_doctor(opts: &DoctorOptions) -> DoctorReport {
         opts.now_unix,
     ));
 
+    // Ledger append-only integrity (high-water vs current count). Guards
+    // against silent truncation of history/token_history/generated-configs.
+    let profile_dir = crate::store::profiles::profile_dir(&opts.profile_id);
+    results.extend(crate::ledger_guard::doctor_check_ledger_integrity(&profile_dir));
+
     DoctorReport {
         checked_at_unix: opts.now_unix as u64,
         results,

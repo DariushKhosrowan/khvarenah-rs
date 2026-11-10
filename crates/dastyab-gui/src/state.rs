@@ -46,6 +46,18 @@ pub struct TokenLedgerRow {
     pub epoch: i64,
 }
 
+/// One row in the generated-configs completeness ledger (the configs manager).
+#[derive(Debug, Clone)]
+pub struct GeneratedConfigRow {
+    pub id: u64,
+    pub created_unix: u64,
+    pub fmt: String,
+    pub source: String,
+    pub label: String,
+    pub content: String,
+    pub content_sha256: [u8; 32],
+}
+
 /// Cached snapshot of what the sidebar + token view need to render.
 #[derive(Debug, Clone, Default)]
 pub struct GuiState {
@@ -62,6 +74,8 @@ pub struct GuiState {
     pub seeds: Vec<String>,
     /// Token-lifecycle ledger (newest first).
     pub token_ledger: Vec<TokenLedgerRow>,
+    /// Generated-configs completeness ledger (the configs manager).
+    pub generated_configs: Vec<GeneratedConfigRow>,
     /// Saved config snapshots (backup bundles) for the Saved Configs manager.
     pub backups: Vec<dastyab_core::backup::BackupRecord>,
     /// Number of undelivered beacon alerts (outbox) for the active profile.
@@ -134,6 +148,21 @@ impl GuiState {
                 label: e.label.clone(),
                 note: e.note.clone(),
                 epoch: e.epoch as i64,
+            })
+            .collect();
+
+        let ledger = dastyab_core::generated_configs::load_generated_configs(&active);
+        self.generated_configs = ledger
+            .records
+            .into_iter()
+            .map(|r| GeneratedConfigRow {
+                id: r.id,
+                created_unix: r.created_unix,
+                fmt: r.fmt.label().to_string(),
+                source: r.source.label().to_string(),
+                label: r.label.unwrap_or_default(),
+                content: r.content.clone(),
+                content_sha256: r.content_sha256,
             })
             .collect();
 

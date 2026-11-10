@@ -117,6 +117,11 @@ enum Command {
     },
     /// Show history.
     History,
+    /// List / show / export generated configs (the completeness ledger).
+    Configs {
+        #[command(subcommand)]
+        action: ConfigsAction,
+    },
     /// Show usage summary.
     Status,
     /// Migrate old flat-file memory into profiles.
@@ -350,6 +355,34 @@ enum Command {
     Onboard {
         #[command(subcommand)]
         action: OnboardAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigsAction {
+    /// List generated configs (optionally filtered).
+    List {
+        /// Filter by export format (v2rayn | singbox | clash | link).
+        #[arg(long)]
+        fmt: Option<String>,
+        /// Only records at or after this unix timestamp.
+        #[arg(long)]
+        since: Option<u64>,
+        /// Text substring to search for in the config content.
+        #[arg(long)]
+        search: Option<String>,
+    },
+    /// Show one generated config by id.
+    Show {
+        #[arg()]
+        id: u64,
+    },
+    /// Write one generated config to a file.
+    Export {
+        #[arg()]
+        id: u64,
+        #[arg(long)]
+        output: String,
     },
 }
 

@@ -11,6 +11,7 @@
 use eframe::egui;
 
 pub mod cleanip;
+pub mod configs;
 pub mod history;
 pub mod profiles;
 pub mod tokens;

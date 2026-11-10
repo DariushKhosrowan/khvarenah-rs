@@ -95,6 +95,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::Scan => scan(&profile, 1).await,
         Command::ScanMany { count } => scan(&profile, count).await,
         Command::History => history(&profile),
+        Command::Configs { action } => configs_cmd(&profile, action),
         Command::Status => status(&profile),
         Command::Migrate => {
             let n = migrate_legacy()?;
@@ -766,6 +767,85 @@ fn history(profile: &str) -> Result<(), CFError> {
         );
     }
     Ok(())
+}
+
+fn configs_cmd(profile: &str, action: crate::ConfigsAction) -> Result<(), CFError> {
+    use dastyab_core::generated_configs::ConfigQuery;
+    let ledger = dastyab_core::generated_configs::load_generated_configs(profile);
+    match action {
+        crate::ConfigsAction::List { fmt, since, search } => {
+            let fmt = fmt
+                .as_deref()
+                .and_then(ExportFormat::parse);
+            let q = ConfigQuery {
+                fmt,
+                source: None,
+                since_unix: since,
+                until_unix: None,
+                label: None,
+                text_substring: search,
+            };
+            let hits = ledger.search(&q);
+            if hits.is_empty() {
+                println!("No generated configs match in profile '{profile}'.");
+                return Ok(());
+            }
+            let n = hits.len();
+            for r in hits {
+                println!(
+                    "[{}] {} ({}) {}",
+                    r.created_unix,
+                    r.fmt.label(),
+                    r.source.label(),
+                    r.label.as_deref().unwrap_or("")
+                );
+            }
+            println!("{n} record(s)");
+            Ok(())
+        }
+        crate::ConfigsAction::Show { id } => {
+            let rec = ledger.records.iter().find(|r| r.id == id);
+            match rec {
+                Some(r) => {
+                    println!("id: {}", r.id);
+                    println!("created: {}", r.created_unix);
+                    println!("format: {}", r.fmt.label());
+                    println!("source: {}", r.source.label());
+                    println!("label: {}", r.label.as_deref().unwrap_or(""));
+                    println!("sha256: {}", hex(&r.content_sha256));
+                    println!("--- content ---");
+                    print!("{}", r.content);
+                    Ok(())
+                }
+                None => Err(CFError::new(
+                    "Not found",
+                    format!("no generated config with id {id}"),
+                    "List configs with `dastyab configs list`.",
+                )),
+            }
+        }
+        crate::ConfigsAction::Export { id, output } => {
+            let rec = ledger.records.iter().find(|r| r.id == id);
+            match rec {
+                Some(r) => {
+                    std::fs::write(&output, &r.content).map_err(|e| {
+                        CFError::new("Write error", format!("{e}"), "Check the output path.")
+                    })?;
+                    println!("Wrote generated config {id} to {output}");
+                    Ok(())
+                }
+                None => Err(CFError::new(
+                    "Not found",
+                    format!("no generated config with id {id}"),
+                    "List configs with `dastyab configs list`.",
+                )),
+            }
+        }
+    }
+}
+
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn status(profile: &str) -> Result<(), CFError> {
