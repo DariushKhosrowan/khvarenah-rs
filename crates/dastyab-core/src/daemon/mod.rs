@@ -14,6 +14,13 @@
 //! 3. **daemon.log** — plain-text, ISO-8601-prefixed, append-only, rotated at
 //!    5MB keeping 3 generations. Crash-diagnostic evidence before the full
 //!    structured journal (Feature B) ships.
+//!
+//! Blackout state machine + carrier reselection (round 4, architect spec #3):
+//! [`blackout`] is a pure, socket-free controller the daemon's tier-decision
+//! seam routes through (see [`blackout::decide_next_tier`]). It makes the
+//! daemon *know* when it is in a total blackout and fast-fail to the worker
+//! bootstrap + reselect carriers from the offline pool — no human.
+pub mod blackout;
 
 use crate::error::CFError;
 use std::future::Future;
