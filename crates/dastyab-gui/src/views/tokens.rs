@@ -406,8 +406,17 @@ pub fn run_action(app: &mut DastYabApp, action: TokensAction) -> Option<crate::d
             }
         }
         TokensAction::MakeActive(label) => {
-            match set_active_token(&app.state.active_profile_id, &label) {
+            // Target the profile the user is actually viewing (`profile_id`),
+            // not the possibly-stale cached `state.active_profile_id` — a
+            // mismatch here silently no-ops ("nothing happens").
+            match set_active_token(&app.profile_id, &label) {
                 Ok(_) => {
+                    // Reflect the change immediately (not just after the next
+                    // reload) so the click has visible feedback.
+                    app.state.active_token_label = Some(label.clone());
+                    for t in &mut app.state.tokens {
+                        t.is_active = t.label == label;
+                    }
                     app.state.reload_pending = true;
                     app.note = format!("'{label}' is now the active token.");
                 }

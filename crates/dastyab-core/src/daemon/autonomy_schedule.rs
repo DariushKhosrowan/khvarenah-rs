@@ -263,6 +263,8 @@ mod tests {
                 pending_since_unix: 0,
                 desync_strategy: None,
                 failed_strategies: Vec::new(),
+                host_down: false,
+                host_down_since_unix: 0,
             },
         );
         assert!(auto_executable(
@@ -287,6 +289,8 @@ mod tests {
                 pending_since_unix: 0,
                 desync_strategy: None,
                 failed_strategies: Vec::new(),
+                host_down: false,
+                host_down_since_unix: 0,
             },
         );
         assert!(!auto_executable(

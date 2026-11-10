@@ -192,4 +192,58 @@ mod tests {
         assert!(all.iter().any(|(l, _)| l == "sing-box"));
         assert!(all.iter().any(|(l, _)| l == "v2rayN"));
     }
+
+    /// This is the exact transformation the Configs tab performs when a user
+    /// creates a config from a clean IP *without redeploying*: it parses the
+    /// last deployed workers.dev link, swaps only the address (the server) for
+    /// the clean IP, and keeps the worker's uuid/path/SNI/host. Every rendered
+    /// format must then connect to the clean IP while still presenting the
+    /// worker's hostname as the TLS SNI and Host header (so Cloudflare edge
+    /// routing keeps working through the clean IP).
+    #[test]
+    fn config_from_clean_ip_preserves_sni_and_host() {
+        // What a real deploy would have recorded as the base workers.dev link.
+        let mut deployed = VlessProfile {
+            uuid: "12345678-1234-1234-1234-123456789abc".into(),
+            address: "amir.xxx.workers.dev".into(),
+            port: 443,
+            security: "tls".into(),
+            path: "/ws".into(),
+            transport: "ws".into(),
+            name: "amir-edge".into(),
+            ..Default::default()
+        };
+        deployed.normalize();
+        let link = deployed.share_link();
+
+        // The GUI parses the deployed link, then overrides address/port.
+        let mut prof = VlessProfile::parse(&link).unwrap();
+        prof.address = "104.16.1.1".into();
+        prof.port = 443;
+        prof.name = "clean-104.16.1.1".into();
+
+        let all = render_all(&prof);
+        // Every format must point its server at the clean IP…
+        for (label, content) in &all {
+            assert!(
+                content.contains("104.16.1.1"),
+                "{label} must use the clean IP as server: {content}"
+            );
+        }
+        // …while preserving the workers.dev hostname as SNI/Host.
+        for (label, content) in &all {
+            assert!(
+                content.contains("amir.xxx.workers.dev"),
+                "{label} must keep the worker host as SNI/Host: {content}"
+            );
+        }
+        // The share link keeps the vless:// origin host intact by construction.
+        let share = all
+            .iter()
+            .find(|(l, _)| l == "share-link")
+            .map(|(_, c)| c.clone())
+            .expect("share link present");
+        assert!(share.contains("104.16.1.1"));
+        assert!(share.contains("amir.xxx.workers.dev"));
+    }
 }

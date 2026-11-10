@@ -1829,6 +1829,9 @@ impl AutopilotEngine {
         let mut ledger = read_ledger(&self.profile_id);
         let mut alive = 0usize;
         let ledger_len = ledger.len();
+        let mut saw_strategy_failure = false;
+        let mut saw_host_down = false;
+        let mut any_probed = false;
         mark_stage(&self.profile_id, CycleStage::LightCheck)?;
         for ep in ledger.iter_mut() {
             let res = crate::health::endpoint_live_with_budget(
@@ -1843,19 +1846,48 @@ impl AutopilotEngine {
             if res.alive {
                 ep.last_checked = Some(store::now_iso());
                 alive += 1;
+            } else {
+                // Classify the failure by transport layer: a TCP connect
+                // refusal/timeout (zero handshake) is a HOST signal, not a
+                // strategy signal. TLS/WS/route failures imply the host is
+                // reachable → strategy-attributable.
+                any_probed = true;
+                match crate::worker_tunnel::secret::classify_endpoint_outcome(res.failure_stage) {
+                    crate::worker_tunnel::secret::LearningSignal::StrategyFailure => {
+                        saw_strategy_failure = true;
+                    }
+                    crate::worker_tunnel::secret::LearningSignal::HostDown => {
+                        saw_host_down = true;
+                    }
+                    _ => {}
+                }
             }
         }
 
-        // Record the light-phase aggregate WS outcome into the per-worker
-        // desync store (serialized persist so deep-discovery and light sweeps
-        // cannot lose an update). Only record when there was at least one
-        // probe; an empty ledger means no signal and must not demote.
+        // Record the light-phase aggregate outcome into the per-worker desync
+        // store (serialized persist so deep-discovery and light sweeps cannot
+        // lose an update). Only record when there was at least one probe; an
+        // empty ledger means no signal and must not demote. Classification:
+        // - alive > 0 → Success (promote + clear any host-down hold).
+        // - else any strategy-level failure → demote (host was reachable).
+        // - else all failures host-unreachable → hold ladder (record host-down).
+        // - else (only unclassifiable) → no learning.
         if ledger_len > 0 {
-            crate::worker_tunnel::secret::learn_from_discovery_persisted(
+            let sig = if alive > 0 {
+                crate::worker_tunnel::secret::LearningSignal::Success
+            } else if saw_strategy_failure {
+                crate::worker_tunnel::secret::LearningSignal::StrategyFailure
+            } else if saw_host_down && any_probed {
+                crate::worker_tunnel::secret::LearningSignal::HostDown
+            } else {
+                crate::worker_tunnel::secret::LearningSignal::Unclassifiable
+            };
+            crate::worker_tunnel::secret::learn_from_discovery_persisted_signal(
                 &self.profile_id,
                 &worker_host,
                 cycle_strategy,
-                alive > 0,
+                sig,
+                store::now_ts() as u64,
             );
         }
 
@@ -3894,15 +3926,28 @@ mod tests {
         }
     }
 
-    /// The light phase records a per-worker desync FAILURE when every ledger
-    /// endpoint is dead: the tried strategy is pushed to the failed-set so the
-    /// ladder demotes on the next probe. Acceptance (b) from the architect
-    /// brief (light-phase failure demotes).
+    /// All endpoints dead at the TRANSPORT level (TCP connect refused/timeout
+    /// on 127.0.0.2:1 — zero handshake) must NOT demote the strategy. Per
+    /// DeepSeek A99/A103(a), a host-unreachable signal is not strategy evidence:
+    /// it records `host_down` (hold ladder) and leaves the strategy record
+    /// unpolluted.
     #[tokio::test]
     async fn test_monitor_light_phase_records_desync_failure_when_all_dead() {
         let _home = rescue_home();
         let id = make_profile();
         seeded_vless_profile(&id);
+        // Pre-seed an effective strategy so we can prove it is HELD (not
+        // advanced/demoted) while the host is down.
+        let worker_host = "amir.dariuskhosrowan.workers.dev";
+        {
+            let mut p = crate::store::profiles::load_profile(&id);
+            crate::worker_tunnel::secret::record_worker_desync_success(
+                &mut p.config,
+                worker_host,
+                crate::desync::DesyncStrategy::SplitClientHello,
+            );
+            crate::store::profiles::save_profile(&p).unwrap();
+        }
         write_ledger(&id, &dead_loopback_ledger()).unwrap();
 
         let engine = AutopilotEngine::with_provider(
@@ -3920,23 +3965,31 @@ mod tests {
             LightOutcome::NeedDeep => {}
         }
 
-        // The worker host is the vless host (header_host/address).
-        let worker_host = "amir.dariuskhosrowan.workers.dev";
         let p = crate::store::profiles::load_profile(&id);
         let entry = p
             .config
             .worker_secrets
             .get(worker_host)
             .expect("record learned");
+        // Host is down: hold recorded, effective strategy preserved, no failed
+        // strategy added (the transport failure is NOT strategy evidence).
         assert!(
-            entry
-                .failed_strategies
-                .contains(&crate::desync::DesyncStrategy::SplitClientHello),
-            "dead light phase must demote the tried strategy"
+            entry.host_down,
+            "transport-level dead must record host_down"
+        );
+        assert_eq!(
+            entry.desync_strategy,
+            Some(crate::desync::DesyncStrategy::SplitClientHello),
+            "host-down must hold the effective strategy, not demote it"
         );
         assert!(
-            entry.desync_strategy.is_none(),
-            "failure must not record an effective strategy"
+            entry.failed_strategies.is_empty(),
+            "connect-refused must not pollute the failed-strategy set"
+        );
+        // And the ladder stays at the held effective.
+        assert_eq!(
+            crate::worker_tunnel::secret::strategy_for_worker(&p.config, worker_host, 0),
+            crate::desync::DesyncStrategy::SplitClientHello
         );
     }
 

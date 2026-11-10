@@ -1261,6 +1261,10 @@ impl DastYabApp {
             match ev {
                 UiEvent::Done { task, summary } => {
                     self.running.retain(|t| t != &task);
+                    // A task succeeding means whatever previously failed has
+                    // recovered (or never applied) — clear stale error banners
+                    // so errors disappear once things work again.
+                    self.error_banner = None;
                     if task == "autopilot" {
                         self.autopilot_status = summary.clone();
                         self.autopilot_on = true;
@@ -1656,7 +1660,14 @@ impl eframe::App for DastYabApp {
             if ui.button("New profile").clicked() && !self.new_profile_name.is_empty() {
                 match create_profile(&self.new_profile_name, "") {
                     Ok(id) => {
+                        // Activate the fresh profile so the store marker, the
+                        // view-model cache, and every action (Make active, …)
+                        // all target it — otherwise `state.active_profile_id`
+                        // stays on the old profile and token/config actions
+                        // silently hit the wrong one.
+                        let _ = set_active_profile(&id);
                         self.profile_id = id;
+                        self.state.reload_pending = true;
                         self.new_profile_name.clear();
                         self.reload_profiles();
                     }
@@ -2299,6 +2310,14 @@ impl DastYabApp {
                     timeout_s: self.scan_timeout,
                     gentle: self.scan_gentle,
                     ports: self.scan_ports.clone(),
+                    // Learn from what we found: bias the scan toward previously
+                    // known-good clean IPs (and their neighborhoods) so every
+                    // successful scan teaches the next one where to look.
+                    seeds: dastyab_core::cf::ips::load_manual_seeds(&pid)
+                        .into_iter()
+                        .filter_map(|s| s.split(':').next().map(|ip| ip.trim().to_string()))
+                        .filter(|ip| !ip.is_empty())
+                        .collect(),
                     ..Default::default()
                 };
                 match link {
@@ -2371,6 +2390,14 @@ impl DastYabApp {
                     timeout_s: self.scan_timeout,
                     gentle: self.scan_gentle,
                     ports: self.scan_ports.clone(),
+                    // Learn from what we found: bias the scan toward previously
+                    // known-good clean IPs (and their neighborhoods) so every
+                    // successful scan teaches the next one where to look.
+                    seeds: dastyab_core::cf::ips::load_manual_seeds(&pid)
+                        .into_iter()
+                        .filter_map(|s| s.split(':').next().map(|ip| ip.trim().to_string()))
+                        .filter(|ip| !ip.is_empty())
+                        .collect(),
                     ..Default::default()
                 };
                 match link {
@@ -3733,24 +3760,27 @@ async fn deploy_worker(token: &str, pid: &str) -> Result<(String, String), CFErr
     let worker_name = dastyab_core::worker::default_worker_name();
     let uuid = generate_uuid();
 
-    // Use the real VLESS worker JS. Prefer a found file (validate it), then
-    // the preset's built-in worker — never the no-op stub that previously
-    // deployed a `Response('ok')` worker that could not proxy traffic.
-    let js: Vec<u8> = match dastyab_core::worker::find_worker_js(None) {
-        Some(path) => {
-            let (ok, msg) = dastyab_core::worker::validate_worker_js(&path)?;
-            if !ok {
-                return Err(CFError::new(
-                    "Invalid worker file",
-                    msg,
-                    "Use the correct edgetunnel module worker.",
-                ));
-            }
-            std::fs::read(&path)
-                .map_err(|e| CFError::new("Read error", format!("{e}"), "Check the file path."))?
-        }
-        None => dastyab_core::presets::fallback_worker_js().into_bytes(),
-    };
+    // Use the real VLESS worker JS. Require an actual worker file — the
+    // fallback constant is only a health-check stub that cannot proxy VLESS
+    // traffic, so deploying it would "succeed" while producing a useless
+    // worker. Refuse loudly instead of shipping a dead deploy.
+    let worker_path = dastyab_core::worker::find_worker_js(None).ok_or_else(|| {
+        CFError::new(
+            "No worker file",
+            "No functional VLESS worker JS was found to deploy.",
+            "Place an edgetunnel worker at ~/Projects/cf-worker-proxy/edgetunnel_worker.js (or run `dastyab setup`) and retry.",
+        )
+    })?;
+    let (ok, msg) = dastyab_core::worker::validate_worker_js(&worker_path)?;
+    if !ok {
+        return Err(CFError::new(
+            "Invalid worker file",
+            msg,
+            "Use the correct edgetunnel module worker.",
+        ));
+    }
+    let js: Vec<u8> = std::fs::read(&worker_path)
+        .map_err(|e| CFError::new("Read error", format!("{e}"), "Check the file path."))?;
 
     client
         .deploy_script(&acc.id, &worker_name, js, "2026-07-01", 2)

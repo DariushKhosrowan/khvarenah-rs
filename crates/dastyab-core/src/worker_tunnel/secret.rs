@@ -63,6 +63,16 @@ pub struct WorkerSecret {
     /// Strategies tried on this worker that failed (ladder skips these).
     #[serde(default)]
     pub failed_strategies: Vec<crate::desync::DesyncStrategy>,
+    /// True while the worker host itself is unreachable at the transport layer
+    /// (TCP connect refused/timeout — zero handshake). While set, the ladder is
+    /// held: probe failures are NOT treated as strategy evidence, so we neither
+    /// demote nor advance. A later success clears this and resumes at the same
+    /// (held) effective strategy. Distinct from a strategy-level demotion.
+    #[serde(default)]
+    pub host_down: bool,
+    /// Epoch-seconds the host was last marked down (0 = never/up).
+    #[serde(default)]
+    pub host_down_since_unix: u64,
 }
 
 /// Maximum age (seconds) of an in-flight pending rotation before it is treated
@@ -214,6 +224,20 @@ pub fn strategy_for_worker(
     attempt: u8,
 ) -> crate::desync::DesyncStrategy {
     let entry = cfg.worker_secrets.get(worker_url);
+    // Host-down hold: the worker host itself is unreachable. The failure was
+    // NOT strategy-attributable, so hold the current strategy (do not advance
+    // the ladder). We still return the held effective strategy if we have one;
+    // with none, fall back to the ladder start (we don't know a good shape
+    // yet). When the host recovers, success clears the hold and we resume.
+    if let Some(e) = entry {
+        if e.host_down {
+            if let Some(ef) = e.desync_strategy.as_ref() {
+                return *ef;
+            }
+            // No learned shape yet — probe with the ladder default (None).
+            return crate::desync::DesyncStrategy::None;
+        }
+    }
     let effective = entry.and_then(|e| e.desync_strategy.as_ref());
     let failed: &[crate::desync::DesyncStrategy] = match entry {
         Some(e) => e.failed_strategies.as_slice(),
@@ -240,6 +264,10 @@ pub fn record_worker_desync_success(
     entry.worker_url = worker_url.to_string();
     entry.desync_strategy = Some(strategy);
     entry.failed_strategies.retain(|s| *s != strategy);
+    // A success proves the host is reachable again — clear any host-down hold
+    // so the ladder resumes (at the still-held effective strategy).
+    entry.host_down = false;
+    entry.host_down_since_unix = 0;
 }
 
 /// Record a failed strategy for a worker relay path: push it to the failed-set
@@ -261,6 +289,124 @@ pub fn record_worker_desync_failure(
             entry.failed_strategies.remove(0);
         }
     }
+}
+
+/// Mark a worker host as unreachable at the transport layer (TCP connect
+/// refused/timeout — zero handshake). This is a HOST signal, not a strategy
+/// signal: we record `host_down` so the ladder is held (no demotion/advance)
+/// until a later success proves the host recovered. Returns `true` if the
+/// record changed (caller persists).
+pub fn record_worker_host_down(
+    cfg: &mut crate::store::profiles::ProfileConfig,
+    worker_url: &str,
+    now_unix: u64,
+) -> bool {
+    let entry = cfg
+        .worker_secrets
+        .entry(worker_url.to_string())
+        .or_default();
+    entry.worker_url = worker_url.to_string();
+    let changed = !entry.host_down || entry.host_down_since_unix == 0;
+    entry.host_down = true;
+    if entry.host_down_since_unix == 0 {
+        entry.host_down_since_unix = now_unix;
+    }
+    changed
+}
+
+/// Classification of a per-worker probe outcome for learning purposes.
+///
+/// This is the deliverable column of the error-variant → classification table
+/// (DeepSeek A100/A105):
+///
+/// | signal | meaning | learn? |
+/// |--------|---------|--------|
+/// | `Success` | 101 + worker bytes ≥ MIN | yes — promote effective, clear host-down |
+/// | `HostDown` | TCP connect refused/timeout, zero handshake | no — hold ladder, record host-down |
+/// | `StrategyFailure` | TCP connected; WS handshake/data/route failed | yes — demote the strategy used |
+/// | `Unclassifiable` | unknown/ambiguous | no — safer to skip than to demote |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearningSignal {
+    Success,
+    HostDown,
+    StrategyFailure,
+    Unclassifiable,
+}
+
+/// Classify a budgeted light-phase endpoint outcome into a [`LearningSignal`].
+/// The light phase aggregates across ports, so we map the *bucket* the sweep
+/// settled on. `TcpTimeoutAllPorts` = transport-level host unreachable (no
+/// handshake ever started) → `HostDown`. TLS/WS/route buckets imply the TCP
+/// layer at least connected → strategy-attributable. `BudgetExceeded` is
+/// ambiguous (could be host-down OR a slow-but-live peer) → `Unclassifiable`.
+pub fn classify_endpoint_outcome(
+    stage: Option<crate::health::EndpointFailureStage>,
+) -> LearningSignal {
+    match stage {
+        None => LearningSignal::Success,
+        Some(crate::health::EndpointFailureStage::TcpTimeoutAllPorts) => LearningSignal::HostDown,
+        Some(crate::health::EndpointFailureStage::TlsResetAllPorts)
+        | Some(crate::health::EndpointFailureStage::WsUpgradeAllPorts)
+        | Some(crate::health::EndpointFailureStage::WorkerBytesAllPorts) => {
+            LearningSignal::StrategyFailure
+        }
+        Some(crate::health::EndpointFailureStage::BudgetExceeded) => LearningSignal::Unclassifiable,
+    }
+}
+
+/// Classify a single `WsProbe` failure reason (used by deeper per-probe paths)
+/// into a [`LearningSignal`]. `ConnectFailed`/`ConnectTimeout` are transport-
+/// level (never reached TLS) → `HostDown`. Everything after a successful TCP
+/// connect is strategy-attributable. `None` (a passing probe) → `Success`.
+pub fn classify_probe_failure(reason: Option<crate::health::WsFailureReason>) -> LearningSignal {
+    match reason {
+        None => LearningSignal::Success,
+        Some(crate::health::WsFailureReason::ConnectFailed)
+        | Some(crate::health::WsFailureReason::ConnectTimeout) => LearningSignal::HostDown,
+        Some(
+            crate::health::WsFailureReason::TlsAlert
+            | crate::health::WsFailureReason::TlsTimeout
+            | crate::health::WsFailureReason::WriteFailed
+            | crate::health::WsFailureReason::ResponseIncomplete
+            | crate::health::WsFailureReason::HttpStatus(_)
+            | crate::health::WsFailureReason::DeadRoute,
+        ) => LearningSignal::StrategyFailure,
+    }
+}
+
+/// Decide whether a [`LearningSignal`] should feed the strategy learner at all.
+/// `Success` and `StrategyFailure` are attributable; `HostDown` and
+/// `Unclassifiable` must NOT demote (no signal is safer than a wrong demotion).
+pub fn should_learn(sig: LearningSignal) -> bool {
+    matches!(
+        sig,
+        LearningSignal::Success | LearningSignal::StrategyFailure
+    )
+}
+
+/// Apply a classified learning signal to the per-worker record. This is the
+/// single choke point the daemon and GUI both call through the persisted path:
+/// - `Success` → record_worker_desync_success (promote + clear host-down).
+/// - `StrategyFailure` → record_worker_desync_failure (demote, advance ladder).
+/// - `HostDown` → record_worker_host_down (hold ladder, no demotion).
+/// - `Unclassifiable` → no-op (no learning).
+pub fn apply_learning_signal(
+    cfg: &mut crate::store::profiles::ProfileConfig,
+    worker_host: &str,
+    strategy: crate::desync::DesyncStrategy,
+    sig: LearningSignal,
+    now_unix: u64,
+) -> bool {
+    let before = cfg.worker_secrets.clone();
+    match sig {
+        LearningSignal::Success => record_worker_desync_success(cfg, worker_host, strategy),
+        LearningSignal::StrategyFailure => record_worker_desync_failure(cfg, worker_host, strategy),
+        LearningSignal::HostDown => {
+            record_worker_host_down(cfg, worker_host, now_unix);
+        }
+        LearningSignal::Unclassifiable => {}
+    }
+    cfg.worker_secrets != before
 }
 
 /// Decide the anti-DPI desync strategy for a discovery scan cycle against
@@ -340,18 +486,47 @@ pub fn learn_from_discovery_persisted(
     strategy: crate::desync::DesyncStrategy,
     had_ws_success: bool,
 ) -> bool {
-    // The worker-secrets map is the single source of truth; a lost update
-    // here would silently reintroduce the exact gap the learning loop closes.
+    // Preserve the legacy boolean contract: a success promotes, a failure
+    // demotes (strategy-attributable). Deep discovery keeps calling this path
+    // unchanged per DeepSeek A35 ("preserve deep-discovery behavior exactly").
+    let sig = if had_ws_success {
+        LearningSignal::Success
+    } else {
+        LearningSignal::StrategyFailure
+    };
+    learn_from_discovery_persisted_signal(profile_id, worker_host, strategy, sig, store_now_bump())
+}
+
+/// Serialize the read-modify-write on a worker's desync record across
+/// concurrent monitor paths (daemon deep discovery + GUI light sweep, possibly
+/// separate processes). This is the signal-aware variant: the caller classifies
+/// the probe outcome into [`LearningSignal`] before the lock, and only
+/// `Success`/`StrategyFailure` actually mutate the ladder (host-up / unclassifiable
+/// are held or ignored). Takes a cross-process exclusive `flock` on a per-profile
+/// lock file, then persists only if the record changed.
+pub fn learn_from_discovery_persisted_signal(
+    profile_id: &str,
+    worker_host: &str,
+    strategy: crate::desync::DesyncStrategy,
+    sig: LearningSignal,
+    now_unix: u64,
+) -> bool {
     let _inner = DESYNC_LEARN_LOCK.lock().unwrap();
     // Cross-process: hold the flock across load→mutate→persist. If flock is
     // unavailable, fall back to the in-process-only path (best-effort).
     let _file = lock_profile_desync(profile_id).ok();
     let mut p = crate::store::profiles::load_profile(profile_id);
-    let changed = learn_from_discovery(&mut p.config, worker_host, strategy, had_ws_success);
+    let changed = apply_learning_signal(&mut p.config, worker_host, strategy, sig, now_unix);
     if changed {
         let _ = crate::store::profiles::save_profile(&p);
     }
     changed
+}
+
+/// Simple now-in-seconds for the learning path (avoids threading a clock
+/// through every caller). Uses the same epoch base as the rest of the store.
+fn store_now_bump() -> u64 {
+    crate::store::profiles::now_ts() as u64
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -381,6 +556,8 @@ mod tests {
             pending_since_unix: 0,
             desync_strategy: None,
             failed_strategies: Vec::new(),
+            host_down: false,
+            host_down_since_unix: 0,
         };
         c.worker_secrets.insert(url.into(), ws);
     }
@@ -782,5 +959,176 @@ mod tests {
             strategy_for_discovery(&p.config, host),
             crate::desync::DesyncStrategy::SplitClientHello
         );
+    }
+
+    // ── DeepSeek A98–A105: transport-layer signal classification ──────────
+    // Acceptance: (a) host-unreachable (connect refused) does not demote and
+    // does not pollute the strategy record; (b) strategy-level WS failure still
+    // demotes; (c) host-down → host-recovered resumes at the same strategy, not
+    // a demoted one; (d) unclassifiable error ⇒ no learning.
+
+    #[test]
+    fn classify_endpoint_outcome_table() {
+        use crate::health::EndpointFailureStage as S;
+        use LearningSignal::*;
+        // Success / no failure stage.
+        assert_eq!(classify_endpoint_outcome(None), Success);
+        // TCP transport-level → host-down.
+        assert_eq!(
+            classify_endpoint_outcome(Some(S::TcpTimeoutAllPorts)),
+            HostDown
+        );
+        // Connected-then-failed buckets → strategy-attributable.
+        assert_eq!(
+            classify_endpoint_outcome(Some(S::TlsResetAllPorts)),
+            StrategyFailure
+        );
+        assert_eq!(
+            classify_endpoint_outcome(Some(S::WsUpgradeAllPorts)),
+            StrategyFailure
+        );
+        assert_eq!(
+            classify_endpoint_outcome(Some(S::WorkerBytesAllPorts)),
+            StrategyFailure
+        );
+        // Ambiguous / unknown → unclassifiable.
+        assert_eq!(
+            classify_endpoint_outcome(Some(S::BudgetExceeded)),
+            Unclassifiable
+        );
+    }
+
+    #[test]
+    fn classify_probe_failure_table() {
+        use crate::health::WsFailureReason as R;
+        use LearningSignal::*;
+        assert_eq!(classify_probe_failure(None), Success);
+        assert_eq!(classify_probe_failure(Some(R::ConnectFailed)), HostDown);
+        assert_eq!(classify_probe_failure(Some(R::ConnectTimeout)), HostDown);
+        assert_eq!(classify_probe_failure(Some(R::TlsAlert)), StrategyFailure);
+        assert_eq!(classify_probe_failure(Some(R::TlsTimeout)), StrategyFailure);
+        assert_eq!(
+            classify_probe_failure(Some(R::WriteFailed)),
+            StrategyFailure
+        );
+        assert_eq!(
+            classify_probe_failure(Some(R::ResponseIncomplete)),
+            StrategyFailure
+        );
+        assert_eq!(
+            classify_probe_failure(Some(R::HttpStatus(403))),
+            StrategyFailure
+        );
+        assert_eq!(classify_probe_failure(Some(R::DeadRoute)), StrategyFailure);
+        // Only Success/StrategyFailure feed the learner.
+        assert!(should_learn(Success));
+        assert!(should_learn(StrategyFailure));
+        assert!(!should_learn(HostDown));
+        assert!(!should_learn(Unclassifiable));
+    }
+
+    /// (a) host-unreachable does not demote and does not pollute the strategy
+    /// record: a pre-existing effective strategy is held (not advanced) and the
+    /// failed-set is untouched, while host_down records.
+    #[test]
+    fn host_down_holds_strategy_and_does_not_demote() {
+        let mut c = cfg();
+        record_worker_desync_success(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitClientHello,
+        );
+        let before_failed = c.worker_secrets["http://w"].failed_strategies.clone();
+        let before_effective = c.worker_secrets["http://w"].desync_strategy;
+
+        let changed = record_worker_host_down(&mut c, "http://w", 1_700_000_000);
+        assert!(changed);
+        let ws = &c.worker_secrets["http://w"];
+        assert!(ws.host_down);
+        assert_eq!(ws.host_down_since_unix, 1_700_000_000);
+        // Not polluted: effective unchanged, failed-set unchanged.
+        assert_eq!(ws.desync_strategy, before_effective);
+        assert_eq!(ws.failed_strategies, before_failed);
+        // Held strategy: select keeps the effective, does NOT walk the ladder.
+        assert_eq!(
+            strategy_for_worker(&c, "http://w", 0),
+            crate::desync::DesyncStrategy::SplitClientHello
+        );
+        // Idempotent re-record returns false (no churn).
+        assert!(!record_worker_host_down(&mut c, "http://w", 1_700_000_001));
+    }
+
+    /// (b) strategy-level WS failure still demotes even after a host-down hold
+    /// — the two signals touch disjoint state via apply_learning_signal.
+    #[test]
+    fn strategy_failure_demotes_independent_of_host_down() {
+        let mut c = cfg();
+        // Host-down hold in place.
+        record_worker_host_down(&mut c, "http://w", 1_700_000_000);
+        // A strategy-level failure (WS layer) must demote regardless.
+        let changed = apply_learning_signal(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitClientHello,
+            LearningSignal::StrategyFailure,
+            1_700_000_100,
+        );
+        assert!(changed);
+        let ws = &c.worker_secrets["http://w"];
+        assert!(ws
+            .failed_strategies
+            .contains(&crate::desync::DesyncStrategy::SplitClientHello));
+        // Host-down hold is independent — it stays until a success clears it.
+        assert!(ws.host_down);
+    }
+
+    /// (c) host-down → host-recovered resumes at the SAME strategy (not a
+    /// demoted one): a success clears the hold and keeps the held effective.
+    #[test]
+    fn host_recovered_resumes_at_same_strategy() {
+        let mut c = cfg();
+        record_worker_desync_success(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitClientHello,
+        );
+        record_worker_host_down(&mut c, "http://w", 1_700_000_000);
+        assert!(c.worker_secrets["http://w"].host_down);
+
+        let changed = apply_learning_signal(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitClientHello,
+            LearningSignal::Success,
+            1_700_000_200,
+        );
+        assert!(changed);
+        let ws = &c.worker_secrets["http://w"];
+        assert!(!ws.host_down, "success must clear the host-down hold");
+        assert_eq!(ws.host_down_since_unix, 0);
+        // Resumes at the same (held) effective — not advanced/demoted.
+        assert_eq!(
+            ws.desync_strategy,
+            Some(crate::desync::DesyncStrategy::SplitClientHello)
+        );
+        assert_eq!(
+            strategy_for_worker(&c, "http://w", 0),
+            crate::desync::DesyncStrategy::SplitClientHello
+        );
+    }
+
+    /// (d) unclassifiable ⇒ no learning: no record is created / mutated.
+    #[test]
+    fn unclassifiable_produces_no_learning() {
+        let mut c = cfg();
+        let changed = apply_learning_signal(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitClientHello,
+            LearningSignal::Unclassifiable,
+            1_700_000_300,
+        );
+        assert!(!changed);
+        assert!(!c.worker_secrets.contains_key("http://w"));
     }
 }

@@ -68,32 +68,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<Confi
     }
     ui.add_space(4.0);
 
-    if rows.is_empty() {
-        let empty_card = egui::Frame::new()
-            .fill(CARD)
-            .inner_margin(egui::Margin::symmetric(12, 14))
-            .corner_radius(8.0)
-            .stroke(egui::Stroke::new(1.0, CARD_STROKE));
-        empty_card.show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("No generated configs recorded yet.")
-                    .color(TEXT)
-                    .strong(),
-            );
-            ui.label(
-                egui::RichText::new(
-                    "Deploy a worker or run autopilot — every config it renders (share link, \
-                     v2rayN, sing-box, Clash, tunnel client) will be recorded here with its \
-                     content hash.",
-                )
-                .color(GOLD_DIM),
-            );
-        });
-        ui.add_space(8.0);
-        return None;
-    }
-
-    // Filter + sort toolbar.
+    // Filter + sort toolbar — always rendered so "Create config from IP"
+    // stays available even before the ledger has any entries (config creation
+    // is fully decoupled from deploying; it only needs a prior deployed link).
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Search:").color(GOLD_DIM));
         ui.add(
@@ -148,6 +125,33 @@ pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<Confi
 
     let q = app.configs_search.trim().to_lowercase();
     let ff = app.configs_fmt_filter.trim().to_lowercase();
+
+    // Empty ledger (no configs have been created yet) — distinct from an
+    // empty *filter* result, which is handled below.
+    if rows.is_empty() {
+        let empty_card = egui::Frame::new()
+            .fill(CARD)
+            .inner_margin(egui::Margin::symmetric(12, 14))
+            .corner_radius(8.0)
+            .stroke(egui::Stroke::new(1.0, CARD_STROKE));
+        empty_card.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("No generated configs recorded yet.")
+                    .color(TEXT)
+                    .strong(),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Deploy a worker once, then use 'Create config from IP' above to make as \
+                     many configs as you like without ever redeploying. Every config the \
+                     console renders is also recorded here with its content hash.",
+                )
+                .color(GOLD_DIM),
+            );
+        });
+        ui.add_space(8.0);
+        return action;
+    }
 
     // Filter + sort into a display vector.
     let mut shown: Vec<&GeneratedConfigRow> = rows
@@ -272,7 +276,7 @@ pub fn run_action(
     use crate::app::PendingDialogAction;
     match act {
         ConfigsAction::ExportAll => {
-            let pid = app.state.active_profile_id.clone();
+            let pid = app.profile_id.clone();
             match export_all(&pid, &app.state.generated_configs) {
                 Ok(path) => {
                     app.note = format!(

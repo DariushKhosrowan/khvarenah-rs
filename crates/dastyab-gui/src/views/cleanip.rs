@@ -361,7 +361,7 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
     use crate::app::PendingDialogAction;
     match action {
         CleanipAction::Remove(ip) => {
-            match remove_clean_ip(&app.state.active_profile_id, &ip) {
+            match remove_clean_ip(&app.profile_id, &ip) {
                 Ok(_) => {
                     app.state.reload_pending = true;
                     app.note = format!("Removed clean IP {ip}.");
@@ -371,7 +371,7 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
             None
         }
         CleanipAction::AddManual(ip) => {
-            match remember_clean_ip_with_source(&app.state.active_profile_id, &ip, "manual") {
+            match remember_clean_ip_with_source(&app.profile_id, &ip, "manual") {
                 Ok(_) => {
                     app.state.reload_pending = true;
                     app.note = format!("Saved clean IP {ip}.");
@@ -381,7 +381,7 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
             None
         }
         CleanipAction::Probe(ip) => {
-            let pid = app.state.active_profile_id.clone();
+            let pid = app.profile_id.clone();
             let tx = app.tx.clone();
             bridge_probe(pid, ip.clone(), tx);
             app.cleanip_test_output = format!("Probing {ip}…");
@@ -389,7 +389,7 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
         }
         CleanipAction::ProbeAll => {
             let ips = app.state.clean_ips.clone();
-            let pid = app.state.active_profile_id.clone();
+            let pid = app.profile_id.clone();
             let tx = app.tx.clone();
             let total = ips.len();
             crate::bridge::spawn("probe-all", tx, async move {
@@ -430,7 +430,7 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
         }
         CleanipAction::PromoteAllSeeds => {
             let seeds: Vec<String> = app.state.seeds.clone();
-            let pid = app.state.active_profile_id.clone();
+            let pid = app.profile_id.clone();
             let mut added = 0usize;
             for s in seeds {
                 if remember_clean_ip_with_source(&pid, &s, "import").is_ok() {
@@ -442,7 +442,7 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
             None
         }
         CleanipAction::ExportToFile => {
-            let target = dastyab_core::cleanip::user_config_dir(&app.state.active_profile_id)
+            let target = dastyab_core::cleanip::user_config_dir(&app.profile_id)
                 .map(|d| d.join("cleanips.txt"))
                 .unwrap_or_else(|_| std::path::PathBuf::from("cleanips.txt"));
             let content = app.state.clean_ips.join(

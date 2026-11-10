@@ -258,6 +258,12 @@ pub struct ScanParams {
     pub scan_timeout: u32,
     /// If true, verify candidate endpoints with a health probe before accepting.
     pub verify: bool,
+    /// Known-good clean IPs to bias discovery toward. When non-empty, the scan
+    /// targets these (and, via `-neighbors`, their /prefix_len siblings) before
+    /// falling back to random sampling — the self-improving loop that reuses a
+    /// found clean IP to find more near it. Bare IPv4 strings (ports stripped).
+    #[serde(default)]
+    pub seeds: Vec<String>,
 }
 
 impl Default for ScanParams {
@@ -271,6 +277,7 @@ impl Default for ScanParams {
             top: 25,
             scan_timeout: 600,
             verify: true,
+            seeds: Vec::new(),
         }
     }
 }
@@ -315,6 +322,15 @@ pub async fn run_scan(
         cmd.arg("-gentle");
     } else {
         cmd.arg("-gentle=false");
+    }
+
+    // Self-improving seeding: when we already know good clean IPs, target them
+    // (and let -neighbors expand around each healthy sibling) so discovery is
+    // biased toward proven-good neighborhoods instead of starting from zero.
+    // If none are known this loop is a no-op and scanning stays fully random.
+    if !params.seeds.is_empty() {
+        let targets = params.seeds.join(" ");
+        cmd.arg("-targets").arg(&targets).arg("-neighbors");
     }
 
     let child = cmd

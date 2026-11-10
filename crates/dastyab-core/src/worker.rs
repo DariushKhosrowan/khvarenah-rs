@@ -49,9 +49,13 @@ pub fn validate_worker_js(path: &Path) -> Result<(bool, String), CFError> {
             "Worker file does not look like a worker (no fetch/WebSocket handler).".into(),
         ));
     }
-    let has_export = data.windows(13).any(|w| w == b"export default")
-        || data.windows(9).any(|w| w == b"export {")
-        || data.windows(15).any(|w| w == b"addEventListener");
+    // NOTE: the window length MUST equal the literal's byte length exactly —
+    // a window of length N can never equal a literal of a different length, so
+    // a mismatched size silently forces `has_export` to false and rejects every
+    // real worker file. ("export default"=14, "export {"=8, "addEventListener"=16)
+    let has_export = data.windows(14).any(|w| w == b"export default")
+        || data.windows(8).any(|w| w == b"export {")
+        || data.windows(16).any(|w| w == b"addEventListener");
     if has_export {
         return Ok((
             true,
@@ -157,5 +161,31 @@ mod tests {
         let u = generate_uuid();
         assert_eq!(u.len(), 36);
         assert_eq!(&u[14..15], "4");
+    }
+
+    /// Regression for the window-length bug: `validate_worker_js` compared a
+    /// literal against windows of the WRONG byte length, so `has_export` was
+    /// always false and every real worker file (module AND service worker) was
+    /// rejected — which made deploy always fail with "no export/fetch handler".
+    #[test]
+    fn validate_accepts_module_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("_worker.js");
+        let js =
+            b"export default { async fetch(request, env, ctx) { return new Response('ok'); } };\n";
+        std::fs::write(&path, js).unwrap();
+        let (ok, msg) = validate_worker_js(&path).unwrap();
+        assert!(ok, "module worker must validate — got {msg}");
+    }
+
+    #[test]
+    fn validate_accepts_service_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("_worker.js");
+        let js =
+            b"addEventListener('fetch', event => { event.respondWith(new Response('ok')); });\n";
+        std::fs::write(&path, js).unwrap();
+        let (ok, msg) = validate_worker_js(&path).unwrap();
+        assert!(ok, "service worker must validate — got {msg}");
     }
 }

@@ -717,9 +717,32 @@ pub fn add_token(id: &str, label: &str, token: &str) -> Result<(), CFError> {
 /// Remove a token from a profile.
 pub fn remove_token(id: &str, label: &str) -> Result<(), CFError> {
     let mut p = load_profile(id);
+    let was_active = get_active_token(id)?.as_deref() == Some(label);
     let had = p.tokens.remove(label).is_some();
     if had {
         push_token_event(&mut p, "removed", label, "removed from profile");
+        // If the removed token was the ACTIVE one, don't leave a stale marker
+        // that `get_active_token` will later silently clear (which silently
+        // stops protection with "No active token" and a ballooning backoff).
+        // Promote the lexicographically-first remaining token, or clear the
+        // marker explicitly if none remain.
+        if was_active {
+            let next = p.tokens.keys().next().cloned();
+            match next {
+                Some(next_label) => {
+                    push_token_event(
+                        &mut p,
+                        "made_active",
+                        &next_label,
+                        "auto-promoted after active token removed",
+                    );
+                    write_json(&active_token_path(id), &next_label)?;
+                }
+                None => {
+                    write_json(&active_token_path(id), &String::new())?;
+                }
+            }
+        }
     }
     save_profile(&p)
 }
@@ -1866,6 +1889,45 @@ mod tests {
 
             clear_token_history(&id).unwrap();
             assert!(token_history(&id).is_empty());
+        });
+    }
+
+    /// Regression for the empty active_token marker bug: removing the ACTIVE
+    /// token must not leave a stale marker that `get_active_token` silently
+    /// clears later (which silently stops protection with "No active token").
+    /// When other tokens remain, the next one is auto-promoted.
+    #[test]
+    fn remove_active_token_promotes_remaining_token() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            add_token(&id, "cf-a", "cf_secret_a").unwrap();
+            add_token(&id, "cf-b", "cf_secret_b").unwrap();
+            set_active_token(&id, "cf-a").unwrap();
+            assert_eq!(get_active_token(&id).unwrap().as_deref(), Some("cf-a"));
+
+            // Removing the active token promotes the remaining one (and does
+            // NOT leave an empty marker).
+            remove_token(&id, "cf-a").unwrap();
+            assert_eq!(get_active_token(&id).unwrap().as_deref(), Some("cf-b"));
+            // And the marker file is non-empty.
+            let marker = read_opt::<String>(&active_token_path(&id)).unwrap_or_default();
+            assert!(!marker.is_empty());
+        });
+    }
+
+    /// When the active token is removed and NO tokens remain, the marker is
+    /// cleared explicitly (still a defined state, not a silent stale marker).
+    #[test]
+    fn remove_last_active_token_clears_marker_explicitly() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            add_token(&id, "cf-only", "cf_secret_only").unwrap();
+            set_active_token(&id, "cf-only").unwrap();
+
+            remove_token(&id, "cf-only").unwrap();
+            assert_eq!(get_active_token(&id).unwrap(), None);
+            // No lingering stale marker: get_active_token is stable (no warn).
+            assert_eq!(get_active_token(&id).unwrap(), None);
         });
     }
 
