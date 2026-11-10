@@ -24,6 +24,7 @@ pub mod blackout;
 pub mod blackout_drill;
 pub mod escalation;
 pub mod reselect;
+pub mod autonomy_schedule;
 
 use crate::error::CFError;
 use std::future::Future;
@@ -144,6 +145,11 @@ pub struct DaemonState {
     /// to ~once per 6h off the hot path).
     #[serde(default)]
     pub last_self_ping_ts: i64,
+    /// Scheduled autonomy-audit state (auto-execute allowlist + regression
+    /// fingerprint). Persisted so the audit cadence and last digest survive
+    /// restarts.
+    #[serde(default)]
+    pub audit: crate::daemon::autonomy_schedule::AuditSchedule,
 }
 
 fn default_interval() -> u64 {
@@ -172,6 +178,7 @@ impl Default for DaemonState {
             account_rotate_exhausted_notified: false,
             blackout_since_unix: 0,
             last_self_ping_ts: 0,
+            audit: crate::daemon::autonomy_schedule::AuditSchedule::default(),
         }
     }
 }
@@ -637,6 +644,159 @@ pub fn push_carriers_via_worker_tunnel(
         }
     }
     Ok(())
+}
+
+/// Production CF seam for the autonomy auto-executor. Holds an owned token so
+/// the auto-fix actions can build a `cf::Client` on a scoped thread (no borrow
+/// crosses into a `'static` future).
+pub struct RealCfSeam {
+    token: String,
+    pub account_id: String,
+}
+
+impl RealCfSeam {
+    pub fn new(token: impl Into<String>, account_id: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+            account_id: account_id.into(),
+        }
+    }
+}
+
+impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
+    fn ensure_second_token(&self, profile: &str) -> Result<bool, CFError> {
+        let token = self.token.clone();
+        let account_id = self.account_id.clone();
+        let profile_owned = profile.to_string();
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(move || {
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| CFError::new("cf-seam", format!("runtime: {e}"), ""))?;
+                rt.block_on(async move {
+                    let create = move |account_id: String, name: String| -> Pin<Box<dyn Future<Output = Result<String, CFError>> + Send>> {
+                        let token = token.clone();
+                        Box::pin(async move {
+                            let cf = crate::cf::Client::new(&token);
+                            cf.create_api_token(&account_id, &name).await
+                        })
+                    };
+                    crate::token_provision::ensure_minimum_tokens(
+                        &profile_owned,
+                        2,
+                        account_id.clone(),
+                        create,
+                    )
+                    .await
+                })
+            });
+            handle.join().unwrap_or_else(|_| {
+                Err(CFError::new("cf-seam", "worker thread panicked", ""))
+            })
+        })
+    }
+
+    fn rotate_worker(&self, profile: &str) -> Result<u32, CFError> {
+        let Some(tcfg) = crate::vps_deploy::load_tunnel_client_config(profile) else {
+            return Ok(0);
+        };
+        let crate::vps_deploy::TunnelMode::Worker = tcfg.mode else {
+            return Ok(0);
+        };
+        let Some(worker_url) = tcfg.worker_url.as_deref() else {
+            return Ok(0);
+        };
+        let mut prof = crate::store::profiles::load_profile(profile);
+        let now = crate::store::now_ts() as u64;
+        crate::worker_tunnel::secret::assign_new_secret(&mut prof.config, worker_url, now)?;
+        crate::store::profiles::save_profile(&prof)?;
+
+        let opts = crate::worker_tunnel::WorkerTunnelDeployOpts {
+            worker_name: tcfg.worker_name.clone(),
+            session_seed: tcfg.session.clone(),
+            compat_date: "2026-07-01".into(),
+            retries: 2,
+            vless_upstream: tcfg.worker_vless_upstream.clone(),
+        };
+        let token = self.token.clone();
+        let account_id = self.account_id.clone();
+        let profile_owned = profile.to_string();
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(move || {
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| CFError::new("cf-seam", format!("runtime: {e}"), ""))?;
+                rt.block_on(async move {
+                    let cf = crate::cf::Client::new(&token);
+                    crate::worker_tunnel::deploy::deploy_worker_tunnel(
+                        &cf,
+                        &account_id,
+                        &profile_owned,
+                        &opts,
+                    )
+                    .await
+                })
+            });
+            handle.join().unwrap_or_else(|_| {
+                Err(CFError::new("cf-seam", "worker thread panicked", ""))
+            })
+        })?;
+
+        let mut prof2 = crate::store::profiles::load_profile(profile);
+        let pending = prof2
+            .config
+            .worker_secrets
+            .get(worker_url)
+            .and_then(|ws| ws.pending_secret.clone());
+        let Some(pending_secret) = pending else {
+            return Ok(prof2.config.worker_secrets.get(worker_url).map(|w| w.version).unwrap_or(0));
+        };
+        let refresher = crate::carrier_refresh::CarrierRefresher::new(worker_url, &pending_secret);
+        if refresher.query_self_ping().is_ok() {
+            crate::worker_tunnel::secret::promote_pending(&mut prof2.config, worker_url, now)?;
+        } else {
+            crate::worker_tunnel::secret::clear_pending(&mut prof2.config, worker_url);
+        }
+        let version = prof2.config.worker_secrets.get(worker_url).map(|w| w.version).unwrap_or(0);
+        crate::store::profiles::save_profile(&prof2)?;
+        Ok(version)
+    }
+
+    fn ensure_dns_tunnel(&self, profile: &str) -> Result<(), CFError> {
+        let prof = crate::store::profiles::load_profile(profile);
+        if crate::vps_deploy::load_tunnel_client_config(profile).is_some() {
+            return Ok(());
+        }
+        let seed = prof.config.active_account.clone();
+        let opts = crate::worker_tunnel::WorkerTunnelDeployOpts {
+            worker_name: None,
+            session_seed: if seed.is_empty() { "default-seed".into() } else { seed },
+            compat_date: "2026-07-01".into(),
+            retries: 2,
+            vless_upstream: None,
+        };
+        let token = self.token.clone();
+        let account_id = self.account_id.clone();
+        let profile_owned = profile.to_string();
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(move || {
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| CFError::new("cf-seam", format!("runtime: {e}"), ""))?;
+                rt.block_on(async move {
+                    let cf = crate::cf::Client::new(&token);
+                    crate::worker_tunnel::deploy::deploy_worker_tunnel(
+                        &cf,
+                        &account_id,
+                        &profile_owned,
+                        &opts,
+                    )
+                    .await
+                })
+            });
+            handle.join().unwrap_or_else(|_| {
+                Err(CFError::new("cf-seam", "worker thread panicked", ""))
+            })
+        })?;
+        Ok(())
+    }
 }
 
 /// Query the deployed worker's last self-ping freshness (the `_ping` KV key

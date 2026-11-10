@@ -44,6 +44,9 @@ pub enum BeaconEventKind {
     /// Scheduled blackout self-test found fewer ladder rungs up than before
     /// — resilience degraded and the user should know without being asked.
     ResilienceDegraded,
+    /// The scheduled autonomy audit flipped from clean to dirty — a new
+    /// safeguard needs attention (auto-execute did not clear it).
+    AutonomyRegression,
 }
 
 /// A concrete event ready to be formatted + sent.
@@ -109,6 +112,12 @@ pub enum BeaconEvent {
         /// Best rung name (Direct/DoH/DoT/DnsTunnel).
         best_tier: String,
     },
+    /// The scheduled autonomy audit flipped from clean to dirty — auto-execute
+    /// did not clear every action item. Carries the remaining action codes.
+    AutonomyRegression {
+        /// Codes of the action items still pending (e.g. "daemon", "token").
+        codes: Vec<String>,
+    },
 }
 
 impl BeaconEvent {
@@ -129,6 +138,7 @@ impl BeaconEvent {
             BeaconEvent::NetworkDown { .. } => BeaconEventKind::NetworkDown,
             BeaconEvent::NetworkRestored => BeaconEventKind::NetworkRestored,
             BeaconEvent::ResilienceDegraded { .. } => BeaconEventKind::ResilienceDegraded,
+            BeaconEvent::AutonomyRegression { .. } => BeaconEventKind::AutonomyRegression,
         }
     }
 }
@@ -430,6 +440,18 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
         (BeaconEvent::ResilienceDegraded { survivors, best_tier }, _) => {
             format!(
                 "⚠️ Blackout self-test: only {survivors}/4 ladder rungs up (best: {best_tier}) — the data channel may not survive a total blackout"
+            )
+        }
+        (BeaconEvent::AutonomyRegression { codes }, crate::diagnose::Locale::Fa) => {
+            let list = codes.join("، ");
+            format!(
+                "🛠 ممیزی خودکار رگرسیون یافت: اقدامات معلق — {list}"
+            )
+        }
+        (BeaconEvent::AutonomyRegression { codes }, _) => {
+            let list = codes.join(", ");
+            format!(
+                "🛠 Autonomy audit regression: action items still pending — {list}"
             )
         }
     }
