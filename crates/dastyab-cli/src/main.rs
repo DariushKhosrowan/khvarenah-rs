@@ -734,7 +734,7 @@ pub enum ProtectionAction {
 /// Anti-DPI TCP desync fragmenter subcommands.
 #[derive(Subcommand)]
 pub enum DesyncAction {
-    /// Show whether desync fragmentation is enabled (and its tuning).
+    /// Show whether desync fragmentation is enabled (and its tuning/strategy).
     Status,
     /// Enable desync fragmentation (persisted on the profile).
     On {
@@ -747,6 +747,9 @@ pub enum DesyncAction {
         /// Pause between flushed fragments, microseconds.
         #[arg(long, default_value_t = 300)]
         delay_us: u64,
+        /// Desync strategy (split-clienthello | split-two | split+decoy | none).
+        #[arg(long, default_value = "none")]
+        strategy: String,
     },
     /// Disable desync fragmentation (persisted).
     Off,

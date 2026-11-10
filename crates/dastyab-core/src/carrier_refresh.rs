@@ -359,6 +359,7 @@ mod tests {
             last_probe_ok_unix: None,
             last_probe_rtt_ms: None,
             provenance: CarrierProvenance::Deployed,
+            desync_strategy: None,
         }
     }
 

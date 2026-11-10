@@ -179,6 +179,30 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Serialize all deploy tests: the mem-dir override is thread-local, so a
+    /// leaked override from one test could bleed into another that reuses the
+    /// same thread. Holding this lock for the whole test makes the isolation
+    /// deterministic.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Isolated mem dir. Keeps the TempDir alive for the whole test (its drop
+    /// would delete the dir out from under the override).
+
+    /// Create a real profile and return its id. The store's `profile_dir`
+    /// falls back to `default` for unknown ids; writing a profile with a
+    /// fictional id makes `save_profile`/`load_profile` diverge (the saved
+    /// meta id then resolves to its own dir), so every test must use a real
+    /// profile id.
+    fn fresh_profile() -> String {
+        crate::store::profiles::create_profile("deploy-test", "test").unwrap()
+    }
+
+    fn isolated_home() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(d.path().to_path_buf());
+        d
+    }
+
     use super::*;
     use crate::cf::Client;
 
@@ -307,11 +331,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_deploy_worker_tunnel_auto_names_worker() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _home = isolated_home();
+        let pid = fresh_profile();
         let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let res = deploy_worker_tunnel(&cf, "acc1", "p1", &opts())
+        let res = deploy_worker_tunnel(&cf, "acc1", &pid, &opts())
             .await
             .unwrap();
         assert!(res.worker_name.starts_with("dyb-tun-"));
@@ -319,42 +346,51 @@ mod tests {
         assert_eq!(res.worker_name.len(), "dyb-tun-".len() + 8);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_deploy_worker_tunnel_persists_worker_mode_config() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _home = isolated_home();
+        let pid = fresh_profile();
         let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let _ = deploy_worker_tunnel(&cf, "acc1", "p_worker_mode", &opts())
+        let _ = deploy_worker_tunnel(&cf, "acc1", &pid, &opts())
             .await
             .unwrap();
-        let cfg = crate::vps_deploy::load_tunnel_client_config("p_worker_mode").unwrap();
+        let cfg = crate::vps_deploy::load_tunnel_client_config(&pid).unwrap();
         assert_eq!(cfg.mode, TunnelMode::Worker);
         assert!(cfg.worker_url.is_some());
         assert!(cfg.shared_secret.is_some());
         assert!(cfg.is_worker_mode());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_deploy_worker_tunnel_sets_session_secret_var() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _home = isolated_home();
+        let pid = fresh_profile();
         let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let res = deploy_worker_tunnel(&cf, "acc1", "p_secvar", &opts())
+        let res = deploy_worker_tunnel(&cf, "acc1", &pid, &opts())
             .await
             .unwrap();
         assert_eq!(res.shared_secret.len(), 32);
         // The per-worker secret is persisted in the profile config keyed by the
         // worker URL, and versioned at 1 on first deploy.
-        let prof = crate::store::profiles::load_profile("p_secvar");
+        let prof = crate::store::profiles::load_profile(&pid);
         let ws = prof.config.worker_secrets.get(&res.worker_url).unwrap();
         assert_eq!(ws.secret, res.shared_secret);
         assert_eq!(ws.version, 1);
         assert!(ws.pending_secret.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_deploy_worker_tunnel_returns_workers_dev_url() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _home = isolated_home();
+        let pid = fresh_profile();
         let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let res = deploy_worker_tunnel(&cf, "acc1", "p_url", &opts())
+        let res = deploy_worker_tunnel(&cf, "acc1", &pid, &opts())
             .await
             .unwrap();
         assert!(res.worker_url.starts_with("https://"));
@@ -362,16 +398,19 @@ mod tests {
         assert_eq!(res.subdomain, "sub");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_deploy_worker_tunnel_persists_vless_upstream() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _home = isolated_home();
+        let pid = fresh_profile();
         let (base, log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
         let mut o = opts();
         o.vless_upstream = Some("203.0.113.10:443".into());
-        let _ = deploy_worker_tunnel(&cf, "acc1", "p_upstream", &o)
+        let _ = deploy_worker_tunnel(&cf, "acc1", &pid, &o)
             .await
             .unwrap();
-        let cfg = crate::vps_deploy::load_tunnel_client_config("p_upstream").unwrap();
+        let cfg = crate::vps_deploy::load_tunnel_client_config(&pid).unwrap();
         assert_eq!(
             cfg.worker_vless_upstream.as_deref(),
             Some("203.0.113.10:443")
@@ -381,11 +420,14 @@ mod tests {
         assert!(log.contains("DYB_VLESS_UPSTREAM"), "log: {log}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_deploy_worker_tunnel_ensures_and_binds_kv_namespace() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _home = isolated_home();
+        let pid = fresh_profile();
         let (base, log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let _ = deploy_worker_tunnel(&cf, "acc1", "p_kv", &opts())
+        let _ = deploy_worker_tunnel(&cf, "acc1", &pid, &opts())
             .await
             .unwrap();
         let log = log.lock().unwrap().join("\n");
@@ -398,11 +440,14 @@ mod tests {
         assert!(log.contains("kv-ns-1"), "log: {log}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_deploy_worker_tunnel_includes_self_ping_cron_trigger() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _home = isolated_home();
+        let pid = fresh_profile();
         let (base, log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
-        let _ = deploy_worker_tunnel(&cf, "acc1", "p_cron", &opts())
+        let _ = deploy_worker_tunnel(&cf, "acc1", &pid, &opts())
             .await
             .unwrap();
         let log = log.lock().unwrap().join("\n");
@@ -414,8 +459,11 @@ mod tests {
         assert!(log.contains(WORKER_CRON_SCHEDULE), "log: {log}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_deploy_worker_tunnel_propagates_cf_error() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _home = isolated_home();
+        let pid = fresh_profile();
         // A server that 403s everything → deploy must surface the error.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -435,7 +483,7 @@ mod tests {
         });
         let base = format!("http://{addr}");
         let cf = Client::with_base("tok", &base);
-        let err = deploy_worker_tunnel(&cf, "acc1", "p_err", &opts())
+        let err = deploy_worker_tunnel(&cf, "acc1", &pid, &opts())
             .await
             .unwrap_err();
         assert_eq!(err.status, Some(403));

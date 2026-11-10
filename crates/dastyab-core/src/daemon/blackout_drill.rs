@@ -249,8 +249,9 @@ mod tests {
     async fn drill_cooldown_prevents_repeated_dead_endpoint() {
         // The cooldown is exercised at the carrier-pool level; verify the
         // escalation escalation_plan and backoff_secs cooperate.
+        let dir = tempfile::tempdir().unwrap();
         let mut pool =
-            crate::carrier_pool::CarrierPool::open(std::env::temp_dir().join("drill_pool.json"))
+            crate::carrier_pool::CarrierPool::open(dir.path().join("drill_pool.json"))
                 .unwrap();
         let mut snap = crate::carrier_pool::CarrierSnapshot::new_empty(1000);
         snap.endpoints.push(crate::carrier_pool::CarrierEndpoint {
@@ -264,6 +265,7 @@ mod tests {
             last_probe_ok_unix: None,
             last_probe_rtt_ms: None,
             provenance: crate::carrier_pool::CarrierProvenance::Deployed,
+            desync_strategy: None,
         });
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
@@ -294,8 +296,9 @@ mod tests {
 
     #[tokio::test]
     async fn drill_escalated_select_fills_from_cooling_when_all_cooled() {
+        let dir = tempfile::tempdir().unwrap();
         let pool =
-            crate::carrier_pool::CarrierPool::open(std::env::temp_dir().join("drill_pool2.json"))
+            crate::carrier_pool::CarrierPool::open(dir.path().join("drill_pool2.json"))
                 .unwrap();
         let mut snap = crate::carrier_pool::CarrierSnapshot::new_empty(1000);
         for (i, h) in ["a", "b"].iter().enumerate() {
@@ -310,6 +313,7 @@ mod tests {
                 last_probe_ok_unix: None,
                 last_probe_rtt_ms: None,
                 provenance: crate::carrier_pool::CarrierProvenance::Deployed,
+                desync_strategy: None,
             });
             let _ = i;
         }

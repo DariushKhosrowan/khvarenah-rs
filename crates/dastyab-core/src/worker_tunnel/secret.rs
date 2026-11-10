@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::CFError;
 
 /// A worker's session secret plus its two-phase rotation state.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct WorkerSecret {
     /// Worker URL (identity key in `ProfileConfig.worker_secrets`).
     #[serde(default)]
@@ -51,6 +51,13 @@ pub struct WorkerSecret {
     /// Epoch-seconds the pending secret was written (for the in-flight guard).
     #[serde(default)]
     pub pending_since_unix: u64,
+    /// Learned anti-DPI strategy that last succeeded for this worker's relay
+    /// control-plane path. `None` = not yet learned (use the ladder).
+    #[serde(default)]
+    pub desync_strategy: Option<crate::desync::DesyncStrategy>,
+    /// Strategies tried on this worker that failed (ladder skips these).
+    #[serde(default)]
+    pub failed_strategies: Vec<crate::desync::DesyncStrategy>,
 }
 
 /// Maximum age (seconds) of an in-flight pending rotation before it is treated
@@ -192,6 +199,55 @@ pub fn clear_pending(cfg: &mut crate::store::profiles::ProfileConfig, worker_url
     }
 }
 
+/// Select the anti-DPI desync strategy for a worker's relay control-plane
+/// call. Mirrors the endpoint ladder: a recorded effective strategy wins when
+/// it isn't in the failed-set; otherwise walk `LADDER` from `attempt`,
+/// skipping failed entries. Falls back to `None` (single segment).
+pub fn strategy_for_worker(
+    cfg: &crate::store::profiles::ProfileConfig,
+    worker_url: &str,
+    attempt: u8,
+) -> crate::desync::DesyncStrategy {
+    let entry = cfg.worker_secrets.get(worker_url);
+    let effective = entry.and_then(|e| e.desync_strategy.as_ref());
+    let failed: &[crate::desync::DesyncStrategy] = match entry {
+        Some(e) => e.failed_strategies.as_slice(),
+        None => &[],
+    };
+    crate::desync::select_strategy(effective, failed, attempt)
+}
+
+/// Record a successful strategy for a worker relay path: set it as effective
+/// and clear the failed-set (persisted on the profile).
+pub fn record_worker_desync_success(
+    cfg: &mut crate::store::profiles::ProfileConfig,
+    worker_url: &str,
+    strategy: crate::desync::DesyncStrategy,
+) {
+    let entry = cfg.worker_secrets.entry(worker_url.to_string()).or_default();
+    entry.worker_url = worker_url.to_string();
+    entry.desync_strategy = Some(strategy);
+    entry.failed_strategies.clear();
+}
+
+/// Record a failed strategy for a worker relay path: push it to the failed-set
+/// (capped at 4) so the ladder advances next attempt.
+pub fn record_worker_desync_failure(
+    cfg: &mut crate::store::profiles::ProfileConfig,
+    worker_url: &str,
+    strategy: crate::desync::DesyncStrategy,
+) {
+    let entry = cfg.worker_secrets.entry(worker_url.to_string()).or_default();
+    entry.worker_url = worker_url.to_string();
+    if !entry.failed_strategies.contains(&strategy) {
+        entry.failed_strategies.push(strategy);
+        const MAX_FAILED: usize = 4;
+        if entry.failed_strategies.len() > MAX_FAILED {
+            entry.failed_strategies.remove(0);
+        }
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -217,6 +273,8 @@ mod tests {
             version: 1,
             pending_secret: None,
             pending_since_unix: 0,
+            desync_strategy: None,
+            failed_strategies: Vec::new(),
         };
         c.worker_secrets.insert(url.into(), ws);
     }
@@ -342,5 +400,78 @@ mod tests {
         let mut c = cfg();
         seed_worker(&mut c, "http://w", 1000);
         assert!(promote_pending(&mut c, "http://w", 3000).is_err());
+    }
+
+    #[test]
+    fn strategy_for_worker_falls_back_to_ladder_when_unset() {
+        let c = cfg();
+        // No worker secrets at all → ladder starts at SplitClientHello.
+        assert_eq!(
+            strategy_for_worker(&c, "http://w", 0),
+            crate::desync::DesyncStrategy::SplitClientHello
+        );
+        assert_eq!(
+            strategy_for_worker(&c, "http://w", 1),
+            crate::desync::DesyncStrategy::SplitTwo
+        );
+        assert_eq!(
+            strategy_for_worker(&c, "http://w", 2),
+            crate::desync::DesyncStrategy::SplitAndDecoy
+        );
+        assert_eq!(
+            strategy_for_worker(&c, "http://w", 3),
+            crate::desync::DesyncStrategy::None
+        );
+    }
+
+    #[test]
+    fn strategy_for_worker_uses_learned_effective() {
+        let mut c = cfg();
+        record_worker_desync_success(&mut c, "http://w", crate::desync::DesyncStrategy::SplitTwo);
+        assert_eq!(
+            strategy_for_worker(&c, "http://w", 0),
+            crate::desync::DesyncStrategy::SplitTwo
+        );
+        // High attempt still prefers the effective strategy.
+        assert_eq!(
+            strategy_for_worker(&c, "http://w", 7),
+            crate::desync::DesyncStrategy::SplitTwo
+        );
+    }
+
+    #[test]
+    fn worker_learn_records_success_and_failure() {
+        let mut c = cfg();
+        record_worker_desync_failure(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitClientHello,
+        );
+        record_worker_desync_failure(&mut c, "http://w", crate::desync::DesyncStrategy::SplitTwo);
+        let ws = &c.worker_secrets["http://w"];
+        assert_eq!(ws.failed_strategies.len(), 2);
+        assert!(ws.desync_strategy.is_none());
+
+        record_worker_desync_success(&mut c, "http://w", crate::desync::DesyncStrategy::SplitAndDecoy);
+        let ws = &c.worker_secrets["http://w"];
+        assert_eq!(
+            ws.desync_strategy,
+            Some(crate::desync::DesyncStrategy::SplitAndDecoy)
+        );
+        assert!(ws.failed_strategies.is_empty());
+    }
+
+    #[test]
+    fn worker_learn_skips_duplicate_failures() {
+        let mut c = cfg();
+        for _ in 0..3 {
+            record_worker_desync_failure(
+                &mut c,
+                "http://w",
+                crate::desync::DesyncStrategy::SplitClientHello,
+            );
+        }
+        let ws = &c.worker_secrets["http://w"];
+        assert_eq!(ws.failed_strategies.len(), 1);
     }
 }

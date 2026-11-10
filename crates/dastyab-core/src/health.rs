@@ -487,10 +487,15 @@ pub async fn probe_ws_ex(
     let req = crate::probe_jitter::randomize_ws_request(&mut rng, base_req.as_bytes());
     // Anti-DPI desync: when enabled, write the WS upgrade as irregular TLS
     // segments (small randomized flushed fragments) so stateful DPI can't
-    // reassemble the request before we own the connection.
+    // reassemble the request before we own the connection. The strategy is
+    // selected from the active profile config (ladder: SplitClientHello →
+    // SplitTwo → SplitAndDecoy → None).
     let desync = crate::desync::active_config();
+    let strategy = desync.strategy;
     if tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-        crate::desync::write_fragmented(&mut stream, &req, &desync).await
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let plan = crate::desync::plan_for_strategy(strategy, &req, &desync, &mut rng);
+        crate::desync::apply_plan(&mut stream, &plan).await
     })
     .await
     .is_err()

@@ -43,6 +43,10 @@ pub struct CarrierEndpoint {
     pub last_probe_ok_unix: Option<u64>,
     pub last_probe_rtt_ms: Option<u32>,
     pub provenance: CarrierProvenance,
+    /// Learned anti-DPI strategy for this endpoint (the "auto-discovered
+    /// value" surfaced in UI). `None` = not yet learned / use the ladder.
+    #[serde(default)]
+    pub desync_strategy: Option<crate::desync::DesyncStrategy>,
 }
 
 impl CarrierEndpoint {
@@ -88,13 +92,21 @@ impl CarrierProvenance {
 /// the snapshot's integrity signature (see [`CarrierSnapshot::canonical_bytes`])
 /// because it is not authoritative routing data. Remote merges never carry
 /// penalties; the local failure knowledge always wins.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct EndpointPenalty {
     /// Consecutive failure count used to compute the exponential backoff.
     pub failure_streak: u8,
     /// Unix seconds at which the cooldown expires; before this the endpoint is
     /// skipped by [`CarrierPool::select_at`].
     pub cooldown_until_unix: u64,
+    /// Learned anti-DPI strategy that last succeeded for this endpoint
+    /// (`None` = never recorded). Persisted so a restart doesn't reset the
+    /// ladder back to the first attempt.
+    #[serde(default)]
+    pub effective_desync: Option<crate::desync::DesyncStrategy>,
+    /// Strategies tried on this endpoint that failed. The ladder skips these.
+    #[serde(default)]
+    pub failed_strategies: Vec<crate::desync::DesyncStrategy>,
 }
 
 /// Current snapshot schema version.
@@ -467,7 +479,7 @@ impl CarrierPool {
             .inner
             .write()
             .map_err(|_| CarrierPoolError::Integrity("carrier pool lock poisoned".into()))?;
-        let mut p = guard.penalties.get(&id).copied().unwrap_or_default();
+        let mut p = guard.penalties.get(&id).cloned().unwrap_or_default();
         p.failure_streak = p.failure_streak.saturating_add(1);
         let backoff = backoff_secs(p.failure_streak);
         p.cooldown_until_unix = now_unix.saturating_add(backoff);
@@ -491,6 +503,74 @@ impl CarrierPool {
             self.store_atomic(&snap)?;
         }
         Ok(())
+    }
+
+    /// Record that `strategy` succeeded for an endpoint: set it as the
+    /// effective strategy and clear the failed-set. Also updates the endpoint's
+    /// own learned `desync_strategy` so the UI (and later probes) can read it.
+    pub fn record_desync_success(
+        &self,
+        ep: &CarrierEndpoint,
+        strategy: crate::desync::DesyncStrategy,
+    ) -> Result<(), CarrierPoolError> {
+        let id = Self::endpoint_id_hex(ep);
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| CarrierPoolError::Integrity("carrier pool lock poisoned".into()))?;
+        let mut p = guard.penalties.get(&id).cloned().unwrap_or_default();
+        p.effective_desync = Some(strategy);
+        p.failed_strategies.clear();
+        guard.penalties.insert(id.clone(), p);
+        for e in guard.endpoints.iter_mut() {
+            if Self::endpoint_id_hex(e) == id {
+                e.desync_strategy = Some(strategy);
+                break;
+            }
+        }
+        let mut snap = guard.clone();
+        snap.sign()?; // endpoint changed → re-sign canonical bytes
+        drop(guard);
+        self.store_atomic(&snap)
+    }
+
+    /// Record that `strategy` failed for an endpoint: push it to the failed-set
+    /// (capped) so the ladder advances on the next attempt. Does not change the
+    /// effective strategy.
+    pub fn record_desync_failure(
+        &self,
+        ep: &CarrierEndpoint,
+        strategy: crate::desync::DesyncStrategy,
+    ) -> Result<(), CarrierPoolError> {
+        let id = Self::endpoint_id_hex(ep);
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| CarrierPoolError::Integrity("carrier pool lock poisoned".into()))?;
+        let mut p = guard.penalties.get(&id).cloned().unwrap_or_default();
+        if !p.failed_strategies.contains(&strategy) {
+            p.failed_strategies.push(strategy);
+            const MAX_FAILED: usize = 4;
+            if p.failed_strategies.len() > MAX_FAILED {
+                p.failed_strategies.remove(0);
+            }
+        }
+        guard.penalties.insert(id.clone(), p);
+        let _ = id;
+        let snap = guard.clone();
+        drop(guard);
+        self.store_atomic(&snap)
+    }
+
+    /// Read the current penalty for an endpoint (for the UI / CLI columns).
+    pub fn penalty(&self, ep: &CarrierEndpoint) -> Option<EndpointPenalty> {
+        let id = Self::endpoint_id_hex(ep);
+        self.inner
+            .read()
+            .ok()?
+            .penalties
+            .get(&id)
+            .cloned()
     }
 
     /// Selection identical to [`Self::select`] but excludes endpoints currently
@@ -613,6 +693,7 @@ mod tests {
             last_probe_ok_unix: None,
             last_probe_rtt_ms: None,
             provenance: CarrierProvenance::Seed,
+            desync_strategy: None,
         }
     }
 
@@ -934,5 +1015,92 @@ mod tests {
         let loaded = pool.load().unwrap();
         let id = CarrierPool::endpoint_id_hex(&snap.endpoints[0]);
         assert!(loaded.penalties.contains_key(&id));
+    }
+
+    #[test]
+    fn effective_desync_recorded_on_probe_success() {
+        let (_dir, pool) = tmp_pool();
+        let mut snap = CarrierSnapshot::new_empty(1000);
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        let ep0 = snap.endpoints[0].clone();
+        pool.record_desync_success(&ep0, crate::desync::DesyncStrategy::SplitTwo)
+            .unwrap();
+        let loaded = pool.load().unwrap();
+        let id = CarrierPool::endpoint_id_hex(&ep0);
+        let p = loaded.penalties.get(&id).unwrap();
+        assert_eq!(p.effective_desync, Some(crate::desync::DesyncStrategy::SplitTwo));
+        assert!(p.failed_strategies.is_empty());
+        // The endpoint's own learned column is updated for the UI.
+        let learned = loaded
+            .endpoints
+            .iter()
+            .find(|e| e.host == "a.example.com")
+            .unwrap();
+        assert_eq!(learned.desync_strategy, Some(crate::desync::DesyncStrategy::SplitTwo));
+    }
+
+    #[test]
+    fn effective_desync_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrier_pool.json");
+        let pool = CarrierPool::open(&path).unwrap();
+        let mut snap = CarrierSnapshot::new_empty(1000);
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        let ep0 = snap.endpoints[0].clone();
+        pool.record_desync_success(&ep0, crate::desync::DesyncStrategy::SplitTwo)
+            .unwrap();
+        // Re-open from disk — the learned strategy must survive.
+        let reloaded = CarrierPool::open(&path).unwrap();
+        let loaded = reloaded.load().unwrap();
+        let id = CarrierPool::endpoint_id_hex(&ep0);
+        assert_eq!(
+            loaded.penalties.get(&id).unwrap().effective_desync,
+            Some(crate::desync::DesyncStrategy::SplitTwo)
+        );
+    }
+
+    #[test]
+    fn desync_failure_advances_failed_set() {
+        let (_dir, pool) = tmp_pool();
+        let mut snap = CarrierSnapshot::new_empty(1000);
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        let ep0 = snap.endpoints[0].clone();
+        pool.record_desync_failure(&ep0, crate::desync::DesyncStrategy::SplitClientHello)
+            .unwrap();
+        pool.record_desync_failure(&ep0, crate::desync::DesyncStrategy::SplitTwo)
+            .unwrap();
+        let loaded = pool.load().unwrap();
+        let id = CarrierPool::endpoint_id_hex(&ep0);
+        let p = loaded.penalties.get(&id).unwrap();
+        assert_eq!(p.failed_strategies.len(), 2);
+        assert!(p.failed_strategies.contains(&crate::desync::DesyncStrategy::SplitClientHello));
+        assert!(p.failed_strategies.contains(&crate::desync::DesyncStrategy::SplitTwo));
+        // Still no effective strategy.
+        assert!(p.effective_desync.is_none());
+    }
+
+    #[test]
+    fn desync_success_clears_failed() {
+        let (_dir, pool) = tmp_pool();
+        let mut snap = CarrierSnapshot::new_empty(1000);
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        let ep0 = snap.endpoints[0].clone();
+        pool.record_desync_failure(&ep0, crate::desync::DesyncStrategy::SplitClientHello)
+            .unwrap();
+        pool.record_desync_success(&ep0, crate::desync::DesyncStrategy::SplitTwo)
+            .unwrap();
+        let loaded = pool.load().unwrap();
+        let id = CarrierPool::endpoint_id_hex(&ep0);
+        let p = loaded.penalties.get(&id).unwrap();
+        assert_eq!(p.effective_desync, Some(crate::desync::DesyncStrategy::SplitTwo));
+        assert!(p.failed_strategies.is_empty());
     }
 }

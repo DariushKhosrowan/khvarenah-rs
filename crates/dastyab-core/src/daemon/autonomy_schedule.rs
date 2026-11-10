@@ -261,6 +261,8 @@ mod tests {
                 version: 1,
                 pending_secret: None,
                 pending_since_unix: 0,
+                desync_strategy: None,
+                failed_strategies: Vec::new(),
             },
         );
         assert!(auto_executable(
@@ -283,6 +285,8 @@ mod tests {
                 version: 1,
                 pending_secret: None,
                 pending_since_unix: 0,
+                desync_strategy: None,
+                failed_strategies: Vec::new(),
             },
         );
         assert!(!auto_executable(

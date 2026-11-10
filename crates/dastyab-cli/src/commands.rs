@@ -1531,19 +1531,41 @@ async fn cmd_protection(profile: &str, action: ProtectionAction) -> Result<(), C
 
 /// Configure / report the anti-DPI TCP desync fragmenter (persisted per-profile).
 fn cmd_desync(profile: &str, action: crate::DesyncAction) -> Result<(), CFError> {
+    use dastyab_core::desync::DesyncStrategy;
     match action {
         crate::DesyncAction::Status => {
-            let cfg = dastyab_core::store::profiles::load_profile(profile)
-                .config
-                .desync;
+            let p = dastyab_core::store::profiles::load_profile(profile);
+            let cfg = p.config.desync;
             println!(
                 "Desync fragmentation: {}",
                 if cfg.enabled { "ON" } else { "OFF" }
             );
+            println!("  strategy: {}", cfg.strategy.label());
             if cfg.enabled {
                 println!("  min fragment: {} B", cfg.min_fragment);
                 println!("  max fragment: {} B", cfg.max_fragment);
                 println!("  inter-fragment delay: {} us", cfg.inter_fragment_delay_us);
+            }
+            // Show learned per-worker strategies (the connector's auto-discovered
+            // values for the worker relay control-plane path).
+            let learned: Vec<_> = p
+                .config
+                .worker_secrets
+                .iter()
+                .filter(|(_, ws)| ws.desync_strategy.is_some())
+                .map(|(url, ws)| {
+                    format!(
+                        "{url}: {} (failed: {})",
+                        ws.desync_strategy.unwrap().label(),
+                        ws.failed_strategies.len()
+                    )
+                })
+                .collect();
+            if !learned.is_empty() {
+                println!("  learned per-worker strategies:");
+                for l in learned {
+                    println!("    {l}");
+                }
             }
             Ok(())
         }
@@ -1551,15 +1573,29 @@ fn cmd_desync(profile: &str, action: crate::DesyncAction) -> Result<(), CFError>
             min_fragment,
             max_fragment,
             delay_us,
+            strategy,
         } => {
+            let strat = DesyncStrategy::parse(&strategy).ok_or_else(|| {
+                CFError::new(
+                    "Desync strategy",
+                    format!(
+                        "unknown strategy '{strategy}' (expected split-clienthello | split-two | split+decoy | none)"
+                    ),
+                    "",
+                )
+            })?;
             let mut p = dastyab_core::store::profiles::load_profile(profile);
             p.config.desync.enabled = true;
             p.config.desync.min_fragment = min_fragment.max(1);
             p.config.desync.max_fragment = max_fragment.max(min_fragment.max(1));
             p.config.desync.inter_fragment_delay_us = delay_us;
+            p.config.desync.strategy = strat;
             dastyab_core::store::profiles::save_profile(&p)?;
             dastyab_core::desync::apply_from_profile(profile);
-            println!("Desync fragmentation ON (saved). Next scan/cycle will write WS upgrades as irregular segments.");
+            println!(
+                "Desync fragmentation ON (saved) with strategy {}.",
+                strat.label()
+            );
             Ok(())
         }
         crate::DesyncAction::Off => {

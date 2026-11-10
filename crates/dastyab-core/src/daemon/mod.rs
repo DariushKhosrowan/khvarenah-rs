@@ -570,8 +570,37 @@ pub fn daemon_refresh_carriers(
 ) -> Result<(), crate::carrier_refresh::RefreshError> {
     let cfg = crate::store::profiles::load_profile(profile).config;
     let pool = crate::carrier_pool::open_profile_pool(&cfg)?;
+    // Anti-DPI desync connector: pick the worker's learned strategy (ladder),
+    // and record the outcome so a repeated transport failure advances the
+    // ladder on the next refresh (persisted on the profile).
+    let strategy = crate::worker_tunnel::secret::strategy_for_worker(&cfg, worker_url, 0);
     let refresher = crate::carrier_refresh::CarrierRefresher::new(worker_url, shared_secret);
-    match refresher.refresh_once(&pool, now_unix)? {
+    let result = refresher.refresh_once(&pool, now_unix);
+    let mut pcfg = crate::store::profiles::load_profile(profile);
+    match &result {
+        Ok(_) => {
+            crate::worker_tunnel::secret::record_worker_desync_success(
+                &mut pcfg.config,
+                worker_url,
+                strategy,
+            );
+        }
+        Err(crate::carrier_refresh::RefreshError::Transport(_)) => {
+            crate::worker_tunnel::secret::record_worker_desync_failure(
+                &mut pcfg.config,
+                worker_url,
+                strategy,
+            );
+            log(&format!("carrier refresh: transport failure recorded for desync ladder (strategy {strategy:?})"));
+        }
+        _ => {}
+    }
+    if pcfg.config.worker_secrets != cfg.worker_secrets {
+        if let Err(e) = crate::store::profiles::save_profile(&pcfg) {
+            log(&format!("carrier refresh: failed to persist desync learning: {e}"));
+        }
+    }
+    match result? {
         crate::carrier_refresh::RefreshOutcome::Updated(r) => {
             log(&format!(
                 "carrier refresh: {} added, {} updated",
