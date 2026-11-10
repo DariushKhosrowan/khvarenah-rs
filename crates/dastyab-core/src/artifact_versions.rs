@@ -342,6 +342,11 @@ pub struct VersioningState {
     /// Index entries whose payload file was missing.
     #[serde(default)]
     pub last_missing_count: u64,
+    /// Corrupt versions identified by the last integrity sweep (flagged, never
+    /// deleted). Authoritative source for the GUI History drawer's per-version
+    /// corrupt flag — counts alone cannot drive a truthful UI.
+    #[serde(default)]
+    pub corrupt_versions: Vec<CorruptVersion>,
 }
 
 /// The on-disk path of the versioning state file.
@@ -691,6 +696,7 @@ pub fn record_verify_outcome(
     st.last_corrupt_count = report.corrupt.len() as u64;
     st.last_orphan_count = report.orphans.len() as u64;
     st.last_missing_count = report.missing.len() as u64;
+    st.corrupt_versions = report.corrupt.clone();
     crate::store::write_json(&versioning_state_path(profile_dir), &st)
         .map_err(|e| VersionError::Io(e.brief()))
 }
@@ -783,6 +789,60 @@ pub fn doctor_check_version_integrity(
             "content verified {age}s ago · 0 corrupt · 0 missing · 0 orphan"
         ),
     }
+}
+
+/// Per-artifact version listing with integrity flags applied, for the GUI
+/// History drawer. Scans the profile's `.versions/` tree and overlays the last
+/// sweep's corrupt-version list so `ArtifactVersion.corrupt` is truthful (from
+/// `versioning_state.corrupt_versions`, never from counts).
+pub struct ArtifactVersionsSummary {
+    /// Artifact name (e.g. "config.json").
+    pub artifact: String,
+    /// Versions, newest first, with `.corrupt` set from the last sweep.
+    pub versions: Vec<ArtifactVersion>,
+}
+
+/// List every artifact's versions, flagging corrupt ones from the last sweep.
+pub fn list_versions_with_integrity(profile_dir: &Path) -> Vec<ArtifactVersionsSummary> {
+    let state = read_versioning_state(profile_dir);
+    let corrupt = &state.corrupt_versions;
+    let Ok(rd) = std::fs::read_dir(profile_dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if name.ends_with(".versions") && p.is_dir() {
+            dirs.push(p);
+        }
+    }
+    dirs.sort();
+    let mut out = Vec::with_capacity(dirs.len());
+    for vdir in dirs {
+        let Some(artifact) = vdir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.trim_end_matches(".versions").to_string())
+        else {
+            continue;
+        };
+        let Ok(mut versions) = list_versions(profile_dir, &artifact) else {
+            continue;
+        };
+        for v in &mut versions {
+            if corrupt
+                .iter()
+                .any(|c| c.rel_path == artifact && c.version_unix == v.saved_unix)
+            {
+                v.corrupt = true;
+            }
+        }
+        out.push(ArtifactVersionsSummary { artifact, versions });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1149,6 +1209,26 @@ mod tests {
             assert_eq!(st.last_corrupt_count, 1);
             assert_eq!(st.last_orphan_count, 1);
             assert_eq!(st.last_missing_count, 1);
+            assert_eq!(st.corrupt_versions.len(), 1);
+            assert_eq!(st.corrupt_versions[0].reason, CorruptReason::ShaMismatch);
+        });
+    }
+
+    #[test]
+    fn list_versions_with_integrity_flags_corrupt_from_persisted_list() {
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            let vdir = versions_dir(&dir, "config.json");
+            std::fs::write(version_file(&vdir, 1000), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            let report = verify_all_versions(&dir, 5000, 2000).unwrap();
+            assert_eq!(report.corrupt.len(), 1);
+            record_verify_outcome(&dir, &report, 5000).unwrap();
+
+            let summaries = list_versions_with_integrity(&dir);
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].artifact, "config.json");
+            let v = &summaries[0].versions[0];
+            assert!(v.corrupt, "version must be flagged corrupt from persisted list");
         });
     }
 
