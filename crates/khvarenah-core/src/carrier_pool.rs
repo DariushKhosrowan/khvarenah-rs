@@ -82,6 +82,21 @@ impl CarrierProvenance {
     }
 }
 
+/// Local failure penalty for a carrier endpoint.
+///
+/// This is *local-only* runtime bookkeeping — it is explicitly excluded from
+/// the snapshot's integrity signature (see [`CarrierSnapshot::canonical_bytes`])
+/// because it is not authoritative routing data. Remote merges never carry
+/// penalties; the local failure knowledge always wins.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EndpointPenalty {
+    /// Consecutive failure count used to compute the exponential backoff.
+    pub failure_streak: u8,
+    /// Unix seconds at which the cooldown expires; before this the endpoint is
+    /// skipped by [`CarrierPool::select_at`].
+    pub cooldown_until_unix: u64,
+}
+
 /// Current snapshot schema version.
 pub const CARRIER_SCHEMA_VERSION: u32 = 1;
 
@@ -93,6 +108,12 @@ pub struct CarrierSnapshot {
     /// Monotonic generation counter.
     pub generation: u64,
     pub endpoints: Vec<CarrierEndpoint>,
+    /// Local-only failure penalties, keyed by endpoint identity hex. Excluded
+    /// from [`Self::canonical_bytes`] (not authoritative routing data), so it
+    /// never affects the integrity signature. `#[serde(default)]` keeps old
+    /// schema-1 pools readable.
+    #[serde(default)]
+    pub penalties: std::collections::HashMap<String, EndpointPenalty>,
     /// Hex SHA-256 of the canonical body (omits `integrity` itself).
     pub integrity: String,
 }
@@ -104,6 +125,7 @@ impl CarrierSnapshot {
             created_unix: now_unix,
             generation: 0,
             endpoints: Vec::new(),
+            penalties: std::collections::HashMap::new(),
             integrity: String::new(),
         }
     }
@@ -408,6 +430,115 @@ impl CarrierPool {
         v.truncate(n);
         Ok(v)
     }
+
+    /// Compute the stable local identity hash of an endpoint: kind + host +
+    /// port + sni + worker_url. Used as the penalty map key so penalties
+    /// survive snapshot re-merges (the key is stable under weight/probe drift).
+    pub fn endpoint_id_hash(ep: &CarrierEndpoint) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(
+            format!(
+                "{:?}|{}|{}|{:?}|{:?}",
+                ep.kind, ep.host, ep.port, ep.sni, ep.worker_url
+            )
+            .as_bytes(),
+        );
+        h.finalize().into()
+    }
+
+    fn endpoint_id_hex(ep: &CarrierEndpoint) -> String {
+        hex_sha256(&Self::endpoint_id_hash(ep))
+    }
+
+    /// Record a failure for `ep`. Bumps the streak, sets a cooldown expiry
+    /// computed from [`backoff_secs`], and persists the pool. Returns the
+    /// computed backoff (seconds) for the caller's logging.
+    pub fn record_failure(
+        &self,
+        ep: &CarrierEndpoint,
+        now_unix: u64,
+    ) -> Result<u64, CarrierPoolError> {
+        let id = Self::endpoint_id_hex(ep);
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| CarrierPoolError::Integrity("carrier pool lock poisoned".into()))?;
+        let mut p = guard.penalties.get(&id).copied().unwrap_or_default();
+        p.failure_streak = p.failure_streak.saturating_add(1);
+        let backoff = backoff_secs(p.failure_streak);
+        p.cooldown_until_unix = now_unix.saturating_add(backoff);
+        guard.penalties.insert(id, p);
+        let snap = guard.clone();
+        drop(guard);
+        self.store_atomic(&snap)?;
+        Ok(backoff)
+    }
+
+    /// Record a success for `ep`: clears any penalty (streak + cooldown).
+    pub fn record_success(
+        &self,
+        ep: &CarrierEndpoint,
+    ) -> Result<(), CarrierPoolError> {
+        let id = Self::endpoint_id_hex(ep);
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| CarrierPoolError::Integrity("carrier pool lock poisoned".into()))?;
+        if guard.penalties.remove(&id).is_some() {
+            let snap = guard.clone();
+            drop(guard);
+            self.store_atomic(&snap)?;
+        }
+        Ok(())
+    }
+
+    /// Selection identical to [`Self::select`] but excludes endpoints currently
+    /// in cooldown. If every matching endpoint is in cooldown, falls back to
+    /// including them (sorted) so the caller never sees an empty candidate
+    /// list while any endpoint of `kind` exists.
+    pub fn select_at(
+        &self,
+        kind: CarrierKind,
+        n: usize,
+        now_unix: u64,
+    ) -> Result<Vec<CarrierEndpoint>, CarrierPoolError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| CarrierPoolError::Integrity("carrier pool lock poisoned".into()))?;
+        let mut avail: Vec<CarrierEndpoint> = Vec::new();
+        let mut cooling: Vec<CarrierEndpoint> = Vec::new();
+        for e in guard.endpoints.iter().filter(|e| e.kind == kind) {
+            let id = Self::endpoint_id_hex(e);
+            let in_cooldown = guard
+                .penalties
+                .get(&id)
+                .is_some_and(|p| p.cooldown_until_unix > now_unix);
+            if in_cooldown {
+                cooling.push(e.clone());
+            } else {
+                avail.push(e.clone());
+            }
+        }
+        let mut v = if avail.is_empty() { cooling } else { avail };
+        if v.is_empty() {
+            return Ok(v);
+        }
+        v.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(
+                    b.last_probe_ok_unix
+                        .unwrap_or(0)
+                        .cmp(&a.last_probe_ok_unix.unwrap_or(0)),
+                )
+                .then(b.provenance.priority().cmp(&a.provenance.priority()))
+        });
+        v.truncate(n);
+        Ok(v)
+    }
 }
 
 /// Resolve the effective carrier-pool path for a profile.
@@ -429,6 +560,13 @@ pub fn open_profile_pool(
     cfg: &crate::store::profiles::ProfileConfig,
 ) -> Result<CarrierPool, CarrierPoolError> {
     CarrierPool::open(profile_carrier_pool_path(cfg))
+}
+
+/// Helper: exponential backoff seconds for a failure streak.
+/// `min(60 * 2^streak, 3600)` — 60s, 120s, 240s, … capped at 1 hour.
+pub fn backoff_secs(streak: u8) -> u64 {
+    let exp = 60u64.saturating_mul(1u64 << streak.min(6));
+    exp.min(3600)
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -591,6 +729,7 @@ mod tests {
             created_unix: 1,
             generation: 0,
             endpoints: vec![],
+            penalties: std::collections::HashMap::new(),
             integrity: String::new(),
         };
         fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
@@ -655,5 +794,114 @@ mod tests {
         p1.store_atomic(&s1).unwrap();
         p2.store_atomic(&s2).unwrap();
         assert_ne!(identity_of(&p1), identity_of(&p2));
+    }
+
+    #[test]
+    fn backoff_secs_exponential_and_capped() {
+        assert_eq!(backoff_secs(0), 60);
+        assert_eq!(backoff_secs(1), 120);
+        assert_eq!(backoff_secs(2), 240);
+        assert_eq!(backoff_secs(6), 3600);
+        assert_eq!(backoff_secs(200), 3600); // capped
+    }
+
+    #[test]
+    fn record_failure_increments_streak_and_sets_cooldown() {
+        let (_dir, pool) = tmp_pool();
+        let mut snap = CarrierSnapshot::new_empty(1000);
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        let e = &snap.endpoints[0];
+        // First failure → streak 1 → backoff 60*2^1 = 120s.
+        let b = pool.record_failure(e, 1000).unwrap();
+        assert_eq!(b, 120);
+        let loaded = pool.load().unwrap();
+        let id = CarrierPool::endpoint_id_hex(e);
+        let p = loaded.penalties.get(&id).unwrap();
+        assert_eq!(p.failure_streak, 1);
+        assert_eq!(p.cooldown_until_unix, 1120);
+        // second failure → streak 2 → backoff 60*2^2 = 240s.
+        let b2 = pool.record_failure(e, 1100).unwrap();
+        assert_eq!(b2, 240);
+    }
+
+    #[test]
+    fn record_success_clears_penalty() {
+        let (_dir, pool) = tmp_pool();
+        let mut snap = CarrierSnapshot::new_empty(1000);
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        let e = &snap.endpoints[0];
+        pool.record_failure(e, 1000).unwrap();
+        assert!(!pool.load().unwrap().penalties.is_empty());
+        pool.record_success(e).unwrap();
+        assert!(pool.load().unwrap().penalties.is_empty());
+    }
+
+    #[test]
+    fn select_at_excludes_cooldowned_endpoint() {
+        let (_dir, pool) = tmp_pool();
+        let mut snap = CarrierSnapshot::new_empty(1000);
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        // cooldown a
+        pool.record_failure(&snap.endpoints[0], 1000).unwrap();
+        let sel = pool.select_at(CarrierKind::WorkerData, 8, 1001).unwrap();
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].host, "b.example.com");
+    }
+
+    #[test]
+    fn select_at_reincludes_after_cooldown_expires() {
+        let (_dir, pool) = tmp_pool();
+        let mut snap = CarrierSnapshot::new_empty(1000);
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        pool.record_failure(&snap.endpoints[0], 1000).unwrap();
+        // cooldown (from streak 1) expires at 1120; at now=1121 it's included again
+        let sel = pool.select_at(CarrierKind::WorkerData, 8, 1121).unwrap();
+        assert_eq!(sel.len(), 2);
+        assert_eq!(sel[0].host, "a.example.com"); // weight desc
+    }
+
+    #[test]
+    fn select_at_never_empty_when_all_cooldowned() {
+        let (_dir, pool) = tmp_pool();
+        let mut snap = CarrierSnapshot::new_empty(1000);
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        pool.record_failure(&snap.endpoints[0], 1000).unwrap();
+        pool.record_failure(&snap.endpoints[1], 1000).unwrap();
+        let sel = pool.select_at(CarrierKind::WorkerData, 8, 1001).unwrap();
+        assert_eq!(sel.len(), 2); // fallback includes cooling ones
+    }
+
+    #[test]
+    fn merge_ignores_remote_penalties_preserves_local() {
+        let (_dir, pool) = tmp_pool();
+        let mut snap = CarrierSnapshot::new_empty(1000);
+        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        // local failure recorded
+        pool.record_failure(&snap.endpoints[0], 1000).unwrap();
+        // remote merge with the same endpoint (fresh, no penalties)
+        let mut incoming = CarrierSnapshot::new_empty(2000);
+        incoming.generation = 1;
+        incoming.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        incoming.sign().unwrap();
+        pool.merge(incoming, CarrierProvenance::Remote, 2000).unwrap();
+        // local penalty survives (remote cannot clear it)
+        let loaded = pool.load().unwrap();
+        let id = CarrierPool::endpoint_id_hex(&snap.endpoints[0]);
+        assert!(loaded.penalties.contains_key(&id));
     }
 }
