@@ -588,6 +588,38 @@ pub fn refresh_carriers_via_worker_tunnel(
     daemon_refresh_carriers(profile, url, secret, crate::store::now_ts() as u64, log)
 }
 
+/// Try to push the profile's carrier snapshot to the worker relay when the
+/// endpoint identity set changed (continuous push on the healthy-network side).
+/// No-op unless the profile uses a Worker-mode tunnel with URL+secret. This is
+/// the counterpart to [`refresh_carriers_via_worker_tunnel`]: push happens when
+/// the network is up, pull during a blackout. Best-effort; failures log and
+/// leave the last-pushed hash unchanged (next tick retries).
+pub fn push_carriers_via_worker_tunnel(
+    profile: &str,
+    log: &mut dyn FnMut(&str),
+) -> Result<(), crate::carrier_refresh::RefreshError> {
+    let Some(cfg) = crate::vps_deploy::load_tunnel_client_config(profile) else {
+        return Ok(());
+    };
+    let crate::vps_deploy::TunnelMode::Worker = cfg.mode else {
+        return Ok(());
+    };
+    let (Some(url), Some(secret)) = (cfg.worker_url.as_deref(), cfg.shared_secret.as_deref()) else {
+        return Ok(());
+    };
+    let pool = crate::carrier_pool::open_profile_pool(&crate::store::profiles::load_profile(profile).config)?;
+    let refresher = crate::carrier_refresh::CarrierRefresher::new(url, secret);
+    match refresher.push_snapshot_if_identity_changed(&pool)? {
+        crate::carrier_refresh::PushOutcome::Pushed { endpoints } => {
+            log(&format!("carrier push: {endpoints} endpoints to worker"));
+        }
+        crate::carrier_refresh::PushOutcome::Skipped { reason } => {
+            log(&format!("carrier push skipped: {reason:?}"));
+        }
+    }
+    Ok(())
+}
+
 /// The result of an automatic token rotation: `(old_label, new_label)`.
 pub type RotationOutcome = (String, String);
 
@@ -878,6 +910,13 @@ pub async fn daemon_tick(
                 );
             }
             state.last_outbox_flush_ts = now;
+        }
+        // Healthy network: keep the worker relay's carrier snapshot fresh by
+        // pushing whenever the endpoint identity set changes (routing table,
+        // not probe telemetry). The last-pushed hash gate makes this a no-op
+        // most ticks. This is the counterpart to the blackout-side pull above.
+        if let Err(e) = crate::daemon::push_carriers_via_worker_tunnel(profile, log) {
+            log(&log_line("WARN", &format!("carrier push to worker failed: {e}")));
         }
     }
 

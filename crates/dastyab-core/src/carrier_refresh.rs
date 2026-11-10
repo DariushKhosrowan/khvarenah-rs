@@ -202,6 +202,124 @@ impl CarrierRefresher {
             })
         })
     }
+
+    /// Push the pool's snapshot to the worker relay, but only if the endpoint
+    /// identity set changed since the last successful push to this worker.
+    ///
+    /// Identity is `(kind, host, port, sni, worker_url)` — weight/probe
+    /// telemetry drift does not trigger a push (the worker carries the routing
+    /// table, not the probe history). The last-pushed hash is persisted next
+    /// to the pool file as `<pool_path>.push_hash`; on push failure the hash
+    /// is left unchanged so the next caller retries.
+    pub fn push_snapshot_if_identity_changed(
+        &self,
+        pool: &CarrierPool,
+    ) -> Result<PushOutcome, RefreshError> {
+        let snapshot = pool.load()?;
+        if snapshot.endpoints.is_empty() {
+            return Ok(PushOutcome::Skipped {
+                reason: SkipReason::Empty,
+            });
+        }
+        let identity = pool.identity_hash().map_err(RefreshError::Pool)?;
+        let hash_path = push_hash_path(pool.path());
+        if let Some(prev) = load_push_hash(&hash_path) {
+            if prev.worker_url == self.worker_url && prev.hash_hex == hex_str(&identity) {
+                return Ok(PushOutcome::Skipped {
+                    reason: SkipReason::Unchanged,
+                });
+            }
+        }
+
+        let body = serde_json::json!({
+            "flag": 5,
+            "snapshot": snapshot,
+        });
+        self.post_ctl_raw(&body)?;
+        // Push succeeded → record the hash for this worker.
+        write_push_hash(&hash_path, PushHashRecord {
+            schema_version: 1,
+            worker_url: self.worker_url.clone(),
+            hash_hex: hex_str(&identity),
+        })?;
+        Ok(PushOutcome::Pushed {
+            endpoints: snapshot.endpoints.len(),
+        })
+    }
+}
+
+/// Outcome of a [`CarrierRefresher::push_snapshot_if_identity_changed`] call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// Pool has no endpoints (nothing to push).
+    Skipped { reason: SkipReason },
+    /// A snapshot was pushed to the worker.
+    Pushed { endpoints: usize },
+}
+
+/// Why a push was skipped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    Empty,
+    Unchanged,
+}
+
+/// Persisted record of the last-pushed identity hash for a worker.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PushHashRecord {
+    schema_version: u32,
+    worker_url: String,
+    hash_hex: String,
+}
+
+/// `push_hash` file path: sibling of the pool file (`<pool_path>.push_hash`).
+fn push_hash_path(pool_path: &std::path::Path) -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(pool_path);
+    p.set_extension("push_hash");
+    p
+}
+
+/// Hex of a 32-byte hash.
+fn hex_str(h: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in h {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Load the stored push-hash record; `None` when missing/corrupt (treated as
+/// "never pushed" → forces a push, the conservative default).
+fn load_push_hash(path: &std::path::Path) -> Option<PushHashRecord> {
+    let bytes = std::fs::read(path).ok()?;
+    let rec: PushHashRecord = serde_json::from_slice(&bytes).ok()?;
+    if rec.schema_version != 1 {
+        return None;
+    }
+    Some(rec)
+}
+
+/// Atomically persist a push-hash record (`.tmp` → rename).
+fn write_push_hash(
+    path: &std::path::Path,
+    rec: PushHashRecord,
+) -> Result<(), RefreshError> {
+    let tmp = {
+        let p = std::path::PathBuf::from(path);
+        let mut os = p.into_os_string();
+        os.push(".tmp");
+        std::path::PathBuf::from(os)
+    };
+    let bytes = serde_json::to_vec(&rec).map_err(|e| RefreshError::Transport(e.to_string()))?;
+    std::fs::write(&tmp, &bytes).map_err(|e| RefreshError::Transport(e.to_string()))?;
+    std::fs::rename(&tmp, path).map_err(|e| RefreshError::Transport(e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -428,5 +546,143 @@ mod tests {
         let (_dir, pool) = tmp_pool_with(&[], 0);
         refresher(&url).push_snapshot(&pool).unwrap();
         assert_eq!(log.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn push_if_changed_skips_when_identity_matches() {
+        let (url, log) = mock_worker(|_| (200, serde_json::json!({ "stored_generation": 1 })));
+        let (_dir, pool) = tmp_pool_with(&["a.example.com"], 1);
+        let r = refresher(&url);
+        assert!(matches!(
+            r.push_snapshot_if_identity_changed(&pool).unwrap(),
+            PushOutcome::Pushed { endpoints: 1 }
+        ));
+        assert_eq!(log.lock().unwrap().len(), 1);
+        // Identical identity → skip; no new flag-5 request.
+        assert!(matches!(
+            r.push_snapshot_if_identity_changed(&pool).unwrap(),
+            PushOutcome::Skipped { reason: SkipReason::Unchanged }
+        ));
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn push_if_changed_pushes_when_endpoint_added() {
+        let (url, log) = mock_worker(|_| (200, serde_json::json!({ "stored_generation": 1 })));
+        let (_dir, pool) = tmp_pool_with(&["a.example.com"], 1);
+        let r = refresher(&url);
+        r.push_snapshot_if_identity_changed(&pool).unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1);
+        // Add an endpoint → identity changes → push.
+        let mut snap = pool.load().unwrap();
+        snap.endpoints.push(ep("b.example.com"));
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        assert!(matches!(
+            r.push_snapshot_if_identity_changed(&pool).unwrap(),
+            PushOutcome::Pushed { endpoints: 2 }
+        ));
+        assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn push_if_changed_pushes_when_endpoint_removed() {
+        let (url, log) = mock_worker(|_| (200, serde_json::json!({ "stored_generation": 1 })));
+        let (_dir, pool) = tmp_pool_with(&["a.example.com", "b.example.com"], 1);
+        let r = refresher(&url);
+        r.push_snapshot_if_identity_changed(&pool).unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1);
+        let mut snap = pool.load().unwrap();
+        snap.endpoints.pop();
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        assert!(matches!(
+            r.push_snapshot_if_identity_changed(&pool).unwrap(),
+            PushOutcome::Pushed { endpoints: 1 }
+        ));
+        assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn push_if_changed_skips_when_weight_only_changed() {
+        let (url, log) = mock_worker(|_| (200, serde_json::json!({ "stored_generation": 1 })));
+        let (_dir, pool) = tmp_pool_with(&["a.example.com"], 1);
+        let r = refresher(&url);
+        r.push_snapshot_if_identity_changed(&pool).unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1);
+        // Same identity, different weight → skip.
+        let mut snap = pool.load().unwrap();
+        snap.endpoints[0].weight = 0.1;
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+        assert!(matches!(
+            r.push_snapshot_if_identity_changed(&pool).unwrap(),
+            PushOutcome::Skipped { reason: SkipReason::Unchanged }
+        ));
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn push_if_changed_empty_pool_skips() {
+        let (url, log) = mock_worker(|_| (200, serde_json::json!({})));
+        let (_dir, pool) = tmp_pool_with(&[], 0);
+        let r = refresher(&url);
+        assert!(matches!(
+            r.push_snapshot_if_identity_changed(&pool).unwrap(),
+            PushOutcome::Skipped { reason: SkipReason::Empty }
+        ));
+        assert_eq!(log.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn push_if_changed_retries_on_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let a2 = attempts.clone();
+        let (url, log) = mock_worker(move |_| {
+            if a2.fetch_add(1, Ordering::SeqCst) == 0 {
+                (500, serde_json::json!({}))
+            } else {
+                (200, serde_json::json!({ "stored_generation": 1 }))
+            }
+        });
+        let (_dir, pool) = tmp_pool_with(&["a.example.com"], 1);
+        let r = refresher(&url);
+        // First push fails → Err, and the stored hash file must be untouched.
+        assert!(r.push_snapshot_if_identity_changed(&pool).is_err());
+        let hash_path = push_hash_path(pool.path());
+        assert!(load_push_hash(&hash_path).is_none());
+        // Identical identity, second push succeeds.
+        assert!(matches!(
+            r.push_snapshot_if_identity_changed(&pool).unwrap(),
+            PushOutcome::Pushed { endpoints: 1 }
+        ));
+        assert!(load_push_hash(&hash_path).is_some());
+        assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn push_if_changed_worker_url_change_forces_push() {
+        let (url, log) = mock_worker(|_| (200, serde_json::json!({ "stored_generation": 1 })));
+        let (_dir, pool) = tmp_pool_with(&["a.example.com"], 1);
+        let r = refresher(&url);
+        r.push_snapshot_if_identity_changed(&pool).unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1);
+        // Seed the hash file with a different worker_url → treat as never pushed.
+        let hash_path = push_hash_path(pool.path());
+        write_push_hash(
+            &hash_path,
+            PushHashRecord {
+                schema_version: 1,
+                worker_url: "http://other.example".into(),
+                hash_hex: "0".repeat(64),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            r.push_snapshot_if_identity_changed(&pool).unwrap(),
+            PushOutcome::Pushed { endpoints: 1 }
+        ));
+        assert_eq!(log.lock().unwrap().len(), 2);
     }
 }
