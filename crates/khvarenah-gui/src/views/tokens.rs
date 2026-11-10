@@ -43,7 +43,7 @@ pub fn show(ui: &mut egui::Ui, app: &KhvarenahApp) -> Option<TokensAction> {
                 for t in &app.state.tokens {
                     let is_active = t.is_active;
                     let frame = egui::Frame::new()
-                        .fill(if is_active { PANEL } else { PANEL })
+                        .fill(PANEL)
                         .inner_margin(egui::Margin::symmetric(10, 6))
                         .stroke(if is_active {
                             egui::Stroke::new(1.5, GOLD)
