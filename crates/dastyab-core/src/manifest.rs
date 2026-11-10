@@ -103,6 +103,28 @@ pub struct ProfileManifest {
     pub created_unix: u64,
     /// rel path (within the profile dir) → entry.
     pub entries: BTreeMap<String, ManifestEntry>,
+    /// Filenames (within the profile dir) that are tracked at runtime but
+    /// excluded from integrity verification (volatile state: health beacon,
+    /// daemon pid/log/state, journal, temp files). Documented in the manifest
+    /// so the exclusion is explicit, not hidden.
+    #[serde(default)]
+    pub excluded_patterns: Vec<String>,
+}
+
+/// The runtime-only filenames that are never tracked as integrity artifacts.
+pub const RUNTIME_EXCLUDED_PATTERNS: [&str; 7] = [
+    "manifest.json",
+    "health.json",
+    "daemon.pid",
+    "daemon.stop",
+    "daemon.log",
+    "daemon-state.json",
+    "journal.json",
+];
+
+/// Whether a filename is a runtime-only file excluded from integrity checks.
+pub fn is_runtime_excluded(name: &str) -> bool {
+    RUNTIME_EXCLUDED_PATTERNS.contains(&name) || name.starts_with(".dyb_tmp_")
 }
 
 /// The on-disk verdict for one artifact.
@@ -141,6 +163,8 @@ pub struct VerifyReport {
     pub missing: Vec<String>,
     pub changed: Vec<String>,
     pub extra: Vec<String>,
+    /// Runtime-only files skipped during verification (documented exclusions).
+    pub excluded: Vec<String>,
 }
 
 impl VerifyReport {
@@ -228,6 +252,7 @@ pub fn build_manifest(profile_id: &str) -> Result<ProfileManifest, CFError> {
         profile_id: profile_id.to_string(),
         created_unix: crate::store::now_ts() as u64,
         entries,
+        excluded_patterns: RUNTIME_EXCLUDED_PATTERNS.iter().map(|s| s.to_string()).collect(),
     })
 }
 
@@ -271,6 +296,7 @@ pub fn refresh_manifest_after_write(
         profile_id,
         created_unix: now_unix,
         entries,
+        excluded_patterns: RUNTIME_EXCLUDED_PATTERNS.iter().map(|s| s.to_string()).collect(),
     };
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| {
         CFError::new(
@@ -332,20 +358,8 @@ pub fn verify_profile(profile_id: &str) -> VerifyReport {
 
     // Extras: files in the profile dir that are not in the manifest (and not
     // the manifest itself). Runtime state files (health beacon, daemon pid/
-    // stop/log, journal, temp files) are intentionally excluded — they are
-    // volatile bookkeeping, not user data, and must not appear as "drift".
-    let runtime_only = |name: &str| -> bool {
-        matches!(
-            name,
-            "manifest.json"
-                | "health.json"
-                | "daemon.pid"
-                | "daemon.stop"
-                | "daemon.log"
-                | "daemon-state.json"
-                | "journal.json"
-        ) || name.starts_with(".dyb_tmp_")
-    };
+    // stop/log, journal, temp files) are excluded and reported separately in
+    // `report.excluded` — they are volatile bookkeeping, not user data.
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let p = e.path();
@@ -357,7 +371,10 @@ pub fn verify_profile(profile_id: &str) -> VerifyReport {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            if runtime_only(&name) {
+            if is_runtime_excluded(&name) {
+                if name != "manifest.json" && !report.excluded.contains(&name) {
+                    report.excluded.push(name);
+                }
                 continue;
             }
             if !seen.contains(&name) && !manifest.entries.contains_key(&name) {

@@ -535,6 +535,94 @@ pub fn doctor_to_json(report: &DoctorReport) -> Result<String, CFError> {
     })
 }
 
+/// A compact, banner-friendly summary of a doctor report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustBanner {
+    /// "All systems green" | "1 warning" | "2 failures" (deterministic).
+    pub text: String,
+    pub severity: CheckStatus,
+    /// True when there is something worth expanding (warnings/failures).
+    pub expandable: bool,
+}
+
+/// Pure formatter: turn a report into a one-line banner.
+pub fn summarize_doctor(report: &DoctorReport) -> TrustBanner {
+    let warns = report.results.iter().filter(|r| r.status == CheckStatus::Warn).count();
+    let fails = report.results.iter().filter(|r| r.status == CheckStatus::Fail).count();
+    let severity = report.overall();
+    let text = match severity {
+        CheckStatus::Ok => "All systems green".to_string(),
+        CheckStatus::Warn => {
+            if warns == 1 {
+                "1 warning".to_string()
+            } else {
+                format!("{warns} warnings")
+            }
+        }
+        CheckStatus::Fail => {
+            if fails == 1 {
+                "1 failure".to_string()
+            } else {
+                format!("{fails} failures")
+            }
+        }
+    };
+    TrustBanner {
+        text,
+        severity,
+        expandable: warns > 0 || fails > 0,
+    }
+}
+
+#[cfg(test)]
+mod summarize_tests {
+    use super::*;
+
+    fn report_with(statuses: &[CheckStatus]) -> DoctorReport {
+        let results = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, st)| CheckResult {
+                name: format!("check{i}"),
+                status: *st,
+                detail: String::new(),
+            })
+            .collect();
+        DoctorReport {
+            checked_at_unix: 0,
+            results,
+        }
+    }
+
+    #[test]
+    fn summarize_all_green() {
+        let b = summarize_doctor(&report_with(&[CheckStatus::Ok, CheckStatus::Ok]));
+        assert_eq!(b.severity, CheckStatus::Ok);
+        assert_eq!(b.text, "All systems green");
+        assert!(!b.expandable);
+    }
+
+    #[test]
+    fn summarize_singular_warning() {
+        let b = summarize_doctor(&report_with(&[CheckStatus::Ok, CheckStatus::Warn]));
+        assert_eq!(b.severity, CheckStatus::Warn);
+        assert_eq!(b.text, "1 warning");
+        assert!(b.expandable);
+    }
+
+    #[test]
+    fn summarize_plural_failures() {
+        let b = summarize_doctor(&report_with(&[
+            CheckStatus::Fail,
+            CheckStatus::Fail,
+            CheckStatus::Ok,
+        ]));
+        assert_eq!(b.severity, CheckStatus::Fail);
+        assert_eq!(b.text, "2 failures");
+        assert!(b.expandable);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

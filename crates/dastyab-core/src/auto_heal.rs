@@ -50,6 +50,9 @@ pub struct HealReport {
     pub still_broken: Vec<String>,
     pub skipped_non_critical: Vec<String>,
     pub backup_used: Option<PathBuf>,
+    /// Artifacts whose restored content parsed (or was structurally valid) but
+    /// failed a required-field check — moved aside, NOT healed.
+    pub rejected: Vec<String>,
 }
 
 /// Errors that are specific to healing.
@@ -165,6 +168,51 @@ fn source_verifies(_backup_path: &Path, _rel: &str, content: &str) -> bool {
     }
 }
 
+/// Post-restore required-field check: a healed artifact must not only parse,
+/// it must carry its logically-required fields (e.g. a token must have a
+/// non-empty token string). This stops "healed" from meaning "parsed but
+/// empty". Returns true when the content is structurally sane for the kind.
+pub fn required_fields_ok(kind: &ArtifactKind, bytes: &[u8]) -> bool {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let v: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    match kind {
+        ArtifactKind::Tokens => {
+            // token.json is a map of label -> TokenEntry{token, ts}. Every
+            // value must have a non-empty token string.
+            let Some(map) = v.as_object() else {
+                return false;
+            };
+            if map.is_empty() {
+                return true; // token set with no tokens is legitimate
+            }
+            map.values().all(|e| {
+                e.get("token")
+                    .and_then(|t| t.as_str())
+                    .map(|t| !t.is_empty())
+                    .unwrap_or(false)
+            })
+        }
+        ArtifactKind::ProfileMeta => {
+            v.get("id").and_then(|i| i.as_str()).map(|s| !s.is_empty()).unwrap_or(false)
+        }
+        ArtifactKind::Accounts => {
+            // accounts.json is a map of name -> account; empty is fine.
+            v.is_object()
+        }
+        ArtifactKind::Config => {
+            // config.json is an object; empty is fine (defaults apply).
+            v.is_object()
+        }
+        _ => v.is_object() || v.is_array(),
+    }
+}
+
 /// Execute a heal plan.
 pub fn execute_heal(
     action: &HealAction,
@@ -198,6 +246,13 @@ pub fn execute_heal(
                 let dest = profile_dir.join(rel);
                 crate::store::atomic_write(&dest, content.as_bytes())
                     .map_err(|e| HealError::Io(e.brief()))?;
+                // Post-restore required-field check: never report "healed"
+                // for content that is logically corrupt (e.g. an empty token).
+                let kind = kind_for_rel(rel).unwrap_or(ArtifactKind::Config);
+                if !required_fields_ok(&kind, content.as_bytes()) {
+                    report.rejected.push(format!("{rel} (missing required fields)"));
+                    continue;
+                }
                 report.healed.push(rel.clone());
             }
             Ok(report)
@@ -205,11 +260,11 @@ pub fn execute_heal(
     }
 }
 
-/// Invariant: every healed file re-verifies against the just-written manifest.
-/// The daemon refuses to claim success otherwise.
+/// Invariant: every healed file re-verifies against the just-written manifest,
+/// and nothing was rejected for missing required fields. The daemon refuses to
+/// claim success otherwise.
 pub fn heal_is_safe(report: &HealReport) -> bool {
-    report.still_broken.is_empty() && report.skipped_non_critical.is_empty()
-        || (report.healed.is_empty() && report.still_broken.is_empty())
+    report.still_broken.is_empty() && report.skipped_non_critical.is_empty() && report.rejected.is_empty()
 }
 
 // ----------------------------------------------------------------------------
@@ -346,6 +401,7 @@ mod tests {
             still_broken: vec![],
             skipped_non_critical: vec![],
             backup_used: None,
+            rejected: vec![],
         };
         assert!(heal_is_safe(&ok));
     }
@@ -355,5 +411,28 @@ mod tests {
         assert_eq!(kind_for_rel("token.json"), Some(ArtifactKind::Tokens));
         assert_eq!(kind_for_rel("config.json"), Some(ArtifactKind::Config));
         assert_eq!(kind_for_rel("nope.json"), None);
+    }
+
+    #[test]
+    fn required_fields_ok_rejects_empty_token() {
+        use crate::manifest::ArtifactKind;
+        // token.json with an empty token string must be rejected.
+        let bad = br#"{"t1":{"token":"","ts":1}}"#;
+        assert!(!required_fields_ok(&ArtifactKind::Tokens, bad));
+        // A valid token passes.
+        let good = br#"{"t1":{"token":"abc","ts":1}}"#;
+        assert!(required_fields_ok(&ArtifactKind::Tokens, good));
+        // Empty map is legitimate.
+        assert!(required_fields_ok(&ArtifactKind::Tokens, br#"{}"#));
+        // Non-JSON is rejected.
+        assert!(!required_fields_ok(&ArtifactKind::Tokens, b"not json"));
+    }
+
+    #[test]
+    fn required_fields_ok_profilemeta_requires_id() {
+        use crate::manifest::ArtifactKind;
+        assert!(required_fields_ok(&ArtifactKind::ProfileMeta, br#"{"id":"p1"}"#));
+        assert!(!required_fields_ok(&ArtifactKind::ProfileMeta, br#"{"name":"x"}"#));
+        assert!(!required_fields_ok(&ArtifactKind::ProfileMeta, br#"{"id":""}"#));
     }
 }

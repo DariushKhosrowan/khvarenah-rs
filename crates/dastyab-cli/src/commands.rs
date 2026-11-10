@@ -3131,6 +3131,9 @@ fn doctor_cmd(profile: &str, json_out: bool) -> Result<(), CFError> {
     if json_out {
         println!("{}", doctor_to_json(&report)?);
     } else {
+        // Compact trust banner first, then the full card.
+        let b = summarize_doctor(&report);
+        println!("[{}] {}", b.severity.label(), b.text);
         print!("{}", doctor_to_markdown(&report));
     }
     // Exit-code signal: 0 = all ok, 1 = warns/fails (scriptable).
