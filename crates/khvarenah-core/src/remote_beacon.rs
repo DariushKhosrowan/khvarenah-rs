@@ -41,6 +41,9 @@ pub enum BeaconEventKind {
     TokenAutoRotated,
     NetworkDown,
     NetworkRestored,
+    /// Scheduled blackout self-test found fewer ladder rungs up than before
+    /// — resilience degraded and the user should know without being asked.
+    ResilienceDegraded,
 }
 
 /// A concrete event ready to be formatted + sent.
@@ -99,6 +102,13 @@ pub enum BeaconEvent {
         survival: String,
     },
     NetworkRestored,
+    /// Scheduled blackout self-test found degraded resilience.
+    ResilienceDegraded {
+        /// "N/4" ladder rungs up.
+        survivors: u8,
+        /// Best rung name (Direct/DoH/DoT/DnsTunnel).
+        best_tier: String,
+    },
 }
 
 impl BeaconEvent {
@@ -118,6 +128,7 @@ impl BeaconEvent {
             BeaconEvent::TokenAutoRotated { .. } => BeaconEventKind::TokenAutoRotated,
             BeaconEvent::NetworkDown { .. } => BeaconEventKind::NetworkDown,
             BeaconEvent::NetworkRestored => BeaconEventKind::NetworkRestored,
+            BeaconEvent::ResilienceDegraded { .. } => BeaconEventKind::ResilienceDegraded,
         }
     }
 }
@@ -410,6 +421,16 @@ pub fn format_message(event: &BeaconEvent, lang: crate::diagnose::Locale) -> Str
         }
         (BeaconEvent::NetworkRestored, _) => {
             "✅ Network restored — protection auto-resumed".to_string()
+        }
+        (BeaconEvent::ResilienceDegraded { survivors, best_tier }, crate::diagnose::Locale::Fa) => {
+            format!(
+                "⚠️ تست خودکار تاب‌آوری: فقط {survivors}/4 مسیر زنده‌اند (بهترین: {best_tier}) — کانال داده در قطعی کامل ممکن است در دسترس نباشد"
+            )
+        }
+        (BeaconEvent::ResilienceDegraded { survivors, best_tier }, _) => {
+            format!(
+                "⚠️ Blackout self-test: only {survivors}/4 ladder rungs up (best: {best_tier}) — the data channel may not survive a total blackout"
+            )
         }
     }
 }
@@ -1100,5 +1121,20 @@ mod tests {
             BeaconEventKind::NetworkDown,
             BeaconEventKind::NetworkRestored
         );
+    }
+
+    #[test]
+    fn resilience_degraded_event_formats_and_kind() {
+        let ev = BeaconEvent::ResilienceDegraded {
+            survivors: 2,
+            best_tier: "DoH".into(),
+        };
+        assert_eq!(ev.kind(), BeaconEventKind::ResilienceDegraded);
+        assert_ne!(ev.kind(), BeaconEventKind::NetworkDown);
+        let en = format_message(&ev, crate::diagnose::Locale::En);
+        assert!(en.contains("Blackout self-test"));
+        assert!(en.contains("2/4"));
+        let fa = format_message(&ev, crate::diagnose::Locale::Fa);
+        assert!(fa.contains("تاب‌آوری"));
     }
 }

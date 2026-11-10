@@ -191,6 +191,12 @@ pub struct ProfileConfig {
     /// outage. Configurable in-app (GUI Settings / CLI `config timeouts`).
     #[serde(default)]
     pub network_down_sleep_secs: u64,
+    /// Scheduled blackout self-test (drill) cadence in seconds: the daemon
+    /// periodically probes every fallback-ladder rung (Direct → DoH → DoT →
+    /// DNS tunnel), journals how many survive, and alerts if resilience
+    /// degrades. 0 = system default (`daemon::DRILL_INTERVAL_SECS`, 86400).
+    #[serde(default)]
+    pub drill_interval_secs: u64,
 }
 
 fn default_auto_rotate_on_blocked() -> bool {
@@ -248,6 +254,16 @@ pub fn effective_network_down_sleep_secs(c: &ProfileConfig) -> u64 {
     }
 }
 
+/// Effective scheduled-drill cadence: per-profile override or the system
+/// default. 0 means "use the default".
+pub fn effective_drill_interval_secs(c: &ProfileConfig) -> u64 {
+    if c.drill_interval_secs > 0 {
+        c.drill_interval_secs
+    } else {
+        crate::daemon::DRILL_INTERVAL_SECS
+    }
+}
+
 impl Default for ProfileConfig {
     fn default() -> Self {
         Self {
@@ -283,6 +299,7 @@ impl Default for ProfileConfig {
             max_backoff_secs: 0,
             auto_rotate_on_blocked: true,
             network_down_sleep_secs: 0,
+            drill_interval_secs: 0,
         }
     }
 }
@@ -1321,5 +1338,21 @@ mod tests {
         let mut cfg = ProfileConfig::default();
         cfg.network_down_sleep_secs = 15;
         assert_eq!(effective_network_down_sleep_secs(&cfg), 15);
+    }
+
+    #[test]
+    fn effective_drill_interval_defaults_to_system() {
+        let cfg = ProfileConfig::default();
+        assert_eq!(
+            effective_drill_interval_secs(&cfg),
+            crate::daemon::DRILL_INTERVAL_SECS
+        );
+    }
+
+    #[test]
+    fn effective_drill_interval_uses_configured() {
+        let mut cfg = ProfileConfig::default();
+        cfg.drill_interval_secs = 3600;
+        assert_eq!(effective_drill_interval_secs(&cfg), 3600);
     }
 }

@@ -26,6 +26,12 @@ pub const DEFAULT_INITIAL_INTERVAL_SECS: u64 = 300;
 pub const DEFAULT_MAX_INTERVAL_SECS: u64 = 21600;
 /// How long to sleep when the network is down before re-probing.
 pub const NETWORK_DOWN_SLEEP_SECS: u64 = 60;
+/// Default cadence for the scheduled blackout self-test (drill): once a day.
+pub const DRILL_INTERVAL_SECS: u64 = 86400;
+/// Fewer than this many ladder rungs up in a scheduled drill triggers a
+/// `ResilienceDegraded` beacon (4 rungs total; <3 = at most Direct/DoH up,
+/// meaning a DoT/tunnel blackout would not be survivable with redundancy).
+pub const DRILL_DEGRADED_THRESHOLD: u8 = 3;
 /// Log rotation threshold (bytes).
 pub const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 /// Number of rotated log generations kept.
@@ -109,6 +115,10 @@ pub struct DaemonState {
     /// during a blackout are delivered on restore, then periodically).
     #[serde(default)]
     pub last_outbox_flush_ts: i64,
+    /// Last epoch-seconds a scheduled blackout self-test (drill) ran. Used to
+    /// rate-limit the daily resilience probe.
+    #[serde(default)]
+    pub last_drill_ts: i64,
     /// Set once per blocked episode when auto-rotation was *attempted* but
     /// every stored token failed verification. Guards the
     /// `AccountBlockedRotationExhausted` beacon so the user is told exactly
@@ -140,6 +150,7 @@ impl Default for DaemonState {
             last_backup_ts: 0,
             last_profile_mtime: 0,
             last_outbox_flush_ts: 0,
+            last_drill_ts: 0,
             account_rotate_exhausted_notified: false,
         }
     }
@@ -674,6 +685,78 @@ async fn run_self_maintenance(
                 ));
             }
         }
+    }
+
+    // 3. Scheduled blackout self-test (drill). Probes every fallback-ladder
+    // rung, journals how many survive, and alerts if resilience has degraded.
+    // Runs whenever the network is up (a probe during a full blackout would
+    // just report all-down — not informative).
+    if net_up {
+        run_scheduled_drill(profile, state, now, &mut |msg| log(&log_line("INFO", msg))).await;
+    }
+}
+
+/// Scheduled blackout self-test (drill). When due, probes every fallback-ladder
+/// rung (Direct → DoH → DoT → DNS tunnel), journals how many survive, and emits
+/// a `ResilienceDegraded` beacon when fewer than `DRILL_DEGRADED_THRESHOLD`
+/// rungs are reachable — so the user learns resilience has slipped without being
+/// asked to run `drill` by hand. `now` is the current epoch-seconds.
+async fn run_scheduled_drill(
+    profile: &str,
+    state: &mut DaemonState,
+    now: i64,
+    log: &mut dyn FnMut(&str),
+) {
+    let p = crate::store::profiles::load_profile(profile);
+    let interval = crate::store::profiles::effective_drill_interval_secs(&p.config);
+    if interval == 0 || now - state.last_drill_ts < interval as i64 {
+        return;
+    }
+
+    let resolver = crate::doh::DohResolver::new();
+    let report = crate::connectivity::drill_all_tiers(crate::connectivity::RealLadderProbe {
+        profile,
+        resolver: &resolver,
+    })
+    .await;
+
+    let mut survivors = 0u8;
+    let mut best_tier = "none".to_string();
+    // TIER_ORDER is best-first, so the first up rung is the best surviving one.
+    for (tier, verdict) in &report {
+        if verdict.ok {
+            survivors += 1;
+            if best_tier == "none" {
+                best_tier = tier.label().to_string();
+            }
+        }
+    }
+
+    state.last_drill_ts = now;
+    let _ = crate::journal::append(
+        profile,
+        crate::journal::JournalKind::DrillPerformed,
+        &format!("{survivors}/4 rungs up (best: {best_tier})"),
+    );
+    log(&format!("blackout self-test: {survivors}/4 rungs up (best: {best_tier})"));
+
+    if survivors < DRILL_DEGRADED_THRESHOLD {
+        // Alert + journal. During a blackout the send fails and the alert is
+        // queued to the durable outbox, delivered when the network returns.
+        let _ = crate::remote_beacon::maybe_emit(
+            profile,
+            &crate::remote_beacon::BeaconEvent::ResilienceDegraded {
+                survivors,
+                best_tier: best_tier.clone(),
+            },
+            crate::diagnose::Locale::En,
+        )
+        .await;
+        let _ = crate::journal::append(
+            profile,
+            crate::journal::JournalKind::DrillPerformed,
+            &format!("DEGRADED, {survivors}/4 rungs up (best: {best_tier})"),
+        );
     }
 }
 
