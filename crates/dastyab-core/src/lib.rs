@@ -41,6 +41,7 @@ pub mod autopilot;
 pub mod backup;
 pub mod backup_autosync;
 pub mod carrier_pool;
+pub mod carrier_refresh;
 pub mod blackout;
 pub mod blackout_bridge;
 pub mod bootstrap;

@@ -277,6 +277,7 @@ impl CarrierPool {
         for (i, e) in guard.endpoints.iter().enumerate() {
             by_key.insert(e.dedup_key(), i);
         }
+        let mut changed = false;
         for ep in incoming.endpoints {
             if ep.weight < 0.0 || ep.weight > 1.0 {
                 report.rejected += 1;
@@ -287,29 +288,46 @@ impl CarrierPool {
                     let cur = &mut guard.endpoints[idx];
                     let cur_prio = cur.provenance.priority();
                     let src_prio = src.priority();
+                    let mut row_changed = false;
                     if src_prio > cur_prio {
                         cur.provenance = src;
+                        row_changed = true;
                     }
                     if ep.weight > cur.weight {
                         cur.weight = ep.weight;
+                        row_changed = true;
                     }
                     if let Some(t) = ep.last_probe_ok_unix {
                         if cur.last_probe_ok_unix.is_none_or(|c| t > c) {
                             cur.last_probe_ok_unix = Some(t);
+                            row_changed = true;
                         }
                     }
-                    report.updated += 1;
+                    if row_changed {
+                        report.updated += 1;
+                        changed = true;
+                    } else {
+                        report.kept += 1;
+                    }
                 }
                 None => {
+                    let mut ep = ep;
+                    ep.provenance = src;
                     by_key.insert(ep.dedup_key(), guard.endpoints.len());
                     guard.endpoints.push(ep);
                     report.added += 1;
+                    changed = true;
                 }
             }
         }
+        // No-op merge (byte-identical snapshot): don't bump generation, don't
+        // rewrite the pool file — the content is already on disk.
+        if !changed {
+            return Ok(report);
+        }
         guard.generation = guard.generation.max(incoming.generation);
         guard.created_unix = now_unix;
-        report.kept = guard.endpoints.len();
+        report.kept = guard.endpoints.len() - report.added - report.updated - report.rejected;
         guard.sign()?;
         let snap = guard.clone();
         drop(guard);
@@ -478,6 +496,29 @@ mod tests {
         assert_eq!(loaded.endpoints.len(), 1);
         assert_eq!(loaded.endpoints[0].provenance, CarrierProvenance::Remote);
         assert_eq!(loaded.endpoints[0].weight, 0.7);
+    }
+
+    #[test]
+    fn carrier_pool_merge_idempotent_noop_does_not_bump_generation() {
+        let (_dir, pool) = tmp_pool();
+        let mut snap = CarrierSnapshot::new_empty(1000);
+        let mut e = ep(CarrierKind::WorkerTunnel, "w.example.com", 443, 0.5);
+        e.provenance = CarrierProvenance::Remote; // already remote (from a prior refresh)
+        snap.endpoints.push(e);
+        snap.generation = 5;
+        snap.sign().unwrap();
+        pool.store_atomic(&snap).unwrap();
+
+        // Merge a byte-identical snapshot (same generation, same endpoints,
+        // same provenance) → true no-op.
+        let report = pool
+            .merge(snap.clone(), CarrierProvenance::Remote, 1000)
+            .unwrap();
+        assert_eq!(report.added, 0);
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.kept, 1);
+        // Generation unchanged.
+        assert_eq!(pool.load().unwrap().generation, 5);
     }
 
     #[test]

@@ -532,6 +532,62 @@ pub trait CycleRunner: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>>;
 }
 
+/// Execute a worker-mediated carrier-snapshot refresh for a profile.
+///
+/// This is the load-bearing implementation of the
+/// `BlackoutAction::RefreshViaWorkerTunnel` arm: it opens the profile's offline
+/// carrier pool, builds a [`CarrierRefresher`] from the profile's worker-tunnel
+/// config, and pulls + merges the latest snapshot. Logs the outcome.
+///
+/// `worker_url`/`shared_secret` come from the profile's `TunnelClientConfig`.
+/// Pure filesystem + localhost only in tests (mock worker URL).
+pub fn daemon_refresh_carriers(
+    profile: &str,
+    worker_url: &str,
+    shared_secret: &str,
+    now_unix: u64,
+    log: &mut dyn FnMut(&str),
+) -> Result<(), crate::carrier_refresh::RefreshError> {
+    let cfg = crate::store::profiles::load_profile(profile).config;
+    let pool = crate::carrier_pool::open_profile_pool(&cfg)?;
+    let refresher = crate::carrier_refresh::CarrierRefresher::new(worker_url, shared_secret);
+    match refresher.refresh_once(&pool, now_unix)? {
+        crate::carrier_refresh::RefreshOutcome::Updated(r) => {
+            log(&format!("carrier refresh: {} added, {} updated", r.added, r.updated));
+        }
+        crate::carrier_refresh::RefreshOutcome::NotNewer { server_generation } => {
+            log(&format!("carrier refresh: not newer (server gen {server_generation})"));
+        }
+        crate::carrier_refresh::RefreshOutcome::NoSnapshot => {
+            log("carrier refresh: worker has no snapshot yet");
+        }
+    }
+    Ok(())
+}
+
+/// Try to refresh the carrier pool via the worker control-plane relay during a
+/// blackout. No-op (`Ok`) unless the profile's tunnel is a Cloudflare-Worker
+/// tunnel with a configured URL + secret, in which case it pulls the latest
+/// carrier snapshot from the KV relay and merges it into the offline pool — so
+/// reselection during a total blackout sees the freshest endpoints. The actual
+/// HTTP runs on its own OS thread (see [`CarrierRefresher`]), so this is safe
+/// to call from the async daemon tick.
+pub fn refresh_carriers_via_worker_tunnel(
+    profile: &str,
+    log: &mut dyn FnMut(&str),
+) -> Result<(), crate::carrier_refresh::RefreshError> {
+    let Some(cfg) = crate::vps_deploy::load_tunnel_client_config(profile) else {
+        return Ok(());
+    };
+    let crate::vps_deploy::TunnelMode::Worker = cfg.mode else {
+        return Ok(());
+    };
+    let (Some(url), Some(secret)) = (cfg.worker_url.as_deref(), cfg.shared_secret.as_deref()) else {
+        return Ok(());
+    };
+    daemon_refresh_carriers(profile, url, secret, crate::store::now_ts() as u64, log)
+}
+
 /// The result of an automatic token rotation: `(old_label, new_label)`.
 pub type RotationOutcome = (String, String);
 
@@ -872,6 +928,17 @@ pub async fn daemon_tick(
                 crate::diagnose::Locale::En,
             )
             .await;
+        }
+        // During a total blackout the Cloudflare Worker control plane is often
+        // the only channel back to our own infra (CF edge stays up when local
+        // DNS/direct are dead). If the worker tunnel is live, pull a fresh
+        // carrier snapshot through it and merge it into the offline pool — so
+        // reselection has the newest endpoints even while fully dark. Best
+        // effort: a failure just logs and the pool stays as-is.
+        if tunnel_ok {
+            if let Err(e) = crate::daemon::refresh_carriers_via_worker_tunnel(profile, log) {
+                log(&log_line("WARN", &format!("carrier refresh via worker failed: {e}")));
+            }
         }
         // Network down → skip cycle, don't burn rescue budget. Sleep the
         // configured blackout poll cadence (per-profile `network_down_sleep_secs`,

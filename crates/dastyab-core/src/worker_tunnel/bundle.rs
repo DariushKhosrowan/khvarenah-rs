@@ -146,11 +146,44 @@ async function handleWs(request, env) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
+// ---- /ctl carrier-snapshot relay (flags 4/5) ----
+async function handleCtl(request, env) {
+  if (!authed(request, env)) {
+    return json(401, { error: "session" });
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json(400, { error: "json" });
+  }
+  if (body.flag === 4) {
+    const snap = await env.DYB_CARRIER_SNAPSHOT.get("snapshot", { type: "json" });
+    if (!snap) return json(200, { snapshot: null, server_generation: 0 });
+    const serverGen = Number((await env.DYB_CARRIER_SNAPSHOT.get("server_generation")) ?? "0");
+    return json(200, { snapshot: snap, server_generation: serverGen });
+  }
+  if (body.flag === 5) {
+    const snap = body.snapshot;
+    if (!snap || snap.schema_version !== 1) {
+      return json(400, { error: "bad-schema" });
+    }
+    await env.DYB_CARRIER_SNAPSHOT.put("snapshot", JSON.stringify(snap));
+    const cur = Number((await env.DYB_CARRIER_SNAPSHOT.get("server_generation")) ?? "0");
+    await env.DYB_CARRIER_SNAPSHOT.put("server_generation", String(cur + 1));
+    return json(200, { stored_generation: cur + 1 });
+  }
+  return json(400, { error: "unknown-flag" });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === "/ws") {
       return handleWs(request, env);
+    }
+    if (url.pathname === "/ctl" && request.method === "POST") {
+      return handleCtl(request, env);
     }
 
     // Control plane (flags 1/2/3).
@@ -179,3 +212,25 @@ export default {
   },
 };
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::WORKER_TUNNEL_JS;
+
+    #[test]
+    fn bundle_contains_flag4_flag5_ctl_relay() {
+        assert!(WORKER_TUNNEL_JS.contains("pathname === \"/ctl\""));
+        assert!(WORKER_TUNNEL_JS.contains("body.flag === 4"));
+        assert!(WORKER_TUNNEL_JS.contains("body.flag === 5"));
+        assert!(WORKER_TUNNEL_JS.contains("DYB_CARRIER_SNAPSHOT"));
+        assert!(WORKER_TUNNEL_JS.contains("server_generation"));
+    }
+
+    #[test]
+    fn bundle_still_serves_control_plane_and_ws() {
+        assert!(WORKER_TUNNEL_JS.contains("pathname === \"/ws\""));
+        assert!(WORKER_TUNNEL_JS.contains("f.flags === 1"));
+        assert!(WORKER_TUNNEL_JS.contains("f.flags === 2"));
+        assert!(WORKER_TUNNEL_JS.contains("f.flags === 3"));
+    }
+}
