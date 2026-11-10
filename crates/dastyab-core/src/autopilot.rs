@@ -428,6 +428,21 @@ async fn discover_native(
     let path = target.path.clone();
     let timeout_s = params.timeout_s.max(1);
 
+    // Per-worker desync learning (round: close the discovery learning loop).
+    // The probe path previously used only the flat global config.strategy.
+    // Select this worker's learned strategy from the reused worker_secrets
+    // store and honor it for this cycle so a repeated transport failure
+    // advances the ladder on the next discovery.
+    let worker_host = target.host.clone();
+    let init_cfg = crate::store::profiles::load_profile(profile_id);
+    let cycle_strategy =
+        crate::worker_tunnel::secret::strategy_for_discovery(&init_cfg.config, &worker_host);
+    {
+        let mut dc = crate::desync::active_config();
+        dc.strategy = cycle_strategy;
+        crate::desync::set_config(dc);
+    }
+
     // Step 0 — worker-health gate (DeepSeek plan #1). If the worker is dead,
     // suspended, or path-mismatched, no scanner can find clean IPs: short-
     // circuit with a plain-language diagnosis instead of wasting a scan.
@@ -653,6 +668,21 @@ async fn discover_native(
     // Persist diagnostics so the GUI/CLI can explain a zero result.
     if let Some(d) = diagnostics {
         let _ = crate::store::profiles::save_last_diagnostics(profile_id, &d);
+    }
+
+    // Record the discovery cycle's aggregate WS outcome into the per-worker
+    // desync store. If any verified endpoint was found the strategy worked and
+    // is promoted to effective; otherwise the strategy is demoted so the next
+    // discovery advances the ladder. Persist only if the store changed.
+    let had_ws_success = !verified.is_empty();
+    let mut final_cfg = crate::store::profiles::load_profile(profile_id);
+    if crate::worker_tunnel::secret::learn_from_discovery(
+        &mut final_cfg.config,
+        &worker_host,
+        cycle_strategy,
+        had_ws_success,
+    ) {
+        let _ = crate::store::profiles::save_profile(&final_cfg);
     }
 
     Ok(verified)

@@ -254,6 +254,38 @@ pub fn record_worker_desync_failure(
     }
 }
 
+/// Decide the anti-DPI desync strategy for a discovery scan cycle against
+/// `worker_host`. Reuses the per-worker learned store (the single
+/// recorded-effective source of truth): a recorded effective strategy wins; a
+/// failed-set advances the ladder; no record falls back to the ladder start.
+/// This closes the discovery-path learning loop — the probe path previously
+/// used only the flat global `active_config().strategy` and never learned.
+pub fn strategy_for_discovery(
+    cfg: &crate::store::profiles::ProfileConfig,
+    worker_host: &str,
+) -> crate::desync::DesyncStrategy {
+    strategy_for_worker(cfg, worker_host, 0)
+}
+
+/// Record a discovery cycle's aggregate WS outcome into the per-worker desync
+/// store. Success promotes `strategy` to effective (clears the failed-set);
+/// failure pushes it to the failed-set so the ladder demotes. Returns `true`
+/// if `cfg` changed (caller persists).
+pub fn learn_from_discovery(
+    cfg: &mut crate::store::profiles::ProfileConfig,
+    worker_host: &str,
+    strategy: crate::desync::DesyncStrategy,
+    had_ws_success: bool,
+) -> bool {
+    let before = cfg.worker_secrets.clone();
+    if had_ws_success {
+        record_worker_desync_success(cfg, worker_host, strategy);
+    } else {
+        record_worker_desync_failure(cfg, worker_host, strategy);
+    }
+    cfg.worker_secrets != before
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -483,5 +515,117 @@ mod tests {
         }
         let ws = &c.worker_secrets["http://w"];
         assert_eq!(ws.failed_strategies.len(), 1);
+    }
+
+    #[test]
+    fn strategy_for_discovery_falls_back_to_ladder_when_unlearned() {
+        // No record → the ladder's first un-failed entry wins.
+        let c = cfg();
+        assert_eq!(
+            strategy_for_discovery(&c, "host.workers.dev"),
+            crate::desync::DesyncStrategy::SplitClientHello
+        );
+    }
+
+    #[test]
+    fn learn_from_discovery_success_promotes_effective_and_clears_failed() {
+        let mut c = cfg();
+        // Seed a failed strategy so the "clears failed-set" branch is exercised.
+        record_worker_desync_failure(
+            &mut c,
+            "host.workers.dev",
+            crate::desync::DesyncStrategy::SplitClientHello,
+        );
+        let changed = learn_from_discovery(
+            &mut c,
+            "host.workers.dev",
+            crate::desync::DesyncStrategy::SplitTwo,
+            true,
+        );
+        assert!(changed, "a fresh success must mutate the store");
+        let ws = &c.worker_secrets["host.workers.dev"];
+        assert_eq!(
+            ws.desync_strategy,
+            Some(crate::desync::DesyncStrategy::SplitTwo)
+        );
+        assert!(ws.failed_strategies.is_empty());
+        // The next discovery now selects the learned effective strategy.
+        assert_eq!(
+            strategy_for_discovery(&c, "host.workers.dev"),
+            crate::desync::DesyncStrategy::SplitTwo
+        );
+    }
+
+    #[test]
+    fn learn_from_discovery_failure_demotes_ladder() {
+        let mut c = cfg();
+        let changed = learn_from_discovery(
+            &mut c,
+            "host.workers.dev",
+            crate::desync::DesyncStrategy::SplitClientHello,
+            false,
+        );
+        assert!(changed);
+        // The failed strategy is skipped → next selection advances the ladder.
+        assert_eq!(
+            strategy_for_discovery(&c, "host.workers.dev"),
+            crate::desync::DesyncStrategy::SplitTwo
+        );
+        // No effective strategy is recorded on failure.
+        assert!(c.worker_secrets["host.workers.dev"]
+            .desync_strategy
+            .is_none());
+    }
+
+    #[test]
+    fn learn_from_discovery_two_endpoints_do_not_interfere() {
+        let mut c = cfg();
+        learn_from_discovery(
+            &mut c,
+            "a.workers.dev",
+            crate::desync::DesyncStrategy::SplitTwo,
+            true,
+        );
+        learn_from_discovery(
+            &mut c,
+            "b.workers.dev",
+            crate::desync::DesyncStrategy::SplitClientHello,
+            false,
+        );
+        // a learned SplitTwo effective; b demoted past SplitClientHello.
+        assert_eq!(
+            strategy_for_discovery(&c, "a.workers.dev"),
+            crate::desync::DesyncStrategy::SplitTwo
+        );
+        assert_eq!(
+            strategy_for_discovery(&c, "b.workers.dev"),
+            crate::desync::DesyncStrategy::SplitTwo
+        );
+        // No cross-endpoint leakage: b's failure did not touch a's records.
+        let a = &c.worker_secrets["a.workers.dev"];
+        assert_eq!(
+            a.desync_strategy,
+            Some(crate::desync::DesyncStrategy::SplitTwo)
+        );
+        assert!(a.failed_strategies.is_empty());
+    }
+
+    #[test]
+    fn learn_from_discovery_noop_when_outcome_already_recorded() {
+        let mut c = cfg();
+        learn_from_discovery(
+            &mut c,
+            "host.workers.dev",
+            crate::desync::DesyncStrategy::SplitTwo,
+            true,
+        );
+        // Same success again → store unchanged → returns false.
+        let changed = learn_from_discovery(
+            &mut c,
+            "host.workers.dev",
+            crate::desync::DesyncStrategy::SplitTwo,
+            true,
+        );
+        assert!(!changed, "idempotent success must not mutate the store");
     }
 }
