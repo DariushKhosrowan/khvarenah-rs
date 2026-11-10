@@ -256,7 +256,8 @@ mod tests {
         with_home(|| {
             let id = fresh_profile_id();
             seed_artifacts(&id);
-            crate::manifest::write_manifest(&crate::manifest::build_manifest(&id).unwrap()).unwrap();
+            crate::manifest::write_manifest(&crate::manifest::build_manifest(&id).unwrap())
+                .unwrap();
             let inv = build_inventory(Path::new("/"), 1000);
             let item = inv
                 .items
@@ -273,11 +274,7 @@ mod tests {
             let id = fresh_profile_id();
             seed_artifacts(&id);
             let inv = build_inventory(Path::new("/"), 1000);
-            let item = inv
-                .items
-                .iter()
-                .find(|i| i.profile_id == id)
-                .unwrap();
+            let item = inv.items.iter().find(|i| i.profile_id == id).unwrap();
             assert_eq!(item.integrity, IntegrityStatus::NoManifest);
         });
     }

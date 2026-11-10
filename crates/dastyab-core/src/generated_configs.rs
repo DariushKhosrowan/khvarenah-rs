@@ -150,8 +150,10 @@ pub fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
 /// Load the generated-configs ledger for a profile (empty default).
 pub fn load_generated_configs(id: &str) -> GeneratedConfigsLedger {
     let dir = crate::store::profiles::profile_dir(id);
-    let records = crate::store::read_opt::<Vec<GeneratedConfigRecord>>(&dir.join(GeneratedConfigsLedger::FILE))
-        .unwrap_or_default();
+    let records = crate::store::read_opt::<Vec<GeneratedConfigRecord>>(
+        &dir.join(GeneratedConfigsLedger::FILE),
+    )
+    .unwrap_or_default();
     GeneratedConfigsLedger { records }
 }
 
@@ -179,17 +181,33 @@ pub fn save_generated_configs(id: &str, ledger: &GeneratedConfigsLedger) -> Resu
 mod tests {
     use super::*;
 
-    fn rec(fmt: ExportFormat, source: ConfigSource, content: &str) -> (ExportFormat, ConfigSource, String) {
+    fn rec(
+        fmt: ExportFormat,
+        source: ConfigSource,
+        content: &str,
+    ) -> (ExportFormat, ConfigSource, String) {
         (fmt, source, content.to_string())
     }
 
     fn sample_ledger() -> GeneratedConfigsLedger {
         let mut l = GeneratedConfigsLedger::default();
-        let (f1, s1, c1) = rec(ExportFormat::ShareLink, ConfigSource::ShareLink, "vless://a");
+        let (f1, s1, c1) = rec(
+            ExportFormat::ShareLink,
+            ConfigSource::ShareLink,
+            "vless://a",
+        );
         l.push(1000, f1, s1, Some("home".into()), c1).unwrap();
-        let (f2, s2, c2) = rec(ExportFormat::SingBox, ConfigSource::WorkerVless, "{\"outbound\":1}");
+        let (f2, s2, c2) = rec(
+            ExportFormat::SingBox,
+            ConfigSource::WorkerVless,
+            "{\"outbound\":1}",
+        );
         l.push(2000, f2, s2, None, c2).unwrap();
-        let (f3, s3, c3) = rec(ExportFormat::Clash, ConfigSource::Other, "proxies:\n  - name: x");
+        let (f3, s3, c3) = rec(
+            ExportFormat::Clash,
+            ConfigSource::Other,
+            "proxies:\n  - name: x",
+        );
         l.push(3000, f3, s3, Some("work".into()), c3).unwrap();
         l
     }
@@ -197,7 +215,11 @@ mod tests {
     #[test]
     fn append_assigns_monotonic_id_and_timestamp() {
         let mut l = GeneratedConfigsLedger::default();
-        let (f, s, c) = rec(ExportFormat::ShareLink, ConfigSource::ShareLink, "vless://x");
+        let (f, s, c) = rec(
+            ExportFormat::ShareLink,
+            ConfigSource::ShareLink,
+            "vless://x",
+        );
         let id1 = l.push(1000, f, s, None, c).unwrap();
         let (f, s, c) = rec(ExportFormat::V2rayN, ConfigSource::V2rayN, "{}");
         let id2 = l.push(1000, f, s, None, c).unwrap();
@@ -274,7 +296,11 @@ mod tests {
         crate::store::set_mem_dir_override(test_mem_dir());
         let id = crate::store::profiles::create_profile("g", "gen").unwrap();
         let mut ledger = GeneratedConfigsLedger::default();
-        let (f, s, c) = rec(ExportFormat::ShareLink, ConfigSource::ShareLink, "vless://zz");
+        let (f, s, c) = rec(
+            ExportFormat::ShareLink,
+            ConfigSource::ShareLink,
+            "vless://zz",
+        );
         ledger.push(1000, f, s, Some("home".into()), c).unwrap();
         save_generated_configs(&id, &ledger).unwrap();
         let loaded = load_generated_configs(&id);

@@ -565,12 +565,7 @@ impl CarrierPool {
     /// Read the current penalty for an endpoint (for the UI / CLI columns).
     pub fn penalty(&self, ep: &CarrierEndpoint) -> Option<EndpointPenalty> {
         let id = Self::endpoint_id_hex(ep);
-        self.inner
-            .read()
-            .ok()?
-            .penalties
-            .get(&id)
-            .cloned()
+        self.inner.read().ok()?.penalties.get(&id).cloned()
     }
 
     /// Selection identical to [`Self::select`] but excludes endpoints currently
@@ -1021,7 +1016,8 @@ mod tests {
     fn effective_desync_recorded_on_probe_success() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         let ep0 = snap.endpoints[0].clone();
@@ -1030,7 +1026,10 @@ mod tests {
         let loaded = pool.load().unwrap();
         let id = CarrierPool::endpoint_id_hex(&ep0);
         let p = loaded.penalties.get(&id).unwrap();
-        assert_eq!(p.effective_desync, Some(crate::desync::DesyncStrategy::SplitTwo));
+        assert_eq!(
+            p.effective_desync,
+            Some(crate::desync::DesyncStrategy::SplitTwo)
+        );
         assert!(p.failed_strategies.is_empty());
         // The endpoint's own learned column is updated for the UI.
         let learned = loaded
@@ -1038,7 +1037,10 @@ mod tests {
             .iter()
             .find(|e| e.host == "a.example.com")
             .unwrap();
-        assert_eq!(learned.desync_strategy, Some(crate::desync::DesyncStrategy::SplitTwo));
+        assert_eq!(
+            learned.desync_strategy,
+            Some(crate::desync::DesyncStrategy::SplitTwo)
+        );
     }
 
     #[test]
@@ -1047,7 +1049,8 @@ mod tests {
         let path = dir.path().join("carrier_pool.json");
         let pool = CarrierPool::open(&path).unwrap();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         let ep0 = snap.endpoints[0].clone();
@@ -1067,7 +1070,8 @@ mod tests {
     fn desync_failure_advances_failed_set() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         let ep0 = snap.endpoints[0].clone();
@@ -1079,8 +1083,12 @@ mod tests {
         let id = CarrierPool::endpoint_id_hex(&ep0);
         let p = loaded.penalties.get(&id).unwrap();
         assert_eq!(p.failed_strategies.len(), 2);
-        assert!(p.failed_strategies.contains(&crate::desync::DesyncStrategy::SplitClientHello));
-        assert!(p.failed_strategies.contains(&crate::desync::DesyncStrategy::SplitTwo));
+        assert!(p
+            .failed_strategies
+            .contains(&crate::desync::DesyncStrategy::SplitClientHello));
+        assert!(p
+            .failed_strategies
+            .contains(&crate::desync::DesyncStrategy::SplitTwo));
         // Still no effective strategy.
         assert!(p.effective_desync.is_none());
     }
@@ -1089,7 +1097,8 @@ mod tests {
     fn desync_success_clears_failed() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         let ep0 = snap.endpoints[0].clone();
@@ -1100,7 +1109,10 @@ mod tests {
         let loaded = pool.load().unwrap();
         let id = CarrierPool::endpoint_id_hex(&ep0);
         let p = loaded.penalties.get(&id).unwrap();
-        assert_eq!(p.effective_desync, Some(crate::desync::DesyncStrategy::SplitTwo));
+        assert_eq!(
+            p.effective_desync,
+            Some(crate::desync::DesyncStrategy::SplitTwo)
+        );
         assert!(p.failed_strategies.is_empty());
     }
 }

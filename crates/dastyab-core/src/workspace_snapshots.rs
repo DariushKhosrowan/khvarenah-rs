@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CFError;
-use crate::workspace_snapshot::{read_snapshot, snapshot_workspace, write_snapshot_atomic, SnapshotKind, WorkspaceSnapshot};
+use crate::workspace_snapshot::{
+    read_snapshot, snapshot_workspace, write_snapshot_atomic, SnapshotKind, WorkspaceSnapshot,
+};
 
 /// Default cadence: every 6 hours.
 pub const WORKSPACE_SNAPSHOT_INTERVAL_SECS: u64 = 6 * 3600;
@@ -152,10 +154,11 @@ pub fn diff_against_current(snap: &WorkspaceSnapshot, _workspace_root: &Path) ->
     let mut summary = DiffSummary::default();
 
     // Current profiles on disk.
-    let current_profiles: std::collections::BTreeSet<String> = crate::store::profiles::list_profiles()
-        .into_iter()
-        .map(|m| m.id)
-        .collect();
+    let current_profiles: std::collections::BTreeSet<String> =
+        crate::store::profiles::list_profiles()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
 
     for profile in &snap.profiles {
         if !current_profiles.contains(&profile.profile_id) {
@@ -210,8 +213,14 @@ mod tests {
 
     #[test]
     fn is_snapshot_due_respects_interval() {
-        assert!(!is_snapshot_due(1000, 1000 + WORKSPACE_SNAPSHOT_INTERVAL_SECS as i64 - 1));
-        assert!(is_snapshot_due(1000, 1000 + WORKSPACE_SNAPSHOT_INTERVAL_SECS as i64));
+        assert!(!is_snapshot_due(
+            1000,
+            1000 + WORKSPACE_SNAPSHOT_INTERVAL_SECS as i64 - 1
+        ));
+        assert!(is_snapshot_due(
+            1000,
+            1000 + WORKSPACE_SNAPSHOT_INTERVAL_SECS as i64
+        ));
     }
 
     #[test]
@@ -263,7 +272,8 @@ mod tests {
             seed_artifacts(&id);
             let snap = snapshot_workspace(root, SnapshotKind::Full, 1000).unwrap();
             // Delete a file the snapshot had.
-            std::fs::remove_file(crate::store::profiles::profile_dir(&id).join("accounts.json")).unwrap();
+            std::fs::remove_file(crate::store::profiles::profile_dir(&id).join("accounts.json"))
+                .unwrap();
             let summary = diff_against_current(&snap, root);
             assert!(summary.files_deleted >= 1);
         });

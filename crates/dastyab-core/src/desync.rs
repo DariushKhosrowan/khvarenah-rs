@@ -145,7 +145,9 @@ where
 // ---------------------------------------------------------------------------
 
 /// A fragmentation strategy for a single connection write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum DesyncStrategy {
     /// Split only the leading TLS record (the ClientHello + start of the
     /// upgrade) at a small randomized boundary. Minimal cost, targets the
@@ -217,11 +219,11 @@ pub fn build_decoy_client_hello() -> Vec<u8> {
     rng.fill(&mut random);
     body.extend_from_slice(&random);
     body.push(0); // session_id length = 0
-    // cipher_suites: one suite (TLS_AES_128_GCM_SHA256).
+                  // cipher_suites: one suite (TLS_AES_128_GCM_SHA256).
     body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
     body.extend_from_slice(&[0x01, 0x00]); // compression: null
     body.extend_from_slice(&[0x00, 0x00]); // extensions length = 0
-    // handshake header: type ClientHello + 3-byte length
+                                           // handshake header: type ClientHello + 3-byte length
     let len = body.len();
     let mut hs = Vec::with_capacity(4 + len);
     hs.push(0x01);
@@ -333,10 +335,7 @@ pub fn plan_for_strategy(
 
 /// Write `plan` through `w`, flushing after each chunk so each leaves as its
 /// own TLS record / TCP segment.
-pub async fn apply_plan<W>(
-    w: &mut W,
-    plan: &[WriteChunk],
-) -> Result<(), std::io::Error>
+pub async fn apply_plan<W>(w: &mut W, plan: &[WriteChunk]) -> Result<(), std::io::Error>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -531,7 +530,10 @@ mod tests {
         let plan = plan_for_strategy(DesyncStrategy::SplitTwo, data, &cfg, &mut rng);
         assert_eq!(plan.len(), 2);
         let joined: Vec<u8> = plan.iter().flat_map(|c| c.data.iter().copied()).collect();
-        assert_eq!(joined, data, "SplitTwo must deliver the identical byte stream");
+        assert_eq!(
+            joined, data,
+            "SplitTwo must deliver the identical byte stream"
+        );
     }
 
     #[test]
@@ -559,7 +561,10 @@ mod tests {
         assert_eq!(plan[0].data[0], 0x16); // handshake record
         assert_eq!(plan[0].data[3], 0x00); // hi byte of 2-byte record length
         let joined: Vec<u8> = plan.iter().flat_map(|c| c.data.iter().copied()).collect();
-        assert!(joined.windows(data.len()).any(|w| w == data), "real request must be present");
+        assert!(
+            joined.windows(data.len()).any(|w| w == data),
+            "real request must be present"
+        );
     }
 
     #[test]
@@ -587,9 +592,18 @@ mod tests {
     async fn apply_plan_writes_chunks_in_order() {
         let mut sink = Sink::new();
         let plan = vec![
-            WriteChunk { data: b"GET ".to_vec(), delay_us: 0 },
-            WriteChunk { data: b"/ HTTP/1.1\r\n".to_vec(), delay_us: 5 },
-            WriteChunk { data: b"Host: x\r\n\r\n".to_vec(), delay_us: 0 },
+            WriteChunk {
+                data: b"GET ".to_vec(),
+                delay_us: 0,
+            },
+            WriteChunk {
+                data: b"/ HTTP/1.1\r\n".to_vec(),
+                delay_us: 5,
+            },
+            WriteChunk {
+                data: b"Host: x\r\n\r\n".to_vec(),
+                delay_us: 0,
+            },
         ];
         apply_plan(&mut sink, &plan).await.unwrap();
         assert_eq!(sink.buf, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -636,20 +650,11 @@ mod tests {
             DesyncStrategy::SplitClientHello
         );
         // attempt 1 → next.
-        assert_eq!(
-            select_strategy(None, &[], 1),
-            DesyncStrategy::SplitTwo
-        );
+        assert_eq!(select_strategy(None, &[], 1), DesyncStrategy::SplitTwo);
         // attempt 2 → next.
-        assert_eq!(
-            select_strategy(None, &[], 2),
-            DesyncStrategy::SplitAndDecoy
-        );
+        assert_eq!(select_strategy(None, &[], 2), DesyncStrategy::SplitAndDecoy);
         // attempt 3 → None (base fallback).
-        assert_eq!(
-            select_strategy(None, &[], 3),
-            DesyncStrategy::None
-        );
+        assert_eq!(select_strategy(None, &[], 3), DesyncStrategy::None);
         // All attempts failed → fallback None.
         let all = vec![
             DesyncStrategy::SplitClientHello,

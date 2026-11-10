@@ -684,7 +684,10 @@ pub fn clone_profile(source_id: &str, new_name: Option<&str>) -> Result<String, 
         if let Some(obj) = meta.as_object_mut() {
             obj.insert("id".into(), serde_json::json!(new_id));
             obj.insert("name".into(), serde_json::json!(name));
-            obj.insert("created_at".into(), serde_json::json!(crate::store::now_iso()));
+            obj.insert(
+                "created_at".into(),
+                serde_json::json!(crate::store::now_iso()),
+            );
         }
     } else {
         val["meta"] = serde_json::json!({

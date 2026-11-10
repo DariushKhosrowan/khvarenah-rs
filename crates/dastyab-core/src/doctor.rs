@@ -215,10 +215,7 @@ pub fn newest_backup(backup_dir: &Path) -> Option<PathBuf> {
 pub fn check_manifest_all_profiles() -> CheckResult {
     let reports = crate::manifest::verify_workspace();
     if reports.is_empty() {
-        return CheckResult::ok(
-            "manifest",
-            "no profiles — nothing to verify",
-        );
+        return CheckResult::ok("manifest", "no profiles — nothing to verify");
     }
     let mut bad: Vec<String> = Vec::new();
     for (meta, r) in &reports {
@@ -247,7 +244,11 @@ pub fn check_manifest_all_profiles() -> CheckResult {
     } else {
         CheckResult::fail(
             "manifest",
-            format!("integrity drift in {} profile(s): {}", bad.len(), bad.join("; ")),
+            format!(
+                "integrity drift in {} profile(s): {}",
+                bad.len(),
+                bad.join("; ")
+            ),
         )
     }
 }
@@ -269,11 +270,7 @@ pub fn check_token_permissions(profile_id: &str) -> CheckResult {
 }
 
 /// Check 3: autosync freshness. `last_backup_ts` from daemon state.
-pub fn check_autosync_freshness(
-    profile_id: &str,
-    last_backup_ts: i64,
-    now: i64,
-) -> CheckResult {
+pub fn check_autosync_freshness(profile_id: &str, last_backup_ts: i64, now: i64) -> CheckResult {
     let p = crate::store::profiles::load_profile(profile_id);
     let cfg = &p.config.backup_autosync;
     if !cfg.enabled {
@@ -306,7 +303,10 @@ pub fn check_autosync_freshness(
 /// Check 4: newest backup structurally verifies.
 pub fn check_latest_backup_verifies(backup_dir: &Path) -> CheckResult {
     let Some(newest) = newest_backup(backup_dir) else {
-        return CheckResult::warn("backup", "no backups exist yet — run `dastyab backup export`");
+        return CheckResult::warn(
+            "backup",
+            "no backups exist yet — run `dastyab backup export`",
+        );
     };
     if backup_bundle_verifies(&newest) {
         CheckResult::ok(
@@ -316,7 +316,10 @@ pub fn check_latest_backup_verifies(backup_dir: &Path) -> CheckResult {
     } else {
         CheckResult::fail(
             "backup",
-            format!("newest backup failed structural verification: {}", newest.display()),
+            format!(
+                "newest backup failed structural verification: {}",
+                newest.display()
+            ),
         )
     }
 }
@@ -364,7 +367,10 @@ pub fn check_daemon_heartbeat(profile_id: &str, now: i64) -> CheckResult {
             "daemon-heartbeat",
             "no health beacon — daemon has never run (start with `dastyab daemon start`)",
         ),
-        Err(e) => CheckResult::fail("daemon-heartbeat", format!("beacon read error: {}", e.brief())),
+        Err(e) => CheckResult::fail(
+            "daemon-heartbeat",
+            format!("beacon read error: {}", e.brief()),
+        ),
     }
 }
 
@@ -373,11 +379,17 @@ pub fn check_daemon_heartbeat(profile_id: &str, now: i64) -> CheckResult {
 pub fn check_tunnel_recently_ok(profile_id: &str, max_age_secs: i64, now: i64) -> CheckResult {
     let tunnel_path = crate::store::profiles::profile_dir(profile_id).join("tunnel-client.json");
     let Some(mtime) = file_mtime_unix(&tunnel_path) else {
-        return CheckResult::warn("tunnel", "no tunnel-client.json present (tunnel not deployed)");
+        return CheckResult::warn(
+            "tunnel",
+            "no tunnel-client.json present (tunnel not deployed)",
+        );
     };
     let age = now - mtime;
     if age <= max_age_secs {
-        CheckResult::ok("tunnel", format!("tunnel-client config refreshed {age}s ago"))
+        CheckResult::ok(
+            "tunnel",
+            format!("tunnel-client config refreshed {age}s ago"),
+        )
     } else {
         CheckResult::warn(
             "tunnel",
@@ -387,11 +399,18 @@ pub fn check_tunnel_recently_ok(profile_id: &str, max_age_secs: i64, now: i64) -
 }
 
 /// Check 8: workspace snapshot age.
-pub fn check_workspace_snapshot_age(snapshots_dir: &Path, max_age_secs: i64, now: i64) -> CheckResult {
+pub fn check_workspace_snapshot_age(
+    snapshots_dir: &Path,
+    max_age_secs: i64,
+    now: i64,
+) -> CheckResult {
     let Some(newest) = newest_snapshot(snapshots_dir) else {
         return CheckResult::warn(
             "workspace-snapshot",
-            format!("no scheduled workspace snapshots in {}", snapshots_dir.display()),
+            format!(
+                "no scheduled workspace snapshots in {}",
+                snapshots_dir.display()
+            ),
         );
     };
     let Some(created) = snapshot_created_unix(&newest) else {
@@ -409,7 +428,10 @@ pub fn check_workspace_snapshot_age(snapshots_dir: &Path, max_age_secs: i64, now
     } else {
         CheckResult::warn(
             "workspace-snapshot",
-            format!("newest snapshot is {age}s old (> {max_age_secs}s): {}", newest.display()),
+            format!(
+                "newest snapshot is {age}s old (> {max_age_secs}s): {}",
+                newest.display()
+            ),
         )
     }
 }
@@ -420,7 +442,12 @@ pub fn newest_snapshot(snapshots_dir: &Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(snapshots_dir).ok()?;
     for e in entries.flatten() {
         let p = e.path();
-        if !p.file_name().and_then(|s| s.to_str()).map(|s| s.ends_with(".dyb-snapshot.json")).unwrap_or(false) {
+        if !p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.ends_with(".dyb-snapshot.json"))
+            .unwrap_or(false)
+        {
             continue;
         }
         if let Some(mtime) = file_mtime_unix(&p) {
@@ -498,12 +525,19 @@ pub fn run_doctor(opts: &DoctorOptions) -> DoctorReport {
     // Ledger append-only integrity (high-water vs current count). Guards
     // against silent truncation of history/token_history/generated-configs.
     let profile_dir = crate::store::profiles::profile_dir(&opts.profile_id);
-    results.extend(crate::ledger_guard::doctor_check_ledger_integrity(&profile_dir));
+    results.extend(crate::ledger_guard::doctor_check_ledger_integrity(
+        &profile_dir,
+    ));
 
     // Per-artifact versioning health (hot-path prune outcomes + dir sizes).
     // Surfaces silent prune failures before version dirs exhaust disk.
-    if let Ok(health) = crate::artifact_versions::measure_versioning_health(&profile_dir, opts.now_unix as u64) {
-        results.push(crate::artifact_versions::doctor_check_versions(&profile_dir, &health));
+    if let Ok(health) =
+        crate::artifact_versions::measure_versioning_health(&profile_dir, opts.now_unix as u64)
+    {
+        results.push(crate::artifact_versions::doctor_check_versions(
+            &profile_dir,
+            &health,
+        ));
     }
 
     // Content-based version integrity (last sweep result). Turns the file-count
@@ -525,10 +559,7 @@ pub fn run_doctor(opts: &DoctorOptions) -> DoctorReport {
 pub fn doctor_to_markdown(report: &DoctorReport) -> String {
     let mut out = String::new();
     let overall = report.overall();
-    out.push_str(&format!(
-        "# DastYab doctor — {}\n",
-        overall.label()
-    ));
+    out.push_str(&format!("# DastYab doctor — {}\n", overall.label()));
     out.push_str(&format!("Checked at {}\n\n", report.checked_at_unix));
     out.push_str("| Check | Status | Detail |\n");
     out.push_str("|-------|--------|--------|\n");
@@ -567,8 +598,16 @@ pub struct TrustBanner {
 
 /// Pure formatter: turn a report into a one-line banner.
 pub fn summarize_doctor(report: &DoctorReport) -> TrustBanner {
-    let warns = report.results.iter().filter(|r| r.status == CheckStatus::Warn).count();
-    let fails = report.results.iter().filter(|r| r.status == CheckStatus::Fail).count();
+    let warns = report
+        .results
+        .iter()
+        .filter(|r| r.status == CheckStatus::Warn)
+        .count();
+    let fails = report
+        .results
+        .iter()
+        .filter(|r| r.status == CheckStatus::Fail)
+        .count();
     let severity = report.overall();
     let text = match severity {
         CheckStatus::Ok => "All systems green".to_string(),
@@ -673,7 +712,8 @@ mod tests {
             std::fs::write(dir.join("accounts.json"), b"{\"a\":1}").unwrap();
             std::fs::write(dir.join("config.json"), b"{\"x\":1}").unwrap();
             std::fs::write(dir.join("tunnel-client.json"), b"{\"tunnel\":1}").unwrap();
-            crate::manifest::write_manifest(&crate::manifest::build_manifest(&id).unwrap()).unwrap();
+            crate::manifest::write_manifest(&crate::manifest::build_manifest(&id).unwrap())
+                .unwrap();
 
             // A fresh daemon beacon (within the 900s heartbeat window).
             let mut beacon = crate::health_beacon::HealthBeacon::new(
@@ -706,11 +746,8 @@ mod tests {
             .unwrap();
             let snap_path = snapshots.join(format!("{}-snapshot.dyb-snapshot.json", now - 200));
             crate::workspace_snapshot::write_snapshot_atomic(&snap, &snap_path).unwrap();
-            filetime::set_file_mtime(
-                &snap_path,
-                filetime::FileTime::from_unix_time(now - 200, 0),
-            )
-            .unwrap();
+            filetime::set_file_mtime(&snap_path, filetime::FileTime::from_unix_time(now - 200, 0))
+                .unwrap();
 
             // Enable autosync and record a recent auto-backup in daemon state.
             {
@@ -734,7 +771,8 @@ mod tests {
 
             // Rebuild the manifest AFTER every on-disk change (beacon, config,
             // tunnel-client) so nothing is flagged extra/changed.
-            crate::manifest::write_manifest(&crate::manifest::build_manifest(&id).unwrap()).unwrap();
+            crate::manifest::write_manifest(&crate::manifest::build_manifest(&id).unwrap())
+                .unwrap();
 
             let opts = DoctorOptions {
                 profile_id: id,
@@ -759,7 +797,8 @@ mod tests {
     fn doctor_missing_manifest_fails() {
         with_home(|_| {
             let id = fresh_profile_id();
-            crate::manifest::write_manifest(&crate::manifest::build_manifest(&id).unwrap()).unwrap();
+            crate::manifest::write_manifest(&crate::manifest::build_manifest(&id).unwrap())
+                .unwrap();
             // Remove the manifest file (simulates a tamper/loss).
             std::fs::remove_file(crate::manifest::manifest_path(&id)).unwrap();
             let r = check_manifest_all_profiles();

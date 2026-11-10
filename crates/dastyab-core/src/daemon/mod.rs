@@ -606,7 +606,9 @@ pub fn daemon_refresh_carriers(
     }
     if pcfg.config.worker_secrets != cfg.worker_secrets {
         if let Err(e) = crate::store::profiles::save_profile(&pcfg) {
-            log(&format!("carrier refresh: failed to persist desync learning: {e}"));
+            log(&format!(
+                "carrier refresh: failed to persist desync learning: {e}"
+            ));
         }
     }
     match result? {
@@ -1311,9 +1313,12 @@ async fn run_self_maintenance(
     // regardless of network (pure local disk work), rate-limited to once/day.
     if now - state.last_verify_ts >= 86400 {
         let profile_dir = crate::store::profiles::profile_dir(profile);
-        if let Ok(report) = crate::artifact_versions::verify_all_versions(&profile_dir, now as u64, 2000) {
+        if let Ok(report) =
+            crate::artifact_versions::verify_all_versions(&profile_dir, now as u64, 2000)
+        {
             state.last_verify_ts = now;
-            let _ = crate::artifact_versions::record_verify_outcome(&profile_dir, &report, now as u64);
+            let _ =
+                crate::artifact_versions::record_verify_outcome(&profile_dir, &report, now as u64);
             let _ = crate::journal::append(
                 profile,
                 crate::journal::JournalKind::VersionVerified,
@@ -1322,12 +1327,18 @@ async fn run_self_maintenance(
             if !report.corrupt.is_empty() {
                 log(&log_line(
                     "WARN",
-                    &format!("version-integrity sweep: {}", crate::artifact_versions::corrupt_versions_summary(&report)),
+                    &format!(
+                        "version-integrity sweep: {}",
+                        crate::artifact_versions::corrupt_versions_summary(&report)
+                    ),
                 ));
             } else {
                 log(&log_line(
                     "INFO",
-                    &format!("version-integrity sweep: {}", crate::artifact_versions::corrupt_versions_summary(&report)),
+                    &format!(
+                        "version-integrity sweep: {}",
+                        crate::artifact_versions::corrupt_versions_summary(&report)
+                    ),
                 ));
             }
         }
@@ -1343,19 +1354,18 @@ fn run_auto_heal(profile: &str, log: &mut dyn FnMut(&str)) {
         return; // no baseline → nothing to heal against
     }
     // Build candidate list from the backup dir.
-    let candidates: Vec<crate::auto_heal::BackupCandidate> =
-        crate::backup::list_backups()
-            .into_iter()
-            .map(|b| {
-                let path = std::path::PathBuf::from(&b.path);
-                let verifies = crate::doctor::backup_bundle_verifies(&path);
-                crate::auto_heal::BackupCandidate {
-                    created_unix: 0, // re-derived from mtime below
-                    verifies,
-                    path,
-                }
-            })
-            .collect();
+    let candidates: Vec<crate::auto_heal::BackupCandidate> = crate::backup::list_backups()
+        .into_iter()
+        .map(|b| {
+            let path = std::path::PathBuf::from(&b.path);
+            let verifies = crate::doctor::backup_bundle_verifies(&path);
+            crate::auto_heal::BackupCandidate {
+                created_unix: 0, // re-derived from mtime below
+                verifies,
+                path,
+            }
+        })
+        .collect();
     let candidates: Vec<crate::auto_heal::BackupCandidate> = candidates
         .into_iter()
         .map(|mut c| {
@@ -1383,12 +1393,19 @@ fn run_auto_heal(profile: &str, log: &mut dyn FnMut(&str)) {
         crate::auto_heal::HealAction::NoAction => {}
         crate::auto_heal::HealAction::AlertOnly { reason } => {
             log(&log_line("WARN", &format!("auto-heal: {reason}")));
-            let _ = crate::journal::append(profile, crate::journal::JournalKind::CycleFailed, &reason);
+            let _ =
+                crate::journal::append(profile, crate::journal::JournalKind::CycleFailed, &reason);
         }
-        crate::auto_heal::HealAction::HealFiles { backup_path, artifacts } => {
+        crate::auto_heal::HealAction::HealFiles {
+            backup_path,
+            artifacts,
+        } => {
             let dir = crate::store::profiles::profile_dir(profile);
             match crate::auto_heal::execute_heal(
-                &crate::auto_heal::HealAction::HealFiles { backup_path: backup_path.clone(), artifacts: artifacts.clone() },
+                &crate::auto_heal::HealAction::HealFiles {
+                    backup_path: backup_path.clone(),
+                    artifacts: artifacts.clone(),
+                },
                 &dir,
                 crate::store::now_ts() as u64,
             ) {
@@ -1422,9 +1439,7 @@ fn run_auto_heal(profile: &str, log: &mut dyn FnMut(&str)) {
                             "WARN",
                             &format!(
                                 "auto-heal incomplete: healed={:?} still_broken={:?} skipped={:?}",
-                                report.healed,
-                                report.still_broken,
-                                report.skipped_non_critical
+                                report.healed, report.still_broken, report.skipped_non_critical
                             ),
                         ));
                     }
@@ -1440,9 +1455,14 @@ fn run_auto_heal(profile: &str, log: &mut dyn FnMut(&str)) {
 /// Scheduled workspace-snapshot step (daemon self-maintenance). On the 6h
 /// cadence (keep 14), snapshots the whole workspace — every profile — into
 /// `~/.dastyab/snapshots/<unix>.dyb-snapshot.json`, then prunes retention.
-fn run_scheduled_snapshot(profile: &str, state: &mut DaemonState, now: i64, log: &mut dyn FnMut(&str)) {
-    use crate::workspace_snapshots::*;
+fn run_scheduled_snapshot(
+    profile: &str,
+    state: &mut DaemonState,
+    now: i64,
+    log: &mut dyn FnMut(&str),
+) {
     use crate::workspace_snapshot::SnapshotKind;
+    use crate::workspace_snapshots::*;
     if !is_snapshot_due(state.last_snapshot_ts, now) {
         return;
     }
@@ -1470,7 +1490,10 @@ fn run_scheduled_snapshot(profile: &str, state: &mut DaemonState, now: i64, log:
             state.last_snapshot_ts = now;
         }
         Err(e) => {
-            log(&log_line("WARN", &format!("workspace snapshot failed: {}", e.brief())));
+            log(&log_line(
+                "WARN",
+                &format!("workspace snapshot failed: {}", e.brief()),
+            ));
         }
     }
 }
@@ -2238,8 +2261,7 @@ mod tests {
         let dir = crate::store::profiles::profile_dir(&profile);
         // Seed one real version so the sweep has content to verify.
         std::fs::write(dir.join("config.json"), b"old").unwrap();
-        crate::artifact_versions::snapshot_before_write(&dir, "config.json", b"new", 1000)
-            .unwrap();
+        crate::artifact_versions::snapshot_before_write(&dir, "config.json", b"new", 1000).unwrap();
 
         let mut state = DaemonState::default();
         state.last_verify_ts = 0; // never verified → due
@@ -2263,7 +2285,9 @@ mod tests {
             state.last_verify_ts, second_ts,
             "sweep must be rate-limited to once per day"
         );
-        assert!(log_lines.iter().any(|l| l.contains("version-integrity sweep")));
+        assert!(log_lines
+            .iter()
+            .any(|l| l.contains("version-integrity sweep")));
     }
 
     #[test]

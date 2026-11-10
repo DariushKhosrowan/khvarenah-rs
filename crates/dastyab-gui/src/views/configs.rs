@@ -73,7 +73,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<Confi
             .corner_radius(8.0)
             .stroke(egui::Stroke::new(1.0, CARD_STROKE));
         empty_card.show(ui, |ui| {
-            ui.label(egui::RichText::new("No generated configs recorded yet.").color(TEXT).strong());
+            ui.label(
+                egui::RichText::new("No generated configs recorded yet.")
+                    .color(TEXT)
+                    .strong(),
+            );
             ui.label(
                 egui::RichText::new(
                     "Deploy a worker or run autopilot — every config it renders (share link, \
@@ -219,13 +223,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<Confi
                         });
                         ui.add_space(2.0);
                         ui.label(
-                            egui::RichText::new(format!(
-                                "sha256 {}",
-                                hex(&row.content_sha256)
-                            ))
-                            .color(GOLD_DIM)
-                            .small()
-                            .monospace(),
+                            egui::RichText::new(format!("sha256 {}", hex(&row.content_sha256)))
+                                .color(GOLD_DIM)
+                                .small()
+                                .monospace(),
                         );
                         ui.add_space(2.0);
                         egui::CollapsingHeader::new("show content")

@@ -189,13 +189,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
             ui.label(egui::RichText::new("No saved IP matches that search.").color(GOLD_DIM));
         } else {
             ui.label(
-                egui::RichText::new(format!(
-                    "{} of {} saved IP(s)",
-                    matched.len(),
-                    ips.len()
-                ))
-                .color(GOLD_DIM)
-                .small(),
+                egui::RichText::new(format!("{} of {} saved IP(s)", matched.len(), ips.len()))
+                    .color(GOLD_DIM)
+                    .small(),
             );
             ui.add_space(2.0);
             egui::ScrollArea::vertical()
@@ -321,11 +317,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
         section_card(ui, "Known-good seeds (imported)", |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(
-                        "Saved as scan seeds — promote to verified clean IPs.",
-                    )
-                    .color(GOLD_DIM)
-                    .small(),
+                    egui::RichText::new("Saved as scan seeds — promote to verified clean IPs.")
+                        .color(GOLD_DIM)
+                        .small(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -451,8 +445,10 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
             let target = dastyab_core::cleanip::user_config_dir(&app.state.active_profile_id)
                 .map(|d| d.join("cleanips.txt"))
                 .unwrap_or_else(|_| std::path::PathBuf::from("cleanips.txt"));
-            let content = app.state.clean_ips.join("
-") + "
+            let content = app.state.clean_ips.join(
+                "
+",
+            ) + "
 ";
             match std::fs::write(&target, content) {
                 Ok(_) => {

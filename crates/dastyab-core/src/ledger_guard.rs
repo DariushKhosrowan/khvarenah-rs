@@ -130,8 +130,8 @@ pub fn read_high_water(profile_dir: &Path, kind: LedgerKind) -> Option<LedgerHig
 
 /// Persist the high-water store for a profile.
 pub fn write_high_waters(profile_dir: &Path, hw: &LedgerHighWaters) -> Result<(), LedgerError> {
-    let bytes = serde_json::to_vec_pretty(hw)
-        .map_err(|e| LedgerError::Io(format!("serialize: {e}")))?;
+    let bytes =
+        serde_json::to_vec_pretty(hw).map_err(|e| LedgerError::Io(format!("serialize: {e}")))?;
     atomic_write(&high_water_path(profile_dir), &bytes).map_err(|e| LedgerError::Io(e.brief()))
 }
 
@@ -157,7 +157,11 @@ fn set_high_water(
 /// Pure append-only check: refuse when the new count drops below the old one.
 ///
 /// Equal is allowed (a no-op rewrite). Growth is always allowed.
-pub fn check_append_only(kind: LedgerKind, old_count: u64, new_count: u64) -> Result<(), LedgerError> {
+pub fn check_append_only(
+    kind: LedgerKind,
+    old_count: u64,
+    new_count: u64,
+) -> Result<(), LedgerError> {
     if new_count < old_count {
         Err(LedgerError::Shrink {
             kind,
@@ -206,7 +210,12 @@ pub(crate) fn read_ledger_count(path: &Path) -> u64 {
 /// Move a ledger's high-water mark down to `count` — used by intentional
 /// mutations that legitimately remove records (delete/clear single So the
 /// doctor does not flag a deliberate action as corruption.
-pub fn rebase_high_water(profile_dir: &Path, kind: LedgerKind, count: u64, now: u64) -> Result<(), LedgerError> {
+pub fn rebase_high_water(
+    profile_dir: &Path,
+    kind: LedgerKind,
+    count: u64,
+    now: u64,
+) -> Result<(), LedgerError> {
     set_high_water(profile_dir, kind, count, now)
 }
 
@@ -219,7 +228,9 @@ pub fn note_ledger_state(
     count: u64,
     now: u64,
 ) -> Result<(), LedgerError> {
-    let existing = read_high_water(profile_dir, kind).map(|h| h.count).unwrap_or(0);
+    let existing = read_high_water(profile_dir, kind)
+        .map(|h| h.count)
+        .unwrap_or(0);
     set_high_water(profile_dir, kind, existing.max(count), now)
 }
 
@@ -282,10 +293,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!(
-            "dyb_ledger_guard_{}_{n}",
-            crate::store::now_ts()
-        ));
+        let d =
+            std::env::temp_dir().join(format!("dyb_ledger_guard_{}_{n}", crate::store::now_ts()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -379,6 +388,8 @@ mod tests {
         rebase_high_water(&dir, LedgerKind::CleanIps, 0, 200).unwrap();
         std::fs::write(dir.join("cleanips.json"), "[]").unwrap();
         let results = doctor_check_ledger_integrity(&dir);
-        assert!(results.iter().all(|r| r.status == CheckStatus::Ok || r.status == CheckStatus::Warn));
+        assert!(results
+            .iter()
+            .all(|r| r.status == CheckStatus::Ok || r.status == CheckStatus::Warn));
     }
 }

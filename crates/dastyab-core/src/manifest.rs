@@ -258,7 +258,10 @@ pub fn build_manifest(profile_id: &str) -> Result<ProfileManifest, CFError> {
         profile_id: profile_id.to_string(),
         created_unix: crate::store::now_ts() as u64,
         entries,
-        excluded_patterns: RUNTIME_EXCLUDED_PATTERNS.iter().map(|s| s.to_string()).collect(),
+        excluded_patterns: RUNTIME_EXCLUDED_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     })
 }
 
@@ -302,7 +305,10 @@ pub fn refresh_manifest_after_write(
         profile_id,
         created_unix: now_unix,
         entries,
-        excluded_patterns: RUNTIME_EXCLUDED_PATTERNS.iter().map(|s| s.to_string()).collect(),
+        excluded_patterns: RUNTIME_EXCLUDED_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     };
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| {
         CFError::new(
@@ -422,7 +428,6 @@ mod tests {
         crate::store::profiles::create_profile("t", "test").unwrap()
     }
 
-
     /// Write a few real-looking artifacts so the manifest has something to
     /// record beyond profile.json (a fresh profile only ships profile.json).
     fn seed_artifacts(id: &str) {
@@ -451,8 +456,13 @@ mod tests {
             write_manifest(&build_manifest(&id).unwrap()).unwrap();
             let r = verify_profile(&id);
             assert!(r.has_manifest);
-            assert!(r.is_clean(), "missing={:?} changed={:?} extra={:?}",
-                r.missing, r.changed, r.extra);
+            assert!(
+                r.is_clean(),
+                "missing={:?} changed={:?} extra={:?}",
+                r.missing,
+                r.changed,
+                r.extra
+            );
             assert!(!r.verified.is_empty());
         });
     }
@@ -508,8 +518,7 @@ mod tests {
             let path = manifest_path(&id);
             let mut v: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            v["entries"]["config.json"]["sha256"] =
-                serde_json::Value::String("0".repeat(64));
+            v["entries"]["config.json"]["sha256"] = serde_json::Value::String("0".repeat(64));
             crate::store::write_json(&path, &v).unwrap();
             let r = verify_profile(&id);
             assert!(r.changed.iter().any(|x| x == "config.json"));

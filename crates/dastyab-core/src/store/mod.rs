@@ -104,10 +104,13 @@ std::thread_local! {
 /// Split a path into (profile_dir, relative_path) when it lives inside a
 /// profile directory (…/profiles/<id>/<file>). Returns `None` otherwise.
 fn profile_rel_from_path(path: &Path) -> Option<(PathBuf, String)> {
-    let comps: Vec<&std::ffi::OsStr> = path.components().filter_map(|c| match c {
-        std::path::Component::Normal(s) => Some(s),
-        _ => None,
-    }).collect();
+    let comps: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
     let idx = comps.iter().position(|c| *c == "profiles")?;
     let after = &comps[idx + 1..];
     if after.len() < 2 {

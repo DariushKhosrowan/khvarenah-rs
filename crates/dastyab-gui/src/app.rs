@@ -1365,8 +1365,7 @@ impl DastYabApp {
                             ) {
                                 Ok(id) => {
                                     self.state.reload_pending = true;
-                                    self.note =
-                                        format!("Cloned profile → '{id}'.");
+                                    self.note = format!("Cloned profile → '{id}'.");
                                 }
                                 Err(e) => self.note = e.brief(),
                             }
@@ -1374,9 +1373,7 @@ impl DastYabApp {
                     }
                     Some(PendingDialogAction::RestoreBackupIntoCurrent(path_str)) => {
                         if let DialogPayload::Confirm = payload {
-                            if self.profile_id == "default"
-                                && path_str.contains("-default-")
-                            {
+                            if self.profile_id == "default" && path_str.contains("-default-") {
                                 self.note =
                                     "Refusing to overwrite the default profile with a default-profile backup.".to_string();
                             } else {
@@ -1423,22 +1420,22 @@ impl DastYabApp {
                                     self.state.reload_pending = true;
                                     self.note = "Token history entry deleted.".to_string();
                                 }
-                                Ok(false) => self.note = "Token history entry not found.".to_string(),
+                                Ok(false) => {
+                                    self.note = "Token history entry not found.".to_string()
+                                }
                                 Err(e) => self.note = e.brief(),
                             }
                         }
                     }
                     Some(PendingDialogAction::ResetSettings) => {
                         if let DialogPayload::Confirm = payload {
-                            let mut p = dastyab_core::store::profiles::load_profile(
-                                &self.profile_id,
-                            );
+                            let mut p =
+                                dastyab_core::store::profiles::load_profile(&self.profile_id);
                             p.config = Default::default();
                             match dastyab_core::store::profiles::save_profile(&p) {
                                 Ok(_) => {
                                     self.state.reload_pending = true;
-                                    self.note =
-                                        "Profile settings reset to defaults.".to_string();
+                                    self.note = "Profile settings reset to defaults.".to_string();
                                 }
                                 Err(e) => self.note = e.brief(),
                             }
@@ -1461,15 +1458,11 @@ impl DastYabApp {
                                 dastyab_core::store::profiles::profile_dir(&self.profile_id);
                             let now = dastyab_core::store::now_ts() as u64;
                             match dastyab_core::artifact_versions::restore_version(
-                                &dir,
-                                &rel_path,
-                                unix,
-                                now,
+                                &dir, &rel_path, unix, now,
                             ) {
                                 Ok(_) => {
                                     self.state.reload_pending = true;
-                                    self.note =
-                                        format!("Restored {rel_path} from version {unix}.");
+                                    self.note = format!("Restored {rel_path} from version {unix}.");
                                 }
                                 Err(e) => self.note = e.to_string(),
                             }
@@ -1497,10 +1490,7 @@ impl DastYabApp {
                             let preview =
                                 dastyab_core::artifact_versions::pitr_preview_markdown(&plan);
                             match dastyab_core::artifact_versions::execute_pitr_plan(
-                                &dir,
-                                &plan,
-                                false,
-                                now,
+                                &dir, &plan, false, now,
                             ) {
                                 Ok(report) => {
                                     self.state.reload_pending = true;
@@ -1625,8 +1615,10 @@ impl DastYabApp {
     fn dashboard_panel(&mut self, ui: &mut egui::Ui, p: &dastyab_core::store::profiles::Profile) {
         ui.heading(egui::RichText::new("Dashboard").color(GOLD));
         ui.label(
-            egui::RichText::new("Everything that matters at a glance — protection, profile, and recent activity.")
-                .color(GOLD_DIM),
+            egui::RichText::new(
+                "Everything that matters at a glance — protection, profile, and recent activity.",
+            )
+            .color(GOLD_DIM),
         );
         ui.add_space(8.0);
 
@@ -1660,7 +1652,11 @@ impl DastYabApp {
 
             // Daemon health line.
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(self.daemon_status_line()).color(GOLD_DIM).small());
+            ui.label(
+                egui::RichText::new(self.daemon_status_line())
+                    .color(GOLD_DIM)
+                    .small(),
+            );
 
             // Running tasks.
             if !self.running.is_empty() {
@@ -1724,12 +1720,7 @@ impl DastYabApp {
                 }
                 if ui.button("➕ Add token").clicked() {
                     self.pending_action = Some(PendingDialogAction::AddToken);
-                    self.dialog = Some(dialogs::prompt_two(
-                        "Add token",
-                        "Label",
-                        "Token",
-                        true,
-                    ));
+                    self.dialog = Some(dialogs::prompt_two("Add token", "Label", "Token", true));
                 }
                 if ui.button("💾 Snapshot config").clicked() {
                     match dastyab_core::backup::export_profile_to_file(&self.profile_id, None) {
@@ -1745,9 +1736,11 @@ impl DastYabApp {
             });
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("Ctrl+1…9 / Ctrl+0 switch views; profile is shown in the sidebar.")
-                    .color(GOLD_DIM)
-                    .small(),
+                egui::RichText::new(
+                    "Ctrl+1…9 / Ctrl+0 switch views; profile is shown in the sidebar.",
+                )
+                .color(GOLD_DIM)
+                .small(),
             );
         });
 
@@ -1760,7 +1753,11 @@ impl DastYabApp {
                 } else {
                     ("workers.dev", GOLD)
                 };
-                let host = if r.name.is_empty() { &r.address } else { &r.name };
+                let host = if r.name.is_empty() {
+                    &r.address
+                } else {
+                    &r.name
+                };
                 items.push((r.epoch as i64, tag, color, host.clone()));
             }
             for e in dastyab_core::journal::recent(&self.profile_id, 8) {
@@ -1793,16 +1790,13 @@ impl DastYabApp {
                         crate::views::tag(ui, tag, color);
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new(title).color(TEXT));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    egui::RichText::new(crate::state::relative_ts(epoch))
-                                        .color(GOLD_DIM)
-                                        .small(),
-                                );
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(crate::state::relative_ts(epoch))
+                                    .color(GOLD_DIM)
+                                    .small(),
+                            );
+                        });
                     });
                     ui.add_space(2.0);
                 }
@@ -1839,8 +1833,10 @@ impl DastYabApp {
                         Ok(d) => d.join("activity.log"),
                         Err(_) => std::path::PathBuf::from("activity.log"),
                     };
-                    let content = self.log_lines.join("
-") + "
+                    let content = self.log_lines.join(
+                        "
+",
+                    ) + "
 ";
                     match std::fs::write(&target, content) {
                         Ok(_) => {
@@ -1850,8 +1846,10 @@ impl DastYabApp {
                     }
                 }
                 if ui.button("📋 Copy").clicked() {
-                    let joined = self.log_lines.join("
-");
+                    let joined = self.log_lines.join(
+                        "
+",
+                    );
                     if !joined.is_empty() {
                         ui.ctx().copy_text(joined);
                         self.note = "Copied log to clipboard.".to_string();
@@ -1869,8 +1867,10 @@ impl DastYabApp {
             return;
         }
 
-        let mut joined = self.log_lines.join("
-");
+        let mut joined = self.log_lines.join(
+            "
+",
+        );
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(self.log_auto_scroll)
@@ -2720,12 +2720,9 @@ impl DastYabApp {
                     ));
                 }
                 ui.label(
-                    egui::RichText::new(format!(
-                        "{} saved config(s)",
-                        self.state.backups.len()
-                    ))
-                    .color(GOLD_DIM)
-                    .small(),
+                    egui::RichText::new(format!("{} saved config(s)", self.state.backups.len()))
+                        .color(GOLD_DIM)
+                        .small(),
                 );
             });
 
@@ -2757,13 +2754,11 @@ impl DastYabApp {
 
             if backups.is_empty() {
                 ui.label(
-                    egui::RichText::new(
-                        if query.is_empty() {
-                            "No saved configs yet — take a snapshot above."
-                        } else {
-                            "No saved config matches that search."
-                        },
-                    )
+                    egui::RichText::new(if query.is_empty() {
+                        "No saved configs yet — take a snapshot above."
+                    } else {
+                        "No saved config matches that search."
+                    })
                     .color(GOLD_DIM),
                 );
             } else {
@@ -3362,9 +3357,7 @@ impl DastYabApp {
                             dastyab_core::journal::JournalKind::DrillPerformed => {
                                 "🩺 blackout-self-test"
                             }
-                            dastyab_core::journal::JournalKind::AutoHealed => {
-                                "🛠 auto-healed"
-                            }
+                            dastyab_core::journal::JournalKind::AutoHealed => "🛠 auto-healed",
                             dastyab_core::journal::JournalKind::SnapshotWritten => {
                                 "📸 workspace-snapshot"
                             }

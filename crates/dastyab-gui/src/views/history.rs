@@ -420,7 +420,9 @@ pub fn show(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("🕑 Restore to a moment…")
-                    .on_hover_text("Point-in-time restore: enter a unix moment, preview, then confirm")
+                    .on_hover_text(
+                        "Point-in-time restore: enter a unix moment, preview, then confirm",
+                    )
                     .clicked()
                 {
                     app.pending_action = Some(crate::app::PendingDialogAction::PitrRestore);
@@ -434,8 +436,10 @@ pub fn show(
         ui.add_space(4.0);
         if summaries.is_empty() {
             ui.label(
-                egui::RichText::new("No saved versions yet — rewrite a file to snapshot a version.")
-                    .color(GOLD_DIM),
+                egui::RichText::new(
+                    "No saved versions yet — rewrite a file to snapshot a version.",
+                )
+                .color(GOLD_DIM),
             );
             return;
         }

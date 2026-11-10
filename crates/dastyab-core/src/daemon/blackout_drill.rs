@@ -251,8 +251,7 @@ mod tests {
         // escalation escalation_plan and backoff_secs cooperate.
         let dir = tempfile::tempdir().unwrap();
         let mut pool =
-            crate::carrier_pool::CarrierPool::open(dir.path().join("drill_pool.json"))
-                .unwrap();
+            crate::carrier_pool::CarrierPool::open(dir.path().join("drill_pool.json")).unwrap();
         let mut snap = crate::carrier_pool::CarrierSnapshot::new_empty(1000);
         snap.endpoints.push(crate::carrier_pool::CarrierEndpoint {
             kind: crate::carrier_pool::CarrierKind::WorkerData,
@@ -298,8 +297,7 @@ mod tests {
     async fn drill_escalated_select_fills_from_cooling_when_all_cooled() {
         let dir = tempfile::tempdir().unwrap();
         let pool =
-            crate::carrier_pool::CarrierPool::open(dir.path().join("drill_pool2.json"))
-                .unwrap();
+            crate::carrier_pool::CarrierPool::open(dir.path().join("drill_pool2.json")).unwrap();
         let mut snap = crate::carrier_pool::CarrierSnapshot::new_empty(1000);
         for (i, h) in ["a", "b"].iter().enumerate() {
             snap.endpoints.push(crate::carrier_pool::CarrierEndpoint {

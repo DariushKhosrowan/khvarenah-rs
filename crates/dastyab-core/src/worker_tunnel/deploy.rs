@@ -407,9 +407,7 @@ mod tests {
         let cf = Client::with_base("tok", &base);
         let mut o = opts();
         o.vless_upstream = Some("203.0.113.10:443".into());
-        let _ = deploy_worker_tunnel(&cf, "acc1", &pid, &o)
-            .await
-            .unwrap();
+        let _ = deploy_worker_tunnel(&cf, "acc1", &pid, &o).await.unwrap();
         let cfg = crate::vps_deploy::load_tunnel_client_config(&pid).unwrap();
         assert_eq!(
             cfg.worker_vless_upstream.as_deref(),

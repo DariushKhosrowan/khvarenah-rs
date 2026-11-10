@@ -198,9 +198,11 @@ pub fn required_fields_ok(kind: &ArtifactKind, bytes: &[u8]) -> bool {
                     .unwrap_or(false)
             })
         }
-        ArtifactKind::ProfileMeta => {
-            v.get("id").and_then(|i| i.as_str()).map(|s| !s.is_empty()).unwrap_or(false)
-        }
+        ArtifactKind::ProfileMeta => v
+            .get("id")
+            .and_then(|i| i.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
         ArtifactKind::Accounts => {
             // accounts.json is a map of name -> account; empty is fine.
             v.is_object()
@@ -236,11 +238,15 @@ pub fn execute_heal(
             report.backup_used = Some(backup_path.clone());
             for rel in artifacts {
                 let Some(content) = artifact_from_backup(backup_path, rel) else {
-                    report.skipped_non_critical.push(format!("{rel} (missing from backup)"));
+                    report
+                        .skipped_non_critical
+                        .push(format!("{rel} (missing from backup)"));
                     continue;
                 };
                 if !source_verifies(backup_path, rel, &content) {
-                    report.skipped_non_critical.push(format!("{rel} (backup copy failed verification)"));
+                    report
+                        .skipped_non_critical
+                        .push(format!("{rel} (backup copy failed verification)"));
                     continue;
                 }
                 let dest = profile_dir.join(rel);
@@ -250,7 +256,9 @@ pub fn execute_heal(
                 // for content that is logically corrupt (e.g. an empty token).
                 let kind = kind_for_rel(rel).unwrap_or(ArtifactKind::Config);
                 if !required_fields_ok(&kind, content.as_bytes()) {
-                    report.rejected.push(format!("{rel} (missing required fields)"));
+                    report
+                        .rejected
+                        .push(format!("{rel} (missing required fields)"));
                     continue;
                 }
                 report.healed.push(rel.clone());
@@ -264,7 +272,9 @@ pub fn execute_heal(
 /// and nothing was rejected for missing required fields. The daemon refuses to
 /// claim success otherwise.
 pub fn heal_is_safe(report: &HealReport) -> bool {
-    report.still_broken.is_empty() && report.skipped_non_critical.is_empty() && report.rejected.is_empty()
+    report.still_broken.is_empty()
+        && report.skipped_non_critical.is_empty()
+        && report.rejected.is_empty()
 }
 
 // ----------------------------------------------------------------------------
@@ -337,7 +347,11 @@ mod tests {
             let id = fresh_profile_id();
             seed_artifacts(&id);
             // Break a critical artifact.
-            std::fs::write(crate::store::profiles::profile_dir(&id).join("token.json"), b"{\"t\":\"tampered\"}").unwrap();
+            std::fs::write(
+                crate::store::profiles::profile_dir(&id).join("token.json"),
+                b"{\"t\":\"tampered\"}",
+            )
+            .unwrap();
             let verify = crate::manifest::verify_profile(&id);
             let mut old = make_verifying_backup(&id, "old");
             old.created_unix = 1000;
@@ -359,7 +373,11 @@ mod tests {
         with_home(|_| {
             let id = fresh_profile_id();
             seed_artifacts(&id);
-            std::fs::write(crate::store::profiles::profile_dir(&id).join("token.json"), b"{\"t\":\"tampered\"}").unwrap();
+            std::fs::write(
+                crate::store::profiles::profile_dir(&id).join("token.json"),
+                b"{\"t\":\"tampered\"}",
+            )
+            .unwrap();
             let verify = crate::manifest::verify_profile(&id);
             let candidates = vec![BackupCandidate {
                 path: PathBuf::from("/nonexistent/backup.json"),
@@ -431,8 +449,17 @@ mod tests {
     #[test]
     fn required_fields_ok_profilemeta_requires_id() {
         use crate::manifest::ArtifactKind;
-        assert!(required_fields_ok(&ArtifactKind::ProfileMeta, br#"{"id":"p1"}"#));
-        assert!(!required_fields_ok(&ArtifactKind::ProfileMeta, br#"{"name":"x"}"#));
-        assert!(!required_fields_ok(&ArtifactKind::ProfileMeta, br#"{"id":""}"#));
+        assert!(required_fields_ok(
+            &ArtifactKind::ProfileMeta,
+            br#"{"id":"p1"}"#
+        ));
+        assert!(!required_fields_ok(
+            &ArtifactKind::ProfileMeta,
+            br#"{"name":"x"}"#
+        ));
+        assert!(!required_fields_ok(
+            &ArtifactKind::ProfileMeta,
+            br#"{"id":""}"#
+        ));
     }
 }

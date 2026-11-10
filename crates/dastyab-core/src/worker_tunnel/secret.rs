@@ -224,7 +224,10 @@ pub fn record_worker_desync_success(
     worker_url: &str,
     strategy: crate::desync::DesyncStrategy,
 ) {
-    let entry = cfg.worker_secrets.entry(worker_url.to_string()).or_default();
+    let entry = cfg
+        .worker_secrets
+        .entry(worker_url.to_string())
+        .or_default();
     entry.worker_url = worker_url.to_string();
     entry.desync_strategy = Some(strategy);
     entry.failed_strategies.clear();
@@ -237,7 +240,10 @@ pub fn record_worker_desync_failure(
     worker_url: &str,
     strategy: crate::desync::DesyncStrategy,
 ) {
-    let entry = cfg.worker_secrets.entry(worker_url.to_string()).or_default();
+    let entry = cfg
+        .worker_secrets
+        .entry(worker_url.to_string())
+        .or_default();
     entry.worker_url = worker_url.to_string();
     if !entry.failed_strategies.contains(&strategy) {
         entry.failed_strategies.push(strategy);
@@ -452,7 +458,11 @@ mod tests {
         assert_eq!(ws.failed_strategies.len(), 2);
         assert!(ws.desync_strategy.is_none());
 
-        record_worker_desync_success(&mut c, "http://w", crate::desync::DesyncStrategy::SplitAndDecoy);
+        record_worker_desync_success(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitAndDecoy,
+        );
         let ws = &c.worker_secrets["http://w"];
         assert_eq!(
             ws.desync_strategy,

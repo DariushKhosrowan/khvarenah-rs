@@ -332,23 +332,38 @@ mod tests {
             seed_artifacts(&id);
             let mut snap = snapshot_workspace(Path::new("/"), SnapshotKind::Full, 1000).unwrap();
             // Corrupt one payload.
-            let prof = snap.profiles.iter_mut().find(|x| x.profile_id == id).unwrap();
-            let art = prof.artifacts.iter_mut().find(|a| a.rel_path == "config.json").unwrap();
+            let prof = snap
+                .profiles
+                .iter_mut()
+                .find(|x| x.profile_id == id)
+                .unwrap();
+            let art = prof
+                .artifacts
+                .iter_mut()
+                .find(|a| a.rel_path == "config.json")
+                .unwrap();
             art.content = "{ \"tampered\": true }".to_string();
 
             let dir = tempfile::tempdir().unwrap();
             set_mem_dir_override(dir.path().join(".dastyab"));
             let new_id = crate::store::profiles::create_profile("t", "test").unwrap();
             let _ = new_id;
-            let report = restore_workspace(&snap, Path::new("/"), &RestoreOptions::default()).unwrap();
+            let report =
+                restore_workspace(&snap, Path::new("/"), &RestoreOptions::default()).unwrap();
             assert!(!report.verified);
             assert!(report.mismatches.iter().any(|m| m.contains("config.json")));
             // The tampered config.json must not have been written.
-            let cfg_path = dir.path().join(".dastyab/profiles").join(&id).join("config.json");
-            assert!(!cfg_path.exists() || {
-                let text = std::fs::read_to_string(&cfg_path).unwrap();
-                !text.contains("tampered")
-            });
+            let cfg_path = dir
+                .path()
+                .join(".dastyab/profiles")
+                .join(&id)
+                .join("config.json");
+            assert!(
+                !cfg_path.exists() || {
+                    let text = std::fs::read_to_string(&cfg_path).unwrap();
+                    !text.contains("tampered")
+                }
+            );
         });
     }
 

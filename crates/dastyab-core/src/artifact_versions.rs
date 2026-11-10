@@ -71,7 +71,10 @@ impl std::fmt::Display for VersionError {
                 write!(f, "no saved version {unix} for {rel_path}")
             }
             VersionError::HashMismatch { expected, actual } => {
-                write!(f, "version hash mismatch (expected {expected}, got {actual})")
+                write!(
+                    f,
+                    "version hash mismatch (expected {expected}, got {actual})"
+                )
             }
             VersionError::AppendOnly(msg) => write!(f, "{msg}"),
         }
@@ -102,7 +105,11 @@ fn read_index(profile_dir: &Path, rel_path: &str) -> Vec<ArtifactVersion> {
 }
 
 /// Persist the version index.
-fn write_index(profile_dir: &Path, rel_path: &str, versions: &[ArtifactVersion]) -> Result<(), VersionError> {
+fn write_index(
+    profile_dir: &Path,
+    rel_path: &str,
+    versions: &[ArtifactVersion],
+) -> Result<(), VersionError> {
     let list: Vec<ArtifactVersion> = versions.to_vec();
     crate::store::write_json(&index_path(profile_dir, rel_path), &list)
         .map_err(|e| VersionError::Io(e.brief()))
@@ -127,7 +134,8 @@ fn record_version(
     now_ms: u64,
 ) -> Result<ArtifactVersion, VersionError> {
     let vdir = versions_dir(profile_dir, rel_path);
-    std::fs::create_dir_all(&vdir).map_err(|e| VersionError::Io(format!("create {vdir:?}: {e}")))?;
+    std::fs::create_dir_all(&vdir)
+        .map_err(|e| VersionError::Io(format!("create {vdir:?}: {e}")))?;
 
     let sha256 = hex_bytes(&sha2::Sha256::digest(bytes));
     let version = ArtifactVersion {
@@ -192,7 +200,10 @@ pub fn snapshot_before_write(
 }
 
 /// List all saved versions for an artifact, newest first.
-pub fn list_versions(profile_dir: &Path, rel_path: &str) -> Result<Vec<ArtifactVersion>, VersionError> {
+pub fn list_versions(
+    profile_dir: &Path,
+    rel_path: &str,
+) -> Result<Vec<ArtifactVersion>, VersionError> {
     let mut all = read_index(profile_dir, rel_path);
     all.sort_by_key(|a| std::cmp::Reverse(a.saved_unix));
     Ok(all)
@@ -237,12 +248,20 @@ pub fn read_version_bytes(
 
 /// Resolve the ledger kind for a profile artifact filename, if it is a ledger.
 fn ledger_kind_for_filename(name: &str) -> Option<LedgerKind> {
-    LedgerKind::all().iter().find(|k| k.filename() == name).copied()
+    LedgerKind::all()
+        .iter()
+        .find(|k| k.filename() == name)
+        .copied()
 }
 
 /// Write restored bytes to the live artifact, respecting the append-only guard
 /// for ledger paths.
-fn write_restored(profile_dir: &Path, rel_path: &str, bytes: &[u8], now_secs: u64) -> Result<(), VersionError> {
+fn write_restored(
+    profile_dir: &Path,
+    rel_path: &str,
+    bytes: &[u8],
+    now_secs: u64,
+) -> Result<(), VersionError> {
     if let Some(kind) = ledger_kind_for_filename(rel_path) {
         let live_path = profile_dir.join(rel_path);
         let old_count = read_ledger_count(&live_path);
@@ -398,7 +417,10 @@ pub struct VersioningHealth {
 }
 
 /// Walk a profile's `.versions/` tree and assemble a health snapshot.
-pub fn measure_versioning_health(profile_dir: &Path, _now: u64) -> Result<VersioningHealth, VersionError> {
+pub fn measure_versioning_health(
+    profile_dir: &Path,
+    _now: u64,
+) -> Result<VersioningHealth, VersionError> {
     let mut h = VersioningHealth {
         ..Default::default()
     };
@@ -498,9 +520,13 @@ fn _now_secs() -> u64 {
 /// Aggregate Doctor row across profiles.
 pub fn doctor_versions_summary(healths: &[(String, VersioningHealth)]) -> CheckResult {
     let name = "versions (all profiles)".to_string();
-    let any_fail = healths.iter().any(|(_, h)| !h.oversized_dirs.is_empty() || h.consecutive_failures > 0);
+    let any_fail = healths
+        .iter()
+        .any(|(_, h)| !h.oversized_dirs.is_empty() || h.consecutive_failures > 0);
     let any_warn = healths.iter().any(|(_, h)| {
-        h.last_prune_unix.map(|last| _now_secs().saturating_sub(last) > STALE_PRUNE_SECS).unwrap_or(false)
+        h.last_prune_unix
+            .map(|last| _now_secs().saturating_sub(last) > STALE_PRUNE_SECS)
+            .unwrap_or(false)
     });
     let total_files: u64 = healths.iter().map(|(_, h)| h.file_count).sum();
     let total_bytes: u64 = healths.iter().map(|(_, h)| h.total_bytes).sum();
@@ -591,7 +617,11 @@ pub fn verify_all_versions(
     dirs.sort();
     for vdir in dirs {
         // Artifact name = "<artifact>.versions"
-        let Some(artifact) = vdir.file_name().and_then(|s| s.to_str()).map(|s| s.trim_end_matches(".versions").to_string()) else {
+        let Some(artifact) = vdir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.trim_end_matches(".versions").to_string())
+        else {
             continue;
         };
         if start.elapsed().as_millis() as u64 >= budget_ms {
@@ -600,7 +630,8 @@ pub fn verify_all_versions(
         }
         // Parse index; a parse failure is itself a corruption signal (the whole
         // artifact's version bookkeeping is unreadable).
-        let Some(index) = crate::store::read_opt::<Vec<ArtifactVersion>>(&vdir.join("index.json")) else {
+        let Some(index) = crate::store::read_opt::<Vec<ArtifactVersion>>(&vdir.join("index.json"))
+        else {
             report.corrupt.push(CorruptVersion {
                 rel_path: artifact.clone(),
                 version_unix: 0,
@@ -613,7 +644,9 @@ pub fn verify_all_versions(
             report.scanned += 1;
             let payload_path = version_file(&vdir, v.saved_unix);
             let Ok(bytes) = std::fs::read(&payload_path) else {
-                report.missing.push(format!("{}/{}", artifact, v.saved_unix));
+                report
+                    .missing
+                    .push(format!("{}/{}", artifact, v.saved_unix));
                 report.corrupt.push(CorruptVersion {
                     rel_path: artifact.clone(),
                     version_unix: v.saved_unix,
@@ -638,7 +671,8 @@ pub fn verify_all_versions(
                 });
                 continue;
             };
-            let Ok(data) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) else {
+            let Ok(data) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            else {
                 report.corrupt.push(CorruptVersion {
                     rel_path: artifact.clone(),
                     version_unix: v.saved_unix,
@@ -741,7 +775,8 @@ pub fn doctor_check_version_integrity(
         return CheckResult {
             name,
             status: CheckStatus::Warn,
-            detail: "version integrity never verified — run `dastyab versions verify`".to_string(),
+            detail: "version integrity never verified — run `dastyab versions verify`"
+                .to_string(),
         };
     };
     if state.last_corrupt_count > 0 {
@@ -785,9 +820,7 @@ pub fn doctor_check_version_integrity(
     CheckResult {
         name,
         status: CheckStatus::Ok,
-        detail: format!(
-            "content verified {age}s ago · 0 corrupt · 0 missing · 0 orphan"
-        ),
+        detail: format!("content verified {age}s ago · 0 corrupt · 0 missing · 0 orphan"),
     }
 }
 
@@ -1005,7 +1038,9 @@ pub fn execute_pitr_plan(
                 match restore_version(profile_dir, &e.rel_path, unix, now) {
                     Ok(()) => report.restored += 1,
                     Err(VersionError::HashMismatch { .. } | VersionError::NotFound { .. }) => {
-                        report.mismatches.push(format!("{}/{} ({})", e.rel_path, unix, e.note));
+                        report
+                            .mismatches
+                            .push(format!("{}/{} ({})", e.rel_path, unix, e.note));
                     }
                     Err(other) => return Err(PitrError::Version(other)),
                 }
@@ -1022,7 +1057,10 @@ pub fn execute_pitr_plan(
 
 /// Deterministic markdown preview of a plan (CLI dry-run / GUI preview).
 pub fn pitr_preview_markdown(plan: &PitrPlan) -> String {
-    let mut s = format!("# Point-in-time restore preview (target {})\n\n", plan.target_unix);
+    let mut s = format!(
+        "# Point-in-time restore preview (target {})\n\n",
+        plan.target_unix
+    );
     for e in &plan.entries {
         let marker = match &e.kind {
             PitrEntryKind::Restore => "[Restore]",
@@ -1053,111 +1091,136 @@ mod tests {
     #[test]
     fn snapshot_before_write_creates_first_version_from_existing_file() {
         with_tmp(|dir| {
-        std::fs::write(dir.join("config.json"), br#"{"x":1}"#).unwrap();
-        let v = snapshot_before_write(&dir, "config.json", br#"{"x":2}"#, 1000)
-            .unwrap()
-            .expect("a prior file exists, so a version should be created");
-        assert_eq!(v.rel_path, "config.json");
-        assert_eq!(v.saved_unix, 1000);
-        assert_eq!(v.size, 7); // b'{"x":1}' is 7 bytes
-        // The stored bytes are the OLD content.
-        assert_eq!(read_version_bytes(&dir, "config.json", 1000).unwrap(), br#"{"x":1}"#);
+            std::fs::write(dir.join("config.json"), br#"{"x":1}"#).unwrap();
+            let v = snapshot_before_write(&dir, "config.json", br#"{"x":2}"#, 1000)
+                .unwrap()
+                .expect("a prior file exists, so a version should be created");
+            assert_eq!(v.rel_path, "config.json");
+            assert_eq!(v.saved_unix, 1000);
+            assert_eq!(v.size, 7); // b'{"x":1}' is 7 bytes
+                                   // The stored bytes are the OLD content.
+            assert_eq!(
+                read_version_bytes(&dir, "config.json", 1000).unwrap(),
+                br#"{"x":1}"#
+            );
         });
     }
 
     #[test]
     fn snapshot_before_write_noops_when_file_absent() {
         with_tmp(|dir| {
-        assert!(snapshot_before_write(&dir, "history.json", b"[1]", 1000)
-            .unwrap()
-            .is_none());
+            assert!(snapshot_before_write(&dir, "history.json", b"[1]", 1000)
+                .unwrap()
+                .is_none());
         });
     }
 
     #[test]
     fn snapshot_before_write_skips_when_bytes_identical() {
         with_tmp(|dir| {
-        std::fs::write(dir.join("config.json"), br#"{"x":1}"#).unwrap();
-        assert!(snapshot_before_write(&dir, "config.json", br#"{"x":1}"#, 1000)
-            .unwrap()
-            .is_none());
+            std::fs::write(dir.join("config.json"), br#"{"x":1}"#).unwrap();
+            assert!(
+                snapshot_before_write(&dir, "config.json", br#"{"x":1}"#, 1000)
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
     #[test]
     fn list_versions_sorted_newest_first() {
         with_tmp(|dir| {
-        std::fs::write(dir.join("config.json"), b"a").unwrap();
-        snapshot_before_write(&dir, "config.json", b"b", 1000).unwrap();
-        snapshot_before_write(&dir, "config.json", b"c", 2000).unwrap();
-        snapshot_before_write(&dir, "config.json", b"d", 3000).unwrap();
-        let all = list_versions(&dir, "config.json").unwrap();
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].saved_unix, 3000);
-        assert_eq!(all[1].saved_unix, 2000);
-        assert_eq!(all[2].saved_unix, 1000);
+            std::fs::write(dir.join("config.json"), b"a").unwrap();
+            snapshot_before_write(&dir, "config.json", b"b", 1000).unwrap();
+            snapshot_before_write(&dir, "config.json", b"c", 2000).unwrap();
+            snapshot_before_write(&dir, "config.json", b"d", 3000).unwrap();
+            let all = list_versions(&dir, "config.json").unwrap();
+            assert_eq!(all.len(), 3);
+            assert_eq!(all[0].saved_unix, 3000);
+            assert_eq!(all[1].saved_unix, 2000);
+            assert_eq!(all[2].saved_unix, 1000);
         });
     }
 
     #[test]
     fn read_version_bytes_rejects_sha256_mismatch() {
         with_tmp(|dir| {
-        std::fs::write(dir.join("config.json"), b"x").unwrap();
-        snapshot_before_write(&dir, "config.json", b"y", 1000).unwrap();
-        // Tamper with the stored snapshot payload. The stored version holds
-        // b'x' (the OLD content before the "y" write), so encode a different
-        // byte (b'z' -> "eg==") to force a hash mismatch.
-        let vdir = versions_dir(&dir, "config.json");
-        std::fs::write(version_file(&vdir, 1000), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
-        let err = read_version_bytes(&dir, "config.json", 1000).unwrap_err();
-        assert!(matches!(err, VersionError::HashMismatch { .. }));
+            std::fs::write(dir.join("config.json"), b"x").unwrap();
+            snapshot_before_write(&dir, "config.json", b"y", 1000).unwrap();
+            // Tamper with the stored snapshot payload. The stored version holds
+            // b'x' (the OLD content before the "y" write), so encode a different
+            // byte (b'z' -> "eg==") to force a hash mismatch.
+            let vdir = versions_dir(&dir, "config.json");
+            std::fs::write(
+                version_file(&vdir, 1000),
+                r#"{"sha256":"00","bytes_b64":"eg=="}"#,
+            )
+            .unwrap();
+            let err = read_version_bytes(&dir, "config.json", 1000).unwrap_err();
+            assert!(matches!(err, VersionError::HashMismatch { .. }));
         });
     }
 
     #[test]
     fn restore_version_snapshots_current_before_overwrite() {
         with_tmp(|dir| {
-        std::fs::write(dir.join("config.json"), br#"{"x":1}"#).unwrap();
-        snapshot_before_write(&dir, "config.json", br#"{"x":2}"#, 1000).unwrap();
-        std::fs::write(dir.join("config.json"), br#"{"x":9}"#).unwrap();
-        // Restore to unix=1000 (the version holding {"x":1}).
-        restore_version(&dir, "config.json", 1000, 5000).unwrap();
-        assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), br#"{"x":1}"#);
-        // The pre-restore state ({"x":9}) was itself snapshotted.
-        assert!(list_versions(&dir, "config.json").unwrap().iter().any(|v| v.saved_unix == 5_000_000));
+            std::fs::write(dir.join("config.json"), br#"{"x":1}"#).unwrap();
+            snapshot_before_write(&dir, "config.json", br#"{"x":2}"#, 1000).unwrap();
+            std::fs::write(dir.join("config.json"), br#"{"x":9}"#).unwrap();
+            // Restore to unix=1000 (the version holding {"x":1}).
+            restore_version(&dir, "config.json", 1000, 5000).unwrap();
+            assert_eq!(
+                std::fs::read(dir.join("config.json")).unwrap(),
+                br#"{"x":1}"#
+            );
+            // The pre-restore state ({"x":9}) was itself snapshotted.
+            assert!(list_versions(&dir, "config.json")
+                .unwrap()
+                .iter()
+                .any(|v| v.saved_unix == 5_000_000));
         });
     }
 
     #[test]
     fn restore_version_respects_ledger_append_only_guard() {
         with_tmp(|dir| {
-        // Seed a history ledger with 3 records via the guarded writer.
-        crate::ledger_guard::write_ledger_guarded::<u64>(&dir, LedgerKind::History, &[1, 2, 3], 100).unwrap();
-        // Snapshot the 3-record state.
-        snapshot_before_write(&dir, "history.json", b"[1,2,3,4]", 1000).unwrap();
-        // Grow to 4, then attempt to restore the 3-record version — refused.
-        std::fs::write(dir.join("history.json"), b"[1,2,3,4]").unwrap();
-        let err = restore_version(&dir, "history.json", 1000, 2000).unwrap_err();
-        assert!(matches!(err, VersionError::AppendOnly(_)));
-        // Live file untouched.
-        assert_eq!(std::fs::read(dir.join("history.json")).unwrap(), b"[1,2,3,4]");
+            // Seed a history ledger with 3 records via the guarded writer.
+            crate::ledger_guard::write_ledger_guarded::<u64>(
+                &dir,
+                LedgerKind::History,
+                &[1, 2, 3],
+                100,
+            )
+            .unwrap();
+            // Snapshot the 3-record state.
+            snapshot_before_write(&dir, "history.json", b"[1,2,3,4]", 1000).unwrap();
+            // Grow to 4, then attempt to restore the 3-record version — refused.
+            std::fs::write(dir.join("history.json"), b"[1,2,3,4]").unwrap();
+            let err = restore_version(&dir, "history.json", 1000, 2000).unwrap_err();
+            assert!(matches!(err, VersionError::AppendOnly(_)));
+            // Live file untouched.
+            assert_eq!(
+                std::fs::read(dir.join("history.json")).unwrap(),
+                b"[1,2,3,4]"
+            );
         });
     }
 
     #[test]
     fn prune_versions_keeps_newest_n_deterministic() {
         with_tmp(|dir| {
-        std::fs::write(dir.join("config.json"), b"a").unwrap();
-        for i in 1..=5u64 {
-            snapshot_before_write(&dir, "config.json", format!("v{i}").as_bytes(), i * 1000).unwrap();
-        }
-        let report = prune_versions(&dir, "config.json", 3).unwrap();
-        assert_eq!(report.kept, 3);
-        assert_eq!(report.removed, 2);
-        let all = list_versions(&dir, "config.json").unwrap();
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].saved_unix, 5000);
-        assert_eq!(all[2].saved_unix, 3000);
+            std::fs::write(dir.join("config.json"), b"a").unwrap();
+            for i in 1..=5u64 {
+                snapshot_before_write(&dir, "config.json", format!("v{i}").as_bytes(), i * 1000)
+                    .unwrap();
+            }
+            let report = prune_versions(&dir, "config.json", 3).unwrap();
+            assert_eq!(report.kept, 3);
+            assert_eq!(report.removed, 2);
+            let all = list_versions(&dir, "config.json").unwrap();
+            assert_eq!(all.len(), 3);
+            assert_eq!(all[0].saved_unix, 5000);
+            assert_eq!(all[2].saved_unix, 3000);
         });
     }
 
@@ -1228,8 +1291,13 @@ mod tests {
             std::fs::write(dir.join("config.json"), b"base").unwrap();
             let cap = VERSIONS_KEEP + 10;
             for i in 1..=cap {
-                snapshot_before_write(&dir, "config.json", format!("v{i}").as_bytes(), i as u64 * 1000)
-                    .unwrap();
+                snapshot_before_write(
+                    &dir,
+                    "config.json",
+                    format!("v{i}").as_bytes(),
+                    i as u64 * 1000,
+                )
+                .unwrap();
             }
             let all = list_versions(&dir, "config.json").unwrap();
             assert_eq!(all.len(), VERSIONS_KEEP);
@@ -1325,7 +1393,11 @@ mod tests {
             seed_version(&dir, "config.json", b"v2", 1000);
             let vdir = versions_dir(&dir, "config.json");
             // Valid JSON payload whose bytes do NOT hash to the recorded sha256.
-            std::fs::write(version_file(&vdir, 1000), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            std::fs::write(
+                version_file(&vdir, 1000),
+                r#"{"sha256":"00","bytes_b64":"eg=="}"#,
+            )
+            .unwrap();
             let r = verify_all_versions(&dir, 5000, 2000).unwrap();
             assert_eq!(r.corrupt.len(), 1);
             assert_eq!(r.corrupt[0].reason, CorruptReason::ShaMismatch);
@@ -1340,7 +1412,10 @@ mod tests {
             std::fs::remove_file(version_file(&vdir, 1000)).unwrap();
             let r = verify_all_versions(&dir, 5000, 2000).unwrap();
             assert_eq!(r.missing.len(), 1);
-            assert!(r.corrupt.iter().any(|c| c.reason == CorruptReason::PayloadMissing));
+            assert!(r
+                .corrupt
+                .iter()
+                .any(|c| c.reason == CorruptReason::PayloadMissing));
         });
     }
 
@@ -1352,9 +1427,16 @@ mod tests {
         with_tmp(|dir| {
             seed_version(&dir, "config.json", b"v2", 1000);
             let vdir = versions_dir(&dir, "config.json");
-            std::fs::write(version_file(&vdir, 99999), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            std::fs::write(
+                version_file(&vdir, 99999),
+                r#"{"sha256":"00","bytes_b64":"eg=="}"#,
+            )
+            .unwrap();
             let r = verify_all_versions(&dir, 5000, 2000).unwrap();
-            assert!(r.corrupt.iter().any(|c| c.reason == CorruptReason::IndexEntryMissing));
+            assert!(r
+                .corrupt
+                .iter()
+                .any(|c| c.reason == CorruptReason::IndexEntryMissing));
         });
     }
 
@@ -1365,7 +1447,11 @@ mod tests {
         with_tmp(|dir| {
             seed_version(&dir, "config.json", b"v2", 1000);
             let vdir = versions_dir(&dir, "config.json");
-            std::fs::write(version_file(&vdir, 99998), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            std::fs::write(
+                version_file(&vdir, 99998),
+                r#"{"sha256":"00","bytes_b64":"eg=="}"#,
+            )
+            .unwrap();
             let r = verify_all_versions(&dir, 5000, 2000).unwrap();
             assert_eq!(r.orphans.len(), 1);
         });
@@ -1409,7 +1495,11 @@ mod tests {
         with_tmp(|dir| {
             seed_version(&dir, "config.json", b"v2", 1000);
             let vdir = versions_dir(&dir, "config.json");
-            std::fs::write(version_file(&vdir, 1000), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            std::fs::write(
+                version_file(&vdir, 1000),
+                r#"{"sha256":"00","bytes_b64":"eg=="}"#,
+            )
+            .unwrap();
             let report = verify_all_versions(&dir, 5000, 2000).unwrap();
             assert_eq!(report.corrupt.len(), 1);
             record_verify_outcome(&dir, &report, 5000).unwrap();
@@ -1418,7 +1508,10 @@ mod tests {
             assert_eq!(summaries.len(), 1);
             assert_eq!(summaries[0].artifact, "config.json");
             let v = &summaries[0].versions[0];
-            assert!(v.corrupt, "version must be flagged corrupt from persisted list");
+            assert!(
+                v.corrupt,
+                "version must be flagged corrupt from persisted list"
+            );
         });
     }
 
@@ -1470,7 +1563,10 @@ mod tests {
             std::fs::write(&p, r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
             let r = verify_all_versions(&dir, 5000, 2000).unwrap();
             assert_eq!(r.corrupt.len(), 1);
-            assert!(p.exists(), "corrupt version must NOT be deleted by the sweep");
+            assert!(
+                p.exists(),
+                "corrupt version must NOT be deleted by the sweep"
+            );
         });
     }
 
@@ -1482,11 +1578,19 @@ mod tests {
             seed_version(&dir, "config.json", b"v2", 1000);
             seed_version(&dir, "config.json", b"v3", 2000);
             let plan = build_pitr_plan(&dir, 1500);
-            let cfg = plan.entries.iter().find(|e| e.rel_path == "config.json").unwrap();
+            let cfg = plan
+                .entries
+                .iter()
+                .find(|e| e.rel_path == "config.json")
+                .unwrap();
             assert_eq!(cfg.kind, PitrEntryKind::Restore);
             assert_eq!(cfg.chosen_version_unix, Some(1000));
             let plan2 = build_pitr_plan(&dir, 2500);
-            let cfg2 = plan2.entries.iter().find(|e| e.rel_path == "config.json").unwrap();
+            let cfg2 = plan2
+                .entries
+                .iter()
+                .find(|e| e.rel_path == "config.json")
+                .unwrap();
             assert_eq!(cfg2.chosen_version_unix, Some(2000));
         });
     }
@@ -1520,7 +1624,11 @@ mod tests {
             // Target at 1500 picks version 1000, but a newer version (2000)
             // exists → must be flagged LedgerShrink regardless of live content.
             let plan = build_pitr_plan(&dir, 1500);
-            let h = plan.entries.iter().find(|e| e.rel_path == "history.json").unwrap();
+            let h = plan
+                .entries
+                .iter()
+                .find(|e| e.rel_path == "history.json")
+                .unwrap();
             assert_eq!(h.kind, PitrEntryKind::Skip(PitrSkipReason::LedgerShrink));
         });
     }
@@ -1530,12 +1638,20 @@ mod tests {
         with_tmp(|dir| {
             seed_version(&dir, "config.json", b"v2", 1000);
             let vdir = versions_dir(&dir, "config.json");
-            std::fs::write(version_file(&vdir, 1000), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            std::fs::write(
+                version_file(&vdir, 1000),
+                r#"{"sha256":"00","bytes_b64":"eg=="}"#,
+            )
+            .unwrap();
             let report = verify_all_versions(&dir, 5000, 2000).unwrap();
             assert_eq!(report.corrupt.len(), 1);
             record_verify_outcome(&dir, &report, 5000).unwrap();
             let plan = build_pitr_plan(&dir, 5000);
-            let cfg = plan.entries.iter().find(|e| e.rel_path == "config.json").unwrap();
+            let cfg = plan
+                .entries
+                .iter()
+                .find(|e| e.rel_path == "config.json")
+                .unwrap();
             assert_eq!(cfg.kind, PitrEntryKind::Skip(PitrSkipReason::Corrupt));
         });
     }
@@ -1555,7 +1671,10 @@ mod tests {
             // Restored to the version's content (the OLD bytes).
             assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), b"old");
             // restore_version snapshots the pre-restore content as a new version.
-            assert!(list_versions(&dir, "config.json").unwrap().iter().any(|v| v.saved_unix == 6_000_000));
+            assert!(list_versions(&dir, "config.json")
+                .unwrap()
+                .iter()
+                .any(|v| v.saved_unix == 6_000_000));
         });
     }
 
@@ -1565,8 +1684,13 @@ mod tests {
             std::fs::write(dir.join("config.json"), b"old").unwrap();
             snapshot_before_write(&dir, "config.json", b"new", 1000).unwrap();
             std::fs::write(dir.join("config.json"), b"current").unwrap();
-            let pid = dir.file_name().and_then(|s| s.to_str()).unwrap_or("default").to_string();
-            crate::manifest::write_manifest(&crate::manifest::build_manifest(&pid).unwrap()).unwrap();
+            let pid = dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("default")
+                .to_string();
+            crate::manifest::write_manifest(&crate::manifest::build_manifest(&pid).unwrap())
+                .unwrap();
             let plan = build_pitr_plan(&dir, 5000);
             execute_pitr_plan(&dir, &plan, false, 6000).unwrap();
             let m = crate::manifest::load_manifest(&pid).unwrap();
@@ -1596,7 +1720,11 @@ mod tests {
             seed_version(&dir, "config.json", b"v2", 1000);
             seed_version(&dir, "other.json", b"o2", 1000);
             let vdir = versions_dir(&dir, "other.json");
-            std::fs::write(version_file(&vdir, 1000), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            std::fs::write(
+                version_file(&vdir, 1000),
+                r#"{"sha256":"00","bytes_b64":"eg=="}"#,
+            )
+            .unwrap();
             let plan = build_pitr_plan(&dir, 5000);
             let r = execute_pitr_plan(&dir, &plan, false, 6000).unwrap();
             assert_eq!(r.restored, 1, "config.json restores fine");
@@ -1610,7 +1738,11 @@ mod tests {
         with_tmp(|dir| {
             seed_version(&dir, "config.json", b"v2", 1000);
             let vdir = versions_dir(&dir, "config.json");
-            std::fs::write(version_file(&vdir, 1000), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            std::fs::write(
+                version_file(&vdir, 1000),
+                r#"{"sha256":"00","bytes_b64":"eg=="}"#,
+            )
+            .unwrap();
             let plan = build_pitr_plan(&dir, 5000);
             let r = execute_pitr_plan(&dir, &plan, false, 6000).unwrap();
             assert_eq!(r.restored, 0);
