@@ -83,6 +83,7 @@ pub mod vless;
 pub mod vps_deploy;
 pub mod vps_provision;
 pub mod worker;
+pub mod worker_tunnel;
 
 pub use blackout::NetworkState;
 pub use connectivity::{FallbackLadder, Probe, ProbeVerdict, RealLadderProbe, Tier, TierChange};

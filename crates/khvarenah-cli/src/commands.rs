@@ -2584,6 +2584,51 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
             }
             Ok(())
         }
+        crate::DnsTunnelAction::Worker {
+            worker_name,
+            compat_date,
+        } => {
+            let token = first_token(&load_profile(profile))?;
+            let client = khvarenah_core::cf::Client::new(&token);
+            let accs = client.list_accounts().await?;
+            let acc = accs.first().ok_or_else(|| {
+                CFError::new(
+                    "No account",
+                    "No Cloudflare account accessible.",
+                    "Check token permissions.",
+                )
+            })?;
+            // Session seed for the secret + auto-name: profile + current time.
+            let seed = format!(
+                "khv-cli-{profile}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            );
+            let opts = khvarenah_core::worker_tunnel::WorkerTunnelDeployOpts {
+                worker_name,
+                session_seed: seed,
+                compat_date,
+                retries: 2,
+            };
+            let res = khvarenah_core::worker_tunnel::deploy_worker_tunnel(
+                &client,
+                &acc.id,
+                profile,
+                &opts,
+            )
+            .await?;
+            println!("Worker DNS tunnel deployed:");
+            println!("  worker      : {}", res.worker_name);
+            println!("  url         : {}", res.worker_url);
+            println!("  account id  : {}", res.account_id);
+            println!("  subdomain   : {}", res.subdomain);
+            println!(
+                "The fallback ladder will now probe this tunnel over HTTPS (no VPS)."
+            );
+            Ok(())
+        }
         crate::DnsTunnelAction::Test { host, port } => {
             if vps::probe_vps_reachable(&host, port) {
                 println!("VPS {host}:{port} is reachable (TCP).");
