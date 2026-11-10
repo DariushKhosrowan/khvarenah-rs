@@ -53,7 +53,7 @@ impl CarrierEndpoint {
 }
 
 /// Kind of a carrier endpoint.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CarrierKind {
     VpsTunnel,
     WorkerTunnel,
@@ -335,6 +335,45 @@ impl CarrierPool {
         Ok(report)
     }
 
+    /// The on-disk path of this pool.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Stable 32-byte hash of the endpoint identity set: sorted
+    /// (kind, host, port, sni, worker_url) tuples, SHA-256. Excludes weight,
+    /// last_probe_ok_unix, last_probe_rtt_ms, and provenance, so probe
+    /// telemetry drift never changes the hash. Order-independent (sorts
+    /// before hashing) — merging the same endpoints in a different order
+    /// yields the same hash. This is what the worker relay uses to decide
+    /// whether a fresh push is warranted.
+    pub fn identity_hash(&self) -> Result<[u8; 32], CarrierPoolError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| CarrierPoolError::Integrity("carrier pool lock poisoned".into()))?;
+        let mut tuples: Vec<(CarrierKind, &str, u16, Option<&str>, Option<&str>)> = guard
+            .endpoints
+            .iter()
+            .map(|e| {
+                (
+                    e.kind,
+                    e.host.as_str(),
+                    e.port,
+                    e.sni.as_deref(),
+                    e.worker_url.as_deref(),
+                )
+            })
+            .collect();
+        tuples.sort();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for (kind, host, port, sni, wurl) in &tuples {
+            h.update(format!("{kind:?}|{host}|{port}|{sni:?}|{wurl:?}").as_bytes());
+        }
+        Ok(h.finalize().into())
+    }
+
     /// Pure offline selection. No network, no probing, no async.
     ///
     /// Sort: weight desc → last_probe_ok recency desc → provenance priority
@@ -557,5 +596,64 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
         // `open` verifies on read → must reject schema v2.
         assert!(matches!(CarrierPool::open(&path), Err(CarrierPoolError::Schema(2))));
+    }
+
+    fn identity_of(pool: &CarrierPool) -> [u8; 32] {
+        pool.identity_hash().unwrap()
+    }
+
+    #[test]
+    fn identity_hash_ignores_weight_and_probe_times() {
+        // Same endpoints, different weights / probe times → same identity hash.
+        let (_d1, p1) = tmp_pool();
+        let (_d2, p2) = tmp_pool();
+        let mut s1 = CarrierSnapshot::new_empty(1000);
+        let mut s2 = CarrierSnapshot::new_empty(1000);
+        s1.endpoints.push(ep(CarrierKind::WorkerData, "d.example.com", 443, 0.1));
+        s1.endpoints[0].last_probe_ok_unix = Some(100);
+        s1.endpoints[0].last_probe_rtt_ms = Some(5);
+        s2.endpoints.push(ep(CarrierKind::WorkerData, "d.example.com", 443, 0.9));
+        s2.endpoints[0].last_probe_ok_unix = Some(500);
+        s2.endpoints[0].last_probe_rtt_ms = Some(200);
+        s1.sign().unwrap();
+        s2.sign().unwrap();
+        p1.store_atomic(&s1).unwrap();
+        p2.store_atomic(&s2).unwrap();
+        assert_eq!(identity_of(&p1), identity_of(&p2));
+    }
+
+    #[test]
+    fn identity_hash_is_order_independent() {
+        // Same endpoint set in different order → same identity hash.
+        let (_d1, p1) = tmp_pool();
+        let (_d2, p2) = tmp_pool();
+        let mut s1 = CarrierSnapshot::new_empty(1000);
+        let mut s2 = CarrierSnapshot::new_empty(1000);
+        for h in ["a.example.com", "b.example.com", "c.example.com"] {
+            s1.endpoints.push(ep(CarrierKind::WorkerData, h, 443, 0.5));
+        }
+        for h in ["c.example.com", "a.example.com", "b.example.com"] {
+            s2.endpoints.push(ep(CarrierKind::WorkerData, h, 443, 0.5));
+        }
+        s1.sign().unwrap();
+        s2.sign().unwrap();
+        p1.store_atomic(&s1).unwrap();
+        p2.store_atomic(&s2).unwrap();
+        assert_eq!(identity_of(&p1), identity_of(&p2));
+    }
+
+    #[test]
+    fn identity_hash_changes_on_host_change() {
+        let (_d1, p1) = tmp_pool();
+        let (_d2, p2) = tmp_pool();
+        let mut s1 = CarrierSnapshot::new_empty(1000);
+        let mut s2 = CarrierSnapshot::new_empty(1000);
+        s1.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.5));
+        s2.endpoints.push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
+        s1.sign().unwrap();
+        s2.sign().unwrap();
+        p1.store_atomic(&s1).unwrap();
+        p2.store_atomic(&s2).unwrap();
+        assert_ne!(identity_of(&p1), identity_of(&p2));
     }
 }
