@@ -300,6 +300,9 @@ pub enum PendingDialogAction {
     RestoreVersion(String, u64),
     /// Point-in-time restore of the whole profile to a past unix moment.
     PitrRestore,
+    /// Create fresh client configs (all formats) from a user-supplied clean
+    /// IP endpoint, reusing the last deployed worker link — no redeploy.
+    CreateConfigFromIp,
 }
 
 impl DastYabApp {
@@ -549,6 +552,27 @@ impl DastYabApp {
         } else {
             pids
         };
+    }
+
+    /// Switch the active profile: persist the store's active marker, refresh
+    /// the view-model cache, and clear transient per-profile UI state. This
+    /// keeps `profile_id` and `state.active_profile_id` in lockstep so actions
+    /// like "Make active" always target the profile the user is actually
+    /// viewing (previously the profile dropdown only changed `profile_id`,
+    /// leaving the store/state on the old profile — a real bug).
+    fn switch_profile(&mut self, id: &str) {
+        if self.profile_id == id {
+            return;
+        }
+        self.profile_id = id.to_string();
+        let _ = set_active_profile(id);
+        self.state.reload_pending = true;
+        self.selected_profile = None;
+        self.dialog = None;
+        self.pending_action = None;
+        self.error_banner = None;
+        self.note.clear();
+        self.last_link.clear();
     }
 
     fn save_scan_params(&mut self) {
@@ -1155,6 +1179,81 @@ impl DastYabApp {
         self.push_log("[autopilot] OFF");
     }
 
+    /// Create fresh client configs (all formats) from a user-supplied clean IP
+    /// endpoint, reusing this profile's most recent deployed worker link — no
+    /// redeploy. `endpoint` may be a bare IP or "ip:port".
+    fn create_config_from_ip(&mut self, endpoint: &str) {
+        let ep = endpoint.trim();
+        if ep.is_empty() {
+            self.note = "Enter an IP (e.g. 104.16.1.1 or 104.16.1.1:443).".to_string();
+            return;
+        }
+        // Reuse the last non-clean deployed worker link from history.
+        let p = load_profile(&self.profile_id);
+        let base_link = p
+            .history
+            .iter()
+            .find(|r| !r.clean_ip)
+            .map(|r| r.link.clone())
+            .or_else(|| p.history.first().map(|r| r.link.clone()));
+        let Some(base_link) = base_link else {
+            self.note = "No deployed worker link yet — deploy once, then you can point configs at any clean IP without redeploying.".to_string();
+            return;
+        };
+
+        // Parse the base worker config, then override the address with the
+        // user-supplied clean IP (keeps uuid/path/security/transport).
+        let mut prof = match dastyab_core::vless::VlessProfile::parse(&base_link) {
+            Ok(pr) => pr,
+            Err(e) => {
+                self.note = format!("Could not parse deployed link: {}", e.brief());
+                return;
+            }
+        };
+        let (ip, port) = match ep.rsplit_once(':') {
+            Some((ip, port)) if port.chars().all(|c| c.is_ascii_digit()) => {
+                (ip.to_string(), port.parse::<u16>().unwrap_or(443))
+            }
+            _ => (ep.to_string(), 443),
+        };
+        prof.address = ip.clone();
+        prof.port = port;
+        prof.name = format!("clean-{ep}");
+
+        // Render all formats and write them into the generated-configs ledger.
+        let all = dastyab_core::export::render_all(&prof);
+        if all.is_empty() {
+            self.note = "Could not render any config for that endpoint.".to_string();
+            return;
+        }
+        let pid = self.profile_id.clone();
+        let mut ledger = dastyab_core::generated_configs::load_generated_configs(&pid);
+        let now = dastyab_core::store::now_ts() as u64;
+        use dastyab_core::generated_configs::ConfigSource;
+        for (fmt_label, content) in &all {
+            let fmt = dastyab_core::export::ExportFormat::parse(fmt_label);
+            let Some(fmt) = fmt else { continue };
+            let _ = ledger.push(
+                now,
+                fmt,
+                ConfigSource::WorkerVless,
+                Some(format!("clean {ep}")),
+                content.clone(),
+            );
+        }
+        let _ = dastyab_core::generated_configs::save_generated_configs(&pid, &ledger);
+
+        // Also remember it as a saved clean IP + learn it as a seed.
+        let _ = remember_clean_ip(&pid, &ep);
+        let _ = dastyab_core::cf::ips::learn_clean_ip(&pid, &ip);
+
+        self.state.reload_pending = true;
+        self.note = format!(
+            "Created {n} config(s) from {ep} — no redeploy needed (url {base_link})",
+            n = all.len()
+        );
+    }
+
     /// Drain the async bridge, applying every pending event to UI state.
     fn poll_bridge(&mut self, ctx: &egui::Context) {
         use bridge::UiEvent;
@@ -1536,8 +1635,14 @@ impl eframe::App for DastYabApp {
             egui::ComboBox::from_label("Profile")
                 .selected_text(&self.profile_id)
                 .show_ui(ui, |ui| {
+                    let mut clicked: Option<String> = None;
                     for id in &self.profiles {
-                        ui.selectable_value(&mut self.profile_id, id.clone(), id.as_str());
+                        if ui.selectable_label(self.profile_id == *id, id.as_str()).clicked() {
+                            clicked = Some(id.clone());
+                        }
+                    }
+                    if let Some(id) = clicked {
+                        self.switch_profile(&id);
                     }
                 });
             if ui.button("New profile").clicked() && !self.new_profile_name.is_empty() {
@@ -1559,21 +1664,39 @@ impl eframe::App for DastYabApp {
         self.render_shell(ui, &p);
         self.handle_dialog(ui.ctx());
 
-        if let Some(err) = &self.error_banner {
+        if let Some(err) = self.error_banner.clone() {
             ui.add_space(8.0);
             egui::Frame::new()
                 .fill(egui::Color32::from_rgb(60, 12, 12))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 60, 60)))
                 .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(err).color(egui::Color32::from_rgb(255, 160, 160)),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(err).color(egui::Color32::from_rgb(255, 160, 160)),
+                        ));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Dismiss this error")
+                                .clicked()
+                            {
+                                self.error_banner = None;
+                            }
+                        });
+                    });
                 });
         }
 
         if !self.note.is_empty() {
             ui.add_space(6.0);
-            ui.label(egui::RichText::new(&self.note).color(GOLD_DIM));
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(egui::RichText::new(&self.note).color(GOLD_DIM)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").on_hover_text("Clear message").clicked() {
+                        self.note.clear();
+                    }
+                });
+            });
         }
     }
 }
@@ -1948,6 +2071,17 @@ impl DastYabApp {
                         .small(),
                     );
                 }
+                // Live background-task status — visible from every tab so a
+                // deploy/scan in progress is never "lost" when the user
+                // switches views.
+                if !self.running.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("⏳ {}", self.running.join(", ")))
+                            .color(egui::Color32::from_rgb(120, 200, 255))
+                            .small(),
+                    );
+                }
             });
 
             ui.separator();
@@ -2165,6 +2299,11 @@ impl DastYabApp {
                                 Ok(Some(ep)) => {
                                     let new_link = dastyab_core::scanner::rewrite_vless_with_endpoint(&link, &ep);
                                     let _ = remember_clean_ip(&pid, &ep);
+                                    // Learn the found clean IP as a seed so
+                                    // future scans + autopilot bias toward its
+                                    // neighbourhood (self-improving scanner).
+                                    let _ =
+                                        dastyab_core::cf::ips::learn_clean_ip(&pid, &ep);
                                     let rec = VlessRecord {
                                         id: dastyab_core::store::new_id(),
                                         ts: dastyab_core::store::profiles::now_iso(),
@@ -2179,7 +2318,7 @@ impl DastYabApp {
                                     };
                                     let _ = remember_vless(&pid, rec);
                                     Ok::<String, CFError>(format!(
-                                        "Found working IP: {ep} — link updated in profile."
+                                        "Found working IP: {ep} — learned as a seed; link updated in profile."
                                     ))
                                 }
                                 Ok(None) => Err(CFError::new(
@@ -2228,9 +2367,14 @@ impl DastYabApp {
                                 Ok(res) => {
                                     for ep in &res.endpoints {
                                         let _ = remember_clean_ip(&pid, ep);
+                                        // Learn each found clean IP as a seed
+                                        // so future scans bias toward these
+                                        // neighbourhoods (self-improving).
+                                        let _ =
+                                            dastyab_core::cf::ips::learn_clean_ip(&pid, ep);
                                     }
                                     Ok::<String, CFError>(format!(
-                                        "{} — {}",
+                                        "{} — {} (learned as seeds)",
                                         res.message,
                                         res.endpoints.join(", ")
                                     ))
@@ -3548,7 +3692,9 @@ fn load_daemon_state_opt(profile: &str) -> Option<dastyab_core::daemon::DaemonSt
     Some(dastyab_core::daemon::load_daemon_state(profile))
 }
 
-async fn deploy_worker(token: &str, _pid: &str) -> Result<(String, String), CFError> {
+/// Deploy the VLESS worker and persist the fresh share link + all client
+/// config formats into the generated-configs ledger. Returns (host, link).
+async fn deploy_worker(token: &str, pid: &str) -> Result<(String, String), CFError> {
     let client = dastyab_core::cf::Client::new(token);
     let accs = client.list_accounts().await?;
     let acc = accs.first().ok_or_else(|| {
@@ -3561,13 +3707,27 @@ async fn deploy_worker(token: &str, _pid: &str) -> Result<(String, String), CFEr
     let subdomain = client.get_subdomain(&acc.id).await?;
     let worker_name = dastyab_core::worker::default_worker_name();
     let uuid = generate_uuid();
-    let js = dastyab_core::worker::find_worker_js(None)
-        .map(std::fs::read)
-        .transpose()
-        .map_err(|e| CFError::new("Read error", format!("{e}"), "Check file."))?
-        .unwrap_or_else(|| {
-            b"export default { async fetch(){ return new Response('ok'); } }".to_vec()
-        });
+
+    // Use the real VLESS worker JS. Prefer a found file (validate it), then
+    // the preset's built-in worker — never the no-op stub that previously
+    // deployed a `Response('ok')` worker that could not proxy traffic.
+    let js: Vec<u8> = match dastyab_core::worker::find_worker_js(None) {
+        Some(path) => {
+            let (ok, msg) = dastyab_core::worker::validate_worker_js(&path)?;
+            if !ok {
+                return Err(CFError::new(
+                    "Invalid worker file",
+                    msg,
+                    "Use the correct edgetunnel module worker.",
+                ));
+            }
+            std::fs::read(&path).map_err(|e| {
+                CFError::new("Read error", format!("{e}"), "Check the file path.")
+            })?
+        }
+        None => dastyab_core::presets::fallback_worker_js().into_bytes(),
+    };
+
     client
         .deploy_script(&acc.id, &worker_name, js, "2026-07-01", 2)
         .await?;
@@ -3590,6 +3750,32 @@ async fn deploy_worker(token: &str, _pid: &str) -> Result<(String, String), CFEr
         ..Default::default()
     };
     let link = vless.share_link();
+
+    // Record every rendered config format (share-link, v2rayN, sing-box,
+    // Clash) into the generated-configs ledger so the Configs tab reflects
+    // the fresh deployment without a separate export step.
+    let mut ledger = dastyab_core::generated_configs::load_generated_configs(pid);
+    let now = dastyab_core::store::now_ts() as u64;
+    use dastyab_core::export::{render, ExportFormat};
+    use dastyab_core::generated_configs::ConfigSource;
+    for fmt in [
+        ExportFormat::ShareLink,
+        ExportFormat::V2rayN,
+        ExportFormat::SingBox,
+        ExportFormat::Clash,
+    ] {
+        if let Ok(content) = render(&vless, fmt) {
+            let _ = ledger.push(
+                now,
+                fmt,
+                ConfigSource::WorkerVless,
+                Some(format!("deploy {worker_name}")),
+                content,
+            );
+        }
+    }
+    let _ = dastyab_core::generated_configs::save_generated_configs(pid, &ledger);
+
     Ok((host, link))
 }
 
