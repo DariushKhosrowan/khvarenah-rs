@@ -3296,6 +3296,9 @@ impl DastYabApp {
                             dastyab_core::journal::JournalKind::SnapshotWritten => {
                                 "📸 workspace-snapshot"
                             }
+                            dastyab_core::journal::JournalKind::VersionVerified => {
+                                "✅ versions-verified"
+                            }
                         };
                         ui.label(format!("{label} — {} (t={})", e.detail, e.ts));
                     }

@@ -915,6 +915,28 @@ fn versions_cmd(profile: &str, action: crate::VersionsAction) -> Result<(), CFEr
             }
             Ok(())
         }
+        crate::VersionsAction::Verify { budget_ms, json } => {
+            let now = dastyab_core::store::now_ts() as u64;
+            let report = av::verify_all_versions(&dir, now, budget_ms).map_err(to_verr)?;
+            let _ = av::record_verify_outcome(&dir, &report, now);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|e| e.to_string())
+                );
+            } else {
+                println!("{}", av::corrupt_versions_summary(&report));
+                if !report.corrupt.is_empty() {
+                    for c in &report.corrupt {
+                        println!(
+                            "  corrupt: {}/{} ({:?})",
+                            c.rel_path, c.version_unix, c.reason
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3137,6 +3159,7 @@ fn kind_label(k: dastyab_core::journal::JournalKind) -> &'static str {
         JournalKind::DrillPerformed => "blackout-self-test",
         JournalKind::AutoHealed => "auto-healed",
         JournalKind::SnapshotWritten => "workspace-snapshot",
+        JournalKind::VersionVerified => "versions-verified",
     }
 }
 

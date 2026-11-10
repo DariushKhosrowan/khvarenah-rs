@@ -130,6 +130,10 @@ pub struct DaemonState {
     /// rate-limit the daily resilience probe.
     #[serde(default)]
     pub last_drill_ts: i64,
+    /// Last epoch-seconds the version-integrity sweep ran. Rate-limits the
+    /// daily cadence (like autosync); the sweep is cheap but not free.
+    #[serde(default)]
+    pub last_verify_ts: i64,
     /// Set once per blocked episode when auto-rotation was *attempted* but
     /// every stored token failed verification. Guards the
     /// `AccountBlockedRotationExhausted` beacon so the user is told exactly
@@ -178,6 +182,7 @@ impl Default for DaemonState {
             last_profile_mtime: 0,
             last_outbox_flush_ts: 0,
             last_drill_ts: 0,
+            last_verify_ts: 0,
             account_rotate_exhausted_notified: false,
             blackout_since_unix: 0,
             last_self_ping_ts: 0,
@@ -1299,6 +1304,34 @@ async fn run_self_maintenance(
     // workspace (all profiles) so every past point is roll-back-able. Trims
     // to keep-14. Local disk work — safe even during a blackout.
     run_scheduled_snapshot(profile, state, now, log);
+
+    // 6. Daily version-integrity sweep (content verification of every saved
+    // version). Turns the Doctor "Versions: ok" claim into a verified one —
+    // bit-rot/truncation is surfaced here, never only at restore time. Runs
+    // regardless of network (pure local disk work), rate-limited to once/day.
+    if now - state.last_verify_ts >= 86400 {
+        let profile_dir = crate::store::profiles::profile_dir(profile);
+        if let Ok(report) = crate::artifact_versions::verify_all_versions(&profile_dir, now as u64, 2000) {
+            state.last_verify_ts = now;
+            let _ = crate::artifact_versions::record_verify_outcome(&profile_dir, &report, now as u64);
+            let _ = crate::journal::append(
+                profile,
+                crate::journal::JournalKind::VersionVerified,
+                &crate::artifact_versions::corrupt_versions_summary(&report),
+            );
+            if !report.corrupt.is_empty() {
+                log(&log_line(
+                    "WARN",
+                    &format!("version-integrity sweep: {}", crate::artifact_versions::corrupt_versions_summary(&report)),
+                ));
+            } else {
+                log(&log_line(
+                    "INFO",
+                    &format!("version-integrity sweep: {}", crate::artifact_versions::corrupt_versions_summary(&report)),
+                ));
+            }
+        }
+    }
 }
 
 /// Auto-heal step (daemon self-maintenance). Runs on every tick, detects
@@ -2194,6 +2227,43 @@ mod tests {
         .await;
         assert_eq!(state.last_backup_ts, 0, "disabled backup must not run");
         assert!(crate::backup::list_backups().is_empty());
+    }
+
+    /// The daily version-integrity sweep runs when due (state-tracked, like
+    /// autosync) and is rate-limited to once per 24h.
+    #[tokio::test]
+    async fn daemon_runs_integrity_sweep_once_per_day() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("verifysweep", "").unwrap();
+        let dir = crate::store::profiles::profile_dir(&profile);
+        // Seed one real version so the sweep has content to verify.
+        std::fs::write(dir.join("config.json"), b"old").unwrap();
+        crate::artifact_versions::snapshot_before_write(&dir, "config.json", b"new", 1000)
+            .unwrap();
+
+        let mut state = DaemonState::default();
+        state.last_verify_ts = 0; // never verified → due
+        let mut log_lines = Vec::new();
+        run_self_maintenance(&profile, &mut state, false, &mut |l| {
+            log_lines.push(l.to_string())
+        })
+        .await;
+        assert!(
+            state.last_verify_ts > 0,
+            "sweep should run and record its timestamp"
+        );
+
+        // Immediately after: still inside the 24h window → must NOT re-run.
+        let second_ts = state.last_verify_ts;
+        run_self_maintenance(&profile, &mut state, false, &mut |l| {
+            log_lines.push(l.to_string())
+        })
+        .await;
+        assert_eq!(
+            state.last_verify_ts, second_ts,
+            "sweep must be rate-limited to once per day"
+        );
+        assert!(log_lines.iter().any(|l| l.contains("version-integrity sweep")));
     }
 
     #[test]

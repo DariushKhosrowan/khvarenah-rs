@@ -428,6 +428,15 @@ pub enum VersionsAction {
     },
     /// Show per-artifact versioning health (dirs, files, bytes, prune state).
     Health,
+    /// Run the version-integrity sweep (content verification of all versions).
+    Verify {
+        /// Wall-clock budget in milliseconds (default 2000).
+        #[arg(long, default_value_t = 2000)]
+        budget_ms: u64,
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

@@ -506,6 +506,15 @@ pub fn run_doctor(opts: &DoctorOptions) -> DoctorReport {
         results.push(crate::artifact_versions::doctor_check_versions(&profile_dir, &health));
     }
 
+    // Content-based version integrity (last sweep result). Turns the file-count
+    // "ok" claim into a verified one — bit-rot/truncation fails here.
+    let vstate = crate::artifact_versions::read_versioning_state_for_doctor(&profile_dir);
+    results.push(crate::artifact_versions::doctor_check_version_integrity(
+        &profile_dir,
+        &vstate,
+        opts.now_unix as u64,
+    ));
+
     DoctorReport {
         checked_at_unix: opts.now_unix as u64,
         results,
@@ -713,6 +722,15 @@ mod tests {
                 st.last_backup_ts = now - 500;
                 crate::daemon::save_daemon_state(&id, &st).unwrap();
             }
+
+            // A clean version-integrity sweep on record, so the content-based
+            // check reports Ok rather than "never verified".
+            crate::artifact_versions::record_verify_outcome(
+                &crate::store::profiles::profile_dir(&id),
+                &crate::artifact_versions::VersionVerifyReport::default(),
+                now as u64,
+            )
+            .unwrap();
 
             // Rebuild the manifest AFTER every on-disk change (beacon, config,
             // tunnel-client) so nothing is flagged extra/changed.

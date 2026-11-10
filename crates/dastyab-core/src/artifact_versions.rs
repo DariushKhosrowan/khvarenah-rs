@@ -44,6 +44,10 @@ pub struct ArtifactVersion {
     pub sha256: String,
     /// Byte length of the stored content.
     pub size: u64,
+    /// Set when the integrity sweep found this version corrupt (sha mismatch,
+    /// missing payload, etc.). Never deleted by the sweep; only surfaced.
+    #[serde(default)]
+    pub corrupt: bool,
 }
 
 /// Errors for the per-artifact version store.
@@ -131,6 +135,7 @@ fn record_version(
         saved_unix: now_ms,
         size: bytes.len() as u64,
         sha256: sha256.clone(),
+        corrupt: false,
     };
 
     // Persist the snapshot as {"sha256", "bytes_b64"} — JSON-encoded so the
@@ -325,6 +330,18 @@ pub struct VersioningState {
     pub last_failure_unix: Option<u64>,
     /// When the last successful prune happened (unix seconds).
     pub last_prune_unix: Option<u64>,
+    /// When the integrity sweep last completed (unix seconds).
+    #[serde(default)]
+    pub last_verify_unix: Option<u64>,
+    /// Corrupt versions found by the last sweep.
+    #[serde(default)]
+    pub last_corrupt_count: u64,
+    /// Orphan payload files found by the last sweep.
+    #[serde(default)]
+    pub last_orphan_count: u64,
+    /// Index entries whose payload file was missing.
+    #[serde(default)]
+    pub last_missing_count: u64,
 }
 
 /// The on-disk path of the versioning state file.
@@ -334,6 +351,11 @@ pub fn versioning_state_path(profile_dir: &Path) -> PathBuf {
 
 fn read_versioning_state(profile_dir: &Path) -> VersioningState {
     crate::store::read_opt(&versioning_state_path(profile_dir)).unwrap_or_default()
+}
+
+/// Public accessor for the persisted versioning state (used by Doctor).
+pub fn read_versioning_state_for_doctor(profile_dir: &Path) -> VersioningState {
+    read_versioning_state(profile_dir)
 }
 
 /// Record the outcome of a hot-path prune. Called from `record_version`; never
@@ -492,6 +514,273 @@ pub fn doctor_versions_summary(healths: &[(String, VersioningHealth)]) -> CheckR
             healths.len(),
             total_files,
             total_bytes
+        ),
+    }
+}
+
+/// Why a version was flagged corrupt by the integrity sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CorruptReason {
+    /// The payload file exists but does not hash to the recorded sha256.
+    ShaMismatch,
+    /// The index references a payload file that does not exist.
+    PayloadMissing,
+    /// A payload file exists on disk but has no index entry (orphan).
+    IndexEntryMissing,
+    /// The index or payload file could not be parsed as the expected JSON.
+    ParseError,
+}
+
+/// One corrupt version identified by the sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorruptVersion {
+    pub rel_path: String,
+    pub version_unix: u64,
+    pub reason: CorruptReason,
+}
+
+/// Report from running the version integrity sweep.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VersionVerifyReport {
+    /// Number of version entries scanned.
+    pub scanned: u64,
+    /// Corrupt versions found (never deleted).
+    pub corrupt: Vec<CorruptVersion>,
+    /// Orphan payload filenames (in a .versions dir but not in its index).
+    pub orphans: Vec<String>,
+    /// Index entries whose payload file was missing.
+    pub missing: Vec<String>,
+    /// True if the wall-clock budget was exhausted before finishing.
+    pub truncated: bool,
+    /// How long the sweep took, in milliseconds.
+    pub elapsed_ms: u64,
+}
+
+/// Run the integrity sweep over a profile's `.versions/` tree.
+///
+/// For every artifact's index: each entry must have a payload file that hashes
+/// to the recorded sha256; every payload file must have an index entry; the
+/// index must parse. Corrupt versions are flagged, never deleted. `budget_ms`
+/// caps wall-clock time; when exceeded, `truncated` is set and the sweep stops
+/// so it never stalls Doctor.
+pub fn verify_all_versions(
+    profile_dir: &Path,
+    _now: u64,
+    budget_ms: u64,
+) -> Result<VersionVerifyReport, VersionError> {
+    let start = std::time::Instant::now();
+    let mut report = VersionVerifyReport::default();
+    let Ok(rd) = std::fs::read_dir(profile_dir) else {
+        return Ok(report);
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if name.ends_with(".versions") && p.is_dir() {
+            dirs.push(p);
+        }
+    }
+    dirs.sort();
+    for vdir in dirs {
+        // Artifact name = "<artifact>.versions"
+        let Some(artifact) = vdir.file_name().and_then(|s| s.to_str()).map(|s| s.trim_end_matches(".versions").to_string()) else {
+            continue;
+        };
+        if start.elapsed().as_millis() as u64 >= budget_ms {
+            report.truncated = true;
+            break;
+        }
+        // Parse index; a parse failure is itself a corruption signal (the whole
+        // artifact's version bookkeeping is unreadable).
+        let Some(index) = crate::store::read_opt::<Vec<ArtifactVersion>>(&vdir.join("index.json")) else {
+            report.corrupt.push(CorruptVersion {
+                rel_path: artifact.clone(),
+                version_unix: 0,
+                reason: CorruptReason::ParseError,
+            });
+            continue;
+        };
+        let mut seen_payloads: std::collections::BTreeSet<u64> = Default::default();
+        for v in &index {
+            report.scanned += 1;
+            let payload_path = version_file(&vdir, v.saved_unix);
+            let Ok(bytes) = std::fs::read(&payload_path) else {
+                report.missing.push(format!("{}/{}", artifact, v.saved_unix));
+                report.corrupt.push(CorruptVersion {
+                    rel_path: artifact.clone(),
+                    version_unix: v.saved_unix,
+                    reason: CorruptReason::PayloadMissing,
+                });
+                continue;
+            };
+            seen_payloads.insert(v.saved_unix);
+            let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                report.corrupt.push(CorruptVersion {
+                    rel_path: artifact.clone(),
+                    version_unix: v.saved_unix,
+                    reason: CorruptReason::ParseError,
+                });
+                continue;
+            };
+            let Some(b64) = payload.get("bytes_b64").and_then(|v| v.as_str()) else {
+                report.corrupt.push(CorruptVersion {
+                    rel_path: artifact.clone(),
+                    version_unix: v.saved_unix,
+                    reason: CorruptReason::ParseError,
+                });
+                continue;
+            };
+            let Ok(data) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) else {
+                report.corrupt.push(CorruptVersion {
+                    rel_path: artifact.clone(),
+                    version_unix: v.saved_unix,
+                    reason: CorruptReason::ParseError,
+                });
+                continue;
+            };
+            let actual = hex_bytes(&sha2::Sha256::digest(&data));
+            if actual != v.sha256 {
+                report.corrupt.push(CorruptVersion {
+                    rel_path: artifact.clone(),
+                    version_unix: v.saved_unix,
+                    reason: CorruptReason::ShaMismatch,
+                });
+            }
+        }
+        // Orphans: payload files on disk not present in the index.
+        if let Ok(pd) = std::fs::read_dir(&vdir) {
+            for pe in pd.flatten() {
+                let p = pe.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let Some(name) = p.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+                    continue;
+                };
+                if name == "index.json" {
+                    continue;
+                }
+                if let Ok(unix) = name.trim_end_matches(".json").parse::<u64>() {
+                    if !seen_payloads.contains(&unix) {
+                        report.orphans.push(format!("{}/{}", artifact, unix));
+                        report.corrupt.push(CorruptVersion {
+                            rel_path: artifact.clone(),
+                            version_unix: unix,
+                            reason: CorruptReason::IndexEntryMissing,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    report.elapsed_ms = start.elapsed().as_millis() as u64;
+    Ok(report)
+}
+
+/// Record the outcome of an integrity sweep into versioning_state.json.
+pub fn record_verify_outcome(
+    profile_dir: &Path,
+    report: &VersionVerifyReport,
+    now: u64,
+) -> Result<(), VersionError> {
+    let mut st = read_versioning_state(profile_dir);
+    st.last_verify_unix = Some(now);
+    st.last_corrupt_count = report.corrupt.len() as u64;
+    st.last_orphan_count = report.orphans.len() as u64;
+    st.last_missing_count = report.missing.len() as u64;
+    crate::store::write_json(&versioning_state_path(profile_dir), &st)
+        .map_err(|e| VersionError::Io(e.brief()))
+}
+
+/// Deterministic one-liner describing a sweep report (Doctor / CLI).
+pub fn corrupt_versions_summary(report: &VersionVerifyReport) -> String {
+    if report.truncated {
+        return format!(
+            "sweep truncated after {}ms at {} scanned (budget exhausted)",
+            report.elapsed_ms, report.scanned
+        );
+    }
+    if report.corrupt.is_empty() {
+        return format!(
+            "verified {} version(s) clean in {}ms",
+            report.scanned, report.elapsed_ms
+        );
+    }
+    let by_reason = |r: CorruptReason| report.corrupt.iter().filter(|c| c.reason == r).count();
+    format!(
+        "{} corrupt: {} sha-mismatch, {} payload-missing, {} orphan/index-missing (in {}ms)",
+        report.corrupt.len(),
+        by_reason(CorruptReason::ShaMismatch),
+        by_reason(CorruptReason::PayloadMissing),
+        by_reason(CorruptReason::IndexEntryMissing),
+        report.elapsed_ms
+    )
+}
+
+/// Doctor check: content-based version integrity from the last recorded sweep.
+///
+/// Ok when the last sweep found no corrupt/orphan/missing and was fresh
+/// (< 7 days). Warn on stale verify or orphans-only. Fail on any corruption.
+pub fn doctor_check_version_integrity(
+    _profile_dir: &Path,
+    state: &VersioningState,
+    now: u64,
+) -> CheckResult {
+    let name = "versions-integrity".to_string();
+    let stale_threshold = 7 * 24 * 3600u64;
+    let Some(last_verify) = state.last_verify_unix else {
+        return CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            detail: "version integrity never verified — run `dastyab versions verify`".to_string(),
+        };
+    };
+    if state.last_corrupt_count > 0 {
+        return CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            detail: format!(
+                "{} corrupt version(s) (last verify at {last_verify}) — restore will refuse these",
+                state.last_corrupt_count
+            ),
+        };
+    }
+    let age = now.saturating_sub(last_verify);
+    if state.last_missing_count > 0 {
+        return CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            detail: format!(
+                "{} payload(s) missing (last verify at {last_verify})",
+                state.last_missing_count
+            ),
+        };
+    }
+    if state.last_orphan_count > 0 {
+        return CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            detail: format!(
+                "{} orphan payload file(s) (last verify at {last_verify})",
+                state.last_orphan_count
+            ),
+        };
+    }
+    if age > stale_threshold {
+        return CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            detail: format!("last integrity verify was {age}s ago (> 7d) — stale"),
+        };
+    }
+    CheckResult {
+        name,
+        status: CheckStatus::Ok,
+        detail: format!(
+            "content verified {age}s ago · 0 corrupt · 0 missing · 0 orphan"
         ),
     }
 }
@@ -755,6 +1044,163 @@ mod tests {
             assert!(!h.oversized_dirs.is_empty());
             let r = doctor_check_versions(&dir, &h);
             assert_eq!(r.status, CheckStatus::Fail);
+        });
+    }
+
+    /// Seed one clean version of `artifact` (holding the PRE-write content)
+    /// at the given unix stamp. `snapshot_before_write` snapshots the old
+    /// bytes, so write "old" first, then request a "new" write.
+    fn seed_version(dir: &Path, artifact: &str, new_content: &[u8], unix: u64) {
+        std::fs::write(dir.join(artifact), b"old").unwrap();
+        snapshot_before_write(dir, artifact, new_content, unix).unwrap();
+    }
+
+    #[test]
+    fn verify_all_versions_reports_clean_when_hashes_match() {
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            seed_version(&dir, "config.json", b"v3", 2000);
+            let r = verify_all_versions(&dir, 5000, 2000).unwrap();
+            assert!(r.corrupt.is_empty(), "no corrupt: {:?}", r.corrupt);
+            assert!(r.orphans.is_empty());
+            assert!(r.missing.is_empty());
+            assert!(!r.truncated);
+            assert_eq!(r.scanned, 2);
+        });
+    }
+
+    #[test]
+    fn verify_all_versions_flags_sha_mismatch() {
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            let vdir = versions_dir(&dir, "config.json");
+            // Valid JSON payload whose bytes do NOT hash to the recorded sha256.
+            std::fs::write(version_file(&vdir, 1000), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            let r = verify_all_versions(&dir, 5000, 2000).unwrap();
+            assert_eq!(r.corrupt.len(), 1);
+            assert_eq!(r.corrupt[0].reason, CorruptReason::ShaMismatch);
+        });
+    }
+
+    #[test]
+    fn verify_all_versions_flags_payload_missing() {
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            let vdir = versions_dir(&dir, "config.json");
+            std::fs::remove_file(version_file(&vdir, 1000)).unwrap();
+            let r = verify_all_versions(&dir, 5000, 2000).unwrap();
+            assert_eq!(r.missing.len(), 1);
+            assert!(r.corrupt.iter().any(|c| c.reason == CorruptReason::PayloadMissing));
+        });
+    }
+
+    #[test]
+    fn verify_all_versions_flags_index_entry_missing() {
+        // A payload file on disk with no index entry → IndexEntryMissing corrupt.
+        // The index must exist for the sweep to know what *should* be there, so
+        // seed a real version first, then drop a stray payload alongside it.
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            let vdir = versions_dir(&dir, "config.json");
+            std::fs::write(version_file(&vdir, 99999), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            let r = verify_all_versions(&dir, 5000, 2000).unwrap();
+            assert!(r.corrupt.iter().any(|c| c.reason == CorruptReason::IndexEntryMissing));
+        });
+    }
+
+    #[test]
+    fn verify_all_versions_flags_orphan_payload() {
+        // Same underlying condition as index_entry_missing — a payload file not
+        // referenced by the index shows up in `orphans`.
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            let vdir = versions_dir(&dir, "config.json");
+            std::fs::write(version_file(&vdir, 99998), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            let r = verify_all_versions(&dir, 5000, 2000).unwrap();
+            assert_eq!(r.orphans.len(), 1);
+        });
+    }
+
+    #[test]
+    fn verify_all_versions_respects_budget_and_sets_truncated() {
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            // A zero budget truncates before scanning anything.
+            let r = verify_all_versions(&dir, 5000, 0).unwrap();
+            assert!(r.truncated);
+            assert_eq!(r.scanned, 0);
+        });
+    }
+
+    #[test]
+    fn record_verify_outcome_persists_counts() {
+        with_tmp(|dir| {
+            let mut report = VersionVerifyReport::default();
+            report.corrupt.push(CorruptVersion {
+                rel_path: "config.json".into(),
+                version_unix: 1000,
+                reason: CorruptReason::ShaMismatch,
+            });
+            report.orphans.push("config.json/2000".into());
+            report.missing.push("config.json/3000".into());
+            record_verify_outcome(&dir, &report, 9000).unwrap();
+            let st = read_versioning_state(&dir);
+            assert_eq!(st.last_verify_unix, Some(9000));
+            assert_eq!(st.last_corrupt_count, 1);
+            assert_eq!(st.last_orphan_count, 1);
+            assert_eq!(st.last_missing_count, 1);
+        });
+    }
+
+    #[test]
+    fn doctor_check_version_integrity_fails_on_corrupt() {
+        let state = VersioningState {
+            last_verify_unix: Some(1000),
+            last_corrupt_count: 2,
+            last_orphan_count: 0,
+            last_missing_count: 0,
+            ..Default::default()
+        };
+        let r = doctor_check_version_integrity(Path::new(""), &state, 2000);
+        assert_eq!(r.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn doctor_check_version_integrity_warns_on_stale_verify() {
+        let state = VersioningState {
+            last_verify_unix: Some(1),
+            last_corrupt_count: 0,
+            last_orphan_count: 0,
+            last_missing_count: 0,
+            ..Default::default()
+        };
+        let r = doctor_check_version_integrity(Path::new(""), &state, 8 * 24 * 3600);
+        assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn doctor_check_version_integrity_ok_when_clean_and_fresh() {
+        let state = VersioningState {
+            last_verify_unix: Some(1000),
+            last_corrupt_count: 0,
+            last_orphan_count: 0,
+            last_missing_count: 0,
+            ..Default::default()
+        };
+        let r = doctor_check_version_integrity(Path::new(""), &state, 2000);
+        assert_eq!(r.status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn corrupt_versions_are_not_deleted_by_sweep() {
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            let vdir = versions_dir(&dir, "config.json");
+            let p = version_file(&vdir, 1000);
+            std::fs::write(&p, r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            let r = verify_all_versions(&dir, 5000, 2000).unwrap();
+            assert_eq!(r.corrupt.len(), 1);
+            assert!(p.exists(), "corrupt version must NOT be deleted by the sweep");
         });
     }
 }

@@ -54,6 +54,8 @@ pub enum JournalKind {
     AutoHealed,
     /// A scheduled workspace snapshot was written (detail = snapshot path).
     SnapshotWritten,
+    /// The version-integrity sweep ran (detail = corrupt/orphan/missing counts).
+    VersionVerified,
 }
 
 /// One durable journal entry.
