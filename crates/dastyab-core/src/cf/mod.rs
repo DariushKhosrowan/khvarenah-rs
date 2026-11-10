@@ -460,9 +460,34 @@ impl Client {
         .await
     }
 
+    /// Build the module-worker deploy `metadata` JSON, including optional
+    /// `triggers.crons` scheduled-trigger entries. Pure — unit-testable
+    /// without any network. Empty `crons` omits the triggers block.
+    pub fn build_deploy_metadata(
+        compat_date: &str,
+        bindings: &[serde_json::Value],
+        crons: &[&str],
+    ) -> serde_json::Value {
+        let mut metadata = serde_json::json!({
+            "main_module": "_worker.js",
+            "compatibility_date": compat_date,
+            "compatibility_flags": ["nodejs_compat"],
+            "bindings": bindings,
+        });
+        if !crons.is_empty() {
+            metadata["triggers"] = serde_json::json!({
+                "crons": crons,
+            });
+        }
+        metadata
+    }
+
     /// Deploy a worker with KV namespace bindings in its metadata. This is the
     /// same upload as [`deploy_script`] but sets `bindings` (e.g. a
     /// `kv_namespace` binding the bundle reads as `env.DYB_CARRIER_SNAPSHOT`).
+    /// `crons` are scheduled-trigger cron strings embedded as
+    /// `triggers.crons` (used for the worker self-ping keep-alive). Empty
+    /// `crons` omits the triggers block entirely.
     pub async fn deploy_script_with_bindings(
         &self,
         account_id: &str,
@@ -471,13 +496,9 @@ impl Client {
         compat_date: &str,
         retries: u32,
         bindings: Vec<serde_json::Value>,
+        crons: &[&str],
     ) -> Result<serde_json::Value, CFError> {
-        let metadata = serde_json::json!({
-            "main_module": "_worker.js",
-            "compatibility_date": compat_date,
-            "compatibility_flags": ["nodejs_compat"],
-            "bindings": bindings,
-        });
+        let metadata = Self::build_deploy_metadata(compat_date, &bindings, crons);
         let metadata_str = metadata.to_string();
 
         let mut last_err: Option<CFError> = None;
@@ -778,6 +799,21 @@ mod tests {
             c.workers_dev_url("a", "name", "sub"),
             "https://name.sub.workers.dev"
         );
+    }
+
+    #[test]
+    fn build_deploy_metadata_omits_triggers_without_crons() {
+        let m = Client::build_deploy_metadata("2026-07-01", &[], &[]);
+        assert_eq!(m["main_module"], "_worker.js");
+        assert!(m.get("triggers").is_none());
+        assert!(m.get("bindings").is_some());
+    }
+
+    #[test]
+    fn build_deploy_metadata_includes_crons_when_configured() {
+        let m = Client::build_deploy_metadata("2026-07-01", &[], &["0 */6 * * *"]);
+        let triggers = &m["triggers"];
+        assert_eq!(triggers["crons"], serde_json::json!(["0 */6 * * *"]));
     }
 
     /// A minimal mock HTTP server that responds to any request with a canned

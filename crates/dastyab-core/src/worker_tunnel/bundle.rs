@@ -15,11 +15,14 @@
 //!    `DYB_VLESS_UPSTREAM` host:port over TCP and forwards every TCP read back
 //!    as a binary WS frame. No VLESS parsing anywhere — it is a byte pipe, so
 //!    it needs no VLESS codec.
-
-/// The worker script, verbatim (module syntax, `export default { fetch }`).
-pub const WORKER_TUNNEL_JS: &str = r#"// DastYab worker-hosted tunnel.
+/// The worker script, verbatim (module syntax, `export default { fetch, scheduled }`).
+pub const WORKER_TUNNEL_JS: &str = r#"
+// DastYab worker-hosted tunnel.
 // Control plane: GET /?q=<encoded-qname> → flags 1/2/3.
 // Data plane:   /ws WebSocket upgrade → dumb WS<->TCP pipe to DYB_VLESS_UPSTREAM.
+// Self-ping:    scheduled() writes _ping to DYB_CARRIER_SNAPSHOT every 6h,
+//                preventing Cloudflare inactivity deactivation during long
+//                blackouts (CF API unreachable mid-blackout to resurrect).
 
 const B32 = "abcdefghijklmnopqrstuvwxyz234567";
 
@@ -173,6 +176,13 @@ async function handleCtl(request, env) {
     await env.DYB_CARRIER_SNAPSHOT.put("server_generation", String(cur + 1));
     return json(200, { stored_generation: cur + 1 });
   }
+  if (body.flag === 6) {
+    // Self-ping status: read the _ping timestamp written by scheduled() (or
+    // by an on-demand /ping PUT). Lets the client verify the worker is not
+    // drifting toward CF inactivity deactivation.
+    const ping = await env.DYB_CARRIER_SNAPSHOT.get("_ping");
+    return json(200, { ping_ts: ping });
+  }
   return json(400, { error: "unknown-flag" });
 }
 
@@ -210,12 +220,27 @@ export default {
     }
     return json(501, { error: "data-plane-not-yet" });
   },
+  async scheduled(event, env, ctx) {
+    // Keep-alive self-ping. Runs on the cron trigger (every 6h) via
+    // `triggers.crons` in deploy metadata. Writes a timestamp to KV so the
+    // worker shows activity and Cloudflare does not deactivate it as idle
+    // during a long blackout (when the CF API is unreachable to resurrect it).
+    if (env.DYB_CARRIER_SNAPSHOT) {
+      await env.DYB_CARRIER_SNAPSHOT.put("_ping", String(Date.now()));
+    }
+  },
 };
 "#;
 
+/// Scheduled-trigger cron schedule for the worker self-ping keep-alive.
+/// Runs every 6 hours: prevents Cloudflare inactivity deactivation of idle
+/// workers during long blackouts (when the CF API is unreachable to resurrect
+/// them), so the worker tier survives a multi-day blackout intact.
+pub const WORKER_CRON_SCHEDULE: &str = "0 */6 * * *";
+
 #[cfg(test)]
 mod tests {
-    use super::WORKER_TUNNEL_JS;
+    use super::{WORKER_CRON_SCHEDULE, WORKER_TUNNEL_JS};
 
     #[test]
     fn bundle_contains_flag4_flag5_ctl_relay() {
@@ -232,5 +257,35 @@ mod tests {
         assert!(WORKER_TUNNEL_JS.contains("f.flags === 1"));
         assert!(WORKER_TUNNEL_JS.contains("f.flags === 2"));
         assert!(WORKER_TUNNEL_JS.contains("f.flags === 3"));
+    }
+
+    #[test]
+    fn worker_bundle_contains_scheduled_handler() {
+        assert!(WORKER_TUNNEL_JS.contains("async scheduled"));
+    }
+
+    #[test]
+    fn scheduled_handler_writes_ping_key() {
+        // The scheduled handler must write the _ping keep-alive key to KV.
+        assert!(WORKER_TUNNEL_JS.contains("\"_ping\""));
+        assert!(
+            WORKER_TUNNEL_JS.contains("DYB_CARRIER_SNAPSHOT.put(\"_ping\"")
+                || WORKER_TUNNEL_JS.contains("DYB_CARRIER_SNAPSHOT.put(\"_ping\")")
+        );
+        assert!(WORKER_TUNNEL_JS.contains("String(Date.now())"));
+    }
+
+    #[test]
+    fn worker_cron_schedule_is_six_hours() {
+        assert_eq!(WORKER_CRON_SCHEDULE, "0 */6 * * *");
+    }
+
+    #[test]
+    fn pull_response_includes_self_ping_timestamp() {
+        // Flag 6 on the /ctl relay must return the _ping timestamp so the
+        // client can verify the worker is not drifting toward deactivation.
+        assert!(WORKER_TUNNEL_JS.contains("body.flag === 6"));
+        assert!(WORKER_TUNNEL_JS.contains("ping_ts"));
+        assert!(WORKER_TUNNEL_JS.contains(".get(\"_ping\")"));
     }
 }

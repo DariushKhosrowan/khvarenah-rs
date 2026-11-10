@@ -39,7 +39,7 @@ pub mod bundle;
 pub mod deploy;
 pub mod resolver;
 
-pub use bundle::WORKER_TUNNEL_JS;
+pub use bundle::{WORKER_CRON_SCHEDULE, WORKER_TUNNEL_JS};
 pub use deploy::{deploy_worker_tunnel, WorkerTunnelDeploy, WorkerTunnelDeployOpts};
 pub use resolver::WorkerTunnelResolver;
 
