@@ -2170,6 +2170,9 @@ impl DastYabApp {
                             dastyab_core::journal::JournalKind::MutationPerformed => {
                                 "🔁 signature-rotated"
                             }
+                            dastyab_core::journal::JournalKind::DrillPerformed => {
+                                "🩺 blackout-self-test"
+                            }
                         };
                         ui.label(format!("{label} — {} (t={})", e.detail, e.ts));
                     }

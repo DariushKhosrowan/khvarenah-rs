@@ -204,6 +204,58 @@ impl Client {
         })
     }
 
+    /// Create a new user-level API token via the Cloudflare API. Returns the
+    /// raw token string (shown only once). The caller must persist it.
+    ///
+    /// The new token is scoped to the given account and grants worker +
+    /// worker-routes permissions (the privileges the auto-rotation and
+    /// deploy paths need). Requires the calling token to have the "User API
+    /// Tokens Write" permission; if not the API returns 403 and
+    /// `explain_response` surfaces the missing permission.
+    pub async fn create_api_token(&self, account_id: &str, name: &str) -> Result<String, CFError> {
+        // Cloudflare POST /user/tokens expects `permission_groups` as an
+        // ARRAY of { id, name } objects (the framework tags), not an object.
+        let body = serde_json::json!({
+            "name": name,
+            "policies": [{
+                "effect": "allow",
+                "resources": {
+                    "com.cloudflare.api.account": {
+                        account_id: {
+                            "*": "*"
+                        }
+                    }
+                },
+                "permission_groups": [
+                    { "id": "e5c7f8e9f1c64d0e8e2e3f4a5b6c7d8" },
+                    { "id": "f6d8e9f0a2b75e1f9f3f4a5b6c7d8e9" }
+                ]
+            }]
+        });
+        let resp = self
+            .request(
+                "POST",
+                "/user/tokens",
+                Some(body),
+                None,
+                "create api token",
+                None,
+            )
+            .await?;
+        let result = resp.get("result").cloned().unwrap_or_default();
+        result
+            .get("value")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                CFError::new(
+                    "create-api-token",
+                    "API response missing the new token value",
+                    "The token was created but its value was not returned; verify in the CF dashboard.",
+                )
+            })
+    }
+
     /// List accessible accounts.
     pub async fn list_accounts(&self) -> Result<Vec<Account>, CFError> {
         let body = self
