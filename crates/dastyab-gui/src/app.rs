@@ -575,6 +575,28 @@ impl DastYabApp {
         self.last_link.clear();
     }
 
+    /// Collect seed IPs for a scan: manual known-good seeds plus every
+    /// recently-verified clean IP from the autopilot ledger. The scanner feeds
+    /// these (and expands their neighborhoods) so each successful scan teaches
+    /// the next one where to look — the self-improving learning loop.
+    fn scan_seed_ips(&self, pid: &str) -> Vec<String> {
+        let mut seeds: Vec<String> = dastyab_core::cf::ips::load_manual_seeds(pid)
+            .into_iter()
+            .filter_map(|s| s.split(':').next().map(|ip| ip.trim().to_string()))
+            .filter(|ip| !ip.is_empty())
+            .collect();
+        for ep in dastyab_core::cf::ips::load_seed_endpoints(pid, 200) {
+            if let Some(ip) = ep.split(':').next() {
+                let ip = ip.trim().to_string();
+                if !ip.is_empty() && !seeds.contains(&ip) {
+                    seeds.push(ip);
+                }
+            }
+        }
+        seeds.truncate(400);
+        seeds
+    }
+
     fn save_scan_params(&mut self) {
         let cfg = ProfileConfig {
             scan_count: self.scan_count,
@@ -886,16 +908,28 @@ impl DastYabApp {
     /// Deploy the Worker-hosted DNS tunnel (no VPS) using the profile's active
     /// Cloudflare token. Fully automatic — no VPS/SSH credentials needed.
     fn deploy_worker_tunnel_gui(&mut self) {
-        // Grab the profile's first token.
-        let token = match dastyab_core::store::profiles::load_profile(&self.profile_id)
-            .tokens
-            .values()
-            .next()
+        // Use the profile's ACTIVE token (not the first token added) — a
+        // stale "first token" pick silently deploys with the wrong credential
+        // and the worker never comes up.
+        let token = match dastyab_core::store::profiles::get_active_token(&self.profile_id)
+            .unwrap_or(None)
         {
-            Some(t) => t.token.clone(),
+            Some(label) => {
+                match dastyab_core::store::profiles::get_token(&self.profile_id, &label)
+                    .unwrap_or(None)
+                {
+                    Some(t) => t,
+                    None => {
+                        self.worker_tunnel_note = format!(
+                        "Active token '{label}' could not be read — re-add it on the Token tab."
+                    );
+                        return;
+                    }
+                }
+            }
             None => {
                 self.worker_tunnel_note =
-                    "No Cloudflare token on this profile — add one first on the Token tab."
+                    "No active Cloudflare token on this profile — add one and mark it active on the Token tab."
                         .to_string();
                 return;
             }
@@ -907,30 +941,14 @@ impl DastYabApp {
         let tx2 = tx.clone();
         bridge::spawn("dns-tunnel-worker", tx.clone(), async move {
             let client = dastyab_core::cf::Client::new(&token);
-            let accs = match client.list_accounts().await {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
-                        task: "dns-tunnel-worker".to_string(),
-                        error: e,
-                    });
-                    return Ok::<String, CFError>("worker-tunnel done".to_string());
-                }
-            };
-            let acc = match accs.first() {
-                Some(a) => a.clone(),
-                None => {
-                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
-                        task: "dns-tunnel-worker".to_string(),
-                        error: CFError::new(
-                            "No account",
-                            "No Cloudflare account accessible.",
-                            "Check token permissions.",
-                        ),
-                    });
-                    return Ok::<String, CFError>("worker-tunnel done".to_string());
-                }
-            };
+            let accs = client.list_accounts().await?;
+            let acc = accs.first().cloned().ok_or_else(|| {
+                dastyab_core::CFError::new(
+                    "No account",
+                    "No Cloudflare account accessible.",
+                    "Check token permissions.",
+                )
+            })?;
             let opts = dastyab_core::worker_tunnel::WorkerTunnelDeployOpts {
                 worker_name: None,
                 session_seed: format!("dyb-gui-{}", pid),
@@ -938,26 +956,45 @@ impl DastYabApp {
                 retries: 2,
                 vless_upstream: None,
             };
-            match dastyab_core::worker_tunnel::deploy_worker_tunnel(&client, &acc.id, &pid, &opts)
-                .await
-            {
-                Ok(res) => {
-                    let _ = tx2.send(crate::bridge::UiEvent::Log {
-                        task: "dns-tunnel-worker".to_string(),
-                        line: format!(
-                            "[worker-tunnel] deployed {} — the fallback ladder can now use it",
-                            res.worker_url
-                        ),
-                    });
-                }
-                Err(e) => {
-                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
-                        task: "dns-tunnel-worker".to_string(),
-                        error: CFError::new("Worker tunnel", e.brief(), "Check the CF token."),
-                    });
-                }
+            let res =
+                dastyab_core::worker_tunnel::deploy_worker_tunnel(&client, &acc.id, &pid, &opts)
+                    .await
+                    .map_err(|e| {
+                        dastyab_core::CFError::new(
+                            "Worker tunnel",
+                            e.brief(),
+                            "Check the CF token.",
+                        )
+                    })?;
+            // Record a non-clean base deploy link in history so the Configs
+            // tab's "create from IP" and scanning always have a vless://
+            // skeleton to build on — no redeploy needed.
+            if let Some(base) = dastyab_core::worker_tunnel::resolve_deployed_base_link(&pid) {
+                let rec = dastyab_core::store::profiles::VlessRecord {
+                    id: dastyab_core::store::new_id(),
+                    ts: dastyab_core::store::profiles::now_iso(),
+                    epoch: dastyab_core::store::now_ts(),
+                    uuid: String::new(),
+                    address: res.worker_url.clone(),
+                    port: 443,
+                    name: format!("worker-{}", res.worker_name),
+                    clean_ip: false,
+                    link: base.clone(),
+                    note: "deployed via worker tunnel".into(),
+                };
+                let _ = dastyab_core::store::profiles::remember_vless(&pid, rec);
             }
-            Ok::<String, CFError>("worker-tunnel done".to_string())
+            let _ = tx2.send(crate::bridge::UiEvent::Log {
+                task: "dns-tunnel-worker".to_string(),
+                line: format!(
+                    "[worker-tunnel] deployed {} — the fallback ladder can now use it",
+                    res.worker_url
+                ),
+            });
+            Ok::<String, CFError>(format!(
+                "Worker tunnel deployed at {} ({}). You can now create configs from any clean IP in the Configs tab without redeploying.",
+                res.worker_url, res.worker_name
+            ))
         });
     }
 
@@ -1188,14 +1225,11 @@ impl DastYabApp {
             self.note = "Enter an IP (e.g. 104.16.1.1 or 104.16.1.1:443).".to_string();
             return;
         }
-        // Reuse the last non-clean deployed worker link from history.
-        let p = load_profile(&self.profile_id);
-        let base_link = p
-            .history
-            .iter()
-            .find(|r| !r.clean_ip)
-            .map(|r| r.link.clone())
-            .or_else(|| p.history.first().map(|r| r.link.clone()));
+        // Reuse the profile's deployed worker base link (non-clean history
+        // record, falling back to the persisted worker-tunnel config). This is
+        // fully decoupled from deploying: after the one-time deploy, the user
+        // can create configs from any clean IP without ever redeploying.
+        let base_link = dastyab_core::worker_tunnel::resolve_deployed_base_link(&self.profile_id);
         let Some(base_link) = base_link else {
             self.note = "No deployed worker link yet — deploy once, then you can point configs at any clean IP without redeploying.".to_string();
             return;
@@ -1261,10 +1295,14 @@ impl DastYabApp {
             match ev {
                 UiEvent::Done { task, summary } => {
                     self.running.retain(|t| t != &task);
-                    // A task succeeding means whatever previously failed has
-                    // recovered (or never applied) — clear stale error banners
-                    // so errors disappear once things work again.
-                    self.error_banner = None;
+                    if task == "dns-tunnel-worker" {
+                        self.worker_tunnel_note = summary.clone();
+                    } else {
+                        // A task succeeding means whatever previously failed has
+                        // recovered (or never applied) — clear stale error banners
+                        // so errors disappear once things work again.
+                        self.error_banner = None;
+                    }
                     if task == "autopilot" {
                         self.autopilot_status = summary.clone();
                         self.autopilot_on = true;
@@ -1275,6 +1313,10 @@ impl DastYabApp {
                         self.cleanip_test_output = summary.clone();
                         self.note = summary.clone();
                         self.state.reload_pending = true;
+                    } else if task == "dns-tunnel-worker" {
+                        self.state.reload_pending = true;
+                        self.push_log(&format!("[done] {task}: {summary}"));
+                        continue;
                     } else {
                         self.note = format!("✓ {task}: {summary}");
                     }
@@ -1284,6 +1326,9 @@ impl DastYabApp {
                 }
                 UiEvent::TaskErr { task, error } => {
                     self.running.retain(|t| t != &task);
+                    if task == "dns-tunnel-worker" {
+                        self.worker_tunnel_note = format!("Deploy failed: {}", error.brief());
+                    }
                     if task == "autopilot" {
                         self.autopilot_on = false;
                         self.autopilot_status = format!("Autopilot error: {}", error.brief());
@@ -2313,11 +2358,7 @@ impl DastYabApp {
                     // Learn from what we found: bias the scan toward previously
                     // known-good clean IPs (and their neighborhoods) so every
                     // successful scan teaches the next one where to look.
-                    seeds: dastyab_core::cf::ips::load_manual_seeds(&pid)
-                        .into_iter()
-                        .filter_map(|s| s.split(':').next().map(|ip| ip.trim().to_string()))
-                        .filter(|ip| !ip.is_empty())
-                        .collect(),
+                    seeds: self.scan_seed_ips(&pid),
                     ..Default::default()
                 };
                 match link {
@@ -2393,11 +2434,7 @@ impl DastYabApp {
                     // Learn from what we found: bias the scan toward previously
                     // known-good clean IPs (and their neighborhoods) so every
                     // successful scan teaches the next one where to look.
-                    seeds: dastyab_core::cf::ips::load_manual_seeds(&pid)
-                        .into_iter()
-                        .filter_map(|s| s.split(':').next().map(|ip| ip.trim().to_string()))
-                        .filter(|ip| !ip.is_empty())
-                        .collect(),
+                    seeds: self.scan_seed_ips(&pid),
                     ..Default::default()
                 };
                 match link {
@@ -3238,10 +3275,24 @@ impl DastYabApp {
             }
         });
         if !self.vps_note.is_empty() {
-            ui.colored_label(GOLD, &self.vps_note);
+            ui.horizontal(|ui| {
+                ui.colored_label(GOLD, &self.vps_note);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
+                        self.vps_note.clear();
+                    }
+                });
+            });
         }
         if !self.worker_tunnel_note.is_empty() {
-            ui.colored_label(GOLD, &self.worker_tunnel_note);
+            ui.horizontal(|ui| {
+                ui.colored_label(GOLD, &self.worker_tunnel_note);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
+                        self.worker_tunnel_note.clear();
+                    }
+                });
+            });
         }
 
         ui.add_space(6.0);

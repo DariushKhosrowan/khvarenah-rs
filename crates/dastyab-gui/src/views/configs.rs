@@ -49,6 +49,42 @@ pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<Confi
     );
     ui.add_space(6.0);
 
+    // Deploy-state status strip: config creation is fully decoupled from
+    // deploying — it only needs a previously deployed worker base link. Show
+    // whether that base link exists so the user always knows they can create
+    // more configs from clean IPs without redeploying.
+    let ready = dastyab_core::worker_tunnel::resolve_deployed_base_link(&app.profile_id);
+    let status_frame = egui::Frame::new()
+        .fill(if ready.is_some() { CARD } else { CARD })
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .corner_radius(6.0)
+        .stroke(egui::Stroke::new(
+            1.0,
+            if ready.is_some() {
+                egui::Color32::from_rgb(90, 210, 120)
+            } else {
+                egui::Color32::from_rgb(230, 160, 60)
+            },
+        ));
+    status_frame.show(ui, |ui| {
+        if ready.is_some() {
+            ui.label(
+                egui::RichText::new(
+                    "✅ Worker deployed — you can create configs from any clean IP, any number of times, without ever redeploying.",
+                )
+                .color(egui::Color32::from_rgb(140, 230, 160)),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "⚠ No deployed worker base link yet. Deploy a worker once (Deploy & Scan → 'Deploy Worker tunnel'), then come back here to create configs from clean IPs without redeploying.",
+                )
+                .color(egui::Color32::from_rgb(250, 190, 110)),
+            );
+        }
+    });
+    ui.add_space(6.0);
+
     // Stats chips.
     {
         let share = rows.iter().filter(|r| r.fmt == "share-link").count();
