@@ -18,7 +18,7 @@ use dastyab_core::CFError;
 use crate::bridge;
 use crate::dialogs::{self, Dialog, DialogPayload, DialogResult};
 use crate::state::GuiState;
-use crate::views::{history, profiles, tokens};
+use crate::views::{cleanip, history, profiles, tokens};
 
 // Royal-gold palette (dark #0a0705 bg per shell spec)
 pub const GOLD: egui::Color32 = egui::Color32::from_rgb(212, 175, 55);
@@ -84,7 +84,7 @@ pub struct DastYabApp {
     error_banner: Option<String>,
     view: View,
     // async bridge
-    tx: bridge::Tx,
+    pub tx: bridge::Tx,
     rx: bridge::Rx,
     running: Vec<String>,   // task names currently in flight
     log_lines: Vec<String>, // live log pane (capped at 5000)
@@ -98,6 +98,8 @@ pub struct DastYabApp {
     pub pending_action: Option<PendingDialogAction>,
     /// Which sidebar profile row is selected (for rename/delete).
     pub selected_profile: Option<usize>,
+    /// Live search filter for the Clean IPs manager.
+    pub cleanip_search: String,
     // inputs
     pub new_profile_name: String,
     // scan params
@@ -193,6 +195,9 @@ pub enum PendingDialogAction {
     DeleteProfile(String),
     AddToken,
     ImportSeeds,
+    ClearCleanIps,
+    ClearHistory,
+    DeleteHistoryRecord(String),
 }
 
 impl DastYabApp {
@@ -247,6 +252,7 @@ impl DastYabApp {
             dialog: None,
             pending_action: None,
             selected_profile: None,
+            cleanip_search: String::new(),
             new_profile_name: String::new(),
             scan_count: profile.config.scan_count.max(1),
             scan_workers: profile.config.scan_workers.max(1),
@@ -1157,6 +1163,43 @@ impl DastYabApp {
                             }
                         }
                     }
+                    Some(PendingDialogAction::ClearCleanIps) => {
+                        if let DialogPayload::Confirm = payload {
+                            match dastyab_core::store::profiles::clear_clean_ips(&self.profile_id)
+                            {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note = "All clean IPs cleared.".to_string();
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::ClearHistory) => {
+                        if let DialogPayload::Confirm = payload {
+                            match dastyab_core::store::profiles::clear_history(&self.profile_id) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note = "History cleared.".to_string();
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::DeleteHistoryRecord(rec_id)) => {
+                        if let DialogPayload::Confirm = payload {
+                            match dastyab_core::store::profiles::remove_history_record(
+                                &self.profile_id,
+                                &rec_id,
+                            ) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note = "History entry deleted.".to_string();
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
                     None => {}
                 }
             }
@@ -1639,25 +1682,23 @@ impl DastYabApp {
     }
 
     fn cleanip_panel(&mut self, ui: &mut egui::Ui, _p: &dastyab_core::store::profiles::Profile) {
-        ui.heading(egui::RichText::new("Clean IPs").color(GOLD));
-        ui.label(
-            egui::RichText::new("Verified endpoints saved per profile (smart stop-on-first).")
-                .color(GOLD_DIM),
-        );
-        ui.add_space(6.0);
-        let p = load_profile(&self.profile_id);
-        if p.clean_ips.is_empty() {
-            ui.label(
-                egui::RichText::new("No clean IPs found yet — scan from Deploy & Scan.")
-                    .color(GOLD_DIM),
-            );
-        }
-        for ip in &p.clean_ips {
-            ui.label(format!("• {ip}"));
+        if let Some(act) = cleanip::show(ui, self) {
+            match act {
+                cleanip::CleanipAction::Copy(ip) => {
+                    let s = ip.clone();
+                    ui.ctx().copy_text(s);
+                    self.note = format!("Copied {ip}.");
+                }
+                other => {
+                    if let Some(dlg) = cleanip::run_action(self, other) {
+                        self.dialog = Some(dlg);
+                    }
+                }
+            }
         }
 
         // Zero-result diagnostics: explain "why nothing found" in plain language.
-        if p.clean_ips.is_empty() {
+        if self.state.clean_ips.is_empty() {
             if let Some(cause) = &self.last_cause {
                 ui.add_space(8.0);
                 ui.separator();
@@ -1671,15 +1712,6 @@ impl DastYabApp {
                         "https://dash.cloudflare.com/?to=/:account/workers",
                     ));
                 }
-            }
-            // Import known-good IPs (the NetworkBlocked fast path).
-            ui.add_space(8.0);
-            if ui.button("📥 Import known-good IPs").clicked() {
-                self.pending_action = Some(PendingDialogAction::ImportSeeds);
-                self.dialog = Some(dialogs::prompt_text_area(
-                    "Import known-good IPs",
-                    "One IP per line — e.g.\n104.16.1.1\n104.16.2.1:2053  # fast",
-                ));
             }
         }
     }
