@@ -1,5 +1,5 @@
-//! Profiles view — a scrollable list of profiles with create / switch /
-//! rename / delete actions, plus Import/Export stubs (Phase 3.7).
+//! Profiles view — a scrollable list of saved configs with create / switch /
+//! rename / delete actions, plus per-profile token counts and creation time.
 
 use eframe::egui;
 use khvarenah_core::store::profiles::set_active_profile;
@@ -28,11 +28,24 @@ fn profile_row(ui: &mut egui::Ui, p: &ProfileSummary) {
 
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
+            if p.is_active {
+                ui.label(egui::RichText::new("●").color(GOLD).strong());
+            }
             ui.label(name);
             if p.token_count > 0 {
                 ui.label(egui::RichText::new(format!("[{}]", p.token_count)).color(GOLD_DIM));
             }
         });
+        if !p.description.is_empty() {
+            ui.label(egui::RichText::new(&p.description).color(GOLD_DIM).small());
+        }
+        if !p.created_at.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("created {}", p.created_at))
+                    .color(GOLD_DIM)
+                    .small(),
+            );
+        }
     });
 }
 
@@ -57,10 +70,18 @@ pub fn show(
     let mut action = None;
 
     ui.heading(egui::RichText::new("Profiles").color(GOLD));
+    ui.label(
+        egui::RichText::new(
+            "Saved configs — switch, rename, or delete. Everything is per-profile.",
+        )
+        .color(GOLD_DIM),
+    );
+    ui.add_space(6.0);
 
     // the list
     egui::ScrollArea::vertical()
-        .max_height(300.0)
+        .auto_shrink([false, false])
+        .max_height(360.0)
         .show(ui, |ui| {
             for (i, p) in app.state.profiles.iter().enumerate() {
                 if selected == Some(i) {
@@ -79,11 +100,12 @@ pub fn show(
             }
         });
 
-    ui.add_space(6.0);
+    ui.add_space(8.0);
+    ui.separator();
 
     // action buttons
     ui.horizontal(|ui| {
-        if ui.button("New Profile").clicked() {
+        if ui.button("➕ New Profile").clicked() {
             action = Some(ProfilesAction::New);
         }
         if let Some(i) = selected {
@@ -96,13 +118,6 @@ pub fn show(
                 }
             }
         }
-    });
-
-    ui.horizontal(|ui| {
-        let imp = ui.add_enabled(false, egui::Button::new("Import"));
-        imp.on_hover_text("Phase 3.7");
-        let exp = ui.add_enabled(false, egui::Button::new("Export"));
-        exp.on_hover_text("Phase 3.7");
     });
 
     ui.add_space(4.0);

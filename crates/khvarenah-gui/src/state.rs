@@ -16,6 +16,10 @@ pub struct ProfileSummary {
     pub name: String,
     pub is_active: bool,
     pub token_count: u32,
+    /// When the profile was created (ISO string).
+    pub created_at: String,
+    /// Optional user description.
+    pub description: String,
 }
 
 /// One row in the token view.
@@ -26,6 +30,10 @@ pub struct TokenSummary {
     pub masked: String,
     /// Human-friendly timestamp (relative when recent, else the raw time).
     pub added_at: String,
+    /// Absolute local timestamp (`YYYY-MM-DD HH:MM:SS`) of when it was added.
+    pub added_at_abs: String,
+    /// Whether this token is the profile's active token.
+    pub is_active: bool,
 }
 
 /// Cached snapshot of what the sidebar + token view need to render.
@@ -36,6 +44,8 @@ pub struct GuiState {
     pub tokens: Vec<TokenSummary>,
     /// Label of the profile's active token (for deploy/scan + stroke).
     pub active_token_label: Option<String>,
+    /// Saved clean IPs for the active profile (cached for fast rendering).
+    pub clean_ips: Vec<String>,
     /// Number of undelivered beacon alerts (outbox) for the active profile.
     pub beacon_outbox: usize,
     /// Set when a background mutation completes; the next frame calls reload.
@@ -52,6 +62,8 @@ impl GuiState {
                 name: m.name,
                 is_active: false,
                 token_count: 0,
+                created_at: m.created_at,
+                description: m.description,
             })
             .collect();
 
@@ -65,6 +77,7 @@ impl GuiState {
         }
 
         let prof = load_profile(&active);
+        let active_token = get_active_token(&active).unwrap_or(None);
         self.tokens = prof
             .tokens
             .iter()
@@ -72,10 +85,14 @@ impl GuiState {
                 label: label.clone(),
                 masked: mask_token(&e.token),
                 added_at: relative_time(&e.ts),
+                added_at_abs: e.ts.clone(),
+                is_active: active_token.as_deref() == Some(label.as_str()),
             })
             .collect();
 
-        self.active_token_label = get_active_token(&active).unwrap_or(None);
+        self.active_token_label = active_token;
+
+        self.clean_ips = prof.clean_ips.clone();
 
         self.beacon_outbox = khvarenah_core::remote_beacon::load_outbox(&active).len();
 

@@ -7,6 +7,7 @@
 //! The palette constants live in `crate::app` and are re-exported here so the
 //! views read them from one place.
 
+pub mod cleanip;
 pub mod history;
 pub mod profiles;
 pub mod tokens;

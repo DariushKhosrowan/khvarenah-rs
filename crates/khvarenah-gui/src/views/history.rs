@@ -2,12 +2,14 @@
 //! persistent VlessRecord history (deploys + clean-IP scans) with the
 //! blackout/rescue journal. Each entry shows its type, a readable local
 //! timestamp, the resolved host/endpoint, and (for VlessRecords that carry a
-//! share link) a one-click copy button.
+//! share link) a one-click copy button. Entries can be deleted individually
+//! or the whole VlessRecord stream cleared.
 
 use eframe::egui;
 use khvarenah_core::journal::JournalKind;
 
-use crate::app::{HistoryFilter, KhvarenahApp};
+use crate::app::{HistoryFilter, KhvarenahApp, PendingDialogAction};
+use crate::dialogs;
 use crate::state::format_ts;
 use crate::views::{GOLD, GOLD_DIM, PANEL, TEXT};
 
@@ -51,6 +53,8 @@ struct Item {
     title: String,
     detail: String,
     link: Option<String>,
+    /// Stable rec id for per-item delete (None for journal entries).
+    rec_id: Option<String>,
 }
 
 /// Render the history view for the active profile.
@@ -61,7 +65,7 @@ pub fn show(
 ) {
     ui.heading(egui::RichText::new("History").color(GOLD));
 
-    // Filter tabs.
+    // Filter tabs + clear actions.
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Show:").color(GOLD_DIM));
         for (f, label) in [
@@ -77,6 +81,19 @@ pub fn show(
                 app.history_filter = f;
             }
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let clear = ui
+                .add_enabled(!p.history.is_empty(), egui::Button::new("🗑 Clear config history"))
+                .on_hover_text("Delete all deploy + clean-IP records (journal is kept)");
+            if clear.clicked() {
+                app.pending_action = Some(PendingDialogAction::ClearHistory);
+                app.dialog = Some(dialogs::confirm(
+                    "Clear history",
+                    "Delete all saved deploy + clean-IP records for this profile? The journal is kept.",
+                    true,
+                ));
+            }
+        });
     });
     ui.separator();
 
@@ -123,6 +140,7 @@ pub fn show(
             } else {
                 Some(r.link.clone())
             },
+            rec_id: Some(r.id.clone()),
         });
     }
 
@@ -137,6 +155,7 @@ pub fn show(
                 title: e.detail.clone(),
                 detail: String::new(),
                 link: None,
+                rec_id: None,
             });
         }
     }
@@ -144,6 +163,7 @@ pub fn show(
     items.sort_unstable_by_key(|it| std::cmp::Reverse(it.epoch));
 
     if items.is_empty() {
+        ui.add_space(8.0);
         ui.label(
             egui::RichText::new(
                 "Nothing here yet — deploy, scan, or let the daemon run a few cycles.",
@@ -153,9 +173,16 @@ pub fn show(
         return;
     }
 
+    ui.label(
+        egui::RichText::new(format!("{} entries", items.len()))
+            .color(GOLD_DIM)
+            .small(),
+    );
+    ui.add_space(4.0);
+
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .max_height(500.0)
+        .max_height(520.0)
         .show(ui, |ui| {
             for it in &items {
                 egui::Frame::new()
@@ -174,6 +201,23 @@ pub fn show(
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
+                                    if let Some(rec_id) = &it.rec_id {
+                                        if ui
+                                            .button("🗑")
+                                            .on_hover_text("Delete this entry")
+                                            .clicked()
+                                        {
+                                            app.pending_action =
+                                                Some(PendingDialogAction::DeleteHistoryRecord(
+                                                    rec_id.clone(),
+                                                ));
+                                            app.dialog = Some(dialogs::confirm(
+                                                "Delete history entry",
+                                                "Delete this history entry?",
+                                                true,
+                                            ));
+                                        }
+                                    }
                                     if let Some(link) = &it.link {
                                         if ui
                                             .button("📋")

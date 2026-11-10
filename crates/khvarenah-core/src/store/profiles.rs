@@ -206,7 +206,8 @@ pub struct ProfileConfig {
     /// worker URL. Falls back to the legacy shared secret when a worker has no
     /// entry yet (see `worker_tunnel::secret::resolve_worker_secret`).
     #[serde(default)]
-    pub worker_secrets: std::collections::HashMap<String, crate::worker_tunnel::secret::WorkerSecret>,
+    pub worker_secrets:
+        std::collections::HashMap<String, crate::worker_tunnel::secret::WorkerSecret>,
 }
 
 fn default_auto_rotate_on_blocked() -> bool {
@@ -646,12 +647,50 @@ pub fn remember_vless(id: &str, rec: VlessRecord) -> Result<(), CFError> {
     save_profile(&p)
 }
 
+/// Remove a single VlessRecord by its id. Returns `Ok(false)` when no record
+/// matched (a no-op). Used by the History view's per-item delete.
+pub fn remove_history_record(id: &str, rec_id: &str) -> Result<bool, CFError> {
+    let mut p = load_profile(id);
+    let before = p.history.len();
+    p.history.retain(|r| r.id != rec_id);
+    let removed = p.history.len() != before;
+    save_profile(&p)?;
+    Ok(removed)
+}
+
+/// Clear the entire config history (deploys + clean-IP records) for a profile.
+/// The journal is untouched — that is a separate stream.
+pub fn clear_history(id: &str) -> Result<(), CFError> {
+    let mut p = load_profile(id);
+    p.history.clear();
+    save_profile(&p)
+}
+
 /// Add a clean IP string (dedup, keep list ordered by insertion).
 pub fn remember_clean_ip(id: &str, ip: &str) -> Result<(), CFError> {
     let mut p = load_profile(id);
     if !p.clean_ips.contains(&ip.to_string()) {
         p.clean_ips.push(ip.to_string());
     }
+    save_profile(&p)
+}
+
+/// Remove a single saved clean IP. Returns `Ok(false)` when it was not
+/// present (a no-op). Used by the Clean IPs manager view.
+pub fn remove_clean_ip(id: &str, ip: &str) -> Result<bool, CFError> {
+    let mut p = load_profile(id);
+    let before = p.clean_ips.len();
+    p.clean_ips.retain(|x| x != ip);
+    let removed = p.clean_ips.len() != before;
+    save_profile(&p)?;
+    Ok(removed)
+}
+
+/// Clear all saved clean IPs for a profile. Used by the Clean IPs manager's
+/// "clear all" action.
+pub fn clear_clean_ips(id: &str) -> Result<(), CFError> {
+    let mut p = load_profile(id);
+    p.clean_ips.clear();
     save_profile(&p)
 }
 
@@ -1366,5 +1405,56 @@ mod tests {
         let mut cfg = ProfileConfig::default();
         cfg.drill_interval_secs = 3600;
         assert_eq!(effective_drill_interval_secs(&cfg), 3600);
+    }
+
+    #[test]
+    fn remove_clean_ip_dedups_and_reports() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            remember_clean_ip(&id, "104.16.1.1").unwrap();
+            remember_clean_ip(&id, "104.16.1.1").unwrap(); // dedup
+            remember_clean_ip(&id, "104.16.2.2").unwrap();
+            assert_eq!(load_profile(&id).clean_ips.len(), 2);
+            assert!(remove_clean_ip(&id, "104.16.1.1").unwrap());
+            assert!(!remove_clean_ip(&id, "104.16.1.1").unwrap()); // already gone
+            assert_eq!(load_profile(&id).clean_ips, vec!["104.16.2.2".to_string()]);
+        });
+    }
+
+    #[test]
+    fn clear_clean_ips_empties_list() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            remember_clean_ip(&id, "104.16.1.1").unwrap();
+            clear_clean_ips(&id).unwrap();
+            assert!(load_profile(&id).clean_ips.is_empty());
+        });
+    }
+
+    #[test]
+    fn remove_and_clear_history_records() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            let rec1 = VlessRecord {
+                id: "rec-1".into(),
+                address: "a.workers.dev".into(),
+                port: 443,
+                ..Default::default()
+            };
+            let rec2 = VlessRecord {
+                id: "rec-2".into(),
+                address: "b.workers.dev".into(),
+                port: 443,
+                ..Default::default()
+            };
+            remember_vless(&id, rec1).unwrap();
+            remember_vless(&id, rec2).unwrap();
+            assert_eq!(load_profile(&id).history.len(), 2);
+            assert!(remove_history_record(&id, "rec-1").unwrap());
+            assert!(!remove_history_record(&id, "rec-1").unwrap());
+            assert_eq!(load_profile(&id).history.len(), 1);
+            clear_history(&id).unwrap();
+            assert!(load_profile(&id).history.is_empty());
+        });
     }
 }
