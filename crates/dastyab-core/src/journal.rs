@@ -47,6 +47,8 @@ pub enum JournalKind {
     BackupWritten,
     /// A scheduled worker-signature rotation ran (detail = new uuid/path).
     MutationPerformed,
+    /// A scheduled blackout self-test (drill) ran (detail = "N/4 rungs").
+    DrillPerformed,
 }
 
 /// One durable journal entry.
