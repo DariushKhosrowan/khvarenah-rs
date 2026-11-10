@@ -115,6 +115,68 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         count: u32,
     },
+    /// Find clean IPs — dead-simple or fully tuned.
+    ///
+    /// Simple (for everyone):
+    ///   dastyab find 1      # one working IP
+    ///   dastyab find 5 ip   # five working IPs
+    ///   dastyab find        # default: one working IP
+    ///
+    /// Advanced knobs: --sample, --workers, --timeout, --top, --seed,
+    /// --strategy, --refresh, --no-retry, --json, --quiet, --out.
+    Find {
+        /// How many clean IPs you want (default 1).
+        #[arg(default_value_t = 1)]
+        count: u32,
+
+        /// Optional decorative word so "find 5 ip" reads naturally.
+        #[arg()]
+        suffix: Option<String>,
+
+        /// Candidate IPs to probe per cycle (advanced).
+        #[arg(long, default_value_t = 2000)]
+        sample: u32,
+
+        /// Probe concurrency (advanced).
+        #[arg(long, default_value_t = 64)]
+        workers: u32,
+
+        /// Per-probe timeout in seconds.
+        #[arg(long, default_value_t = 8)]
+        timeout: u32,
+
+        /// How many validated endpoints to aim for (defaults to count).
+        #[arg(long)]
+        top: Option<u32>,
+
+        /// Force refresh of the Cloudflare range list.
+        #[arg(long)]
+        refresh: bool,
+
+        /// Known-good IP seeds (comma-separated) to expand neighbourhoods around.
+        #[arg(long)]
+        seed: Option<String>,
+
+        /// Phase-2 SNI strategy for this cycle.
+        #[arg(long, value_enum)]
+        strategy: Option<StrategyChoice>,
+
+        /// Disable retry-on-fail for cold-start validation.
+        #[arg(long)]
+        no_retry: bool,
+
+        /// Emit JSON instead of human text.
+        #[arg(long, conflicts_with = "quiet")]
+        json: bool,
+
+        /// Print only the IPs (one per line), nothing else.
+        #[arg(long, conflicts_with = "json")]
+        quiet: bool,
+
+        /// Write the client bundle (active.vless / QR / fallbacks) to a dir.
+        #[arg(long)]
+        out: Option<String>,
+    },
     /// Show history.
     History,
     /// List / show / export generated configs (the completeness ledger).
@@ -610,6 +672,17 @@ pub enum FixWhat {
     Mutation,
     /// Apply every config-only fix that resolves an ACTION item.
     All,
+}
+
+/// Phase-2 SNI strategy for the `find` command's advanced mode.
+#[derive(clap::ValueEnum, Clone, Copy)]
+pub enum StrategyChoice {
+    /// Use only the worker hostname as SNI (`*.workers.dev`).
+    WorkerOnly,
+    /// Try a generic Cloudflare SNI first (bypasses `*.workers.dev` blocking).
+    GenericFirst,
+    /// Try the worker hostname first, then a generic CF SNI.
+    WorkerThenGeneric,
 }
 
 #[derive(Subcommand)]

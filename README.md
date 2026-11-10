@@ -105,7 +105,13 @@ dastyab profile-create work --description "my setup"
 dastyab deploy --preset standard
 
 # 5. Find a clean IP (stops on the first working one)
-dastyab scan
+#    Simple — for everyone:
+dastyab find 1        # one working IP
+dastyab find 5 ip     # five working IPs
+dastyab find           # same as `find 1`
+#    Advanced — when you need to tune:
+#    dastyab find 10 --sample 5000 --workers 128 --timeout 12 \
+#        --strategy generic-first --out ~/my-configs
 
 # 6. Export client configs
 dastyab export clash    --output clash.yaml

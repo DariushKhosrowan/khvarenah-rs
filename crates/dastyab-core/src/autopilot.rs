@@ -121,6 +121,32 @@ pub fn rotate_strategy(s: crate::health::SniStrategy) -> crate::health::SniStrat
     }
 }
 
+/// Ordered list of SNI strategies to try within ONE cycle (Shiro-style multi-
+/// SNI cascade). A single strategy — especially the default `WorkerOnly`
+/// (`*.workers.dev` SNI) — is commonly DPI-blocked on censored networks, and
+/// the same candidate IPs often pass under a different SNI. We honor an
+/// explicitly requested/persisted strategy FIRST, then fall through the rest,
+/// so a one-shot `find`/`scan` tries every front before reporting "No clean IP".
+pub fn strategy_cascade(
+    preferred: Option<crate::health::SniStrategy>,
+) -> Vec<crate::health::SniStrategy> {
+    const ORDER: [crate::health::SniStrategy; 3] = [
+        crate::health::SniStrategy::GenericCfFirst,
+        crate::health::SniStrategy::WorkerThenGenericCf,
+        crate::health::SniStrategy::WorkerOnly,
+    ];
+    let mut out: Vec<crate::health::SniStrategy> = Vec::with_capacity(3);
+    if let Some(p) = preferred {
+        out.push(p);
+    }
+    for s in ORDER {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 /// --- v2 rolling-window strategy (round 3) ---
 ///
 /// Replaces the v1 consecutive-zero streak (which never rotated when a strategy
@@ -469,114 +495,160 @@ async fn discover_native(
     // Local builder for one pipeline round (rebuildable per expansion round).
     // The phase-2 SNI strategy is resolved once per cycle (Copy) and captured
     // by value, so the boxed future does not borrow `params`.
-    let cycle_strategy = params
-        .preferred_strategy
-        .unwrap_or(crate::health::SniStrategy::WorkerOnly);
-    let run_round = |cands: Vec<String>| {
-        let phase1: crate::slipscan::Phase1Fn = Box::new(move |ip: &str, fast_fail_ms: u64| {
-            let ip = ip.to_string();
-            Box::pin(async move { crate::health::probe_fast_any_port(&ip, fast_fail_ms).await })
-        });
-        let phase2: crate::slipscan::Phase2Fn =
-            Box::new(move |ip: &str, sni: &str, path: &str, ws_timeout_ms: u64| {
-                let ip = ip.to_string();
-                let sni = sni.to_string();
-                let path = path.to_string();
-                let strategy = cycle_strategy;
-                Box::pin(async move {
-                    crate::health::probe_with_sni_strategy(
-                        &ip,
-                        &sni,
-                        crate::health::GENERIC_CF_SNI,
-                        &sni,
-                        &path,
-                        ws_timeout_ms,
-                        strategy,
-                    )
-                    .await
-                })
-            });
-        let e2e: crate::slipscan::E2eFn =
-            Box::new(move |ip: &str, port: u16, vless: &str, timeout_s: u64| {
-                let ip = ip.to_string();
-                let vless = vless.to_string();
-                let bin = crate::e2e::singbox_bin();
-                Box::pin(async move {
-                    let _ = crate::e2e::ensure_singbox("1.11.4").await;
-                    crate::e2e::verify_tunnel(&ip, port, &vless, "0.0.0.0", &bin, timeout_s).await
-                })
-            });
-        let pipeline_params = crate::slipscan::PipelineParams {
-            target_n,
-            phase1_workers: params.workers.max(1),
-            phase2_workers: (params.workers / 4).clamp(4, 48),
-            e2e_workers: 4,
-            score_threshold: crate::health::ACCEPT_THRESHOLD,
-            fast_fail_ms: crate::health::FAST_FAIL_MS,
-            ws_timeout_ms: timeout_s as u64 * 1000,
-        };
-        crate::slipscan::pipeline_scan(
-            cands,
-            &sni,
-            &path,
-            &vless_link,
-            direct_ip.clone(),
-            pipeline_params,
-            phase1,
-            phase2,
-            e2e,
-            None,
-            None,
-        )
+    // Strategy cascade (Shiro-style multi-SNI): within ONE cycle, try every
+    // SNI strategy before declaring "no clean IP". A single strategy —
+    // especially the default WorkerOnly (`*.workers.dev` SNI) — is commonly
+    // DPI-blocked on censored networks, and the same candidate IPs often pass
+    // under a different SNI. Each strategy runs a first round over all
+    // candidates plus cluster expansion; verified endpoints accumulate across
+    // strategies, skipping those already covered.
+    let cascade = strategy_cascade(params.preferred_strategy);
+    let mut verified: Vec<CleanEndpoint> = Vec::new();
+    let mut diagnostics: Option<crate::slipscan::PipelineDiagnostics> = None;
+
+    let extend_unique = |dst: &mut Vec<CleanEndpoint>, src: Vec<CleanEndpoint>| {
+        for ep in src {
+            if !dst.iter().any(|v| v.ip == ep.ip) {
+                dst.push(ep);
+            }
+        }
     };
 
-    let mut examined: std::collections::HashSet<String> = candidate_ips.iter().cloned().collect();
-
-    let first = run_round(candidate_ips).await?;
-    let mut diagnostics = Some(first.diagnostics.clone());
-    let mut verified = first.verified;
-
-    // Multi-round cluster expansion (SlipNet style): when we find fewer than
-    // target_n clean IPs, expand around the ones we DID find (their /24
-    // siblings) and scan those next. One hit becomes a cluster. Bounded to
-    // avoid runaway scans; only runs while there is still room to improve.
-    let mut round = 0;
-    while verified.len() < target_n && round < 3 && !verified.is_empty() {
-        let expanded = crate::cf::ips::expand_around(&verified, 24, 254);
-        let mut new_cands = Vec::new();
-        for ip in expanded {
-            if examined.insert(ip.clone()) {
-                new_cands.push(ip);
-            }
-        }
-        if new_cands.is_empty() {
+    for strategy in cascade {
+        if verified.len() >= target_n {
             break;
         }
-        let r = run_round(new_cands).await?;
-        if let Some(d) = &mut diagnostics {
-            d.examined_total = d
-                .examined_total
-                .saturating_add(r.diagnostics.examined_total);
-            d.phase1_pass = d.phase1_pass.saturating_add(r.diagnostics.phase1_pass);
-            d.phase2_pass = d.phase2_pass.saturating_add(r.diagnostics.phase2_pass);
-            d.score_above_threshold = d
-                .score_above_threshold
-                .saturating_add(r.diagnostics.score_above_threshold);
-            d.e2e_pass = d.e2e_pass.saturating_add(r.diagnostics.e2e_pass);
-        }
-        for ep in r.verified {
-            if !verified.iter().any(|v| v.ip == ep.ip) {
-                verified.push(ep);
+        let cycle_strategy = strategy;
+        let run_round = |cands: Vec<String>| {
+            let phase1: crate::slipscan::Phase1Fn = Box::new(move |ip: &str, fast_fail_ms: u64| {
+                let ip = ip.to_string();
+                Box::pin(async move { crate::health::probe_fast_any_port(&ip, fast_fail_ms).await })
+            });
+            let phase2: crate::slipscan::Phase2Fn =
+                Box::new(move |ip: &str, sni: &str, path: &str, ws_timeout_ms: u64| {
+                    let ip = ip.to_string();
+                    let sni = sni.to_string();
+                    let path = path.to_string();
+                    let strategy = cycle_strategy;
+                    Box::pin(async move {
+                        crate::health::probe_with_sni_strategy(
+                            &ip,
+                            &sni,
+                            crate::health::GENERIC_CF_SNI,
+                            &sni,
+                            &path,
+                            ws_timeout_ms,
+                            strategy,
+                        )
+                        .await
+                    })
+                });
+            let e2e: crate::slipscan::E2eFn =
+                Box::new(move |ip: &str, port: u16, vless: &str, timeout_s: u64| {
+                    let ip = ip.to_string();
+                    let vless = vless.to_string();
+                    let bin = crate::e2e::singbox_bin();
+                    Box::pin(async move {
+                        let _ = crate::e2e::ensure_singbox("1.11.4").await;
+                        crate::e2e::verify_tunnel(&ip, port, &vless, "0.0.0.0", &bin, timeout_s)
+                            .await
+                    })
+                });
+            let pipeline_params = crate::slipscan::PipelineParams {
+                target_n,
+                phase1_workers: params.workers.max(1),
+                phase2_workers: (params.workers / 4).clamp(4, 48),
+                e2e_workers: 4,
+                score_threshold: crate::health::ACCEPT_THRESHOLD,
+                fast_fail_ms: crate::health::FAST_FAIL_MS,
+                ws_timeout_ms: timeout_s as u64 * 1000,
+            };
+            crate::slipscan::pipeline_scan(
+                cands,
+                &sni,
+                &path,
+                &vless_link,
+                direct_ip.clone(),
+                pipeline_params,
+                phase1,
+                phase2,
+                e2e,
+                None,
+                None,
+            )
+        };
+
+        let mut examined: std::collections::HashSet<String> =
+            candidate_ips.iter().cloned().collect();
+
+        let first = run_round(candidate_ips.clone()).await?;
+        match &mut diagnostics {
+            Some(d) => {
+                d.examined_total = d
+                    .examined_total
+                    .saturating_add(first.diagnostics.examined_total);
+                d.phase1_pass = d.phase1_pass.saturating_add(first.diagnostics.phase1_pass);
+                d.phase2_pass = d.phase2_pass.saturating_add(first.diagnostics.phase2_pass);
+                d.score_above_threshold = d
+                    .score_above_threshold
+                    .saturating_add(first.diagnostics.score_above_threshold);
+                d.e2e_pass = d.e2e_pass.saturating_add(first.diagnostics.e2e_pass);
             }
+            None => diagnostics = Some(first.diagnostics.clone()),
         }
-        verified.sort_by(|a, b| {
+        let mut strategy_verified = first.verified;
+        strategy_verified.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        verified.truncate(target_n);
-        round += 1;
+
+        // Multi-round cluster expansion per strategy (SlipNet style): when we
+        // find fewer than target_n clean IPs, expand around the ones we DID
+        // find (their /24 siblings) and scan those next. Bounded; only runs
+        // while there is still room to improve.
+        let mut round = 0;
+        while strategy_verified.len() < target_n && round < 3 && !strategy_verified.is_empty() {
+            let expanded = crate::cf::ips::expand_around(&strategy_verified, 24, 254);
+            let mut new_cands = Vec::new();
+            for ip in expanded {
+                if examined.insert(ip.clone()) {
+                    new_cands.push(ip);
+                }
+            }
+            if new_cands.is_empty() {
+                break;
+            }
+            let r = run_round(new_cands).await?;
+            if let Some(d) = &mut diagnostics {
+                d.examined_total = d
+                    .examined_total
+                    .saturating_add(r.diagnostics.examined_total);
+                d.phase1_pass = d.phase1_pass.saturating_add(r.diagnostics.phase1_pass);
+                d.phase2_pass = d.phase2_pass.saturating_add(r.diagnostics.phase2_pass);
+                d.score_above_threshold = d
+                    .score_above_threshold
+                    .saturating_add(r.diagnostics.score_above_threshold);
+                d.e2e_pass = d.e2e_pass.saturating_add(r.diagnostics.e2e_pass);
+            }
+            extend_unique(&mut strategy_verified, r.verified);
+            strategy_verified.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            round += 1;
+        }
+
+        extend_unique(&mut verified, strategy_verified);
     }
+
+    verified.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    verified.truncate(target_n);
 
     // Persist diagnostics so the GUI/CLI can explain a zero result.
     if let Some(d) = diagnostics {
@@ -1011,14 +1083,38 @@ pub fn write_active_configs(
         use crate::generated_configs::ConfigSource;
         let mut ledger = crate::generated_configs::load_generated_configs(profile_id);
         let now = crate::store::now_ts() as u64;
-        ledger.push(now, crate::export::ExportFormat::ShareLink, ConfigSource::WorkerVless, Some(format!("active {}", ep.ip)), link.clone())?;
+        ledger.push(
+            now,
+            crate::export::ExportFormat::ShareLink,
+            ConfigSource::WorkerVless,
+            Some(format!("active {}", ep.ip)),
+            link.clone(),
+        )?;
         if let Ok(xray) = fronted.xray_client_json() {
-            ledger.push(now, crate::export::ExportFormat::V2rayN, ConfigSource::WorkerVless, Some(format!("active {}", ep.ip)), xray.clone())?;
+            ledger.push(
+                now,
+                crate::export::ExportFormat::V2rayN,
+                ConfigSource::WorkerVless,
+                Some(format!("active {}", ep.ip)),
+                xray.clone(),
+            )?;
         }
         if let Ok(sb) = crate::export::sing_box_json(&fronted) {
-            ledger.push(now, crate::export::ExportFormat::SingBox, ConfigSource::WorkerVless, Some(format!("active {}", ep.ip)), sb.clone())?;
+            ledger.push(
+                now,
+                crate::export::ExportFormat::SingBox,
+                ConfigSource::WorkerVless,
+                Some(format!("active {}", ep.ip)),
+                sb.clone(),
+            )?;
         }
-        ledger.push(now, crate::export::ExportFormat::Clash, ConfigSource::WorkerVless, Some(format!("active {}", ep.ip)), crate::export::clash_entry(&fronted))?;
+        ledger.push(
+            now,
+            crate::export::ExportFormat::Clash,
+            ConfigSource::WorkerVless,
+            Some(format!("active {}", ep.ip)),
+            crate::export::clash_entry(&fronted),
+        )?;
         crate::generated_configs::save_generated_configs(profile_id, &ledger)?;
     }
 
@@ -2605,6 +2701,25 @@ mod tests {
     fn split_endpoint_handles_port() {
         assert_eq!(split_endpoint("1.2.3.4:443"), ("1.2.3.4".into(), 443));
         assert_eq!(split_endpoint("1.2.3.4"), ("1.2.3.4".into(), 443));
+    }
+
+    #[test]
+    fn strategy_cascade_puts_preferred_first_and_covers_all() {
+        use crate::health::SniStrategy as S;
+        // No preferred → full cascade, GenericCfFirst first (most DPI-proof).
+        let c = strategy_cascade(None);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0], S::GenericCfFirst);
+        assert!(c.contains(&S::WorkerOnly));
+        assert!(c.contains(&S::WorkerThenGenericCf));
+        // Explicit preferred is honored first, no dupes.
+        let c = strategy_cascade(Some(S::WorkerOnly));
+        assert_eq!(c[0], S::WorkerOnly);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.iter().filter(|&&s| s == S::WorkerOnly).count(), 1);
+        let c = strategy_cascade(Some(S::GenericCfFirst));
+        assert_eq!(c[0], S::GenericCfFirst);
+        assert_eq!(c.len(), 3);
     }
 
     #[test]

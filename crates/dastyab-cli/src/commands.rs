@@ -16,7 +16,10 @@ use dastyab_core::worker::{
 use dastyab_core::{CFError, BRAND, VERSION};
 use std::path::PathBuf;
 
-use crate::{BackupAction, Command, DaemonAction, DnsAction, ProtectionAction, RoutesAction, SnapshotsAction, WorkspaceAction};
+use crate::{
+    BackupAction, Command, DaemonAction, DnsAction, ProtectionAction, RoutesAction,
+    SnapshotsAction, WorkspaceAction,
+};
 use dastyab_core::remote_beacon::BeaconConfig;
 /// Run a command. `profile` is the active profile id.
 pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
@@ -94,6 +97,40 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         } => deploy(&profile, account, worker, preset).await,
         Command::Scan => scan(&profile, 1).await,
         Command::ScanMany { count } => scan(&profile, count).await,
+        Command::Find {
+            count,
+            suffix: _,
+            sample,
+            workers,
+            timeout,
+            top,
+            refresh,
+            seed,
+            strategy,
+            no_retry,
+            json,
+            quiet,
+            out,
+        } => {
+            cmd_find(
+                &profile,
+                FindOpts {
+                    count,
+                    sample,
+                    workers,
+                    timeout,
+                    top,
+                    refresh,
+                    seed,
+                    strategy,
+                    no_retry,
+                    json,
+                    quiet,
+                    out,
+                },
+            )
+            .await
+        }
         Command::History => history(&profile),
         Command::Configs { action } => configs_cmd(&profile, action),
         Command::Status => status(&profile),
@@ -775,9 +812,7 @@ fn configs_cmd(profile: &str, action: crate::ConfigsAction) -> Result<(), CFErro
     let ledger = dastyab_core::generated_configs::load_generated_configs(profile);
     match action {
         crate::ConfigsAction::List { fmt, since, search } => {
-            let fmt = fmt
-                .as_deref()
-                .and_then(ExportFormat::parse);
+            let fmt = fmt.as_deref().and_then(ExportFormat::parse);
             let q = ConfigQuery {
                 fmt,
                 source: None,
@@ -894,8 +929,9 @@ fn versions_cmd(profile: &str, action: crate::VersionsAction) -> Result<(), CFEr
             Ok(())
         }
         crate::VersionsAction::Health => {
-            let health = av::measure_versioning_health(&dir, dastyab_core::store::now_ts() as u64)
-                .map_err(to_verr)?;
+            let health =
+                av::measure_versioning_health(&dir, dastyab_core::store::now_ts() as u64)
+                    .map_err(to_verr)?;
             println!("Profile: {profile}");
             println!("Version dirs: {}", health.dir_count);
             println!("Version files: {}", health.file_count);
@@ -906,7 +942,10 @@ fn versions_cmd(profile: &str, action: crate::VersionsAction) -> Result<(), CFEr
             if !health.oversized_dirs.is_empty() {
                 println!("OVERSIZED dirs: {}", health.oversized_dirs.join(", "));
             }
-            println!("Consecutive prune failures: {}", health.consecutive_failures);
+            println!(
+                "Consecutive prune failures: {}",
+                health.consecutive_failures
+            );
             if let Some(t) = health.last_failure_unix {
                 println!("Last failure at unix: {t}");
             }
@@ -942,8 +981,9 @@ fn versions_cmd(profile: &str, action: crate::VersionsAction) -> Result<(), CFEr
             println!("{}", av::pitr_preview_markdown(&plan));
             if !dry_run {
                 let now = dastyab_core::store::now_ts() as u64;
-                let report = av::execute_pitr_plan(&dir, &plan, false, now)
-                    .map_err(|e| CFError::new("PITR error", format!("{e:?}"), "Version restore failed."))?;
+                let report = av::execute_pitr_plan(&dir, &plan, false, now).map_err(|e| {
+                    CFError::new("PITR error", format!("{e:?}"), "Version restore failed.")
+                })?;
                 println!(
                     "restored={} skipped={} mismatches={} verified={}",
                     report.restored,
@@ -961,7 +1001,11 @@ fn versions_cmd(profile: &str, action: crate::VersionsAction) -> Result<(), CFEr
 }
 
 fn to_verr(e: dastyab_core::artifact_versions::VersionError) -> CFError {
-    CFError::new("Version error", e.to_string(), "Check the artifact path and version timestamp.")
+    CFError::new(
+        "Version error",
+        e.to_string(),
+        "Check the artifact path and version timestamp.",
+    )
 }
 
 fn status(profile: &str) -> Result<(), CFError> {
@@ -1315,6 +1359,182 @@ fn cmd_ranges() -> Result<(), CFError> {
             println!("No cached Cloudflare ranges yet. Run `dastyab discover` to fetch.");
         }
     }
+    Ok(())
+}
+
+/// Options backing `dastyab find [COUNT]`.
+struct FindOpts {
+    count: u32,
+    sample: u32,
+    workers: u32,
+    timeout: u32,
+    top: Option<u32>,
+    refresh: bool,
+    seed: Option<String>,
+    strategy: Option<crate::StrategyChoice>,
+    no_retry: bool,
+    json: bool,
+    quiet: bool,
+    out: Option<String>,
+}
+
+/// `dastyab find [COUNT]` — dead-simple by default, fully tunable when you
+/// want the advanced knobs. Simple: `find 1`, `find 5 ip`. Advanced: `--sample`,
+/// `--workers`, `--timeout`, `--top`, `--seed`, `--strategy`, `--refresh`,
+/// `--no-retry`, `--json`, `--quiet`, `--out`.
+async fn cmd_find(profile: &str, o: FindOpts) -> Result<(), CFError> {
+    let target_n = o.top.unwrap_or(o.count.max(1)).max(1);
+    let strategy = o.strategy.map(|s| match s {
+        crate::StrategyChoice::WorkerOnly => dastyab_core::health::SniStrategy::WorkerOnly,
+        crate::StrategyChoice::GenericFirst => dastyab_core::health::SniStrategy::GenericCfFirst,
+        crate::StrategyChoice::WorkerThenGeneric => {
+            dastyab_core::health::SniStrategy::WorkerThenGenericCf
+        }
+    });
+    let seed_ips: Vec<String> = o
+        .seed
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let params = dastyab_core::autopilot::DiscoveryParams {
+        sample: o.sample.max(1),
+        workers: o.workers.max(1) as usize,
+        timeout_s: o.timeout.max(1),
+        top_n: target_n as usize,
+        force_refresh_ranges: o.refresh,
+        retry_on_fail: !o.no_retry,
+        seed_ips,
+        preferred_strategy: strategy,
+        ..Default::default()
+    };
+
+    // Make sure we have a base worker config to front.
+    let _ = dastyab_core::autopilot::base_vless(profile)?;
+
+    if !o.quiet && !o.json {
+        println!(
+            "Finding {} clean IP(s) … ({} candidates, {} workers, {}s timeout)",
+            target_n, o.sample, o.workers, o.timeout
+        );
+    }
+
+    let engine = dastyab_core::autopilot::AutopilotEngine::new(
+        profile,
+        params.clone(),
+        std::time::Duration::from_secs(300),
+    );
+    let (found, summary) = engine
+        .run_cycle_guarded(std::time::Duration::from_secs(
+            dastyab_core::cycle_guard::DISCOVERY_TIMEOUT_SECS,
+        ))
+        .await?;
+
+    if found.is_empty() {
+        if o.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": false,
+                    "found": 0,
+                    "message": summary.note,
+                })
+            );
+        } else if !o.quiet {
+            println!("No clean IP found. {}", summary.note);
+            println!("Tip: try a larger --sample, or --refresh, or re-deploy the worker.");
+        }
+        return Ok(());
+    }
+
+    if o.json {
+        let endpoints: Vec<serde_json::Value> = found
+            .iter()
+            .map(|ep| {
+                serde_json::json!({
+                    "ip": ep.ip,
+                    "port": ep.port,
+                    "score": ep.score,
+                    "tcp_ms": ep.tcp_ms,
+                    "download_kbps": ep.download_kbps,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "found": found.len(),
+                "endpoints": endpoints,
+                "message": summary.note,
+            })
+        );
+    } else if o.quiet {
+        for ep in &found {
+            println!("{}", ep.ip);
+        }
+    } else {
+        for ep in &found {
+            println!(
+                "✓ {}:{} (score {:.1}, tcp {:.0}ms, {:.0} kbps)",
+                ep.ip, ep.port, ep.score, ep.tcp_ms, ep.download_kbps
+            );
+        }
+        println!("{}", summary.note);
+    }
+
+    // Surface the user-facing bundle (QR + active config). Copy to --out if given.
+    if let Ok(bundle) =
+        dastyab_core::cleanip::write_user_bundle(profile, &base_vless_for(profile), &found)
+    {
+        if !o.quiet && !o.json {
+            println!();
+            println!("✓ Bundle written: {}", bundle.dir.display());
+            println!("  → active.png   (scan with your phone)");
+            println!("  → active.vless (paste into your desktop client)");
+            if let Some(best) = found.first() {
+                println!(
+                    "  Best endpoint: {}:{} ({:.0}ms)",
+                    best.ip, best.port, best.tcp_ms
+                );
+            }
+        }
+        if let Some(dest) = o.out {
+            copy_bundle(&bundle.dir, &dest)?;
+        }
+    }
+
+    Ok(())
+}
+/// user-specified directory. Used by `find --out <dir>`.
+fn copy_bundle(src: &std::path::Path, dest: &str) -> Result<(), CFError> {
+    let dest_path = std::path::Path::new(dest);
+    std::fs::create_dir_all(dest_path).map_err(|e| {
+        CFError::new(
+            "Out dir",
+            format!("Cannot create {dest}: {e}"),
+            "Check permissions and retry.",
+        )
+    })?;
+    let names = ["active.vless", "active.png", "fallbacks.txt", "README.txt"];
+    let mut copied = 0;
+    for n in names {
+        let s = src.join(n);
+        if s.exists() {
+            std::fs::copy(&s, dest_path.join(n))
+                .map_err(|e| CFError::new("Copy", format!("Cannot copy {n}: {e}"), ""))?;
+            copied += 1;
+        }
+    }
+    println!(
+        "✓ Copied bundle ({copied} files) to {}",
+        dest_path.display()
+    );
     Ok(())
 }
 
@@ -3213,7 +3433,6 @@ mod tests {
     }
 }
 
-
 /// `inventory` subcommand — render the configs inventory.
 fn inventory_cmd(
     profile_filter: Option<String>,
@@ -3245,14 +3464,16 @@ fn inventory_cmd(
             })
             .collect::<Vec<_>>()
     });
-    let status_opt = integrity_filter.as_deref().map(|s| match s.to_lowercase().as_str() {
-        "verified" => IntegrityStatus::Verified,
-        "missing" => IntegrityStatus::Missing,
-        "changed" => IntegrityStatus::Changed,
-        "extra" => IntegrityStatus::Extra,
-        "no-manifest" | "nomanifest" => IntegrityStatus::NoManifest,
-        _ => IntegrityStatus::NoManifest,
-    });
+    let status_opt = integrity_filter
+        .as_deref()
+        .map(|s| match s.to_lowercase().as_str() {
+            "verified" => IntegrityStatus::Verified,
+            "missing" => IntegrityStatus::Missing,
+            "changed" => IntegrityStatus::Changed,
+            "extra" => IntegrityStatus::Extra,
+            "no-manifest" | "nomanifest" => IntegrityStatus::NoManifest,
+            _ => IntegrityStatus::NoManifest,
+        });
 
     let filter = InventoryFilter {
         profile_id: profile_filter,
@@ -3275,7 +3496,11 @@ fn inventory_cmd(
     match output {
         Some(p) => {
             std::fs::write(&p, rendered).map_err(|e| {
-                CFError::new("Inventory error", format!("Cannot write {p}: {e}"), "Check permissions.")
+                CFError::new(
+                    "Inventory error",
+                    format!("Cannot write {p}: {e}"),
+                    "Check permissions.",
+                )
             })?;
             println!("✓ Wrote inventory → {p}");
         }
@@ -3353,7 +3578,10 @@ fn snapshots_cmd(profile: &str, action: SnapshotsAction) -> Result<(), CFError> 
         SnapshotsAction::List => {
             let list = list_snapshots(&snaps);
             if list.is_empty() {
-                println!("No scheduled workspace snapshots yet ({}).", snaps.display());
+                println!(
+                    "No scheduled workspace snapshots yet ({}).",
+                    snaps.display()
+                );
                 println!("The daemon writes one every 6h automatically, or run:");
                 println!("  dastyab workspace snapshot");
                 return Ok(());
@@ -3363,7 +3591,10 @@ fn snapshots_cmd(profile: &str, action: SnapshotsAction) -> Result<(), CFError> 
                 let status = if e.invalid {
                     "INVALID".to_string()
                 } else {
-                    format!("{} profile(s), {} artifact(s)", e.profile_count, e.artifact_count)
+                    format!(
+                        "{} profile(s), {} artifact(s)",
+                        e.profile_count, e.artifact_count
+                    )
                 };
                 println!(
                     "  [{}] {} — {} — {}",
@@ -3381,7 +3612,8 @@ fn snapshots_cmd(profile: &str, action: SnapshotsAction) -> Result<(), CFError> 
             overwrite,
             dry_run,
         } => {
-            let snap = dastyab_core::workspace_snapshot::read_snapshot(std::path::Path::new(&path))?;
+            let snap =
+                dastyab_core::workspace_snapshot::read_snapshot(std::path::Path::new(&path))?;
             let opts = dastyab_core::workspace_snapshot::RestoreOptions {
                 overwrite_existing: overwrite,
                 dry_run,
@@ -3401,7 +3633,8 @@ fn snapshots_cmd(profile: &str, action: SnapshotsAction) -> Result<(), CFError> 
                     summary.profiles_removed
                 );
             }
-            let report = dastyab_core::workspace_snapshot::restore_workspace(&snap, &workspace, &opts)?;
+            let report =
+                dastyab_core::workspace_snapshot::restore_workspace(&snap, &workspace, &opts)?;
             let _ = profile;
             if dry_run {
                 println!(
@@ -3436,7 +3669,8 @@ fn workspace_cmd(action: WorkspaceAction) -> Result<(), CFError> {
                 _ => SnapshotKind::Full,
             };
             let workspace = dastyab_core::store::mem_dir();
-            let snap = snapshot_workspace(&workspace, kind, dastyab_core::store::now_ts() as u64)?;
+            let snap =
+                snapshot_workspace(&workspace, kind, dastyab_core::store::now_ts() as u64)?;
             let dest = match output {
                 Some(p) => std::path::PathBuf::from(p),
                 None => workspace.join("workspace-snapshot.json"),
@@ -3462,9 +3696,15 @@ fn workspace_cmd(action: WorkspaceAction) -> Result<(), CFError> {
             let workspace = dastyab_core::store::mem_dir();
             let report = restore_workspace(&snap, &workspace, &opts)?;
             if dry_run {
-                println!("✓ Dry run: would restore {} profile(s), {} file(s).", report.profiles_restored, report.files_written);
+                println!(
+                    "✓ Dry run: would restore {} profile(s), {} file(s).",
+                    report.profiles_restored, report.files_written
+                );
             } else {
-                println!("✓ Restored {} profile(s), {} file(s).", report.profiles_restored, report.files_written);
+                println!(
+                    "✓ Restored {} profile(s), {} file(s).",
+                    report.profiles_restored, report.files_written
+                );
             }
             if !report.verified {
                 println!("⚠ {} integrity mismatch(es):", report.mismatches.len());
@@ -3476,4 +3716,3 @@ fn workspace_cmd(action: WorkspaceAction) -> Result<(), CFError> {
     }
     Ok(())
 }
-
