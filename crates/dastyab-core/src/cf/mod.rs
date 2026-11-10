@@ -595,10 +595,7 @@ impl Client {
     }
 
     /// List KV namespaces in the account.
-    pub async fn list_kv_namespaces(
-        &self,
-        account_id: &str,
-    ) -> Result<Vec<KvNamespace>, CFError> {
+    pub async fn list_kv_namespaces(&self, account_id: &str) -> Result<Vec<KvNamespace>, CFError> {
         let body = self
             .request(
                 "GET",

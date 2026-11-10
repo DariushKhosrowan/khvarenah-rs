@@ -19,7 +19,7 @@
 //! case, so the preservation assertion is against the on-disk contract the
 //! daemon actually uses.
 
-use crate::daemon::{AccountProbe, CycleRunner, DaemonState, NetworkProbe, NetStatus};
+use crate::daemon::{AccountProbe, CycleRunner, DaemonState, NetStatus, NetworkProbe};
 use crate::error::CFError;
 use std::future::Future;
 use std::pin::Pin;
@@ -61,7 +61,10 @@ impl ScriptedProbe {
 
     pub fn down() -> Self {
         Self {
-            status: NetStatus { up: false, tier: None },
+            status: NetStatus {
+                up: false,
+                tier: None,
+            },
             calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -177,9 +180,8 @@ pub async fn run_blackout_scenario(
     let mut reloaded = crate::daemon::load_daemon_state(profile);
     // Simulate elapsed blackout time across the restart.
     if reloaded.blackout_since_unix > 0 {
-        reloaded.blackout_since_unix -= blackout_elapsed_secs.min(
-            reloaded.blackout_since_unix as u64,
-        ) as i64;
+        reloaded.blackout_since_unix -=
+            blackout_elapsed_secs.min(reloaded.blackout_since_unix as u64) as i64;
         if reloaded.blackout_since_unix < 0 {
             reloaded.blackout_since_unix = 0;
         }
@@ -247,10 +249,9 @@ mod tests {
     async fn drill_cooldown_prevents_repeated_dead_endpoint() {
         // The cooldown is exercised at the carrier-pool level; verify the
         // escalation escalation_plan and backoff_secs cooperate.
-        let mut pool = crate::carrier_pool::CarrierPool::open(
-            std::env::temp_dir().join("drill_pool.json"),
-        )
-        .unwrap();
+        let mut pool =
+            crate::carrier_pool::CarrierPool::open(std::env::temp_dir().join("drill_pool.json"))
+                .unwrap();
         let mut snap = crate::carrier_pool::CarrierSnapshot::new_empty(1000);
         snap.endpoints.push(crate::carrier_pool::CarrierEndpoint {
             kind: crate::carrier_pool::CarrierKind::WorkerData,
@@ -275,19 +276,27 @@ mod tests {
         // escalation escalation_plan + cooldown cooperation is what prevents
         // re-dialing it every tick. Assert the fallback is non-empty and the
         // cooldown is recorded.
-        let sel = pool.select_at(crate::carrier_pool::CarrierKind::WorkerData, 8, 1001).unwrap();
-        assert_eq!(sel.len(), 1, "single cooling endpoint must fall back (never empty)");
+        let sel = pool
+            .select_at(crate::carrier_pool::CarrierKind::WorkerData, 8, 1001)
+            .unwrap();
+        assert_eq!(
+            sel.len(),
+            1,
+            "single cooling endpoint must fall back (never empty)"
+        );
         let loaded = pool.load().unwrap();
         let id = crate::carrier_pool::CarrierPool::endpoint_id_hex(e);
-        assert!(loaded.penalties.contains_key(&id), "cooldown penalty must be recorded");
+        assert!(
+            loaded.penalties.contains_key(&id),
+            "cooldown penalty must be recorded"
+        );
     }
 
     #[tokio::test]
     async fn drill_escalated_select_fills_from_cooling_when_all_cooled() {
-        let pool = crate::carrier_pool::CarrierPool::open(
-            std::env::temp_dir().join("drill_pool2.json"),
-        )
-        .unwrap();
+        let pool =
+            crate::carrier_pool::CarrierPool::open(std::env::temp_dir().join("drill_pool2.json"))
+                .unwrap();
         let mut snap = crate::carrier_pool::CarrierSnapshot::new_empty(1000);
         for (i, h) in ["a", "b"].iter().enumerate() {
             snap.endpoints.push(crate::carrier_pool::CarrierEndpoint {
@@ -318,7 +327,11 @@ mod tests {
             1001,
         )
         .unwrap();
-        assert_eq!(sel.len(), 2, "escalated_select must fill from cooling endpoints");
+        assert_eq!(
+            sel.len(),
+            2,
+            "escalated_select must fill from cooling endpoints"
+        );
     }
 
     #[tokio::test]
@@ -330,7 +343,10 @@ mod tests {
         assert!(state.network_was_down);
         let mut probe = ScriptedProbe::healthy();
         let obs = run_ticks(profile, &mut state, &mut probe, 2, 0).await;
-        assert!(!obs[1].network_was_down, "must recover to Direct within 2 ticks");
+        assert!(
+            !obs[1].network_was_down,
+            "must recover to Direct within 2 ticks"
+        );
         assert_eq!(obs[1].blackout_since_unix, 0);
     }
 
@@ -345,13 +361,22 @@ mod tests {
         // Persist + reload (real path).
         let _ = crate::daemon::save_daemon_state(profile, &state);
         let reloaded = crate::daemon::load_daemon_state(profile);
-        assert!(reloaded.network_was_down, "network_was_down must survive restart");
-        assert!(reloaded.blackout_since_unix > 0, "blackout clock must survive restart");
+        assert!(
+            reloaded.network_was_down,
+            "network_was_down must survive restart"
+        );
+        assert!(
+            reloaded.blackout_since_unix > 0,
+            "blackout clock must survive restart"
+        );
         // Next tick is still blackout (not Direct).
         let mut probe = ScriptedProbe::down();
         let mut st = reloaded;
         let obs = run_ticks(profile, &mut st, &mut probe, 1, 0).await;
-        assert!(obs[0].network_was_down, "restart must stay in blackout, not Direct");
+        assert!(
+            obs[0].network_was_down,
+            "restart must stay in blackout, not Direct"
+        );
     }
 
     #[tokio::test]

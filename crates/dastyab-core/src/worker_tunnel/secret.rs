@@ -117,7 +117,10 @@ pub fn assign_new_secret(
     now_unix: u64,
 ) -> Result<(), CFError> {
     let secret = generate_secret();
-    let entry = cfg.worker_secrets.entry(worker_url.to_string()).or_default();
+    let entry = cfg
+        .worker_secrets
+        .entry(worker_url.to_string())
+        .or_default();
     entry.worker_url = worker_url.to_string();
     if entry.secret.is_empty() {
         // First assignment → promote immediately; no pending phase needed.
@@ -241,7 +244,10 @@ mod tests {
     fn resolve_worker_secret_returns_per_worker_when_present() {
         let mut c = cfg();
         seed_worker(&mut c, "http://w", 0);
-        assert_eq!(resolve_worker_secret(&c, "http://w", "shared"), "current-secret");
+        assert_eq!(
+            resolve_worker_secret(&c, "http://w", "shared"),
+            "current-secret"
+        );
     }
 
     #[test]
@@ -279,7 +285,10 @@ mod tests {
         let mut c = cfg();
         seed_worker(&mut c, "http://w", 1000);
         c.worker_secrets.get_mut("http://w").unwrap().pending_secret = Some("pending".into());
-        c.worker_secrets.get_mut("http://w").unwrap().pending_since_unix = 2000;
+        c.worker_secrets
+            .get_mut("http://w")
+            .unwrap()
+            .pending_since_unix = 2000;
         // now = 2100 → pending is 100s old (< 1h) → blocked.
         assert!(!rotation_eligible(&c, "http://w", 2100, 100, true));
         // now = 2000 + 2h → pending stale → eligible again.
@@ -291,7 +300,10 @@ mod tests {
         let mut c = cfg();
         seed_worker(&mut c, "http://w", 1000);
         c.worker_secrets.get_mut("http://w").unwrap().pending_secret = Some("pending-2".into());
-        c.worker_secrets.get_mut("http://w").unwrap().pending_since_unix = 2000;
+        c.worker_secrets
+            .get_mut("http://w")
+            .unwrap()
+            .pending_since_unix = 2000;
         let v = promote_pending(&mut c, "http://w", 3000).unwrap();
         assert_eq!(v, 2);
         let ws = &c.worker_secrets["http://w"];
@@ -321,7 +333,10 @@ mod tests {
         assert!(ws.pending_secret.is_some());
         assert_eq!(ws.pending_since_unix, 2000);
         // resolve still returns the current, never pending.
-        assert_eq!(resolve_worker_secret(&c, "http://w", "shared"), "current-secret");
+        assert_eq!(
+            resolve_worker_secret(&c, "http://w", "shared"),
+            "current-secret"
+        );
     }
 
     #[test]

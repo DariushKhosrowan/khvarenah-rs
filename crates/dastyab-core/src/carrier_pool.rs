@@ -241,9 +241,10 @@ impl CarrierPool {
 
     /// Read the current snapshot (verifies integrity).
     pub fn load(&self) -> Result<CarrierSnapshot, CarrierPoolError> {
-        let guard = self.inner.read().map_err(|_| {
-            CarrierPoolError::Integrity("carrier pool lock poisoned".into())
-        })?;
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| CarrierPoolError::Integrity("carrier pool lock poisoned".into()))?;
         Ok(guard.clone())
     }
 
@@ -476,10 +477,7 @@ impl CarrierPool {
     }
 
     /// Record a success for `ep`: clears any penalty (streak + cooldown).
-    pub fn record_success(
-        &self,
-        ep: &CarrierEndpoint,
-    ) -> Result<(), CarrierPoolError> {
+    pub fn record_success(&self, ep: &CarrierEndpoint) -> Result<(), CarrierPoolError> {
         let id = Self::endpoint_id_hex(ep);
         let mut guard = self
             .inner
@@ -619,7 +617,8 @@ mod tests {
     #[test]
     fn carrier_snapshot_roundtrip() {
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerTunnel, "w1.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerTunnel, "w1.example.com", 443, 0.9));
         snap.sign().unwrap();
         assert!(snap.verify().is_ok());
         // Re-serialize → parse → verify still ok.
@@ -632,7 +631,8 @@ mod tests {
     #[test]
     fn carrier_snapshot_tamper_detected() {
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "w.example.com", 443, 0.8));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "w.example.com", 443, 0.8));
         snap.sign().unwrap();
         // Tamper: mutate the host string (safe, no unsafe).
         snap.endpoints[0].host = "X.example.com".to_string();
@@ -643,7 +643,8 @@ mod tests {
     fn carrier_pool_atomic_store() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerTunnel, "a.example.com", 443, 0.5));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerTunnel, "a.example.com", 443, 0.5));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         let loaded = pool.load().unwrap();
@@ -658,15 +659,20 @@ mod tests {
     fn carrier_pool_merge_dedups_by_kind_host_port_sni() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerTunnel, "w.example.com", 443, 0.5));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerTunnel, "w.example.com", 443, 0.5));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
 
         let mut incoming = CarrierSnapshot::new_empty(2000);
         incoming.generation = 1;
-        incoming.endpoints.push(ep(CarrierKind::WorkerTunnel, "w.example.com", 443, 0.7));
+        incoming
+            .endpoints
+            .push(ep(CarrierKind::WorkerTunnel, "w.example.com", 443, 0.7));
         incoming.sign().unwrap();
-        let report = pool.merge(incoming, CarrierProvenance::Remote, 2000).unwrap();
+        let report = pool
+            .merge(incoming, CarrierProvenance::Remote, 2000)
+            .unwrap();
         assert_eq!(report.added, 0);
         assert_eq!(report.updated, 1);
         let loaded = pool.load().unwrap();
@@ -702,10 +708,14 @@ mod tests {
     fn carrier_pool_select_offline_pure() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "d1.example.com", 443, 0.3));
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "d2.example.com", 443, 0.9));
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "d3.example.com", 443, 0.6));
-        snap.endpoints.push(ep(CarrierKind::WorkerTunnel, "c1.example.com", 443, 1.0));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "d1.example.com", 443, 0.3));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "d2.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "d3.example.com", 443, 0.6));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerTunnel, "c1.example.com", 443, 1.0));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
 
@@ -734,7 +744,10 @@ mod tests {
         };
         fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
         // `open` verifies on read → must reject schema v2.
-        assert!(matches!(CarrierPool::open(&path), Err(CarrierPoolError::Schema(2))));
+        assert!(matches!(
+            CarrierPool::open(&path),
+            Err(CarrierPoolError::Schema(2))
+        ));
     }
 
     fn identity_of(pool: &CarrierPool) -> [u8; 32] {
@@ -748,10 +761,12 @@ mod tests {
         let (_d2, p2) = tmp_pool();
         let mut s1 = CarrierSnapshot::new_empty(1000);
         let mut s2 = CarrierSnapshot::new_empty(1000);
-        s1.endpoints.push(ep(CarrierKind::WorkerData, "d.example.com", 443, 0.1));
+        s1.endpoints
+            .push(ep(CarrierKind::WorkerData, "d.example.com", 443, 0.1));
         s1.endpoints[0].last_probe_ok_unix = Some(100);
         s1.endpoints[0].last_probe_rtt_ms = Some(5);
-        s2.endpoints.push(ep(CarrierKind::WorkerData, "d.example.com", 443, 0.9));
+        s2.endpoints
+            .push(ep(CarrierKind::WorkerData, "d.example.com", 443, 0.9));
         s2.endpoints[0].last_probe_ok_unix = Some(500);
         s2.endpoints[0].last_probe_rtt_ms = Some(200);
         s1.sign().unwrap();
@@ -787,8 +802,10 @@ mod tests {
         let (_d2, p2) = tmp_pool();
         let mut s1 = CarrierSnapshot::new_empty(1000);
         let mut s2 = CarrierSnapshot::new_empty(1000);
-        s1.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.5));
-        s2.endpoints.push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
+        s1.endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.5));
+        s2.endpoints
+            .push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
         s1.sign().unwrap();
         s2.sign().unwrap();
         p1.store_atomic(&s1).unwrap();
@@ -809,7 +826,8 @@ mod tests {
     fn record_failure_increments_streak_and_sets_cooldown() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         let e = &snap.endpoints[0];
@@ -830,7 +848,8 @@ mod tests {
     fn record_success_clears_penalty() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         let e = &snap.endpoints[0];
@@ -844,8 +863,10 @@ mod tests {
     fn select_at_excludes_cooldowned_endpoint() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         // cooldown a
@@ -859,8 +880,10 @@ mod tests {
     fn select_at_reincludes_after_cooldown_expires() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         pool.record_failure(&snap.endpoints[0], 1000).unwrap();
@@ -874,8 +897,10 @@ mod tests {
     fn select_at_never_empty_when_all_cooldowned() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "b.example.com", 443, 0.5));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         pool.record_failure(&snap.endpoints[0], 1000).unwrap();
@@ -888,7 +913,8 @@ mod tests {
     fn merge_ignores_remote_penalties_preserves_local() {
         let (_dir, pool) = tmp_pool();
         let mut snap = CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        snap.endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         // local failure recorded
@@ -896,9 +922,12 @@ mod tests {
         // remote merge with the same endpoint (fresh, no penalties)
         let mut incoming = CarrierSnapshot::new_empty(2000);
         incoming.generation = 1;
-        incoming.endpoints.push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
+        incoming
+            .endpoints
+            .push(ep(CarrierKind::WorkerData, "a.example.com", 443, 0.9));
         incoming.sign().unwrap();
-        pool.merge(incoming, CarrierProvenance::Remote, 2000).unwrap();
+        pool.merge(incoming, CarrierProvenance::Remote, 2000)
+            .unwrap();
         // local penalty survives (remote cannot clear it)
         let loaded = pool.load().unwrap();
         let id = CarrierPool::endpoint_id_hex(&snap.endpoints[0]);

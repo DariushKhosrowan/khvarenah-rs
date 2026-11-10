@@ -144,10 +144,7 @@ pub const ROTATION_MAX_AGE_SECS: u64 = 30 * 86400;
 /// Execute one auto-fix action. Returns the number of distinct fixes applied.
 /// Errors are surfaced to the caller (logged / surfaced as a pending retry)
 /// without aborting the rest of the audit pass.
-pub fn execute_auto_fix(
-    code: &str,
-    ctx: &mut AutonomyContext<'_>,
-) -> Result<bool, CFError> {
+pub fn execute_auto_fix(code: &str, ctx: &mut AutonomyContext<'_>) -> Result<bool, CFError> {
     match code {
         // Config toggles — no seam, no network; flip the profile flag.
         "backup" => {
@@ -167,16 +164,9 @@ pub fn execute_auto_fix(
             }
             Ok(true)
         }
-        "token_rotate" => ctx
-            .seam
-            .ensure_second_token(ctx.profile)
-            .map(|_| true),
-        "worker_secret_rotate" => {
-            ctx.seam.rotate_worker(ctx.profile).map(|_| true)
-        }
-        "tunnel" => {
-            ctx.seam.ensure_dns_tunnel(ctx.profile).map(|_| true)
-        }
+        "token_rotate" => ctx.seam.ensure_second_token(ctx.profile).map(|_| true),
+        "worker_secret_rotate" => ctx.seam.rotate_worker(ctx.profile).map(|_| true),
+        "tunnel" => ctx.seam.ensure_dns_tunnel(ctx.profile).map(|_| true),
         _ => Ok(false),
     }
 }
@@ -243,7 +233,10 @@ mod tests {
         // First audit (None old) never regresses.
         assert!(!regression_events(None, action_digest(&["a"])));
         // old empty → new with action = clean→dirty.
-        assert!(regression_events(Some(action_digest(&[])), action_digest(&["a"])));
+        assert!(regression_events(
+            Some(action_digest(&[])),
+            action_digest(&["a"])
+        ));
     }
 
     #[test]
@@ -270,7 +263,12 @@ mod tests {
                 pending_since_unix: 0,
             },
         );
-        assert!(auto_executable("worker_secret_rotate", &cfg, true, 3_000_000));
+        assert!(auto_executable(
+            "worker_secret_rotate",
+            &cfg,
+            true,
+            3_000_000
+        ));
     }
 
     #[test]
@@ -287,7 +285,12 @@ mod tests {
                 pending_since_unix: 0,
             },
         );
-        assert!(!auto_executable("worker_secret_rotate", &cfg, false, 999_999));
+        assert!(!auto_executable(
+            "worker_secret_rotate",
+            &cfg,
+            false,
+            999_999
+        ));
     }
 
     #[test]

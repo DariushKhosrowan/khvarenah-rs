@@ -15,8 +15,8 @@
 //! daemon cycle). We therefore run each query on a dedicated OS thread, where
 //! the blocking client is built and dropped in a clean non-async context.
 
-use crate::error::CFError;
 use crate::dnstunnel::Resolver;
+use crate::error::CFError;
 
 /// Timeout for the blocking HTTP call.
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -94,13 +94,9 @@ impl WorkerTunnelResolver {
                     .map_err(|e| CFError::new("worker-tunnel", format!("body: {e}"), ""))
             });
 
-            handle.join().unwrap_or_else(|_| {
-                Err(CFError::new(
-                    "worker-tunnel",
-                    "query thread panicked",
-                    "",
-                ))
-            })
+            handle
+                .join()
+                .unwrap_or_else(|_| Err(CFError::new("worker-tunnel", "query thread panicked", "")))
         })
     }
 }
@@ -170,7 +166,10 @@ mod tests {
         let replied = r.query_txt(&ping_qname()).unwrap();
         assert!(replied.ends_with(&format!(".{DYB_TUNNEL_BASE}")));
         let req = std::fs::read_to_string("/tmp/kv_resolver_log.txt").unwrap();
-        assert!(req.contains("?q="), "qname must be sent as query param: {req}");
+        assert!(
+            req.contains("?q="),
+            "qname must be sent as query param: {req}"
+        );
         assert!(req.contains("HTTP/1.1"));
     }
 

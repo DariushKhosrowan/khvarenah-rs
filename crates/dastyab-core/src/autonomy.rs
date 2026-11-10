@@ -320,22 +320,24 @@ pub fn run_audit(profile: &Profile) -> AutonomyReport {
         let now = crate::store::now_ts() as u64;
         let elapsed = now.saturating_sub(daemon.blackout_since_unix as u64);
         let esc = crate::daemon::escalation::escalation_plan(elapsed);
-        let tip = if esc.probe_interval_secs
-            < crate::daemon::escalation::BASELINE_PROBE_INTERVAL_SECS
-        {
-            format!(
-                " blackout escalation L(probe={}s parallel={})",
-                esc.probe_interval_secs, esc.parallel_probes
-            )
-        } else {
-            String::new()
-        };
+        let tip =
+            if esc.probe_interval_secs < crate::daemon::escalation::BASELINE_PROBE_INTERVAL_SECS {
+                format!(
+                    " blackout escalation L(probe={}s parallel={})",
+                    esc.probe_interval_secs, esc.parallel_probes
+                )
+            } else {
+                String::new()
+            };
         (
             format!("Blackout active {}s{tip}", elapsed),
             "network still down; daemon keeps trying fallback tiers".into(),
         )
     } else if daemon.network_was_down {
-        ("Blackout active (escalation disabled)".into(), String::new())
+        (
+            "Blackout active (escalation disabled)".into(),
+            String::new(),
+        )
     } else {
         ("No blackout".into(), String::new())
     };

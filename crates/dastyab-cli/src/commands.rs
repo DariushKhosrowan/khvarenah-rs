@@ -482,7 +482,10 @@ async fn token_ensure(profile: &str, min: usize) -> Result<(), CFError> {
 
     let p = load_profile(profile);
     if p.tokens.len() >= min {
-        println!("Profile '{profile}' already has {} token(s); nothing to do.", p.tokens.len());
+        println!(
+            "Profile '{profile}' already has {} token(s); nothing to do.",
+            p.tokens.len()
+        );
         return Ok(());
     }
     // We mint the new token using the FIRST stored token's credentials.
@@ -2614,10 +2617,7 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
                 vless_upstream: None,
             };
             let res = dastyab_core::worker_tunnel::deploy_worker_tunnel(
-                &client,
-                &acc.id,
-                profile,
-                &opts,
+                &client, &acc.id, profile, &opts,
             )
             .await?;
             println!("Worker DNS tunnel deployed:");
@@ -2625,9 +2625,7 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
             println!("  url         : {}", res.worker_url);
             println!("  account id  : {}", res.account_id);
             println!("  subdomain   : {}", res.subdomain);
-            println!(
-                "The fallback ladder will now probe this tunnel over HTTPS (no VPS)."
-            );
+            println!("The fallback ladder will now probe this tunnel over HTTPS (no VPS).");
             Ok(())
         }
         crate::DnsTunnelAction::Test { host, port } => {
@@ -2888,11 +2886,15 @@ async fn cmd_autonomy(profile: &str, action: crate::AutonomyAction) -> Result<()
             } else {
                 println!("Applied {} config fix(es):", applied.len());
                 for f in &applied {
-                    println!("  ✓ {}", match f {
-                        FixAction::EnableBackupAutoSync => "scheduled auto-backup enabled",
-                        FixAction::EnableSignatureMutation => "worker-signature rotation enabled",
-                        FixAction::EnableDaemon => "daemon (apply via `dastyab up`)",
-                    });
+                    println!(
+                        "  ✓ {}",
+                        match f {
+                            FixAction::EnableBackupAutoSync => "scheduled auto-backup enabled",
+                            FixAction::EnableSignatureMutation =>
+                                "worker-signature rotation enabled",
+                            FixAction::EnableDaemon => "daemon (apply via `dastyab up`)",
+                        }
+                    );
                 }
             }
 
