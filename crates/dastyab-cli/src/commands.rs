@@ -937,6 +937,26 @@ fn versions_cmd(profile: &str, action: crate::VersionsAction) -> Result<(), CFEr
             }
             Ok(())
         }
+        crate::VersionsAction::Pitr { unix, dry_run } => {
+            let plan = av::build_pitr_plan(&dir, unix);
+            println!("{}", av::pitr_preview_markdown(&plan));
+            if !dry_run {
+                let now = dastyab_core::store::now_ts() as u64;
+                let report = av::execute_pitr_plan(&dir, &plan, false, now)
+                    .map_err(|e| CFError::new("PITR error", format!("{e:?}"), "Version restore failed."))?;
+                println!(
+                    "restored={} skipped={} mismatches={} verified={}",
+                    report.restored,
+                    report.skipped,
+                    report.mismatches.len(),
+                    report.verified
+                );
+                for m in &report.mismatches {
+                    println!("  mismatch: {m}");
+                }
+            }
+            Ok(())
+        }
     }
 }
 

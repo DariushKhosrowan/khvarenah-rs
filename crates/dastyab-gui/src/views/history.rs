@@ -417,6 +417,19 @@ pub fn show(
                         .color(egui::Color32::from_rgb(220, 120, 90)),
                 );
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("🕑 Restore to a moment…")
+                    .on_hover_text("Point-in-time restore: enter a unix moment, preview, then confirm")
+                    .clicked()
+                {
+                    app.pending_action = Some(crate::app::PendingDialogAction::PitrRestore);
+                    app.dialog = Some(dialogs::prompt_text(
+                        "Restore to a moment",
+                        "unix seconds (e.g. 1750000000)",
+                    ));
+                }
+            });
         });
         ui.add_space(4.0);
         if summaries.is_empty() {

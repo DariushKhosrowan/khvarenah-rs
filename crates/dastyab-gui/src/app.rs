@@ -298,6 +298,8 @@ pub enum PendingDialogAction {
     /// Restore a specific saved version of an artifact (dialog confirms the
     /// destructive overwrite of the live file).
     RestoreVersion(String, u64),
+    /// Point-in-time restore of the whole profile to a past unix moment.
+    PitrRestore,
 }
 
 impl DastYabApp {
@@ -1470,6 +1472,46 @@ impl DastYabApp {
                                         format!("Restored {rel_path} from version {unix}.");
                                 }
                                 Err(e) => self.note = e.to_string(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::PitrRestore) => {
+                        if let DialogPayload::Text(txt) = payload {
+                            let target_unix: u64 = match txt.trim().parse() {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    self.note = format!(
+                                        "Invalid unix moment: {:?} (expected integer seconds)",
+                                        txt.trim()
+                                    );
+                                    return;
+                                }
+                            };
+                            let dir =
+                                dastyab_core::store::profiles::profile_dir(&self.profile_id);
+                            let now = dastyab_core::store::now_ts() as u64;
+                            let plan = dastyab_core::artifact_versions::build_pitr_plan(
+                                &dir,
+                                target_unix,
+                            );
+                            let preview =
+                                dastyab_core::artifact_versions::pitr_preview_markdown(&plan);
+                            match dastyab_core::artifact_versions::execute_pitr_plan(
+                                &dir,
+                                &plan,
+                                false,
+                                now,
+                            ) {
+                                Ok(report) => {
+                                    self.state.reload_pending = true;
+                                    self.note = format!(
+                                        "PITR → {target_unix}: restored={} skipped={} mismatches={}\n{preview}",
+                                        report.restored,
+                                        report.skipped,
+                                        report.mismatches.len()
+                                    );
+                                }
+                                Err(e) => self.note = format!("PITR error: {e:?}"),
                             }
                         }
                     }

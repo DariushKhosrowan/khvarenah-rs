@@ -437,6 +437,15 @@ pub enum VersionsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Point-in-time restore: preview or execute a whole-profile restore to a
+    /// past moment (unix seconds).
+    Pitr {
+        /// Target moment as unix seconds.
+        unix: u64,
+        /// Only preview the plan; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]

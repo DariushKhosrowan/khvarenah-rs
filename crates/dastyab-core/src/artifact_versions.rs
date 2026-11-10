@@ -845,6 +845,196 @@ pub fn list_versions_with_integrity(profile_dir: &Path) -> Vec<ArtifactVersionsS
     out
 }
 
+/// ── Point-in-Time Restore (PITR) ─────────────────────────────────────────
+/// Restore a whole profile to a past moment in ONE operation, composing on the
+/// shipped per-artifact `restore_version` (flag a). The plan is built purely
+/// from the version indexes + persisted corrupt list (flags b/c) and the
+/// executor reuses `restore_version` so behavior cannot diverge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PitrSkipReason {
+    /// Restoring would shrink an append-only ledger (a newer version exists).
+    LedgerShrink,
+    /// The chosen version was flagged corrupt by the integrity sweep.
+    Corrupt,
+    /// No version exists at or before the target moment.
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PitrEntryKind {
+    Restore,
+    Skip(PitrSkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PitrEntry {
+    pub rel_path: String,
+    pub chosen_version_unix: Option<u64>,
+    pub kind: PitrEntryKind,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PitrPlan {
+    pub target_unix: u64,
+    pub entries: Vec<PitrEntry>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PitrReport {
+    pub restored: u64,
+    pub skipped: u64,
+    pub mismatches: Vec<String>,
+    /// True when every attempted restore succeeded.
+    pub verified: bool,
+}
+
+#[derive(Debug)]
+pub enum PitrError {
+    Version(VersionError),
+    Manifest(String),
+}
+
+impl From<VersionError> for PitrError {
+    fn from(e: VersionError) -> Self {
+        PitrError::Version(e)
+    }
+}
+
+/// All artifact names that have a `.versions/` directory under the profile.
+fn versions_artifact_names(profile_dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(profile_dir) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if name.ends_with(".versions") && p.is_dir() {
+            if let Some(a) = name.strip_suffix(".versions") {
+                names.push(a.to_string());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Build a PITR plan: for every artifact, pick the latest version at-or-before
+/// `target_unix`. Skip entries are marked with their reason — append-only
+/// ledger shrink is decided by VERSION COUNT (a newer version exists), never by
+/// reading current live content (flag c); corrupt targets come from the
+/// persisted sweep list (flag of sweep missing from missing versions.
+pub fn build_pitr_plan(profile_dir: &Path, target_unix: u64) -> PitrPlan {
+    let state = read_versioning_state(profile_dir);
+    let mut plan = PitrPlan {
+        target_unix,
+        entries: Vec::new(),
+    };
+    for artifact in versions_artifact_names(profile_dir) {
+        let Ok(all) = list_versions(profile_dir, &artifact) else {
+            continue;
+        };
+        let Some(chosen) = all.iter().find(|v| v.saved_unix <= target_unix) else {
+            plan.entries.push(PitrEntry {
+                rel_path: artifact.clone(),
+                chosen_version_unix: None,
+                kind: PitrEntryKind::Skip(PitrSkipReason::Missing),
+                note: "no version at or before target".to_string(),
+            });
+            continue;
+        };
+        if state
+            .corrupt_versions
+            .iter()
+            .any(|c| c.rel_path == artifact && c.version_unix == chosen.saved_unix)
+        {
+            plan.entries.push(PitrEntry {
+                rel_path: artifact.clone(),
+                chosen_version_unix: Some(chosen.saved_unix),
+                kind: PitrEntryKind::Skip(PitrSkipReason::Corrupt),
+                note: "chosen version flagged corrupt by integrity sweep".to_string(),
+            });
+            continue;
+        }
+        if ledger_kind_for_filename(&artifact).is_some()
+            && all.iter().any(|v| v.saved_unix > chosen.saved_unix)
+        {
+            plan.entries.push(PitrEntry {
+                rel_path: artifact.clone(),
+                chosen_version_unix: Some(chosen.saved_unix),
+                kind: PitrEntryKind::Skip(PitrSkipReason::LedgerShrink),
+                note: "newer ledger version exists — restore would shrink the append-only ledger"
+                    .to_string(),
+            });
+            continue;
+        }
+        plan.entries.push(PitrEntry {
+            rel_path: artifact.clone(),
+            chosen_version_unix: Some(chosen.saved_unix),
+            kind: PitrEntryKind::Restore,
+            note: format!("latest version at/before target ({})", chosen.saved_unix),
+        });
+    }
+    plan
+}
+
+/// Execute a PITR plan. Reuses `restore_version` per artifact (flag a); on a
+/// hash/not-found mismatch it records the mismatch and continues. When
+/// `dry_run` is true nothing on disk is touched. After any successful restore,
+/// the profile manifest is refreshed (flag b).
+pub fn execute_pitr_plan(
+    profile_dir: &Path,
+    plan: &PitrPlan,
+    dry_run: bool,
+    now: u64,
+) -> Result<PitrReport, PitrError> {
+    let mut report = PitrReport::default();
+    for e in &plan.entries {
+        match &e.kind {
+            PitrEntryKind::Skip(_) => {
+                report.skipped += 1;
+            }
+            PitrEntryKind::Restore => {
+                if dry_run {
+                    continue;
+                }
+                let unix = e.chosen_version_unix.unwrap_or(0);
+                match restore_version(profile_dir, &e.rel_path, unix, now) {
+                    Ok(()) => report.restored += 1,
+                    Err(VersionError::HashMismatch { .. } | VersionError::NotFound { .. }) => {
+                        report.mismatches.push(format!("{}/{} ({})", e.rel_path, unix, e.note));
+                    }
+                    Err(other) => return Err(PitrError::Version(other)),
+                }
+            }
+        }
+    }
+    if !dry_run && report.restored > 0 {
+        crate::manifest::refresh_manifest_after_write(profile_dir, now)
+            .map_err(|e| PitrError::Manifest(e.brief()))?;
+    }
+    report.verified = report.mismatches.is_empty();
+    Ok(report)
+}
+
+/// Deterministic markdown preview of a plan (CLI dry-run / GUI preview).
+pub fn pitr_preview_markdown(plan: &PitrPlan) -> String {
+    let mut s = format!("# Point-in-time restore preview (target {})\n\n", plan.target_unix);
+    for e in &plan.entries {
+        let marker = match &e.kind {
+            PitrEntryKind::Restore => "[Restore]",
+            PitrEntryKind::Skip(PitrSkipReason::LedgerShrink) => "[SKIP ledger-shrink]",
+            PitrEntryKind::Skip(PitrSkipReason::Corrupt) => "[SKIP corrupt]",
+            PitrEntryKind::Skip(PitrSkipReason::Missing) => "[SKIP missing]",
+        };
+        s.push_str(&format!("- {marker} {} ({})\n", e.rel_path, e.note));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1281,6 +1471,163 @@ mod tests {
             let r = verify_all_versions(&dir, 5000, 2000).unwrap();
             assert_eq!(r.corrupt.len(), 1);
             assert!(p.exists(), "corrupt version must NOT be deleted by the sweep");
+        });
+    }
+
+    // ── PITR ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_pitr_plan_picks_latest_at_or_before_target() {
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            seed_version(&dir, "config.json", b"v3", 2000);
+            let plan = build_pitr_plan(&dir, 1500);
+            let cfg = plan.entries.iter().find(|e| e.rel_path == "config.json").unwrap();
+            assert_eq!(cfg.kind, PitrEntryKind::Restore);
+            assert_eq!(cfg.chosen_version_unix, Some(1000));
+            let plan2 = build_pitr_plan(&dir, 2500);
+            let cfg2 = plan2.entries.iter().find(|e| e.rel_path == "config.json").unwrap();
+            assert_eq!(cfg2.chosen_version_unix, Some(2000));
+        });
+    }
+
+    #[test]
+    fn build_pitr_plan_skips_artifact_without_versions() {
+        with_tmp(|dir| {
+            // An artifact directory exists but holds no version index.
+            std::fs::create_dir_all(versions_dir(&dir, "config.json")).unwrap();
+            let plan = build_pitr_plan(&dir, 9999);
+            let cfg = plan.entries.iter().find(|e| e.rel_path == "config.json");
+            // Either not listed, or listed as Missing skip — never Restore.
+            if let Some(c) = cfg {
+                assert_eq!(c.kind, PitrEntryKind::Skip(PitrSkipReason::Missing));
+            }
+            // A non-existent artifact simply isn't in the plan.
+            assert!(!plan.entries.iter().any(|e| e.rel_path == "nope.json"));
+        });
+    }
+
+    #[test]
+    fn build_pitr_plan_marks_ledger_shrink_by_version_count_not_current() {
+        with_tmp(|dir| {
+            // Seed two versions of a ledger artifact (history.json).
+            crate::ledger_guard::write_ledger_guarded::<u64>(&dir, LedgerKind::History, &[1], 100)
+                .unwrap();
+            std::fs::write(dir.join("history.json"), b"[1]").unwrap();
+            snapshot_before_write(&dir, "history.json", b"[1,2]", 1000).unwrap();
+            std::fs::write(dir.join("history.json"), b"[1,2]").unwrap();
+            snapshot_before_write(&dir, "history.json", b"[1,2,3]", 2000).unwrap();
+            // Target at 1500 picks version 1000, but a newer version (2000)
+            // exists → must be flagged LedgerShrink regardless of live content.
+            let plan = build_pitr_plan(&dir, 1500);
+            let h = plan.entries.iter().find(|e| e.rel_path == "history.json").unwrap();
+            assert_eq!(h.kind, PitrEntryKind::Skip(PitrSkipReason::LedgerShrink));
+        });
+    }
+
+    #[test]
+    fn build_pitr_plan_marks_corrupt_target_as_skip() {
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            let vdir = versions_dir(&dir, "config.json");
+            std::fs::write(version_file(&vdir, 1000), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            let report = verify_all_versions(&dir, 5000, 2000).unwrap();
+            assert_eq!(report.corrupt.len(), 1);
+            record_verify_outcome(&dir, &report, 5000).unwrap();
+            let plan = build_pitr_plan(&dir, 5000);
+            let cfg = plan.entries.iter().find(|e| e.rel_path == "config.json").unwrap();
+            assert_eq!(cfg.kind, PitrEntryKind::Skip(PitrSkipReason::Corrupt));
+        });
+    }
+
+    #[test]
+    fn execute_pitr_plan_composes_on_restore_version_not_reimplements() {
+        with_tmp(|dir| {
+            std::fs::write(dir.join("config.json"), b"old").unwrap();
+            snapshot_before_write(&dir, "config.json", b"new", 1000).unwrap();
+            // Current live content differs from the saved version.
+            std::fs::write(dir.join("config.json"), b"current").unwrap();
+            let plan = build_pitr_plan(&dir, 5000);
+            let r = execute_pitr_plan(&dir, &plan, false, 6000).unwrap();
+            assert_eq!(r.restored, 1);
+            assert_eq!(r.skipped, 0);
+            assert!(r.verified);
+            // Restored to the version's content (the OLD bytes).
+            assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), b"old");
+            // restore_version snapshots the pre-restore content as a new version.
+            assert!(list_versions(&dir, "config.json").unwrap().iter().any(|v| v.saved_unix == 6_000_000));
+        });
+    }
+
+    #[test]
+    fn execute_pitr_plan_refreshes_manifest_after_restore() {
+        with_tmp(|dir| {
+            std::fs::write(dir.join("config.json"), b"old").unwrap();
+            snapshot_before_write(&dir, "config.json", b"new", 1000).unwrap();
+            std::fs::write(dir.join("config.json"), b"current").unwrap();
+            let pid = dir.file_name().and_then(|s| s.to_str()).unwrap_or("default").to_string();
+            crate::manifest::write_manifest(&crate::manifest::build_manifest(&pid).unwrap()).unwrap();
+            let plan = build_pitr_plan(&dir, 5000);
+            execute_pitr_plan(&dir, &plan, false, 6000).unwrap();
+            let m = crate::manifest::load_manifest(&pid).unwrap();
+            assert!(m.entries.contains_key("config.json"));
+        });
+    }
+
+    #[test]
+    fn execute_pitr_plan_dry_run_writes_nothing() {
+        with_tmp(|dir| {
+            std::fs::write(dir.join("config.json"), b"old").unwrap();
+            snapshot_before_write(&dir, "config.json", b"new", 1000).unwrap();
+            std::fs::write(dir.join("config.json"), b"current").unwrap();
+            let plan = build_pitr_plan(&dir, 5000);
+            let r = execute_pitr_plan(&dir, &plan, true, 6000).unwrap();
+            assert_eq!(r.restored, 0);
+            assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), b"current");
+        });
+    }
+
+    #[test]
+    fn execute_pitr_plan_aborts_artifact_on_sha_mismatch_and_continues() {
+        with_tmp(|dir| {
+            // Two artifacts: config.json clean-restorable, other.json tampered
+            // (payload hashes mismatch) but NOT persisted as corrupt — so the
+            // plan says Restore and execution hits the real hash mismatch.
+            seed_version(&dir, "config.json", b"v2", 1000);
+            seed_version(&dir, "other.json", b"o2", 1000);
+            let vdir = versions_dir(&dir, "other.json");
+            std::fs::write(version_file(&vdir, 1000), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            let plan = build_pitr_plan(&dir, 5000);
+            let r = execute_pitr_plan(&dir, &plan, false, 6000).unwrap();
+            assert_eq!(r.restored, 1, "config.json restores fine");
+            assert_eq!(r.mismatches.len(), 1, "other.json hash mismatch recorded");
+            assert!(!r.verified);
+        });
+    }
+
+    #[test]
+    fn execute_pitr_plan_report_mismatches_match_failures() {
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            let vdir = versions_dir(&dir, "config.json");
+            std::fs::write(version_file(&vdir, 1000), r#"{"sha256":"00","bytes_b64":"eg=="}"#).unwrap();
+            let plan = build_pitr_plan(&dir, 5000);
+            let r = execute_pitr_plan(&dir, &plan, false, 6000).unwrap();
+            assert_eq!(r.restored, 0);
+            assert_eq!(r.mismatches.len(), 1);
+            assert!(!r.verified);
+        });
+    }
+
+    #[test]
+    fn pitr_preview_markdown_deterministic() {
+        with_tmp(|dir| {
+            seed_version(&dir, "config.json", b"v2", 1000);
+            let plan = build_pitr_plan(&dir, 1500);
+            let a = pitr_preview_markdown(&plan);
+            let b = pitr_preview_markdown(&plan);
+            assert_eq!(a, b);
+            assert!(a.contains("[Restore]"));
         });
     }
 }
