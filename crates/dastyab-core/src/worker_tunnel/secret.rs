@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::CFError;
 
 /// A worker's session secret plus its two-phase rotation state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkerSecret {
     /// Worker URL (identity key in `ProfileConfig.worker_secrets`).
     #[serde(default)]
@@ -51,19 +51,6 @@ pub struct WorkerSecret {
     /// Epoch-seconds the pending secret was written (for the in-flight guard).
     #[serde(default)]
     pub pending_since_unix: u64,
-}
-
-impl Default for WorkerSecret {
-    fn default() -> Self {
-        Self {
-            worker_url: String::new(),
-            secret: String::new(),
-            rotated_unix: 0,
-            version: 0,
-            pending_secret: None,
-            pending_since_unix: 0,
-        }
-    }
 }
 
 /// Maximum age (seconds) of an in-flight pending rotation before it is treated

@@ -1,12 +1,12 @@
 //! Clean IPs view — a fast, searchable manager for the profile's saved
-//! clean-IP endpoints. Includes copy/delete per entry, search, clear-all, and
-//! import of known-good seeds.
+//! clean-IP endpoints. Includes copy/delete per entry, search, stats,
+//! copy-all, clear-all, and import of known-good seeds.
 
 use eframe::egui;
 use dastyab_core::store::profiles::remove_clean_ip;
 
 use crate::app::DastYabApp;
-use crate::views::{GOLD, GOLD_DIM, PANEL, TEXT};
+use crate::views::{mono_copy_row, stat_chips, CARD, CARD_STROKE, GOLD, GOLD_DIM};
 
 /// Actions the Clean IPs view can request.
 #[derive(Debug)]
@@ -17,8 +17,10 @@ pub enum CleanipAction {
     ClearAll,
     /// Open the import-seeds text-area dialog.
     Import,
-    /// Copy an endpoint into the clipboard (handled inline).
-    Copy(String),
+    /// Copy every endpoint (newline-joined) into the clipboard.
+    CopyAll,
+    /// Export all endpoints as text (handled inline).
+    Export,
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
@@ -33,6 +35,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
 
     let ips = &app.state.clean_ips;
 
+    // Stats chip row (always visible, even when empty).
+    stat_chips(ui, &[("saved", &ips.len().to_string())]);
+
     // Search box (only when there is anything to search).
     if !ips.is_empty() {
         ui.horizontal(|ui| {
@@ -42,11 +47,20 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
                     .hint_text("filter IPs…")
                     .desired_width(220.0),
             );
-            ui.label(
-                egui::RichText::new(format!("{} saved", ips.len()))
-                    .color(GOLD_DIM)
-                    .small(),
-            );
+            if ui
+                .button("📋 Copy all")
+                .on_hover_text("Copy every saved IP")
+                .clicked()
+            {
+                action = Some(CleanipAction::CopyAll);
+            }
+            if ui
+                .button("💾 Export")
+                .on_hover_text("Export all IPs as text")
+                .clicked()
+            {
+                action = Some(CleanipAction::Export);
+            }
         });
         ui.add_space(4.0);
     }
@@ -54,8 +68,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
     if ips.is_empty() {
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new("No clean IPs found yet — scan from Deploy & Scan, or import known-good seeds below.")
-                .color(GOLD_DIM),
+            egui::RichText::new(
+                "No clean IPs found yet — scan from Deploy & Scan, or import known-good seeds below.",
+            )
+            .color(GOLD_DIM),
         );
     } else {
         let query = app.cleanip_search.trim().to_lowercase();
@@ -73,13 +89,20 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
                 .show(ui, |ui| {
                     for ip in matched {
                         egui::Frame::new()
-                            .fill(PANEL)
-                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .fill(CARD)
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .corner_radius(6.0)
+                            .stroke(egui::Stroke::new(1.0, CARD_STROKE))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(ip.as_str()).monospace().color(TEXT),
-                                    );
+                                    ui.vertical(|ui| {
+                                        mono_copy_row(ui, ip);
+                                        ui.label(
+                                            egui::RichText::new("verified clean-IP")
+                                                .color(GOLD_DIM)
+                                                .small(),
+                                        );
+                                    });
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
@@ -89,13 +112,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
                                                 .clicked()
                                             {
                                                 action = Some(CleanipAction::Remove(ip.clone()));
-                                            }
-                                            if ui
-                                                .button("📋")
-                                                .on_hover_text("Copy endpoint")
-                                                .clicked()
-                                            {
-                                                action = Some(CleanipAction::Copy(ip.clone()));
                                             }
                                         },
                                     );
@@ -140,8 +156,20 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
             }
             None
         }
-        CleanipAction::Copy(_ip) => {
-            // Copy is handled inline; nothing to run here.
+        CleanipAction::CopyAll => {
+            let all = app.state.clean_ips.join("\n");
+            if all.is_empty() {
+                app.note = "No clean IPs to copy.".to_string();
+            } else {
+                app.note = format!("Copied {} clean IP(s).", app.state.clean_ips.len());
+            }
+            None
+        }
+        CleanipAction::Export => {
+            let all = app.state.clean_ips.join("\n");
+            if all.is_empty() {
+                app.note = "No clean IPs to export.".to_string();
+            }
             None
         }
         CleanipAction::ClearAll => {

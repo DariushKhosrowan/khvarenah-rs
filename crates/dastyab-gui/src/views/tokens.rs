@@ -1,12 +1,16 @@
 //! Tokens view — a per-profile list of API tokens with add / remove /
-//! verify, an active-token marker, and one-click "make active".
+//! verify, an active-token marker, live search, and one-click "make active".
+//!
+//! Design: a gold-rule header, a stats chip row, a live filter box, then a
+//! scrollable card list. Active tokens get a gold stroke and a "● ACTIVE"
+//! badge; secondary tokens offer Make-active / Verify / Remove actions.
 
 use eframe::egui;
 use dastyab_core::store::profiles::{get_token, remove_token, set_active_token};
 
 use crate::app::DastYabApp;
 use crate::bridge;
-use crate::views::{GOLD, GOLD_DIM, PANEL, TEXT};
+use crate::views::{stat_chips, tag, CARD, CARD_STROKE, GOLD, GOLD_DIM, SUCCESS, TEXT};
 use dastyab_core::CFError;
 
 /// Render the tokens panel. Returns an action the app should handle.
@@ -22,7 +26,7 @@ pub enum TokensAction {
     MakeActive(String),
 }
 
-pub fn show(ui: &mut egui::Ui, app: &DastYabApp) -> Option<TokensAction> {
+pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<TokensAction> {
     let mut action = None;
 
     ui.heading(egui::RichText::new("Tokens").color(GOLD));
@@ -32,73 +36,121 @@ pub fn show(ui: &mut egui::Ui, app: &DastYabApp) -> Option<TokensAction> {
     );
     ui.add_space(6.0);
 
+    // Stats chips.
+    {
+        let total = app.state.tokens.len();
+        let active = app
+            .state
+            .active_token_label
+            .clone()
+            .unwrap_or_else(|| "—".to_string());
+        stat_chips(ui, &[("tokens", &total.to_string()), ("active", &active)]);
+    }
+
     if app.state.tokens.is_empty() {
         ui.add_space(8.0);
         ui.label(egui::RichText::new("No tokens yet — add one.").color(GOLD_DIM));
     } else {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .max_height(400.0)
-            .show(ui, |ui| {
-                for t in &app.state.tokens {
-                    let is_active = t.is_active;
-                    let frame = egui::Frame::new()
-                        .fill(PANEL)
-                        .inner_margin(egui::Margin::symmetric(10, 6))
-                        .stroke(if is_active {
-                            egui::Stroke::new(1.5, GOLD)
-                        } else {
-                            egui::Stroke::new(0.0, egui::Color32::TRANSPARENT)
-                        });
-                    frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if is_active {
-                                ui.label(egui::RichText::new("●").color(GOLD).strong());
-                            }
-                            ui.label(
-                                egui::RichText::new(&t.label)
-                                    .color(if is_active { GOLD } else { TEXT })
-                                    .strong(),
-                            );
-                            ui.label(egui::RichText::new(&t.masked).color(TEXT).monospace());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("🗑").on_hover_text("Remove token").clicked() {
-                                        action = Some(TokensAction::Remove(t.label.clone()));
-                                    }
-                                    if is_active {
+        // Live search filter.
+        let query = {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Search:").color(GOLD_DIM));
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.token_search)
+                        .hint_text("filter by label…")
+                        .desired_width(220.0),
+                );
+                ui.label(
+                    egui::RichText::new(format!("{} token(s)", app.state.tokens.len()))
+                        .color(GOLD_DIM)
+                        .small(),
+                );
+            });
+            app.token_search.trim().to_lowercase()
+        };
+        ui.add_space(4.0);
+
+        let matched: Vec<&crate::state::TokenSummary> = app
+            .state
+            .tokens
+            .iter()
+            .filter(|t| query.is_empty() || t.label.to_lowercase().contains(&query))
+            .collect();
+
+        if matched.is_empty() {
+            ui.label(egui::RichText::new("No token matches that search.").color(GOLD_DIM));
+            ui.add_space(8.0);
+        } else {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height(440.0)
+                .show(ui, |ui| {
+                    for t in matched {
+                        let is_active = t.is_active;
+                        let frame = egui::Frame::new()
+                            .fill(CARD)
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .corner_radius(6.0)
+                            .stroke(if is_active {
+                                egui::Stroke::new(1.5, GOLD)
+                            } else {
+                                egui::Stroke::new(1.0, CARD_STROKE)
+                            });
+                        frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        if is_active {
+                                            ui.label(egui::RichText::new("●").color(GOLD).strong());
+                                        }
                                         ui.label(
-                                            egui::RichText::new("ACTIVE")
-                                                .color(GOLD)
-                                                .small()
+                                            egui::RichText::new(&t.label)
+                                                .color(if is_active { GOLD } else { TEXT })
                                                 .strong(),
                                         );
-                                    } else if ui.button("Make active").clicked() {
-                                        action = Some(TokensAction::MakeActive(t.label.clone()));
-                                    }
-                                    if ui
-                                        .button("Verify")
-                                        .on_hover_text("Check this token against Cloudflare")
-                                        .clicked()
-                                    {
-                                        action = Some(TokensAction::Verify(t.label.clone()));
-                                    }
-                                },
-                            );
+                                        ui.label(
+                                            egui::RichText::new(&t.masked).color(TEXT).monospace(),
+                                        );
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "added {} ({})",
+                                            t.added_at, t.added_at_abs
+                                        ))
+                                        .color(GOLD_DIM)
+                                        .small(),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if is_active {
+                                            tag(ui, "ACTIVE", SUCCESS);
+                                            ui.add_space(6.0);
+                                        }
+                                        if ui.button("🗑").on_hover_text("Remove token").clicked()
+                                        {
+                                            action = Some(TokensAction::Remove(t.label.clone()));
+                                        }
+                                        if !is_active && ui.button("Make active").clicked() {
+                                            action =
+                                                Some(TokensAction::MakeActive(t.label.clone()));
+                                        }
+                                        if ui
+                                            .button("Verify")
+                                            .on_hover_text("Check this token against Cloudflare")
+                                            .clicked()
+                                        {
+                                            action = Some(TokensAction::Verify(t.label.clone()));
+                                        }
+                                    },
+                                );
+                            });
                         });
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "added {} ({})",
-                                t.added_at, t.added_at_abs
-                            ))
-                            .color(GOLD_DIM)
-                            .small(),
-                        );
-                    });
-                    ui.add_space(5.0);
-                }
-            });
+                        ui.add_space(6.0);
+                    }
+                });
+        }
     }
 
     ui.add_space(8.0);

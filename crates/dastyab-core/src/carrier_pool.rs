@@ -216,6 +216,8 @@ pub struct CarrierPool {
     inner: Arc<RwLock<CarrierSnapshot>>,
 }
 
+pub(crate) type CarrierTuple<'a> = (CarrierKind, &'a str, u16, Option<&'a str>, Option<&'a str>);
+
 impl CarrierPool {
     /// Open (or lazily initialize) a pool at `path`.
     ///
@@ -375,7 +377,7 @@ impl CarrierPool {
             .inner
             .read()
             .map_err(|_| CarrierPoolError::Integrity("carrier pool lock poisoned".into()))?;
-        let mut tuples: Vec<(CarrierKind, &str, u16, Option<&str>, Option<&str>)> = guard
+        let mut tuples: Vec<CarrierTuple<'_>> = guard
             .endpoints
             .iter()
             .map(|e| {
