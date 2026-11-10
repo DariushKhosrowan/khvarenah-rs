@@ -18,7 +18,7 @@ use khvarenah_core::CFError;
 use crate::bridge;
 use crate::dialogs::{self, Dialog, DialogPayload, DialogResult};
 use crate::state::GuiState;
-use crate::views::{profiles, tokens};
+use crate::views::{history, profiles, tokens};
 
 // Royal-gold palette (dark #0a0705 bg per shell spec)
 pub const GOLD: egui::Color32 = egui::Color32::from_rgb(212, 175, 55);
@@ -33,18 +33,20 @@ enum View {
     Profiles,
     Tokens,
     CleanIps,
+    History,
     Tools,
     Settings,
     Autonomy,
 }
 
 impl View {
-    /// The seven-item sidebar, in order.
-    const ALL: [View; 7] = [
+    /// The eight-item sidebar, in order.
+    const ALL: [View; 8] = [
         View::DeployScan,
         View::Profiles,
         View::Tokens,
         View::CleanIps,
+        View::History,
         View::Tools,
         View::Settings,
         View::Autonomy,
@@ -56,11 +58,22 @@ impl View {
             View::Profiles => "Profiles",
             View::Tokens => "Tokens",
             View::CleanIps => "Clean IPs",
+            View::History => "History",
             View::Tools => "Tools",
             View::Settings => "Settings",
             View::Autonomy => "Autonomy",
         }
     }
+}
+
+/// Which streams the History view shows.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistoryFilter {
+    #[default]
+    All,
+    Deploys,
+    CleanIps,
+    Journal,
 }
 
 pub struct KhvarenahApp {
@@ -77,6 +90,8 @@ pub struct KhvarenahApp {
     log_lines: Vec<String>, // live log pane (capped at 5000)
     // view-model cache (Phase 3.2/3.3)
     pub state: GuiState,
+    /// Which streams the History view shows.
+    pub history_filter: HistoryFilter,
     /// Currently open modal dialog (if any).
     pub dialog: Option<Dialog>,
     /// The action a dialog submit should take.
@@ -148,6 +163,12 @@ pub struct KhvarenahApp {
     pub deep_timeout_s: u64,
     pub max_backoff_s: u64,
     pub network_down_sleep_s: u64,
+    /// Monitor light-check cadence (seconds between light WS-gate checks).
+    /// 0 = system default (`default_light_interval`, 300).
+    pub light_check_interval_s: u64,
+    /// Scheduled blackout self-test (drill) cadence (seconds). 0 = system
+    /// default (24h). The daemon runs a drill this often when the network is up.
+    pub drill_interval_s: u64,
     pub timeouts_note: String,
     // automatic token rotation on account-blocked (default on)
     pub auto_rotate_enabled: bool,
@@ -334,6 +355,8 @@ impl KhvarenahApp {
             deep_timeout_s: profile.config.deep_timeout_secs,
             max_backoff_s: profile.config.max_backoff_secs,
             network_down_sleep_s: profile.config.network_down_sleep_secs,
+            light_check_interval_s: profile.config.light_interval_secs,
+            drill_interval_s: profile.config.drill_interval_secs,
             timeouts_note: String::new(),
             auto_rotate_enabled: profile.config.auto_rotate_on_blocked,
             auto_rotate_note: String::new(),
@@ -363,6 +386,7 @@ impl KhvarenahApp {
             mw_count: 2,
             mw_note: String::new(),
             view: View::DeployScan,
+            history_filter: HistoryFilter::default(),
         };
         app.refresh_diagnostics();
         app
@@ -419,6 +443,8 @@ impl KhvarenahApp {
         p.config.deep_timeout_secs = self.deep_timeout_s;
         p.config.max_backoff_secs = self.max_backoff_s;
         p.config.network_down_sleep_secs = self.network_down_sleep_s;
+        p.config.light_interval_secs = self.light_check_interval_s.max(30);
+        p.config.drill_interval_secs = self.drill_interval_s.max(300);
         match khvarenah_core::store::profiles::save_profile(&p) {
             Ok(()) => self.timeouts_note = "Protection pacing saved to profile.".to_string(),
             Err(e) => self.timeouts_note = e.brief(),
@@ -712,7 +738,8 @@ impl KhvarenahApp {
             Some(t) => t.token.clone(),
             None => {
                 self.worker_tunnel_note =
-                    "No Cloudflare token on this profile — add one first on the Token tab.".to_string();
+                    "No Cloudflare token on this profile — add one first on the Token tab."
+                        .to_string();
                 return;
             }
         };
@@ -754,13 +781,8 @@ impl KhvarenahApp {
                 retries: 2,
                 vless_upstream: None,
             };
-            match khvarenah_core::worker_tunnel::deploy_worker_tunnel(
-                &client,
-                &acc.id,
-                &pid,
-                &opts,
-            )
-            .await
+            match khvarenah_core::worker_tunnel::deploy_worker_tunnel(&client, &acc.id, &pid, &opts)
+                .await
             {
                 Ok(res) => {
                     let _ = tx2.send(crate::bridge::UiEvent::Log {
@@ -1250,6 +1272,7 @@ impl KhvarenahApp {
                     View::Profiles => self.profile_panel(ui, p),
                     View::Tokens => self.token_panel(ui, p),
                     View::CleanIps => self.cleanip_panel(ui, p),
+                    View::History => history::show(ui, self, p),
                     View::Tools => self.tools_panel(ui, p),
                     View::Settings => self.settings_panel(ui, p),
                     View::Autonomy => self.autonomy_panel(ui, p),
@@ -1281,9 +1304,7 @@ impl KhvarenahApp {
                     .strong(),
             );
             if remaining == 0 {
-                ui.label(
-                    egui::RichText::new("✓ complete — protection live").color(ok_green),
-                );
+                ui.label(egui::RichText::new("✓ complete — protection live").color(ok_green));
             } else {
                 ui.label(
                     egui::RichText::new(format!(
@@ -1293,13 +1314,21 @@ impl KhvarenahApp {
                     .color(GOLD),
                 );
             }
-            if ui.button("⟳").on_hover_text("Refresh setup status").clicked() {
+            if ui
+                .button("⟳")
+                .on_hover_text("Refresh setup status")
+                .clicked()
+            {
                 self.state.reload_pending = true;
             }
         });
         for step in all {
             let mark = if steps.contains(&step) { "✓" } else { "·" };
-            let color = if steps.contains(&step) { ok_green } else { GOLD_DIM };
+            let color = if steps.contains(&step) {
+                ok_green
+            } else {
+                GOLD_DIM
+            };
             ui.label(egui::RichText::new(format!("  {mark} {}", step.label())).color(color));
         }
         ui.separator();
@@ -2018,9 +2047,15 @@ impl KhvarenahApp {
             ui.add(egui::DragValue::new(&mut self.max_backoff_s).range(0..=86400));
             ui.label("Blackout poll (s):");
             ui.add(egui::DragValue::new(&mut self.network_down_sleep_s).range(0..=3600));
+            ui.label("Light check cadence (s):");
+            ui.add(egui::DragValue::new(&mut self.light_check_interval_s).range(30..=3600));
             if ui.button("Save pacing").clicked() {
                 self.save_timeouts();
             }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Scheduled self-test cadence (s):");
+            ui.add(egui::DragValue::new(&mut self.drill_interval_s).range(300..=604800));
         });
         ui.label("On a degraded tier the deep budget is auto-extended 2× (capped at");
         ui.label("1800s). Lower 'Max backoff' so a long blackout re-rotates faster.");

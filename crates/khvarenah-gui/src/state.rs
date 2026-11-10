@@ -125,6 +125,19 @@ pub fn relative_time(ts: &str) -> String {
     }
 }
 
+/// Format a UNIX-epoch seconds value as a readable local timestamp
+/// (`YYYY-MM-DD HH:MM`), falling back to the raw integer when it cannot be
+/// converted.
+pub fn format_ts(epoch: i64) -> String {
+    match chrono::DateTime::from_timestamp(epoch, 0) {
+        Some(dt) => dt
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+        None => format!("{epoch}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +163,15 @@ mod tests {
     #[test]
     fn mask_trimmed_input() {
         assert_eq!(mask_token("  cf_live_token_abc  "), "cf_l…_abc");
+    }
+
+    #[test]
+    fn format_ts_renders_local_timestamp() {
+        // 2024-01-15 12:30:00 UTC. Local rendering is timezone-dependent, so
+        // just assert we get a "YYYY-MM-DD HH:MM" shape, not the raw int.
+        let out = format_ts(1_705_322_600);
+        assert_ne!(out, "1705322600");
+        assert!(out.len() >= 13, "unexpected output: {out}");
     }
 
     #[test]
