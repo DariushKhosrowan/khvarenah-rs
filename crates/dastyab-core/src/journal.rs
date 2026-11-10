@@ -49,6 +49,11 @@ pub enum JournalKind {
     MutationPerformed,
     /// A scheduled blackout self-test (drill) ran (detail = "N/4 rungs").
     DrillPerformed,
+    /// Auto-heal restored a broken artifact from a verified backup (detail =
+    /// list of healed files + the backup path used).
+    AutoHealed,
+    /// A scheduled workspace snapshot was written (detail = snapshot path).
+    SnapshotWritten,
 }
 
 /// One durable journal entry.

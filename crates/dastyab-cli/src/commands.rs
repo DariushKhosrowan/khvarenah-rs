@@ -16,7 +16,7 @@ use dastyab_core::worker::{
 use dastyab_core::{CFError, BRAND, VERSION};
 use std::path::PathBuf;
 
-use crate::{BackupAction, Command, DaemonAction, DnsAction, ProtectionAction, RoutesAction, WorkspaceAction};
+use crate::{BackupAction, Command, DaemonAction, DnsAction, ProtectionAction, RoutesAction, SnapshotsAction, WorkspaceAction};
 use dastyab_core::remote_beacon::BeaconConfig;
 /// Run a command. `profile` is the active profile id.
 pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
@@ -116,6 +116,8 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             output,
         } => inventory_cmd(profile, kind, integrity, json, output),
         Command::ManifestVerify { refresh } => manifest_verify_cmd(refresh),
+        Command::Doctor { json } => doctor_cmd(&profile, json),
+        Command::Snapshots { action } => snapshots_cmd(&profile, action),
         Command::Workspace { action } => workspace_cmd(action),
         Command::Mutation { action } => cmd_mutation(profile, action),
         Command::Analytics => analytics(profile).await,
@@ -2979,6 +2981,8 @@ fn kind_label(k: dastyab_core::journal::JournalKind) -> &'static str {
         JournalKind::BackupWritten => "backup-written",
         JournalKind::MutationPerformed => "signature-rotated",
         JournalKind::DrillPerformed => "blackout-self-test",
+        JournalKind::AutoHealed => "auto-healed",
+        JournalKind::SnapshotWritten => "workspace-snapshot",
     }
 }
 
@@ -3114,6 +3118,111 @@ fn manifest_verify_cmd(refresh: bool) -> Result<(), CFError> {
         println!("{} [{}] — {}", meta.name, status, meta.id);
     }
     Ok(())
+}
+
+/// `doctor` subcommand — the "state of trust" card.
+fn doctor_cmd(profile: &str, json_out: bool) -> Result<(), CFError> {
+    use dastyab_core::doctor::*;
+    let opts = DoctorOptions {
+        profile_id: profile.to_string(),
+        ..Default::default()
+    };
+    let report = run_doctor(&opts);
+    if json_out {
+        println!("{}", doctor_to_json(&report)?);
+    } else {
+        print!("{}", doctor_to_markdown(&report));
+    }
+    // Exit-code signal: 0 = all ok, 1 = warns/fails (scriptable).
+    if report.overall() == CheckStatus::Ok {
+        Ok(())
+    } else {
+        Err(CFError::new(
+            "Doctor",
+            format!("overall status: {}", report.overall().label()),
+            "See the checks above for what needs attention.",
+        ))
+    }
+}
+
+/// `snapshots` subcommand — list / restore scheduled workspace snapshots.
+fn snapshots_cmd(profile: &str, action: SnapshotsAction) -> Result<(), CFError> {
+    use dastyab_core::workspace_snapshots::*;
+    let snaps = snapshots_dir();
+    match action {
+        SnapshotsAction::List => {
+            let list = list_snapshots(&snaps);
+            if list.is_empty() {
+                println!("No scheduled workspace snapshots yet ({}).", snaps.display());
+                println!("The daemon writes one every 6h automatically, or run:");
+                println!("  dastyab workspace snapshot");
+                return Ok(());
+            }
+            println!("Workspace snapshots ({}):", snaps.display());
+            for (i, e) in list.iter().enumerate() {
+                let status = if e.invalid {
+                    "INVALID".to_string()
+                } else {
+                    format!("{} profile(s), {} artifact(s)", e.profile_count, e.artifact_count)
+                };
+                println!(
+                    "  [{}] {} — {} — {}",
+                    i,
+                    e.created_unix,
+                    status,
+                    e.path.display()
+                );
+            }
+            println!("Restore: dastyab snapshots restore <path>");
+            Ok(())
+        }
+        SnapshotsAction::Restore {
+            path,
+            overwrite,
+            dry_run,
+        } => {
+            let snap = dastyab_core::workspace_snapshot::read_snapshot(std::path::Path::new(&path))?;
+            let opts = dastyab_core::workspace_snapshot::RestoreOptions {
+                overwrite_existing: overwrite,
+                dry_run,
+                verify_after_write: true,
+            };
+            let workspace = dastyab_core::store::mem_dir();
+            // Offer a diff preview before the real restore on dry_run.
+            if dry_run {
+                let summary = diff_against_current(&snap, &workspace);
+                println!(
+                    "Dry run: would restore {} profile(s); diff: +{} added, ~{} changed, -{} deleted, profiles added {:?}, removed {:?}",
+                    snap.profiles.len(),
+                    summary.files_added,
+                    summary.files_changed,
+                    summary.files_deleted,
+                    summary.profiles_added,
+                    summary.profiles_removed
+                );
+            }
+            let report = dastyab_core::workspace_snapshot::restore_workspace(&snap, &workspace, &opts)?;
+            let _ = profile;
+            if dry_run {
+                println!(
+                    "✓ Dry run: would restore {} profile(s), {} file(s).",
+                    report.profiles_restored, report.files_written
+                );
+            } else {
+                println!(
+                    "✓ Restored {} profile(s), {} file(s).",
+                    report.profiles_restored, report.files_written
+                );
+            }
+            if !report.verified {
+                println!("⚠ {} integrity mismatch(es):", report.mismatches.len());
+                for m in &report.mismatches {
+                    println!("  - {m}");
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// `workspace` subcommand — snapshot or restore the whole workspace.

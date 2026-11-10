@@ -331,7 +331,21 @@ pub fn verify_profile(profile_id: &str) -> VerifyReport {
     }
 
     // Extras: files in the profile dir that are not in the manifest (and not
-    // the manifest itself).
+    // the manifest itself). Runtime state files (health beacon, daemon pid/
+    // stop/log, journal, temp files) are intentionally excluded — they are
+    // volatile bookkeeping, not user data, and must not appear as "drift".
+    let runtime_only = |name: &str| -> bool {
+        matches!(
+            name,
+            "manifest.json"
+                | "health.json"
+                | "daemon.pid"
+                | "daemon.stop"
+                | "daemon.log"
+                | "daemon-state.json"
+                | "journal.json"
+        ) || name.starts_with(".dyb_tmp_")
+    };
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let p = e.path();
@@ -343,7 +357,7 @@ pub fn verify_profile(profile_id: &str) -> VerifyReport {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            if name == "manifest.json" {
+            if runtime_only(&name) {
                 continue;
             }
             if !seen.contains(&name) && !manifest.entries.contains_key(&name) {

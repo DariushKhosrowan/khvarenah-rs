@@ -174,6 +174,19 @@ enum Command {
         #[arg(long)]
         refresh: bool,
     },
+    /// Doctor — the "state of trust" card. Runs a battery of checks over every
+    /// safety subsystem (manifest, backup, autosync, daemon, tunnel, workspace
+    /// snapshot) and reports the overall verdict.
+    Doctor {
+        /// Emit the report as JSON instead of Markdown.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scheduled workspace snapshots (the "Restore a past point" timeline).
+    Snapshots {
+        #[command(subcommand)]
+        action: SnapshotsAction,
+    },
     /// Whole-workspace snapshot (all profiles in one portable bundle).
     Workspace {
         #[command(subcommand)]
@@ -664,7 +677,7 @@ enum BackupAction {
 }
 
 #[derive(Subcommand)]
-enum WorkspaceAction {
+pub enum WorkspaceAction {
     /// Snapshot the whole workspace to a portable .dyb-snapshot.json.
     Snapshot {
         /// Output path (default: ~/.dastyab/workspace-snapshot.json).
@@ -675,6 +688,25 @@ enum WorkspaceAction {
         scope: String,
     },
     /// Restore the whole workspace from a snapshot.
+    Restore {
+        /// Snapshot file to restore from.
+        #[arg()]
+        path: String,
+        /// Overwrite existing profiles.
+        #[arg(long)]
+        overwrite: bool,
+        /// Dry run: verify + report, write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// Scheduled workspace-snapshot subcommands.
+#[derive(Subcommand)]
+pub enum SnapshotsAction {
+    /// List scheduled snapshots newest-first.
+    List,
+    /// Restore a past point (by index from `list`, newest = 0).
     Restore {
         /// Snapshot file to restore from.
         #[arg()]

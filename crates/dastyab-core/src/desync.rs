@@ -145,7 +145,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// A fragmentation strategy for a single connection write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub enum DesyncStrategy {
     /// Split only the leading TLS record (the ClientHello + start of the
     /// upgrade) at a small randomized boundary. Minimal cost, targets the
@@ -157,13 +157,8 @@ pub enum DesyncStrategy {
     /// fragmented after it. Heaviest anti-DPI shape.
     SplitAndDecoy,
     /// Single segment (no fragmentation) — the base fallback.
+    #[default]
     None,
-}
-
-impl Default for DesyncStrategy {
-    fn default() -> Self {
-        DesyncStrategy::None
-    }
 }
 
 impl DesyncStrategy {

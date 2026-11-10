@@ -3270,6 +3270,12 @@ impl DastYabApp {
                             dastyab_core::journal::JournalKind::DrillPerformed => {
                                 "🩺 blackout-self-test"
                             }
+                            dastyab_core::journal::JournalKind::AutoHealed => {
+                                "🛠 auto-healed"
+                            }
+                            dastyab_core::journal::JournalKind::SnapshotWritten => {
+                                "📸 workspace-snapshot"
+                            }
                         };
                         ui.label(format!("{label} — {} (t={})", e.detail, e.ts));
                     }

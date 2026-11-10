@@ -25,6 +25,8 @@ fn journal_kind_label(kind: &JournalKind) -> &'static str {
         JournalKind::BackupWritten => "backup-written",
         JournalKind::MutationPerformed => "signature-rotated",
         JournalKind::DrillPerformed => "blackout-self-test",
+        JournalKind::AutoHealed => "auto-healed",
+        JournalKind::SnapshotWritten => "workspace-snapshot",
     }
 }
 
@@ -41,6 +43,8 @@ fn journal_kind_color(kind: &JournalKind) -> egui::Color32 {
         JournalKind::BackupWritten => egui::Color32::from_rgb(150, 190, 255),
         JournalKind::MutationPerformed => egui::Color32::from_rgb(200, 160, 255),
         JournalKind::DrillPerformed => egui::Color32::from_rgb(120, 200, 180),
+        JournalKind::AutoHealed => egui::Color32::from_rgb(150, 230, 150),
+        JournalKind::SnapshotWritten => egui::Color32::from_rgb(170, 170, 255),
     }
 }
 

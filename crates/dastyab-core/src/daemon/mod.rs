@@ -150,6 +150,9 @@ pub struct DaemonState {
     /// restarts.
     #[serde(default)]
     pub audit: crate::daemon::autonomy_schedule::AuditSchedule,
+    /// Last epoch-seconds a scheduled workspace snapshot was written.
+    #[serde(default)]
+    pub last_snapshot_ts: i64,
 }
 
 fn default_interval() -> u64 {
@@ -179,6 +182,7 @@ impl Default for DaemonState {
             blackout_since_unix: 0,
             last_self_ping_ts: 0,
             audit: crate::daemon::autonomy_schedule::AuditSchedule::default(),
+            last_snapshot_ts: 0,
         }
     }
 }
@@ -1284,6 +1288,157 @@ async fn run_self_maintenance(
     // just report all-down — not informative).
     if net_up {
         run_scheduled_drill(profile, state, now, &mut |msg| log(&log_line("INFO", msg))).await;
+    }
+
+    // 4. Auto-heal: if a critical artifact (profile/token/accounts/config) is
+    // Missing or Changed, restore it from the newest verifying backup — never
+    // from an unverified source, and never silently (always journaled).
+    run_auto_heal(profile, log);
+
+    // 5. Scheduled workspace snapshot: on the 6h cadence, snapshot the whole
+    // workspace (all profiles) so every past point is roll-back-able. Trims
+    // to keep-14. Local disk work — safe even during a blackout.
+    run_scheduled_snapshot(profile, state, now, log);
+}
+
+/// Auto-heal step (daemon self-maintenance). Runs on every tick, detects
+/// critical-artifact drift via the manifest, and restores from the newest
+/// verifying backup. Never heals from an unverified source; always journaled.
+fn run_auto_heal(profile: &str, log: &mut dyn FnMut(&str)) {
+    let verify = crate::manifest::verify_profile(profile);
+    if !verify.has_manifest {
+        return; // no baseline → nothing to heal against
+    }
+    // Build candidate list from the backup dir.
+    let candidates: Vec<crate::auto_heal::BackupCandidate> =
+        crate::backup::list_backups()
+            .into_iter()
+            .map(|b| {
+                let path = std::path::PathBuf::from(&b.path);
+                let verifies = crate::doctor::backup_bundle_verifies(&path);
+                crate::auto_heal::BackupCandidate {
+                    created_unix: 0, // re-derived from mtime below
+                    verifies,
+                    path,
+                }
+            })
+            .collect();
+    let candidates: Vec<crate::auto_heal::BackupCandidate> = candidates
+        .into_iter()
+        .map(|mut c| {
+            c.created_unix = std::fs::metadata(&c.path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| {
+                    t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs())
+                })
+                .unwrap_or(0);
+            c
+        })
+        .collect();
+
+    let action = crate::auto_heal::plan_heal(
+        &verify,
+        &candidates,
+        &crate::auto_heal::critical_artifact_kinds(),
+        crate::store::now_ts() as u64,
+    );
+
+    match action {
+        crate::auto_heal::HealAction::NoAction => {}
+        crate::auto_heal::HealAction::AlertOnly { reason } => {
+            log(&log_line("WARN", &format!("auto-heal: {reason}")));
+            let _ = crate::journal::append(profile, crate::journal::JournalKind::CycleFailed, &reason);
+        }
+        crate::auto_heal::HealAction::HealFiles { backup_path, artifacts } => {
+            let dir = crate::store::profiles::profile_dir(profile);
+            match crate::auto_heal::execute_heal(
+                &crate::auto_heal::HealAction::HealFiles { backup_path: backup_path.clone(), artifacts: artifacts.clone() },
+                &dir,
+                crate::store::now_ts() as u64,
+            ) {
+                Ok(report) => {
+                    // Refresh the manifest so the single source of truth reflects
+                    // the healed content.
+                    let _ = crate::manifest::refresh_manifest_after_write(
+                        &dir,
+                        crate::store::now_ts() as u64,
+                    );
+                    if crate::auto_heal::heal_is_safe(&report) {
+                        log(&log_line(
+                            "INFO",
+                            &format!(
+                                "auto-healed {:?} from {} (verified)",
+                                report.healed,
+                                backup_path.display()
+                            ),
+                        ));
+                        let _ = crate::journal::append(
+                            profile,
+                            crate::journal::JournalKind::AutoHealed,
+                            &format!(
+                                "healed={:?} backup={}",
+                                report.healed,
+                                backup_path.display()
+                            ),
+                        );
+                    } else {
+                        log(&log_line(
+                            "WARN",
+                            &format!(
+                                "auto-heal incomplete: healed={:?} still_broken={:?} skipped={:?}",
+                                report.healed,
+                                report.still_broken,
+                                report.skipped_non_critical
+                            ),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    log(&log_line("WARN", &format!("auto-heal failed: {e}")));
+                }
+            }
+        }
+    }
+}
+
+/// Scheduled workspace-snapshot step (daemon self-maintenance). On the 6h
+/// cadence (keep 14), snapshots the whole workspace — every profile — into
+/// `~/.dastyab/snapshots/<unix>.dyb-snapshot.json`, then prunes retention.
+fn run_scheduled_snapshot(profile: &str, state: &mut DaemonState, now: i64, log: &mut dyn FnMut(&str)) {
+    use crate::workspace_snapshots::*;
+    use crate::workspace_snapshot::SnapshotKind;
+    if !is_snapshot_due(state.last_snapshot_ts, now) {
+        return;
+    }
+    let workspace = crate::store::mem_dir();
+    let snaps = snapshots_dir();
+    match take_scheduled_snapshot(&workspace, &snaps, SnapshotKind::Full, now as u64) {
+        Ok(entry) => {
+            let _ = crate::journal::append(
+                profile,
+                crate::journal::JournalKind::SnapshotWritten,
+                &entry.path.display().to_string(),
+            );
+            log(&log_line(
+                "INFO",
+                &format!("workspace snapshot written → {}", entry.path.display()),
+            ));
+            if let Ok(prune) = prune_old_snapshots(&snaps, WORKSPACE_SNAPSHOT_KEEP) {
+                if !prune.removed.is_empty() {
+                    log(&log_line(
+                        "INFO",
+                        &format!("pruned {} old workspace snapshot(s)", prune.removed.len()),
+                    ));
+                }
+            }
+            state.last_snapshot_ts = now;
+        }
+        Err(e) => {
+            log(&log_line("WARN", &format!("workspace snapshot failed: {}", e.brief())));
+        }
     }
 }
 
