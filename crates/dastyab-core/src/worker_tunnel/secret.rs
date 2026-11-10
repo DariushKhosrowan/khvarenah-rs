@@ -25,10 +25,15 @@
 //! `resolve_worker_secret` always returns the current (never pending) secret.
 
 use std::borrow::Cow;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::CFError;
+
+/// Serializes the read-modify-write on per-worker desync learning records
+/// across concurrent monitor paths (daemon deep discovery + GUI light sweep).
+static DESYNC_LEARN_LOCK: Mutex<()> = Mutex::new(());
 
 /// A worker's session secret plus its two-phase rotation state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -284,6 +289,27 @@ pub fn learn_from_discovery(
         record_worker_desync_failure(cfg, worker_host, strategy);
     }
     cfg.worker_secrets != before
+}
+
+/// Serializes the read-modify-write on a worker's desync record across
+/// concurrent monitor paths (the daemon's deep discovery and a GUI-triggered
+/// light sweep can run in the same process). Loads the profile, applies
+/// `learn_from_discovery`, and persists only if the record changed.
+pub fn learn_from_discovery_persisted(
+    profile_id: &str,
+    worker_host: &str,
+    strategy: crate::desync::DesyncStrategy,
+    had_ws_success: bool,
+) -> bool {
+    // The worker-secrets map is the single source of truth; a lost update
+    // here would silently reintroduce the exact gap the learning loop closes.
+    let _guard = DESYNC_LEARN_LOCK.lock().unwrap();
+    let mut p = crate::store::profiles::load_profile(profile_id);
+    let changed = learn_from_discovery(&mut p.config, worker_host, strategy, had_ws_success);
+    if changed {
+        let _ = crate::store::profiles::save_profile(&p);
+    }
+    changed
 }
 
 fn hex(bytes: &[u8]) -> String {

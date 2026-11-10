@@ -673,17 +673,15 @@ async fn discover_native(
     // Record the discovery cycle's aggregate WS outcome into the per-worker
     // desync store. If any verified endpoint was found the strategy worked and
     // is promoted to effective; otherwise the strategy is demoted so the next
-    // discovery advances the ladder. Persist only if the store changed.
+    // discovery advances the ladder. The persist path is serialized across
+    // concurrent monitor paths (deep discovery + GUI light sweep).
     let had_ws_success = !verified.is_empty();
-    let mut final_cfg = crate::store::profiles::load_profile(profile_id);
-    if crate::worker_tunnel::secret::learn_from_discovery(
-        &mut final_cfg.config,
+    crate::worker_tunnel::secret::learn_from_discovery_persisted(
+        profile_id,
         &worker_host,
         cycle_strategy,
         had_ws_success,
-    ) {
-        let _ = crate::store::profiles::save_profile(&final_cfg);
-    }
+    );
 
     Ok(verified)
 }
@@ -1810,10 +1808,27 @@ impl AutopilotEngine {
         let _ = crate::cleanip::reconcile_bundle_if_drifted(&self.profile_id);
         mark_stage(&self.profile_id, CycleStage::Prepare)?;
         let vless = base_vless(&self.profile_id)?;
-        let path = crate::health::derive_ws_target(&vless).path;
+        let target = crate::health::derive_ws_target(&vless);
+        let path = target.path.clone();
+        let worker_host = target.host.clone();
+
+        // Per-worker desync learning applies to the light-phase sweep too:
+        // select this worker's learned strategy (falling back to the ladder /
+        // global default when unlearned) and install it for the probes so the
+        // same anti-DPI shape is honored in steady-state monitoring, not just
+        // deep discovery.
+        let init_cfg = crate::store::profiles::load_profile(&self.profile_id);
+        let cycle_strategy =
+            crate::worker_tunnel::secret::strategy_for_discovery(&init_cfg.config, &worker_host);
+        {
+            let mut dc = crate::desync::active_config();
+            dc.strategy = cycle_strategy;
+            crate::desync::set_config(dc);
+        }
 
         let mut ledger = read_ledger(&self.profile_id);
         let mut alive = 0usize;
+        let ledger_len = ledger.len();
         mark_stage(&self.profile_id, CycleStage::LightCheck)?;
         for ep in ledger.iter_mut() {
             let res = crate::health::endpoint_live_with_budget(
@@ -1829,6 +1844,19 @@ impl AutopilotEngine {
                 ep.last_checked = Some(store::now_iso());
                 alive += 1;
             }
+        }
+
+        // Record the light-phase aggregate WS outcome into the per-worker
+        // desync store (serialized persist so deep-discovery and light sweeps
+        // cannot lose an update). Only record when there was at least one
+        // probe; an empty ledger means no signal and must not demote.
+        if ledger_len > 0 {
+            crate::worker_tunnel::secret::learn_from_discovery_persisted(
+                &self.profile_id,
+                &worker_host,
+                cycle_strategy,
+                alive > 0,
+            );
         }
 
         ledger.sort_by(|a, b| {
@@ -3864,6 +3892,175 @@ mod tests {
             LightOutcome::Alive(_) => panic!("dead endpoints must yield NeedDeep"),
             LightOutcome::NeedDeep => {}
         }
+    }
+
+    /// The light phase records a per-worker desync FAILURE when every ledger
+    /// endpoint is dead: the tried strategy is pushed to the failed-set so the
+    /// ladder demotes on the next probe. Acceptance (b) from the architect
+    /// brief (light-phase failure demotes).
+    #[tokio::test]
+    async fn test_monitor_light_phase_records_desync_failure_when_all_dead() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        write_ledger(&id, &dead_loopback_ledger()).unwrap();
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(ScriptedProvider { result: Ok(vec![]) }),
+        );
+        match engine
+            .monitor_light_phase()
+            .await
+            .expect("light phase runs")
+        {
+            LightOutcome::Alive(_) => panic!("dead endpoints must yield NeedDeep"),
+            LightOutcome::NeedDeep => {}
+        }
+
+        // The worker host is the vless host (header_host/address).
+        let worker_host = "amir.dariuskhosrowan.workers.dev";
+        let p = crate::store::profiles::load_profile(&id);
+        let entry = p
+            .config
+            .worker_secrets
+            .get(worker_host)
+            .expect("record learned");
+        assert!(
+            entry
+                .failed_strategies
+                .contains(&crate::desync::DesyncStrategy::SplitClientHello),
+            "dead light phase must demote the tried strategy"
+        );
+        assert!(
+            entry.desync_strategy.is_none(),
+            "failure must not record an effective strategy"
+        );
+    }
+
+    /// The light phase records a per-worker desync SUCCESS when the probe finds
+    /// a live endpoint: the strategy is promoted to effective and the failed-set
+    /// is cleared. Acceptance (a). Uses the real mock worker on an alt port so
+    /// the light probe genuinely succeeds.
+    #[cfg(feature = "dev-mock")]
+    #[tokio::test]
+    async fn test_monitor_light_phase_records_desync_success_when_alive() {
+        use crate::mock_worker::{run_mock_worker, MockWorkerConfig};
+
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+
+        // Seed a NOT-split failure first so the "clears failed-set" branch is
+        // exercised by the success path.
+        let worker_host = "amir.dariuskhosrowan.workers.dev";
+        {
+            let mut p = crate::store::profiles::load_profile(&id);
+            crate::worker_tunnel::secret::record_worker_desync_failure(
+                &mut p.config,
+                worker_host,
+                crate::desync::DesyncStrategy::SplitClientHello,
+            );
+            crate::store::profiles::save_profile(&p).unwrap();
+        }
+
+        let cfg = MockWorkerConfig {
+            listen_addr: "127.0.0.1:2053".parse().unwrap(),
+            worker_path: "/".into(),
+            ws_payload_bytes: 4096,
+            trace_ip: "198.51.100.1".into(),
+            cert_sni: "mock.workers.dev".into(),
+        };
+        let _handle = tokio::spawn(run_mock_worker(cfg));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let live = vec![CleanEndpoint {
+            ip: "127.0.0.1".into(),
+            port: 2053,
+            sni: "mock.workers.dev".into(),
+            score: 99.0,
+            tcp_ms: 1.0,
+            connect_ms: 1.0,
+            download_kbps: 1000.0,
+            verified: true,
+            alive: true,
+            last_checked: None,
+            ts: String::new(),
+        }];
+        write_ledger(&id, &live).unwrap();
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(ScriptedProvider { result: Ok(vec![]) }),
+        );
+        match engine
+            .monitor_light_phase()
+            .await
+            .expect("light phase runs")
+        {
+            LightOutcome::Alive(_) => {}
+            LightOutcome::NeedDeep => panic!("live mock worker must yield Alive"),
+        }
+
+        // We seeded a SplitClientHello failure, so the ladder selects SplitTwo
+        // (skipping the failed entry); success promotes SplitTwo and clears the
+        // failed-set.
+        let p = crate::store::profiles::load_profile(&id);
+        let entry = p
+            .config
+            .worker_secrets
+            .get(worker_host)
+            .expect("record learned");
+        assert_eq!(
+            entry.desync_strategy,
+            Some(crate::desync::DesyncStrategy::SplitTwo),
+            "light success must promote the tried strategy"
+        );
+        assert!(
+            entry.failed_strategies.is_empty(),
+            "success must clear the failed-set"
+        );
+    }
+
+    /// The light phase on a worker with NO prior record falls back to the
+    /// ladder (global default) — it must not panic and must not invent a
+    /// second source of truth. Combined with the failure test above this
+    /// covers acceptance (d): unknown worker falls back to global from the
+    /// light-phase path.
+    #[tokio::test]
+    async fn test_monitor_light_phase_unknown_worker_falls_back_to_ladder() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        write_ledger(&id, &dead_loopback_ledger()).unwrap();
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(ScriptedProvider { result: Ok(vec![]) }),
+        );
+        // Must not panic: selection falls back to the ladder entry for the
+        // unknown worker host.
+        let _ = engine
+            .monitor_light_phase()
+            .await
+            .expect("light phase runs");
+
+        // The seeded profile's host is the only worker that should have a
+        // record (no invented keys).
+        let p = crate::store::profiles::load_profile(&id);
+        assert!(
+            p.config
+                .worker_secrets
+                .keys()
+                .all(|k| k == "amir.dariuskhosrowan.workers.dev"),
+            "only the seeded worker host may learn a record"
+        );
     }
 
     /// The deep phase runs discovery, merges fresh endpoints, best-score-wins,

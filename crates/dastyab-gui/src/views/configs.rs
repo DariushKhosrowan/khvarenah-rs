@@ -32,6 +32,8 @@ pub enum ConfigsSort {
 pub enum ConfigsAction {
     /// Write every matching generated config to disk under the export folder.
     ExportAll,
+    /// Open the "create config from a clean IP" dialog (no redeploy).
+    CreateFromIp,
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<ConfigsAction> {
@@ -131,6 +133,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<Confi
                 .clicked()
             {
                 action = Some(ConfigsAction::ExportAll);
+            }
+            ui.add_space(6.0);
+            if ui
+                .button("🧭 Create config from IP")
+                .on_hover_text("Point a fresh v2rayN/sing-box/Clash config at a clean IP — no redeploy (reuses the last deployed worker uuid/path)")
+                .clicked()
+            {
+                action = Some(ConfigsAction::CreateFromIp);
             }
         });
     });
@@ -254,8 +264,12 @@ fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Run a configs action (surfaces a note on the app).
-pub fn run_action(app: &mut crate::app::DastYabApp, act: ConfigsAction) {
+/// Run a configs action. Returns a dialog to open (or None).
+pub fn run_action(
+    app: &mut crate::app::DastYabApp,
+    act: ConfigsAction,
+) -> Option<crate::dialogs::Dialog> {
+    use crate::app::PendingDialogAction;
     match act {
         ConfigsAction::ExportAll => {
             let pid = app.state.active_profile_id.clone();
@@ -271,6 +285,14 @@ pub fn run_action(app: &mut crate::app::DastYabApp, act: ConfigsAction) {
                     app.note = format!("Export failed: {e}");
                 }
             }
+            None
+        }
+        ConfigsAction::CreateFromIp => {
+            app.pending_action = Some(PendingDialogAction::CreateConfigFromIp);
+            Some(crate::dialogs::prompt_text(
+                "Create config from clean IP",
+                "IP or ip:port (e.g. 104.16.1.1 or 104.16.1.1:443)",
+            ))
         }
     }
 }

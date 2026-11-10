@@ -1244,7 +1244,7 @@ impl DastYabApp {
         let _ = dastyab_core::generated_configs::save_generated_configs(&pid, &ledger);
 
         // Also remember it as a saved clean IP + learn it as a seed.
-        let _ = remember_clean_ip(&pid, &ep);
+        let _ = remember_clean_ip(&pid, ep);
         let _ = dastyab_core::cf::ips::learn_clean_ip(&pid, &ip);
 
         self.state.reload_pending = true;
@@ -1604,6 +1604,11 @@ impl DastYabApp {
                             }
                         }
                     }
+                    Some(PendingDialogAction::CreateConfigFromIp) => {
+                        if let DialogPayload::Text(ep) = payload {
+                            self.create_config_from_ip(&ep);
+                        }
+                    }
                     None => {}
                 }
             }
@@ -1637,7 +1642,10 @@ impl eframe::App for DastYabApp {
                 .show_ui(ui, |ui| {
                     let mut clicked: Option<String> = None;
                     for id in &self.profiles {
-                        if ui.selectable_label(self.profile_id == *id, id.as_str()).clicked() {
+                        if ui
+                            .selectable_label(self.profile_id == *id, id.as_str())
+                            .clicked()
+                        {
                             clicked = Some(id.clone());
                         }
                     }
@@ -1690,9 +1698,15 @@ impl eframe::App for DastYabApp {
         if !self.note.is_empty() {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.add(egui::Label::new(egui::RichText::new(&self.note).color(GOLD_DIM)));
+                ui.add(egui::Label::new(
+                    egui::RichText::new(&self.note).color(GOLD_DIM),
+                ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✕").on_hover_text("Clear message").clicked() {
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("Clear message")
+                        .clicked()
+                    {
                         self.note.clear();
                     }
                 });
@@ -2413,7 +2427,16 @@ impl DastYabApp {
             .clicked()
         {
             let pid = self.profile_id.clone();
-            let token = p.tokens.values().next().map(|t| t.token.clone());
+            // Prefer the store's active token (falls back to the first one).
+            let token = dastyab_core::store::profiles::get_active_token(&pid)
+                .ok()
+                .flatten()
+                .and_then(|label| {
+                    dastyab_core::store::profiles::get_token(&pid, &label)
+                        .ok()
+                        .flatten()
+                })
+                .or_else(|| p.tokens.values().next().map(|t| t.token.clone()));
             match token {
                 Some(token) => {
                     self.running.push("deploy".to_string());
@@ -2547,7 +2570,9 @@ impl DastYabApp {
 
     fn configs_panel(&mut self, ui: &mut egui::Ui) {
         if let Some(act) = configs::show(ui, self) {
-            configs::run_action(self, act);
+            if let Some(dlg) = configs::run_action(self, act) {
+                self.dialog = Some(dlg);
+            }
         }
     }
 
@@ -3721,9 +3746,8 @@ async fn deploy_worker(token: &str, pid: &str) -> Result<(String, String), CFErr
                     "Use the correct edgetunnel module worker.",
                 ));
             }
-            std::fs::read(&path).map_err(|e| {
-                CFError::new("Read error", format!("{e}"), "Check the file path.")
-            })?
+            std::fs::read(&path)
+                .map_err(|e| CFError::new("Read error", format!("{e}"), "Check the file path."))?
         }
         None => dastyab_core::presets::fallback_worker_js().into_bytes(),
     };
