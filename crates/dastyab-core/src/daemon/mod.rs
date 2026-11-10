@@ -21,6 +21,7 @@
 //! daemon *know* when it is in a total blackout and fast-fail to the worker
 //! bootstrap + reselect carriers from the offline pool — no human.
 pub mod blackout;
+pub mod blackout_drill;
 pub mod escalation;
 pub mod reselect;
 
