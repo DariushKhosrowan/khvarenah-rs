@@ -75,6 +75,8 @@ pub enum ProfilesAction {
     Delete(String),
     /// Back up / export the selected profile to a JSON bundle.
     Backup(String),
+    /// Duplicate a profile into a fresh one.
+    Clone(String),
 }
 
 pub fn show(
@@ -142,6 +144,13 @@ pub fn show(
                 {
                     action = Some(ProfilesAction::Backup(p.id.clone()));
                 }
+                if ui
+                    .button("⧉ Clone")
+                    .on_hover_text("Duplicate this profile into a fresh one")
+                    .clicked()
+                {
+                    action = Some(ProfilesAction::Clone(p.id.clone()));
+                }
                 if ui.button("Delete").clicked() {
                     action = Some(ProfilesAction::Delete(p.id.clone()));
                 }
@@ -207,6 +216,13 @@ pub fn run_action(
                 Err(e) => app.note = e.explain(),
             }
             None
+        }
+        ProfilesAction::Clone(id) => {
+            app.pending_action = Some(PendingDialogAction::CloneProfile(id));
+            Some(crate::dialogs::prompt_text(
+                "Clone profile",
+                "New profile name (blank uses '<name> copy')",
+            ))
         }
     }
 }

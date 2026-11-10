@@ -206,8 +206,29 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<TokensAction> {
             ui.add(
                 egui::TextEdit::singleline(&mut app.token_history_search)
                     .hint_text("filter events…")
-                    .desired_width(200.0),
+                    .desired_width(160.0),
             );
+            egui::ComboBox::from_id_salt("tokled_filter")
+                .selected_text(if app.token_history_filter.is_empty() {
+                    "kind: all".to_string()
+                } else {
+                    format!("kind: {}", app.token_history_filter)
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut app.token_history_filter,
+                        String::new(),
+                        "all",
+                    );
+                    for k in ["added", "removed", "made_active", "verified", "rotated", "auto_rotate"]
+                    {
+                        ui.selectable_value(
+                            &mut app.token_history_filter,
+                            k.to_string(),
+                            k,
+                        );
+                    }
+                });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("📋 Export")
@@ -244,15 +265,17 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<TokensAction> {
         });
         ui.add_space(4.0);
         let q = app.token_history_search.trim().to_lowercase();
+        let kf = app.token_history_filter.trim().to_lowercase();
         let shown = app
             .state
             .token_ledger
             .iter()
             .filter(|e| {
-                q.is_empty()
-                    || e.label.to_lowercase().contains(&q)
-                    || e.kind.to_lowercase().contains(&q)
-                    || e.note.to_lowercase().contains(&q)
+                (kf.is_empty() || e.kind.to_lowercase() == kf)
+                    && (q.is_empty()
+                        || e.label.to_lowercase().contains(&q)
+                        || e.kind.to_lowercase().contains(&q)
+                        || e.note.to_lowercase().contains(&q))
             })
             .collect::<Vec<_>>();
         if shown.is_empty() {
@@ -287,6 +310,22 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<TokensAction> {
                                             .color(GOLD_DIM)
                                             .small(),
                                         );
+                                        if ui
+                                            .button("🗑")
+                                            .on_hover_text("Delete this token-history event")
+                                            .clicked()
+                                        {
+                                            app.pending_action = Some(
+                                                crate::app::PendingDialogAction::DeleteTokenHistoryEvent(
+                                                    e.id.clone(),
+                                                ),
+                                            );
+                                            app.dialog = Some(dialogs::confirm(
+                                                "Delete token-history event",
+                                                "Delete this ledger event? Tokens themselves are not touched.",
+                                                true,
+                                            ));
+                                        }
                                     },
                                 );
                             });

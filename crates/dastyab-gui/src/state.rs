@@ -39,6 +39,7 @@ pub struct TokenSummary {
 /// One entry in the token-lifecycle ledger (adds/removes/active/verify).
 #[derive(Debug, Clone)]
 pub struct TokenLedgerRow {
+    pub id: String,
     pub kind: String,
     pub label: String,
     pub note: String,
@@ -128,6 +129,7 @@ impl GuiState {
             .token_history
             .iter()
             .map(|e| TokenLedgerRow {
+                id: e.id.clone(),
                 kind: e.kind.clone(),
                 label: e.label.clone(),
                 note: e.note.clone(),

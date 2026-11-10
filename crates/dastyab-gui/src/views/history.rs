@@ -95,6 +95,18 @@ pub fn show(
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button("🗑 Clear journal")
+                .on_hover_text("Delete the blackout/rescue journal")
+                .clicked()
+            {
+                app.pending_action = Some(PendingDialogAction::ClearJournal);
+                app.dialog = Some(dialogs::confirm(
+                    "Clear journal",
+                    "Delete the blackout/rescue journal for this profile?",
+                    true,
+                ));
+            }
             let clear = ui
                 .add_enabled(!p.history.is_empty(), egui::Button::new("🗑 Clear config history"))
                 .on_hover_text("Delete all deploy + clean-IP records (journal is kept)");

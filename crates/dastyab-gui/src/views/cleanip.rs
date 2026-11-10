@@ -31,6 +31,10 @@ pub enum CleanipAction {
     Probe(String),
     /// Probe every saved clean IP in sequence.
     ProbeAll,
+    /// Promote every imported seed to a saved clean IP.
+    PromoteAllSeeds,
+    /// Write all saved clean IPs to a text file in the profile config dir.
+    ExportToFile,
 }
 
 /// How the Clean IPs list is sorted.
@@ -296,6 +300,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
         if ui.button("📥 Import known-good IPs").clicked() {
             action = Some(CleanipAction::Import);
         }
+        let export_btn = ui
+            .add_enabled(!ips.is_empty(), egui::Button::new("💾 Export to file"))
+            .on_hover_text("Save all clean IPs to a text file in the profile config folder");
+        if export_btn.clicked() {
+            action = Some(CleanipAction::ExportToFile);
+        }
         let clear_btn = ui
             .add_enabled(!ips.is_empty(), egui::Button::new("🗑 Clear all"))
             .on_hover_text("Remove every saved clean IP");
@@ -309,13 +319,24 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
     // Seeds sub-list (imported known-good endpoints, not yet verified).
     if !app.state.seeds.is_empty() {
         section_card(ui, "Known-good seeds (imported)", |ui| {
-            ui.label(
-                egui::RichText::new(
-                    "These are saved as scan seeds — promote the ones you want saved as verified clean IPs.",
-                )
-                .color(GOLD_DIM)
-                .small(),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Saved as scan seeds — promote to verified clean IPs.",
+                    )
+                    .color(GOLD_DIM)
+                    .small(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("🌟 Promote all")
+                        .on_hover_text("Save every seed as a clean IP")
+                        .clicked()
+                    {
+                        action = Some(CleanipAction::PromoteAllSeeds);
+                    }
+                });
+            });
             ui.add_space(4.0);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -410,6 +431,38 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
             let all = app.state.clean_ips.join("\n");
             if all.is_empty() {
                 app.note = "No clean IPs to export.".to_string();
+            }
+            None
+        }
+        CleanipAction::PromoteAllSeeds => {
+            let seeds: Vec<String> = app.state.seeds.clone();
+            let pid = app.state.active_profile_id.clone();
+            let mut added = 0usize;
+            for s in seeds {
+                if remember_clean_ip_with_source(&pid, &s, "import").is_ok() {
+                    added += 1;
+                }
+            }
+            app.state.reload_pending = true;
+            app.note = format!("Promoted {added} seed(s) to clean IPs.");
+            None
+        }
+        CleanipAction::ExportToFile => {
+            let target = dastyab_core::cleanip::user_config_dir(&app.state.active_profile_id)
+                .map(|d| d.join("cleanips.txt"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("cleanips.txt"));
+            let content = app.state.clean_ips.join("
+") + "
+";
+            match std::fs::write(&target, content) {
+                Ok(_) => {
+                    app.note = format!(
+                        "Exported {} clean IP(s) → {}",
+                        app.state.clean_ips.len(),
+                        target.display()
+                    );
+                }
+                Err(e) => app.note = format!("Export failed: {e}"),
             }
             None
         }

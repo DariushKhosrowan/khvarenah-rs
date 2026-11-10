@@ -33,24 +33,28 @@ pub const CARD_STROKE: egui::Color32 = egui::Color32::from_rgb(52, 44, 30);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
+    Dashboard,
     DeployScan,
     Profiles,
     Tokens,
     CleanIps,
     History,
+    Log,
     Tools,
     Settings,
     Autonomy,
 }
 
 impl View {
-    /// The eight-item sidebar, in order.
-    const ALL: [View; 8] = [
+    /// The ten-item sidebar, in order.
+    const ALL: [View; 10] = [
+        View::Dashboard,
         View::DeployScan,
         View::Profiles,
         View::Tokens,
         View::CleanIps,
         View::History,
+        View::Log,
         View::Tools,
         View::Settings,
         View::Autonomy,
@@ -58,11 +62,13 @@ impl View {
 
     fn label(self) -> &'static str {
         match self {
+            View::Dashboard => "Dashboard",
             View::DeployScan => "Deploy & Scan",
             View::Profiles => "Profiles",
             View::Tokens => "Tokens",
             View::CleanIps => "Clean IPs",
             View::History => "History",
+            View::Log => "Log",
             View::Tools => "Tools",
             View::Settings => "Settings",
             View::Autonomy => "Autonomy",
@@ -73,14 +79,41 @@ impl View {
     /// heading), so the navigation reads at a glance.
     fn glyph(self) -> &'static str {
         match self {
+            View::Dashboard => "📊",
             View::DeployScan => "🛰",
             View::Profiles => "📁",
             View::Tokens => "🔑",
             View::CleanIps => "🌐",
             View::History => "🕘",
+            View::Log => "📜",
             View::Tools => "🧰",
             View::Settings => "⚙",
             View::Autonomy => "🤖",
+        }
+    }
+}
+
+/// How the Saved Configs manager sorts its snapshot list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackupSort {
+    /// Newest snapshot first.
+    #[default]
+    Newest,
+    /// Oldest snapshot first.
+    Oldest,
+    /// Alphabetical by profile name.
+    Name,
+    /// Largest bundle first.
+    Size,
+}
+
+impl BackupSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            BackupSort::Newest => "newest",
+            BackupSort::Oldest => "oldest",
+            BackupSort::Name => "name",
+            BackupSort::Size => "size",
         }
     }
 }
@@ -124,6 +157,12 @@ pub struct DastYabApp {
     pub cleanip_sort: crate::views::cleanip::CleanipSort,
     /// Live search filter for the Saved Configs manager.
     pub backups_search: String,
+    /// Sort mode for the Saved Configs manager.
+    pub backup_sort: BackupSort,
+    /// Kind filter for the token-history ledger (empty = all).
+    pub token_history_filter: String,
+    /// Auto-scroll the Log view to the newest line.
+    pub log_auto_scroll: bool,
     // inputs
     pub new_profile_name: String,
     // scan params
@@ -234,6 +273,18 @@ pub enum PendingDialogAction {
     ClearHistory,
     DeleteHistoryRecord(String),
     ClearTokenHistory,
+    /// Clone a profile into a fresh one (dialog supplies the new name).
+    CloneProfile(String),
+    /// Overwrite the current profile from a saved bundle (destructive confirm).
+    RestoreBackupIntoCurrent(String),
+    /// Restore a bundle from an arbitrary path typed by the user.
+    ImportBackupFromPath,
+    /// Delete one token-history ledger event.
+    DeleteTokenHistoryEvent(String),
+    /// Reset the current profile's settings to defaults (destructive confirm).
+    ResetSettings,
+    /// Clear the blackout/rescue journal for the active profile.
+    ClearJournal,
 }
 
 impl DastYabApp {
@@ -440,7 +491,7 @@ impl DastYabApp {
             hz_server_type: "cx22".to_string(),
             mw_count: 2,
             mw_note: String::new(),
-            view: View::DeployScan,
+            view: View::Dashboard,
             history_filter: HistoryFilter::default(),
             token_search: String::new(),
             history_search: String::new(),
@@ -448,6 +499,9 @@ impl DastYabApp {
             cleanip_test_output: String::new(),
             cleanip_add_draft: String::new(),
             token_history_search: String::new(),
+            backup_sort: BackupSort::default(),
+            token_history_filter: String::new(),
+            log_auto_scroll: true,
         };
         app.refresh_diagnostics();
         app
@@ -1285,6 +1339,104 @@ impl DastYabApp {
                             }
                         }
                     }
+                    Some(PendingDialogAction::CloneProfile(src_id)) => {
+                        if let DialogPayload::Text(name) = payload {
+                            match dastyab_core::store::profiles::clone_profile(
+                                &src_id,
+                                Some(&name),
+                            ) {
+                                Ok(id) => {
+                                    self.state.reload_pending = true;
+                                    self.note =
+                                        format!("Cloned profile → '{id}'.");
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::RestoreBackupIntoCurrent(path_str)) => {
+                        if let DialogPayload::Confirm = payload {
+                            if self.profile_id == "default"
+                                && path_str.contains("-default-")
+                            {
+                                self.note =
+                                    "Refusing to overwrite the default profile with a default-profile backup.".to_string();
+                            } else {
+                                match dastyab_core::store::profiles::overwrite_profile_from_bundle(
+                                    &self.profile_id,
+                                    std::path::Path::new(&path_str),
+                                ) {
+                                    Ok(_) => {
+                                        self.state.reload_pending = true;
+                                        self.note = format!(
+                                            "Restored backup into profile '{}'.",
+                                            self.profile_id
+                                        );
+                                    }
+                                    Err(e) => self.note = e.brief(),
+                                }
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::ImportBackupFromPath) => {
+                        if let DialogPayload::Text(p) = payload {
+                            let path = std::path::PathBuf::from(p.trim());
+                            if !path.exists() {
+                                self.note = format!("File not found: {}", path.display());
+                            } else {
+                                match dastyab_core::backup::import_profile_from_file(&path) {
+                                    Ok(pid) => {
+                                        self.state.reload_pending = true;
+                                        self.note =
+                                            format!("Imported backup → new profile '{pid}'.");
+                                    }
+                                    Err(e) => self.note = e.explain(),
+                                }
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::DeleteTokenHistoryEvent(ev_id)) => {
+                        if let DialogPayload::Confirm = payload {
+                            match dastyab_core::store::profiles::remove_token_history_event(
+                                &self.profile_id,
+                                &ev_id,
+                            ) {
+                                Ok(true) => {
+                                    self.state.reload_pending = true;
+                                    self.note = "Token history entry deleted.".to_string();
+                                }
+                                Ok(false) => self.note = "Token history entry not found.".to_string(),
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::ResetSettings) => {
+                        if let DialogPayload::Confirm = payload {
+                            let mut p = dastyab_core::store::profiles::load_profile(
+                                &self.profile_id,
+                            );
+                            p.config = Default::default();
+                            match dastyab_core::store::profiles::save_profile(&p) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note =
+                                        "Profile settings reset to defaults.".to_string();
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::ClearJournal) => {
+                        if let DialogPayload::Confirm = payload {
+                            match dastyab_core::journal::clear(&self.profile_id) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note = "Journal cleared.".to_string();
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
                     None => {}
                 }
             }
@@ -1302,6 +1454,9 @@ impl eframe::App for DastYabApp {
 
         // Drain background async work before rendering any frame.
         self.poll_bridge(ui.ctx());
+
+        // Keyboard shortcuts (Ctrl+1..9 / Ctrl+0).
+        self.handle_shortcuts(ui);
 
         ui.vertical_centered(|ui| {
             ui.heading(egui::RichText::new("DastYab").color(GOLD).size(28.0));
@@ -1356,6 +1511,303 @@ impl eframe::App for DastYabApp {
 }
 
 impl DastYabApp {
+    /// Keyboard shortcuts: Ctrl+1..9 / Ctrl+0 switch views instantly.
+    fn handle_shortcuts(&mut self, ui: &egui::Ui) {
+        let pressed = |key: egui::Key| ui.input(|i| i.modifiers.command && i.key_pressed(key));
+        let view = if pressed(egui::Key::Num1) {
+            Some(View::Dashboard)
+        } else if pressed(egui::Key::Num2) {
+            Some(View::DeployScan)
+        } else if pressed(egui::Key::Num3) {
+            Some(View::Profiles)
+        } else if pressed(egui::Key::Num4) {
+            Some(View::Tokens)
+        } else if pressed(egui::Key::Num5) {
+            Some(View::CleanIps)
+        } else if pressed(egui::Key::Num6) {
+            Some(View::History)
+        } else if pressed(egui::Key::Num7) {
+            Some(View::Log)
+        } else if pressed(egui::Key::Num8) {
+            Some(View::Tools)
+        } else if pressed(egui::Key::Num9) {
+            Some(View::Settings)
+        } else if pressed(egui::Key::Num0) {
+            Some(View::Autonomy)
+        } else {
+            None
+        };
+        if let Some(v) = view {
+            self.view = v;
+        }
+    }
+
+    /// The Dashboard — a single glance at everything: protection status,
+    /// active profile, key counts, daemon health, and the latest activity.
+    fn dashboard_panel(&mut self, ui: &mut egui::Ui, p: &dastyab_core::store::profiles::Profile) {
+        ui.heading(egui::RichText::new("Dashboard").color(GOLD));
+        ui.label(
+            egui::RichText::new("Everything that matters at a glance — protection, profile, and recent activity.")
+                .color(GOLD_DIM),
+        );
+        ui.add_space(8.0);
+
+        // ── Protection status card ────────────────────────────────
+        crate::views::section_card(ui, "Protection", |ui| {
+            ui.horizontal(|ui| {
+                let (label, color) = if self.autopilot_on {
+                    ("🛡 PROTECTION: ON", egui::Color32::from_rgb(90, 210, 120))
+                } else {
+                    ("🛡 PROTECTION: OFF", egui::Color32::from_rgb(220, 120, 90))
+                };
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new(label).color(color).strong().size(16.0),
+                    ))
+                    .clicked()
+                {
+                    if self.autopilot_on {
+                        self.autopilot_off();
+                    } else {
+                        self.autopilot_on(ui.ctx());
+                    }
+                }
+                ui.label(
+                    egui::RichText::new("auto-find clean IP · export configs · keep them healthy")
+                        .color(GOLD_DIM),
+                );
+            });
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(&self.autopilot_status).color(TEXT));
+
+            // Daemon health line.
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(self.daemon_status_line()).color(GOLD_DIM).small());
+
+            // Running tasks.
+            if !self.running.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("⏳ running: {}", self.running.join(", ")))
+                        .color(GOLD),
+                );
+            }
+        });
+
+        // ── Active profile card ───────────────────────────────────
+        crate::views::section_card(ui, "Active profile", |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("profile").color(GOLD_DIM));
+                ui.label(egui::RichText::new(&self.profile_id).color(TEXT).strong());
+                let dstate = dastyab_core::daemon::load_daemon_state(&self.profile_id);
+                if dstate.account_state.blocks_cycle() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "⚠ account {} — daemon waiting",
+                            dstate.account_state.label()
+                        ))
+                        .color(GOLD)
+                        .small(),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            let backups = self.state.backups.len();
+            crate::views::stat_chips(
+                ui,
+                &[
+                    ("tokens", &self.state.tokens.len().to_string()),
+                    ("clean IPs", &self.state.clean_ips.len().to_string()),
+                    ("seeds", &self.state.seeds.len().to_string()),
+                    ("history", &p.history.len().to_string()),
+                    ("snapshots", &backups.to_string()),
+                ],
+            );
+            if self.state.beacon_outbox > 0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "⚠ {} alert(s) queued for delivery",
+                        self.state.beacon_outbox
+                    ))
+                    .color(egui::Color32::from_rgb(230, 160, 60)),
+                );
+            }
+        });
+
+        // ── Quick actions card ────────────────────────────────────
+        crate::views::section_card(ui, "Quick actions", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("🛰 Scan ONE clean IP").clicked() {
+                    self.view = View::DeployScan;
+                    self.note = "Run a scan from Deploy & Scan (or press Ctrl+2).".to_string();
+                }
+                if ui.button("🚀 Deploy worker").clicked() {
+                    self.view = View::DeployScan;
+                }
+                if ui.button("➕ Add token").clicked() {
+                    self.pending_action = Some(PendingDialogAction::AddToken);
+                    self.dialog = Some(dialogs::prompt_two(
+                        "Add token",
+                        "Label",
+                        "Token",
+                        true,
+                    ));
+                }
+                if ui.button("💾 Snapshot config").clicked() {
+                    match dastyab_core::backup::export_profile_to_file(&self.profile_id, None) {
+                        Ok(path) => {
+                            self.note = format!("✓ Snapshot saved → {}", path.display());
+                        }
+                        Err(e) => self.note = e.explain(),
+                    }
+                }
+                if ui.button("⚙ Settings").clicked() {
+                    self.view = View::Settings;
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Ctrl+1…9 / Ctrl+0 switch views; profile is shown in the sidebar.")
+                    .color(GOLD_DIM)
+                    .small(),
+            );
+        });
+
+        // ── Recent activity ───────────────────────────────────────
+        crate::views::section_card(ui, "Recent activity", |ui| {
+            let mut items: Vec<(i64, &'static str, egui::Color32, String)> = Vec::new();
+            for r in p.history.iter().take(12) {
+                let (tag, color) = if r.clean_ip {
+                    ("clean-IP", egui::Color32::from_rgb(100, 170, 220))
+                } else {
+                    ("workers.dev", GOLD)
+                };
+                let host = if r.name.is_empty() { &r.address } else { &r.name };
+                items.push((r.epoch as i64, tag, color, host.clone()));
+            }
+            for e in dastyab_core::journal::recent(&self.profile_id, 8) {
+                items.push((
+                    e.ts,
+                    "journal",
+                    egui::Color32::from_rgb(140, 200, 255),
+                    e.detail.clone(),
+                ));
+            }
+            for e in self.state.token_ledger.iter().take(8) {
+                items.push((
+                    e.epoch,
+                    "token",
+                    egui::Color32::from_rgb(200, 160, 255),
+                    format!("{} — {}", e.label, e.note),
+                ));
+            }
+            items.sort_unstable_by_key(|i| std::cmp::Reverse(i.0));
+            if items.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "Nothing yet — deploy, scan, or let the daemon run a few cycles.",
+                    )
+                    .color(GOLD_DIM),
+                );
+            } else {
+                for (epoch, tag, color, title) in items.into_iter().take(8) {
+                    ui.horizontal(|ui| {
+                        crate::views::tag(ui, tag, color);
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(title).color(TEXT));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(crate::state::relative_ts(epoch))
+                                        .color(GOLD_DIM)
+                                        .small(),
+                                );
+                            },
+                        );
+                    });
+                    ui.add_space(2.0);
+                }
+                ui.add_space(2.0);
+                if ui.button("View full history →").clicked() {
+                    self.view = View::History;
+                }
+            }
+        });
+    }
+
+    /// Dedicated Live Log view — the async bridge streams every background
+    /// task's output here. Supports clear, save-to-file, and filtering.
+    fn log_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading(egui::RichText::new("Live log").color(GOLD));
+        ui.label(
+            egui::RichText::new(
+                "Deploy, scans, autopilot, and daemon tasks stream their output here.",
+            )
+            .color(GOLD_DIM),
+        );
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.log_auto_scroll, "auto-scroll");
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("🗑 Clear").clicked() {
+                    self.log_lines.clear();
+                }
+                if ui.button("💾 Save to file").clicked() {
+                    let dir = dastyab_core::cleanip::user_config_dir(&self.profile_id);
+                    let target = match dir {
+                        Ok(d) => d.join("activity.log"),
+                        Err(_) => std::path::PathBuf::from("activity.log"),
+                    };
+                    let content = self.log_lines.join("
+") + "
+";
+                    match std::fs::write(&target, content) {
+                        Ok(_) => {
+                            self.note = format!("Log saved → {}", target.display());
+                        }
+                        Err(e) => self.note = format!("Save failed: {e}"),
+                    }
+                }
+                if ui.button("📋 Copy").clicked() {
+                    let joined = self.log_lines.join("
+");
+                    if !joined.is_empty() {
+                        ui.ctx().copy_text(joined);
+                        self.note = "Copied log to clipboard.".to_string();
+                    }
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        if self.log_lines.is_empty() {
+            ui.label(
+                egui::RichText::new("Idle — run a deploy, scan, or autopilot to see live output.")
+                    .color(GOLD_DIM),
+            );
+            return;
+        }
+
+        let mut joined = self.log_lines.join("
+");
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .stick_to_bottom(self.log_auto_scroll)
+            .max_height(520.0)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut joined)
+                        .desired_rows(20)
+                        .desired_width(ui.available_width())
+                        .font(egui::TextStyle::Monospace)
+                        .interactive(false),
+                );
+            });
+    }
+
     /// The app shell: left navigation sidebar + active view, with the active
     /// view name shown in gold.
     fn render_shell(&mut self, ui: &mut egui::Ui, p: &dastyab_core::store::profiles::Profile) {
@@ -1439,11 +1891,13 @@ impl DastYabApp {
                 });
                 ui.separator();
                 match self.view {
+                    View::Dashboard => self.dashboard_panel(ui, p),
                     View::DeployScan => self.deploy_panel(ui, p),
                     View::Profiles => self.profile_panel(ui, p),
                     View::Tokens => self.token_panel(ui, p),
                     View::CleanIps => self.cleanip_panel(ui, p),
                     View::History => history::show(ui, self, p),
+                    View::Log => self.log_panel(ui),
                     View::Tools => self.tools_panel(ui, p),
                     View::Settings => self.settings_panel(ui, p),
                     View::Autonomy => self.autonomy_panel(ui, p),
@@ -2021,6 +2475,18 @@ impl DastYabApp {
                     self.save_scan_params();
                     self.note = "Scan defaults saved to profile.".to_string();
                 }
+                if ui
+                    .button("Reset settings to defaults")
+                    .on_hover_text("Reset every per-profile setting to its default")
+                    .clicked()
+                {
+                    self.pending_action = Some(PendingDialogAction::ResetSettings);
+                    self.dialog = Some(dialogs::confirm(
+                        "Reset settings to defaults",
+                        "Reset ALL profile settings (scan, protection pacing, notifications, desync, scheduled maintenance) to defaults? This does not touch tokens or clean IPs.",
+                        true,
+                    ));
+                }
                 ui.label(
                     egui::RichText::new("Used by Deploy & Scan and the automatic monitor.")
                         .color(GOLD_DIM)
@@ -2122,8 +2588,20 @@ impl DastYabApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.backups_search)
                         .hint_text("filter saved configs…")
-                        .desired_width(200.0),
+                        .desired_width(180.0),
                 );
+                egui::ComboBox::from_id_salt("backup_sort")
+                    .selected_text(format!("sort: {}", self.backup_sort.label()))
+                    .show_ui(ui, |ui| {
+                        for s in [
+                            BackupSort::Newest,
+                            BackupSort::Oldest,
+                            BackupSort::Name,
+                            BackupSort::Size,
+                        ] {
+                            ui.selectable_value(&mut self.backup_sort, s, s.label());
+                        }
+                    });
                 if ui
                     .button("⟳")
                     .on_hover_text("Refresh the saved-configs list")
@@ -2138,6 +2616,17 @@ impl DastYabApp {
                 {
                     open_folder(&dastyab_core::backup::backup_dir());
                 }
+                if ui
+                    .button("📥 Import from path")
+                    .on_hover_text("Restore a bundle from an arbitrary file path")
+                    .clicked()
+                {
+                    self.pending_action = Some(PendingDialogAction::ImportBackupFromPath);
+                    self.dialog = Some(dialogs::prompt_text(
+                        "Import backup from file",
+                        "Full path to a .json bundle",
+                    ));
+                }
                 ui.label(
                     egui::RichText::new(format!(
                         "{} saved config(s)",
@@ -2149,7 +2638,7 @@ impl DastYabApp {
             });
 
             let query = self.backups_search.trim().to_lowercase();
-            let backups: Vec<_> = self
+            let mut backups: Vec<_> = self
                 .state
                 .backups
                 .iter()
@@ -2159,6 +2648,20 @@ impl DastYabApp {
                         || b.profile_id.to_lowercase().contains(&query)
                 })
                 .collect();
+            match self.backup_sort {
+                BackupSort::Newest => {
+                    backups.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                }
+                BackupSort::Oldest => {
+                    backups.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                }
+                BackupSort::Name => {
+                    backups.sort_by(|a, b| a.profile_name.cmp(&b.profile_name));
+                }
+                BackupSort::Size => {
+                    backups.sort_by_key(|a| std::cmp::Reverse(a.size));
+                }
+            }
 
             if backups.is_empty() {
                 ui.label(
@@ -2212,7 +2715,11 @@ impl DastYabApp {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if ui.button("🗑").on_hover_text("Delete this snapshot").clicked() {
+                                                if ui
+                                                    .button("🗑")
+                                                    .on_hover_text("Delete this snapshot")
+                                                    .clicked()
+                                                {
                                                     match dastyab_core::backup::delete_backup(
                                                         std::path::Path::new(&b.path),
                                                     ) {
@@ -2228,7 +2735,36 @@ impl DastYabApp {
                                                         }
                                                     }
                                                 }
-                                                if ui.button("Restore").on_hover_text("Restore this snapshot into a new profile").clicked() {
+                                                if ui
+                                                    .button("📄")
+                                                    .on_hover_text("Preview this snapshot (read the JSON)")
+                                                    .clicked()
+                                                {
+                                                    match std::fs::read_to_string(&b.path) {
+                                                        Ok(text) => {
+                                                            self.backup_output = text;
+                                                        }
+                                                        Err(e) => {
+                                                            self.backup_output = format!(
+                                                                "Read failed: {e}"
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                                if ui
+                                                    .button("📋")
+                                                    .on_hover_text("Copy this snapshot's path")
+                                                    .clicked()
+                                                {
+                                                    ui.ctx().copy_text(b.path.clone());
+                                                    self.note =
+                                                        format!("Copied path: {}", b.path);
+                                                }
+                                                if ui
+                                                    .button("Restore → new")
+                                                    .on_hover_text("Restore this snapshot into a new profile")
+                                                    .clicked()
+                                                {
                                                     match dastyab_core::backup::import_profile_from_file(
                                                         std::path::Path::new(&b.path),
                                                     ) {
@@ -2238,8 +2774,29 @@ impl DastYabApp {
                                                             );
                                                             self.state.reload_pending = true;
                                                         }
-                                                        Err(e) => self.backup_output = e.explain(),
+                                                        Err(e) => {
+                                                            self.backup_output = e.explain()
+                                                        }
                                                     }
+                                                }
+                                                if ui
+                                                    .button("Restore → here")
+                                                    .on_hover_text("Overwrite THIS profile from this snapshot")
+                                                    .clicked()
+                                                {
+                                                    self.pending_action = Some(
+                                                        PendingDialogAction::RestoreBackupIntoCurrent(
+                                                            b.path.clone(),
+                                                        ),
+                                                    );
+                                                    self.dialog = Some(dialogs::confirm(
+                                                        "Restore into current profile",
+                                                        format!(
+                                                            "Overwrite profile '{}' with this snapshot? Tokens, config, clean IPs and history will be replaced. This cannot be undone.",
+                                                            self.profile_id
+                                                        ),
+                                                        true,
+                                                    ));
                                                 }
                                             },
                                         );

@@ -609,6 +609,94 @@ pub fn import_profile(json: &serde_json::Value) -> Result<String, CFError> {
     Ok(id)
 }
 
+/// Overwrite an existing profile's data files from an exported JSON bundle
+/// (the format produced by [`export_profile`]). This is the "restore into the
+/// current profile" action: it replaces tokens, config, clean IPs, history,
+/// the token ledger and provenance in place, keeping the profile's id/name.
+pub fn overwrite_profile_from_bundle(id: &str, path: &std::path::Path) -> Result<(), CFError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        CFError::new(
+            "Backup error",
+            format!("Cannot read {}: {e}", path.display()),
+            "Check the file path.",
+        )
+    })?;
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        CFError::new(
+            "Backup error",
+            format!("Invalid JSON: {e}"),
+            "Export a profile first.",
+        )
+    })?;
+    let dir = profile_dir(id);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        CFError::new(
+            "Storage error",
+            format!("Cannot create {}: {e}", dir.display()),
+            "Check permissions.",
+        )
+    })?;
+    // Preserve the destination profile's own meta (id/name/description) —
+    // only the data files are replaced from the bundle.
+    if let Some(tokens) = json.get("tokens") {
+        write_json(&dir.join("token.json"), tokens)?;
+        set_file_private(&dir.join("token.json"));
+    }
+    if let Some(accounts) = json.get("accounts") {
+        write_json(&dir.join("accounts.json"), accounts)?;
+    }
+    if let Some(history) = json.get("history") {
+        write_json(&dir.join("history.json"), history)?;
+    }
+    if let Some(clean) = json.get("clean_ips") {
+        write_json(&dir.join("cleanips.json"), clean)?;
+    }
+    if let Some(cfg) = json.get("config") {
+        write_json(&dir.join("config.json"), cfg)?;
+    }
+    if let Some(th) = json.get("token_history") {
+        write_json(&dir.join("token_history.json"), th)?;
+    }
+    if let Some(cim) = json.get("clean_ip_meta") {
+        write_json(&dir.join("cleanip_meta.json"), cim)?;
+    }
+    Ok(())
+}
+
+/// Clone a profile into a brand-new profile with a fresh id. The new name
+/// defaults to the source name + " copy", or the supplied name. Tokens,
+/// clean IPs, history, config and the token ledger are copied verbatim.
+/// Returns the new profile id.
+pub fn clone_profile(source_id: &str, new_name: Option<&str>) -> Result<String, CFError> {
+    let mut val = export_profile(source_id)?;
+    let new_id = new_id();
+    let base = val
+        .get("meta")
+        .and_then(|m| m.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("profile")
+        .to_string();
+    let name = match new_name {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => format!("{base} copy"),
+    };
+    if let Some(meta) = val.get_mut("meta") {
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert("id".into(), serde_json::json!(new_id));
+            obj.insert("name".into(), serde_json::json!(name));
+            obj.insert("created_at".into(), serde_json::json!(crate::store::now_iso()));
+        }
+    } else {
+        val["meta"] = serde_json::json!({
+            "id": new_id,
+            "name": name,
+            "created_at": crate::store::now_iso(),
+            "description": "",
+        });
+    }
+    import_profile(&val)
+}
+
 /// Add a token to a profile (keyed by label).
 pub fn add_token(id: &str, label: &str, token: &str) -> Result<(), CFError> {
     let mut p = load_profile(id);
@@ -836,6 +924,19 @@ pub fn clear_token_history(id: &str) -> Result<(), CFError> {
     let mut p = load_profile(id);
     p.token_history.clear();
     save_profile(&p)
+}
+
+/// Remove a single event from the token-lifecycle ledger. Returns `Ok(true)`
+/// when the event was found and removed, `Ok(false)` when it was absent.
+pub fn remove_token_history_event(id: &str, event_id: &str) -> Result<bool, CFError> {
+    let mut p = load_profile(id);
+    let before = p.token_history.len();
+    p.token_history.retain(|e| e.id != event_id);
+    if p.token_history.len() == before {
+        return Ok(false);
+    }
+    save_profile(&p)?;
+    Ok(true)
 }
 
 /// Update per-profile settings.
@@ -1211,6 +1312,68 @@ mod tests {
             add_token(&id, "cf-main", "secret-token").unwrap();
             let p2 = load_profile(&id);
             assert_eq!(p2.tokens.get("cf-main").unwrap().token, "secret-token");
+        });
+    }
+
+    #[test]
+    fn overwrite_profile_from_bundle_replaces_data_in_place() {
+        with_home(|| {
+            let src = create_profile("src", "").unwrap();
+            add_token(&src, "cf-main", "secret-token").unwrap();
+            remember_clean_ip(&src, "104.16.1.1:443").unwrap();
+            let bundle = crate::backup::export_profile_to_file(&src, None).unwrap();
+
+            let dst = create_profile("dst", "keep me").unwrap();
+            add_token(&dst, "other", "other-token").unwrap();
+            overwrite_profile_from_bundle(&dst, &bundle).unwrap();
+
+            // id/name/description preserved, data replaced.
+            let p = load_profile(&dst);
+            assert_eq!(p.meta.name, "dst");
+            assert_eq!(p.meta.description, "keep me");
+            assert!(p.tokens.contains_key("cf-main"));
+            assert!(!p.tokens.contains_key("other"));
+            assert!(p.clean_ips.iter().any(|ip| ip == "104.16.1.1:443"));
+            assert_eq!(p.token_history.len(), 1);
+        });
+    }
+
+    #[test]
+    fn clone_profile_creates_fresh_id_and_copies_state() {
+        with_home(|| {
+            let src = create_profile("srv", "prod").unwrap();
+            add_token(&src, "cf-main", "secret-token").unwrap();
+            remember_clean_ip(&src, "104.16.1.1:443").unwrap();
+
+            let cloned = clone_profile(&src, Some("srv test")).unwrap();
+            assert_ne!(cloned, src);
+
+            let p = load_profile(&cloned);
+            assert_eq!(p.meta.name, "srv test");
+            assert_eq!(p.tokens.get("cf-main").unwrap().token, "secret-token");
+            assert!(p.clean_ips.iter().any(|ip| ip == "104.16.1.1:443"));
+            assert_eq!(p.token_history.len(), 1); // the "added" event copied
+
+            // Default name suffix when none provided.
+            let c2 = clone_profile(&src, None).unwrap();
+            assert_eq!(load_profile(&c2).meta.name, "srv copy");
+        });
+    }
+
+    #[test]
+    fn remove_token_history_event_removes_single_event() {
+        with_home(|| {
+            let id = create_profile("tok", "").unwrap();
+            // add_token records an "added" lifecycle event.
+            add_token(&id, "cf-main", "secret-token").unwrap();
+            assert_eq!(token_history(&id).len(), 1);
+            let ev = token_history(&id).remove(0);
+            let ev_id = ev.id.clone();
+            // Removing an existing event succeeds.
+            assert!(remove_token_history_event(&id, &ev_id).unwrap());
+            assert!(token_history(&id).is_empty());
+            // Removing a missing event returns Ok(false).
+            assert!(!remove_token_history_event(&id, &ev_id).unwrap());
         });
     }
 
