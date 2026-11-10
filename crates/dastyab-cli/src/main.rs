@@ -149,6 +149,36 @@ enum Command {
         #[command(subcommand)]
         action: BackupAction,
     },
+    /// Show the configs inventory across all profiles (the "configs manager").
+    /// Exports deterministic Markdown or JSON.
+    Inventory {
+        /// Filter output by profile id.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Filter output by artifact kind label.
+        #[arg(long, value_delimiter = ',')]
+        kind: Option<Vec<String>>,
+        /// Filter output by integrity status (verified|missing|changed|extra|no-manifest).
+        #[arg(long)]
+        integrity: Option<String>,
+        /// Emit JSON instead of Markdown.
+        #[arg(long)]
+        json: bool,
+        /// Output file (default: print to stdout).
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Verify all profiles against their manifests (proof nothing is lost).
+    ManifestVerify {
+        /// Refresh manifests first (re-hash current artifacts).
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Whole-workspace snapshot (all profiles in one portable bundle).
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
     /// Configure scheduled worker-signature rotation (anti-DPI moving target).
     /// The daemon redeploys the worker with a fresh UUID/path on the interval.
     Mutation {
@@ -630,6 +660,31 @@ enum BackupAction {
         /// How many newest backups to keep (default 7).
         #[arg(long)]
         keep: Option<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceAction {
+    /// Snapshot the whole workspace to a portable .dyb-snapshot.json.
+    Snapshot {
+        /// Output path (default: ~/.dastyab/workspace-snapshot.json).
+        #[arg(long)]
+        output: Option<String>,
+        /// Snapshot scope: full|profiles|configs (default full).
+        #[arg(long, default_value = "full")]
+        scope: String,
+    },
+    /// Restore the whole workspace from a snapshot.
+    Restore {
+        /// Snapshot file to restore from.
+        #[arg()]
+        path: String,
+        /// Overwrite existing profiles.
+        #[arg(long)]
+        overwrite: bool,
+        /// Dry run: verify + report, write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

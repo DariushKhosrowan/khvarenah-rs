@@ -16,7 +16,7 @@ use dastyab_core::worker::{
 use dastyab_core::{CFError, BRAND, VERSION};
 use std::path::PathBuf;
 
-use crate::{BackupAction, Command, DaemonAction, DnsAction, ProtectionAction, RoutesAction};
+use crate::{BackupAction, Command, DaemonAction, DnsAction, ProtectionAction, RoutesAction, WorkspaceAction};
 use dastyab_core::remote_beacon::BeaconConfig;
 /// Run a command. `profile` is the active profile id.
 pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
@@ -108,6 +108,15 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::Routes { action } => routes(profile, action).await,
         Command::Export { format, output } => export_cmd(profile, &format, output).await,
         Command::Backup { action } => backup(profile, action),
+        Command::Inventory {
+            profile,
+            kind,
+            integrity,
+            json,
+            output,
+        } => inventory_cmd(profile, kind, integrity, json, output),
+        Command::ManifestVerify { refresh } => manifest_verify_cmd(refresh),
+        Command::Workspace { action } => workspace_cmd(action),
         Command::Mutation { action } => cmd_mutation(profile, action),
         Command::Analytics => analytics(profile).await,
         Command::Diag { endpoints } => diag(&endpoints).await,
@@ -3002,3 +3011,160 @@ mod tests {
         assert!(cmd_verify("", "").is_err());
     }
 }
+
+
+/// `inventory` subcommand — render the configs inventory.
+fn inventory_cmd(
+    profile_filter: Option<String>,
+    kind_filter: Option<Vec<String>>,
+    integrity_filter: Option<String>,
+    json_out: bool,
+    output: Option<String>,
+) -> Result<(), CFError> {
+    use dastyab_core::inventory::*;
+    use dastyab_core::manifest::{ArtifactKind, IntegrityStatus};
+
+    let workspace = dastyab_core::store::mem_dir();
+    let inv = build_inventory(&workspace, dastyab_core::store::now_ts() as u64);
+
+    let kind_opt = kind_filter.map(|kinds| {
+        kinds
+            .into_iter()
+            .filter_map(|k| match k.to_lowercase().as_str() {
+                "profilemeta" | "profile-meta" => Some(ArtifactKind::ProfileMeta),
+                "tokens" | "token" => Some(ArtifactKind::Tokens),
+                "accounts" => Some(ArtifactKind::Accounts),
+                "history" => Some(ArtifactKind::History),
+                "cleanips" | "clean-ips" => Some(ArtifactKind::CleanIps),
+                "config" => Some(ArtifactKind::Config),
+                "tokenhistory" | "token-history" => Some(ArtifactKind::TokenHistory),
+                "cleanipmeta" | "clean-ip-meta" => Some(ArtifactKind::CleanIpMeta),
+                "tunnelclient" | "tunnel-client" => Some(ArtifactKind::TunnelClient),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    let status_opt = integrity_filter.as_deref().map(|s| match s.to_lowercase().as_str() {
+        "verified" => IntegrityStatus::Verified,
+        "missing" => IntegrityStatus::Missing,
+        "changed" => IntegrityStatus::Changed,
+        "extra" => IntegrityStatus::Extra,
+        "no-manifest" | "nomanifest" => IntegrityStatus::NoManifest,
+        _ => IntegrityStatus::NoManifest,
+    });
+
+    let filter = InventoryFilter {
+        profile_id: profile_filter,
+        kinds: kind_opt,
+        integrity: status_opt,
+    };
+    let filtered = filter_inventory(&inv, &filter);
+    let filtered_inv = Inventory {
+        generated_unix: inv.generated_unix,
+        items: filtered.into_iter().cloned().collect(),
+        totals: inv.totals.clone(),
+    };
+
+    let rendered = if json_out {
+        inventory_to_json(&filtered_inv)?
+    } else {
+        inventory_to_markdown(&filtered_inv)
+    };
+
+    match output {
+        Some(p) => {
+            std::fs::write(&p, rendered).map_err(|e| {
+                CFError::new("Inventory error", format!("Cannot write {p}: {e}"), "Check permissions.")
+            })?;
+            println!("✓ Wrote inventory → {p}");
+        }
+        None => print!("{rendered}"),
+    }
+    Ok(())
+}
+
+/// `verify` subcommand — verify every profile against its manifest.
+fn manifest_verify_cmd(refresh: bool) -> Result<(), CFError> {
+    use dastyab_core::manifest::*;
+    if refresh {
+        for meta in dastyab_core::store::profiles::list_profiles() {
+            write_manifest(&build_manifest(&meta.id)?)?;
+        }
+        println!("✓ Refreshed manifests.");
+    }
+    let report = verify_workspace();
+    for (meta, r) in &report {
+        let status = if !r.has_manifest {
+            "NO MANIFEST".to_string()
+        } else if r.is_clean() {
+            "clean".to_string()
+        } else {
+            let mut parts = Vec::new();
+            if !r.missing.is_empty() {
+                parts.push(format!("missing={}", r.missing.join(",")));
+            }
+            if !r.changed.is_empty() {
+                parts.push(format!("changed={}", r.changed.join(",")));
+            }
+            if !r.extra.is_empty() {
+                parts.push(format!("extra={}", r.extra.join(",")));
+            }
+            parts.join("; ")
+        };
+        println!("{} [{}] — {}", meta.name, status, meta.id);
+    }
+    Ok(())
+}
+
+/// `workspace` subcommand — snapshot or restore the whole workspace.
+fn workspace_cmd(action: WorkspaceAction) -> Result<(), CFError> {
+    use dastyab_core::workspace_snapshot::*;
+    match action {
+        WorkspaceAction::Snapshot { output, scope } => {
+            let kind = match scope.as_str() {
+                "profiles" => SnapshotKind::ProfilesOnly,
+                "configs" => SnapshotKind::ConfigsOnly,
+                _ => SnapshotKind::Full,
+            };
+            let workspace = dastyab_core::store::mem_dir();
+            let snap = snapshot_workspace(&workspace, kind, dastyab_core::store::now_ts() as u64)?;
+            let dest = match output {
+                Some(p) => std::path::PathBuf::from(p),
+                None => workspace.join("workspace-snapshot.json"),
+            };
+            write_snapshot_atomic(&snap, &dest)?;
+            println!(
+                "✓ Snapshot wrote {} profile(s) → {}",
+                snap.profiles.len(),
+                dest.display()
+            );
+        }
+        WorkspaceAction::Restore {
+            path,
+            overwrite,
+            dry_run,
+        } => {
+            let snap = read_snapshot(std::path::Path::new(&path))?;
+            let opts = RestoreOptions {
+                overwrite_existing: overwrite,
+                dry_run,
+                verify_after_write: true,
+            };
+            let workspace = dastyab_core::store::mem_dir();
+            let report = restore_workspace(&snap, &workspace, &opts)?;
+            if dry_run {
+                println!("✓ Dry run: would restore {} profile(s), {} file(s).", report.profiles_restored, report.files_written);
+            } else {
+                println!("✓ Restored {} profile(s), {} file(s).", report.profiles_restored, report.files_written);
+            }
+            if !report.verified {
+                println!("⚠ {} integrity mismatch(es):", report.mismatches.len());
+                for m in &report.mismatches {
+                    println!("  - {m}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+

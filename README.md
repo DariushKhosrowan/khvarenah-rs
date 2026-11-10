@@ -41,6 +41,11 @@ DastYab turns a single **Cloudflare API token** into a complete, self-hosted
 - **Protect** your setup: auditable token storage (`0600`), atomic profile
   writes, and a built-in security audit.
 - **Back up / restore** entire profiles as portable JSON bundles.
+- **Configs manager** — a whole-workspace inventory of every generated
+  artifact across all profiles, with per-artifact integrity status.
+- **Nothing gets lost** — per-profile manifests (sha256) prove nothing was
+  corrupted or dropped; `dastyab manifest-verify`; a whole-workspace
+  snapshot/restore bundles every profile into one portable, hash-verified file.
 
 Everything is built on a clean, pure-Rust core that is fully documented,
 tested, and ready to extend.
@@ -129,6 +134,10 @@ dastyab routes list                        # list worker routes
 dastyab analytics                          # per-worker request usage
 dastyab security                           # run a local security audit
 dastyab backup export <profile_id>         # back up a profile
+dastyab inventory                          # configs inventory (the "configs manager")
+dastyab manifest-verify                    # prove nothing was lost/corrupted
+dastyab workspace snapshot                 # whole-workspace snapshot
+dastyab workspace restore <file>           # restore from a snapshot
 dastyab update-check                       # check for a newer release
 ```
 
@@ -176,6 +185,9 @@ dastyab/
 │   │       ├── diagnostics.rs # endpoint diagnostics
 │   │       ├── security.rs    # local security audit
 │   │       ├── backup.rs      # profile backup / restore
+│   │       ├── manifest.rs    # per-profile integrity manifests + verify
+│   │       ├── inventory.rs   # whole-workspace configs inventory
+│   │       ├── workspace_snapshot.rs # hash-verified whole-workspace snap/restore
 │   │       ├── selfupdate.rs  # GitHub release updater
 │   │       ├── presets.rs     # curated deploy presets
 │   │       ├── stealth.rs     # anti-bot pacing + worker humanization
