@@ -10,7 +10,7 @@ fn candidate_paths() -> Vec<PathBuf> {
     // relative to the current crate/project
     out.push(PathBuf::from("_worker.js"));
     out.push(PathBuf::from("worker.js"));
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::store::home_dir() {
         out.push(
             home.join("Projects")
                 .join("cf-worker-proxy")
@@ -108,7 +108,7 @@ pub fn safe_worker_name(raw: &str) -> String {
 
 /// A safe default worker name — the OS account name, never a "vpn" label.
 pub fn default_worker_name() -> String {
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::store::home_dir() {
         if let Some(user) = home.file_name().and_then(|s| s.to_str()) {
             let u = safe_worker_name(user);
             if !u.is_empty() && u != "root" && u != "admin" {

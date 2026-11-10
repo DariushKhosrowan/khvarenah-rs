@@ -46,7 +46,7 @@ pub fn user_config_dir(profile_id: &str) -> Result<PathBuf, CFError> {
     let dir = if let Some(base) = store::mem_override() {
         base.join("configs").join(&safe)
     } else {
-        dirs::home_dir()
+        store::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("dastyab-configs")
             .join(&safe)

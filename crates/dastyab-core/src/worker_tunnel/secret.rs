@@ -223,7 +223,11 @@ pub fn strategy_for_worker(
 }
 
 /// Record a successful strategy for a worker relay path: set it as effective
-/// and clear the failed-set (persisted on the profile).
+/// and clear it from the failed-set (persisted on the profile). Other failed
+/// strategies are retained — a success on one shape does not invalidate the
+/// observation that a different shape failed. This makes success and failure
+/// updates touch disjoint state, so concurrent/unanchored learn writes compose
+/// order-independently (acceptance 'c').
 pub fn record_worker_desync_success(
     cfg: &mut crate::store::profiles::ProfileConfig,
     worker_url: &str,
@@ -235,7 +239,7 @@ pub fn record_worker_desync_success(
         .or_default();
     entry.worker_url = worker_url.to_string();
     entry.desync_strategy = Some(strategy);
-    entry.failed_strategies.clear();
+    entry.failed_strategies.retain(|s| *s != strategy);
 }
 
 /// Record a failed strategy for a worker relay path: push it to the failed-set
@@ -291,10 +295,45 @@ pub fn learn_from_discovery(
     cfg.worker_secrets != before
 }
 
+/// Cross-process exclusive lock on a profile's desync-learning record file.
+/// The daemon and GUI are separate processes and both persist per-worker
+/// desync records; a static in-process mutex alone cannot prevent a lost
+/// update across that boundary. `flock` (advisory, on the same host) closes
+/// the race. Returns the locked file handle, which must be kept alive (and
+/// dropped) for the duration of the critical section.
+///
+/// Assumption: the profile store lives on a local filesystem (the default
+/// `~/.dastyab`). Network/remote FS is out of scope.
+fn lock_profile_desync(profile_id: &str) -> std::io::Result<std::fs::File> {
+    use std::io::Write;
+    let dir = crate::store::profiles::profile_dir(profile_id);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("cannot create profile dir {}: {e}", dir.display()),
+        )
+    })?;
+    let path = dir.join(".desync-learn.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    // Best-effort write a pid marker for debuggability (ignored on failure).
+    let _ = writeln!(&file, "{}", std::process::id());
+    let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
 /// Serializes the read-modify-write on a worker's desync record across
 /// concurrent monitor paths (the daemon's deep discovery and a GUI-triggered
-/// light sweep can run in the same process). Loads the profile, applies
-/// `learn_from_discovery`, and persists only if the record changed.
+/// light sweep can run in separate processes). Takes a cross-process exclusive
+/// `flock` on a per-profile lock file, then applies `learn_from_discovery` and
+/// persists only if the record changed. The in-process static mutex remains
+/// as the inner guard so threads within one process never contend on flock.
 pub fn learn_from_discovery_persisted(
     profile_id: &str,
     worker_host: &str,
@@ -303,7 +342,10 @@ pub fn learn_from_discovery_persisted(
 ) -> bool {
     // The worker-secrets map is the single source of truth; a lost update
     // here would silently reintroduce the exact gap the learning loop closes.
-    let _guard = DESYNC_LEARN_LOCK.lock().unwrap();
+    let _inner = DESYNC_LEARN_LOCK.lock().unwrap();
+    // Cross-process: hold the flock across load→mutate→persist. If flock is
+    // unavailable, fall back to the in-process-only path (best-effort).
+    let _file = lock_profile_desync(profile_id).ok();
     let mut p = crate::store::profiles::load_profile(profile_id);
     let changed = learn_from_discovery(&mut p.config, worker_host, strategy, had_ws_success);
     if changed {
@@ -526,7 +568,9 @@ mod tests {
             ws.desync_strategy,
             Some(crate::desync::DesyncStrategy::SplitAndDecoy)
         );
-        assert!(ws.failed_strategies.is_empty());
+        // Success retains other failed strategies (only the successful one is
+        // removed): SplitClientHello + SplitTwo remain.
+        assert_eq!(ws.failed_strategies.len(), 2);
     }
 
     #[test]
@@ -554,13 +598,19 @@ mod tests {
     }
 
     #[test]
-    fn learn_from_discovery_success_promotes_effective_and_clears_failed() {
+    fn learn_from_discovery_success_promotes_effective_and_removes_only_that_failure() {
         let mut c = cfg();
-        // Seed a failed strategy so the "clears failed-set" branch is exercised.
+        // Seed a failed strategy so the "remove only the successful one" branch
+        // is exercised; a second, unrelated failure must be retained.
         record_worker_desync_failure(
             &mut c,
             "host.workers.dev",
             crate::desync::DesyncStrategy::SplitClientHello,
+        );
+        record_worker_desync_failure(
+            &mut c,
+            "host.workers.dev",
+            crate::desync::DesyncStrategy::SplitAndDecoy,
         );
         let changed = learn_from_discovery(
             &mut c,
@@ -574,8 +624,9 @@ mod tests {
             ws.desync_strategy,
             Some(crate::desync::DesyncStrategy::SplitTwo)
         );
-        assert!(ws.failed_strategies.is_empty());
-        // The next discovery now selects the learned effective strategy.
+        // SplitClientHello and SplitAndDecoy are unrelated to SplitTwo and stay.
+        assert_eq!(ws.failed_strategies.len(), 2);
+        // The next discovery selects the learned effective strategy.
         assert_eq!(
             strategy_for_discovery(&c, "host.workers.dev"),
             crate::desync::DesyncStrategy::SplitTwo
@@ -653,5 +704,83 @@ mod tests {
             true,
         );
         assert!(!changed, "idempotent success must not mutate the store");
+    }
+
+    /// Acceptance (c): light-phase and deep-discovery outcomes for the same
+    /// worker finish through the shared serialized persist path must compose
+    /// order-independently with no lost update. We exercise the real persisted
+    /// path (`learn_from_discovery_persisted`) — the one the GUI and daemon
+    /// both call across the process boundary — against a scratch mem-dir.
+    #[test]
+    fn learn_from_discovery_persisted_composes_order_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(dir.path().join(".dastyab"));
+        let id = crate::store::profiles::create_profile("test", "c").unwrap();
+        let host = "host.workers.dev";
+
+        // Light = success (promote SplitClientHello), deep = failure (demote
+        // SplitTwo). Apply in both orders; the final record must be identical.
+        let apply_light_then_deep = |id: &str, host: &str| {
+            // Start from a clean profile.
+            let mut p = crate::store::profiles::load_profile(id);
+            p.config.worker_secrets.clear();
+            crate::store::profiles::save_profile(&p).unwrap();
+            crate::worker_tunnel::secret::learn_from_discovery_persisted(
+                id,
+                host,
+                crate::desync::DesyncStrategy::SplitClientHello,
+                true,
+            );
+            crate::worker_tunnel::secret::learn_from_discovery_persisted(
+                id,
+                host,
+                crate::desync::DesyncStrategy::SplitTwo,
+                false,
+            );
+            let p = crate::store::profiles::load_profile(id);
+            p.config.worker_secrets.get(host).cloned().unwrap()
+        };
+        let apply_deep_then_light = |id: &str, host: &str| {
+            let mut p = crate::store::profiles::load_profile(id);
+            p.config.worker_secrets.clear();
+            crate::store::profiles::save_profile(&p).unwrap();
+            crate::worker_tunnel::secret::learn_from_discovery_persisted(
+                id,
+                host,
+                crate::desync::DesyncStrategy::SplitTwo,
+                false,
+            );
+            crate::worker_tunnel::secret::learn_from_discovery_persisted(
+                id,
+                host,
+                crate::desync::DesyncStrategy::SplitClientHello,
+                true,
+            );
+            let p = crate::store::profiles::load_profile(id);
+            p.config.worker_secrets.get(host).cloned().unwrap()
+        };
+
+        let a = apply_light_then_deep(&id, host);
+        let b = apply_deep_then_light(&id, host);
+        assert_eq!(a, b, "composed record must be order-independent");
+        // The final record reflects the last-writer (success) state: effective
+        // SplitClientHello. The earlier failure is retained in the failed-set
+        // (success on one shape does not invalidate the observation that a
+        // different shape failed) — that retained-failure semantics is what
+        // makes the two orders compose to an identical record.
+        assert_eq!(
+            a.desync_strategy,
+            Some(crate::desync::DesyncStrategy::SplitClientHello)
+        );
+        assert_eq!(
+            a.failed_strategies,
+            vec![crate::desync::DesyncStrategy::SplitTwo]
+        );
+        // And a subsequent discovery selects the learned effective.
+        let p = crate::store::profiles::load_profile(&id);
+        assert_eq!(
+            strategy_for_discovery(&p.config, host),
+            crate::desync::DesyncStrategy::SplitClientHello
+        );
     }
 }

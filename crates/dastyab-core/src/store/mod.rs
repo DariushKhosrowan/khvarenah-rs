@@ -37,9 +37,18 @@ pub fn mem_dir() -> PathBuf {
     if let Some(override_dir) = MEM_DIR_OVERRIDE.with(|cell| cell.borrow().clone()) {
         return override_dir;
     }
-    dirs::home_dir()
+    home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".dastyab")
+}
+
+/// The user's home directory (no external `dirs` dependency).
+///
+/// Checks `HOME` (Unix), then `USERPROFILE` (Windows). Falls back to `None`.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 // Thread-local override so parallel tests never clobber each other.
