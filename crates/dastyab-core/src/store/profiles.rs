@@ -202,6 +202,11 @@ pub struct ProfileConfig {
     /// absolute. Defaults to `<mem_dir>/carrier_pool.json`.
     #[serde(default)]
     pub carrier_pool_path: Option<PathBuf>,
+    /// Per-worker session secrets with two-phase rotation state. Keyed by
+    /// worker URL. Falls back to the legacy shared secret when a worker has no
+    /// entry yet (see `worker_tunnel::secret::resolve_worker_secret`).
+    #[serde(default)]
+    pub worker_secrets: std::collections::HashMap<String, crate::worker_tunnel::secret::WorkerSecret>,
 }
 
 fn default_auto_rotate_on_blocked() -> bool {
@@ -306,6 +311,7 @@ impl Default for ProfileConfig {
             network_down_sleep_secs: 0,
             drill_interval_secs: 0,
             carrier_pool_path: None,
+            worker_secrets: std::collections::HashMap::new(),
         }
     }
 }
