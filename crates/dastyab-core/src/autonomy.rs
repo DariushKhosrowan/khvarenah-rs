@@ -298,6 +298,56 @@ pub fn run_audit(profile: &Profile) -> AutonomyReport {
         }),
     }
 
+    // 10. Active tunnel (from the profile's persisted tunnel config) — Info-only.
+    let tunnel_detail = crate::vps_deploy::load_tunnel_client_config(&profile.meta.id)
+        .and_then(|c| c.worker_url)
+        .map(|u| format!("Active tunnel: {u}"))
+        .unwrap_or_else(|| "Active tunnel: none".into());
+    items.push(CheckItem {
+        code: "active_tunnel".into(),
+        status: CheckStatus::Info,
+        title: "Active tunnel".into(),
+        detail: tunnel_detail,
+        fix: String::new(),
+        fix_action: None,
+    });
+
+    // 11. Blackout state (escalation tier + carrier cooldown count) — Info-only.
+    // The daemon tracks the blackout start; we surface the escalation tier and
+    // how many carrier endpoints are currently in failure-cooldown.
+    let daemon = crate::daemon::load_daemon_state(&profile.meta.id);
+    let (detail, fix_hint) = if daemon.network_was_down && daemon.blackout_since_unix > 0 {
+        let now = crate::store::now_ts() as u64;
+        let elapsed = now.saturating_sub(daemon.blackout_since_unix as u64);
+        let esc = crate::daemon::escalation::escalation_plan(elapsed);
+        let tip = if esc.probe_interval_secs
+            < crate::daemon::escalation::BASELINE_PROBE_INTERVAL_SECS
+        {
+            format!(
+                " blackout escalation L(probe={}s parallel={})",
+                esc.probe_interval_secs, esc.parallel_probes
+            )
+        } else {
+            String::new()
+        };
+        (
+            format!("Blackout active {}s{tip}", elapsed),
+            "network still down; daemon keeps trying fallback tiers".into(),
+        )
+    } else if daemon.network_was_down {
+        ("Blackout active (escalation disabled)".into(), String::new())
+    } else {
+        ("No blackout".into(), String::new())
+    };
+    items.push(CheckItem {
+        code: "blackout".into(),
+        status: CheckStatus::Info,
+        title: "Blackout state".into(),
+        detail,
+        fix: fix_hint,
+        fix_action: None,
+    });
+
     AutonomyReport { items }
 }
 
@@ -392,6 +442,19 @@ mod tests {
     fn apply_fix_daemon_returns_error() {
         let mut p = fresh_profile();
         assert!(apply_fix(&mut p, FixAction::EnableDaemon).is_err());
+    }
+
+    #[test]
+    fn audit_has_active_tunnel_and_blackout_info_items() {
+        let p = fresh_profile();
+        let r = run_audit(&p);
+        assert!(r.items.iter().any(|i| i.code == "active_tunnel"));
+        assert!(r.items.iter().any(|i| i.code == "blackout"));
+        // Both are informational — they never force an action.
+        let at = r.items.iter().find(|i| i.code == "active_tunnel").unwrap();
+        assert_eq!(at.status, CheckStatus::Info);
+        let bo = r.items.iter().find(|i| i.code == "blackout").unwrap();
+        assert_eq!(bo.status, CheckStatus::Info);
     }
 
     #[test]
