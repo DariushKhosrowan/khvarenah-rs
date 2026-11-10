@@ -684,6 +684,36 @@ pub fn load_manual_seeds(profile_id: &str) -> Vec<String> {
     crate::store::read_opt::<Vec<String>>(&path).unwrap_or_default()
 }
 
+/// Learn a discovered clean IP as a persistent seed for this profile.
+///
+/// This is the "self-improving scanner" hook: whenever the console finds a
+/// working clean IP, it is appended to the manual-seeds list (deduplicated)
+/// so subsequent discovery — both the GUI scanner and autopilot's
+/// [`crate::autopilot`] cycle — is biased toward that IP and its /prefix_len
+/// neighbourhood instead of starting from zero. Returns the new seed count.
+pub fn learn_clean_ip(profile_id: &str, ip: &str) -> Result<usize, CFError> {
+    let ip = ip.trim().to_string();
+    if ip.is_empty() {
+        return Ok(load_manual_seeds(profile_id).len());
+    }
+    let mut seeds = load_manual_seeds(profile_id);
+    if !seeds.iter().any(|s| s.trim() == ip) {
+        seeds.push(ip);
+    }
+    let path = manual_seeds_path(profile_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CFError::new(
+                "Storage error",
+                format!("Cannot create profile dir: {e}"),
+                "",
+            )
+        })?;
+    }
+    crate::store::write_json(&path, &seeds)?;
+    Ok(seeds.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +842,27 @@ not-an-ip
         assert_eq!(loaded.len(), 2);
         assert!(loaded.contains(&"8.8.8.8".to_string()));
         assert!(loaded.contains(&"8.8.4.4:443".to_string()));
+    }
+
+    #[test]
+    fn learn_clean_ip_appends_and_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(dir.path().join(".dastyab"));
+        let id = "default";
+        // seed from a manual import first
+        import_manual_seeds(id, "8.8.8.8").unwrap();
+        // learn a new clean IP -> appended, count grows
+        let n = learn_clean_ip(id, "104.16.1.1").unwrap();
+        assert_eq!(n, 2);
+        let seeds = load_manual_seeds(id);
+        assert!(seeds.contains(&"104.16.1.1".to_string()));
+        // learning the same IP again is a no-op (dedup)
+        let n2 = learn_clean_ip(id, "104.16.1.1").unwrap();
+        assert_eq!(n2, 2);
+        assert_eq!(load_manual_seeds(id).len(), 2);
+        // empty input is a no-op
+        let n3 = learn_clean_ip(id, "  ").unwrap();
+        assert_eq!(n3, 2);
     }
 
     #[test]
