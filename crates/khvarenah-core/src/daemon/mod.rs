@@ -21,6 +21,7 @@
 //! daemon *know* when it is in a total blackout and fast-fail to the worker
 //! bootstrap + reselect carriers from the offline pool — no human.
 pub mod blackout;
+pub mod escalation;
 pub mod reselect;
 
 use crate::error::CFError;
@@ -134,6 +135,10 @@ pub struct DaemonState {
     /// cycle. Reset to false when the account returns to Active.
     #[serde(default)]
     pub account_rotate_exhausted_notified: bool,
+    /// Unix seconds when the current total blackout began. 0 = not in a
+    /// blackout. Drives escalation (`daemon/escalation.rs`).
+    #[serde(default)]
+    pub blackout_since_unix: i64,
 }
 
 fn default_interval() -> u64 {
@@ -160,6 +165,7 @@ impl Default for DaemonState {
             last_outbox_flush_ts: 0,
             last_drill_ts: 0,
             account_rotate_exhausted_notified: false,
+            blackout_since_unix: 0,
         }
     }
 }
@@ -1000,6 +1006,7 @@ pub async fn daemon_tick(
                 ),
             ));
             state.network_was_down = true;
+            state.blackout_since_unix = crate::store::now_ts() as i64;
             state.survival_plan = plan.label().to_string();
             let _ = crate::journal::append(
                 profile,
@@ -1038,36 +1045,75 @@ pub async fn daemon_tick(
         // is bounded, and an empty pool is a no-op.
         {
             let cfg_local = crate::store::profiles::load_profile(profile).config;
+            let now = crate::store::now_ts() as u64;
+            // Escalation: the longer the blackout, the harder we probe. The
+            // plan tunes probe cadence + parallel probes (plumbed through;
+            // execution stays serial) + faster SNI rotation + worker-refresh
+            // cadence.
+            let plan = crate::daemon::escalation::escalation_plan(
+                crate::daemon::escalation::BlackoutClock::from_since(
+                    (state.blackout_since_unix > 0).then_some(state.blackout_since_unix as u64),
+                )
+                .elapsed_secs(now),
+            );
             let pool =
                 crate::carrier_pool::open_profile_pool(&cfg_local).ok();
             let data_count = pool
                 .as_ref()
                 .and_then(|p| {
-                    p.select(crate::carrier_pool::CarrierKind::WorkerData, 1).ok()
+                    crate::daemon::escalation::escalated_select(
+                        p,
+                        crate::carrier_pool::CarrierKind::WorkerData,
+                        1,
+                        now,
+                    )
+                    .ok()
                 })
                 .map(|v| v.len())
                 .unwrap_or(0);
+            let reselect_n = (plan.parallel_probes as usize).max(2);
             if data_count > 0 {
                 crate::daemon::exec_reselection(
                     profile,
                     crate::carrier_pool::CarrierKind::WorkerData,
-                    8,
+                    reselect_n,
                     log,
                 );
             } else {
                 crate::daemon::exec_reselection(
                     profile,
                     crate::carrier_pool::CarrierKind::WorkerTunnel,
-                    8,
+                    reselect_n,
                     log,
                 );
+            }
+            // Log the active escalation tier on transition.
+            if plan.probe_interval_secs < crate::daemon::escalation::BASELINE_PROBE_INTERVAL_SECS {
+                log(&log_line(
+                    "INFO",
+                    &format!(
+                        "blackout escalation: probe={}s parallel={} sni_faster={}",
+                        plan.probe_interval_secs, plan.parallel_probes, plan.sni_rotation_faster
+                    ),
+                ));
             }
         }
         // Network down → skip cycle, don't burn rescue budget. Sleep the
         // configured blackout poll cadence (per-profile `network_down_sleep_secs`,
-        // 0 = default 60s). A shorter value re-probes for a restored path sooner;
-        // a longer value conserves battery/CPU during a long outage.
-        return crate::store::profiles::effective_network_down_sleep_secs(&cfg);
+        // 0 = default 60s), but never longer than the escalation plan's probe
+        // interval — escalation shortens the poll so a long blackout keeps
+        // trying harder. A shorter value re-probes sooner; a longer value
+        // conserves battery/CPU during a long outage.
+        let base_sleep = crate::store::profiles::effective_network_down_sleep_secs(&cfg);
+        let now = crate::store::now_ts() as u64;
+        let plan = crate::daemon::escalation::escalation_plan(
+            crate::daemon::escalation::BlackoutClock::from_since(
+                (state.blackout_since_unix > 0).then_some(state.blackout_since_unix as u64),
+            )
+            .elapsed_secs(now),
+        );
+        let sleep = base_sleep.min(plan.probe_interval_secs).max(1);
+        return sleep;
     }
 
     // d. Account-level gate. If the account is suspended/invalid, hold cycles
@@ -1206,6 +1252,7 @@ pub async fn daemon_tick(
         // backoff. We return 0 so the caller cycles immediately, keeping the
         // current (possibly backed-off) interval for the *next* failure.
         state.network_was_down = false;
+        state.blackout_since_unix = 0;
         let _ = crate::journal::append(profile, crate::journal::JournalKind::NetworkUp, "");
         let _ = crate::remote_beacon::maybe_emit(
             profile,

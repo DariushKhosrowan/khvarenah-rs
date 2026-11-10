@@ -447,7 +447,7 @@ impl CarrierPool {
         h.finalize().into()
     }
 
-    fn endpoint_id_hex(ep: &CarrierEndpoint) -> String {
+    pub(crate) fn endpoint_id_hex(ep: &CarrierEndpoint) -> String {
         hex_sha256(&Self::endpoint_id_hash(ep))
     }
 
