@@ -893,6 +893,28 @@ fn versions_cmd(profile: &str, action: crate::VersionsAction) -> Result<(), CFEr
             );
             Ok(())
         }
+        crate::VersionsAction::Health => {
+            let health = av::measure_versioning_health(&dir, dastyab_core::store::now_ts() as u64)
+                .map_err(to_verr)?;
+            println!("Profile: {profile}");
+            println!("Version dirs: {}", health.dir_count);
+            println!("Version files: {}", health.file_count);
+            println!("Total bytes: {}", health.total_bytes);
+            if let Some((name, bytes)) = &health.largest_dir {
+                println!("Largest version dir: {name} ({bytes} B)");
+            }
+            if !health.oversized_dirs.is_empty() {
+                println!("OVERSIZED dirs: {}", health.oversized_dirs.join(", "));
+            }
+            println!("Consecutive prune failures: {}", health.consecutive_failures);
+            if let Some(t) = health.last_failure_unix {
+                println!("Last failure at unix: {t}");
+            }
+            if let Some(t) = health.last_prune_unix {
+                println!("Last successful prune at unix: {t}");
+            }
+            Ok(())
+        }
     }
 }
 

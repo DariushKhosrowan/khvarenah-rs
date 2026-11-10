@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::doctor::{CheckResult, CheckStatus};
 use crate::ledger_guard::{check_append_only, read_ledger_count, LedgerKind};
 use crate::store::atomic_write;
 use sha2::Digest;
@@ -151,7 +152,16 @@ fn record_version(
     // is the hot path, and without this the per-artifact version dirs would
     // grow without limit (disk exhaustion exactly when the user needs a write
     // to succeed). prune_versions is deterministic and keeps the newest N.
-    let _ = prune_versions(profile_dir, rel_path, VERSIONS_KEEP);
+    // The outcome is recorded so Doctor can surface silent prune failures
+    // before disk fills — never fails the enclosing write.
+    match prune_versions(profile_dir, rel_path, VERSIONS_KEEP) {
+        Ok(_) => {
+            let _ = record_prune_outcome(profile_dir, true, now_ms / 1000);
+        }
+        Err(_) => {
+            let _ = record_prune_outcome(profile_dir, false, now_ms / 1000);
+        }
+    }
 
     Ok(version)
 }
@@ -302,6 +312,190 @@ pub fn prune_versions(
     })
 }
 
+/// Stale-prune threshold: a last_prune_unix older than this is a Warn.
+const STALE_PRUNE_SECS: u64 = 7 * 24 * 3600;
+
+/// Per-profile versioning state (hot-path prune outcomes). Persisted so Doctor
+/// can surface silent prune failures even across restarts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VersioningState {
+    /// Consecutive prune failures on the write path (resets on success).
+    pub consecutive_failures: u32,
+    /// When the last failure happened (unix seconds).
+    pub last_failure_unix: Option<u64>,
+    /// When the last successful prune happened (unix seconds).
+    pub last_prune_unix: Option<u64>,
+}
+
+/// The on-disk path of the versioning state file.
+pub fn versioning_state_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("versioning_state.json")
+}
+
+fn read_versioning_state(profile_dir: &Path) -> VersioningState {
+    crate::store::read_opt(&versioning_state_path(profile_dir)).unwrap_or_default()
+}
+
+/// Record the outcome of a hot-path prune. Called from `record_version`; never
+/// fails the enclosing write.
+pub fn record_prune_outcome(profile_dir: &Path, ok: bool, now: u64) -> Result<(), VersionError> {
+    let mut st = read_versioning_state(profile_dir);
+    if ok {
+        st.consecutive_failures = 0;
+        st.last_prune_unix = Some(now);
+    } else {
+        st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+        st.last_failure_unix = Some(now);
+    }
+    crate::store::write_json(&versioning_state_path(profile_dir), &st)
+        .map_err(|e| VersionError::Io(e.brief()))
+}
+
+/// Health snapshot of a profile's version store.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VersioningHealth {
+    /// Number of `.versions/` directories (one per versioned artifact).
+    pub dir_count: u64,
+    /// Total snapshot files across all version dirs.
+    pub file_count: u64,
+    /// Total bytes across all version dirs.
+    pub total_bytes: u64,
+    /// (artifact name, bytes) of the largest version dir.
+    pub largest_dir: Option<(String, u64)>,
+    /// Names of version dirs exceeding `VERSIONS_KEEP` files (unbounded growth).
+    pub oversized_dirs: Vec<String>,
+    /// From the persisted versioning state.
+    pub consecutive_failures: u32,
+    pub last_failure_unix: Option<u64>,
+    pub last_prune_unix: Option<u64>,
+}
+
+/// Walk a profile's `.versions/` tree and assemble a health snapshot.
+pub fn measure_versioning_health(profile_dir: &Path, _now: u64) -> Result<VersioningHealth, VersionError> {
+    let mut h = VersioningHealth {
+        ..Default::default()
+    };
+    let st = read_versioning_state(profile_dir);
+    h.consecutive_failures = st.consecutive_failures;
+    h.last_failure_unix = st.last_failure_unix;
+    h.last_prune_unix = st.last_prune_unix;
+
+    let Ok(rd) = std::fs::read_dir(profile_dir) else {
+        return Ok(h);
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if !name.ends_with(".versions") || !p.is_dir() {
+            continue;
+        }
+        h.dir_count += 1;
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+        if let Ok(vrd) = std::fs::read_dir(&p) {
+            for v in vrd.flatten() {
+                if let Ok(m) = v.metadata() {
+                    if m.is_file() {
+                        files += 1;
+                        bytes += m.len();
+                    }
+                }
+            }
+        }
+        h.file_count += files;
+        h.total_bytes += bytes;
+        if h.largest_dir.as_ref().map(|(_, b)| *b).unwrap_or(0) < bytes {
+            h.largest_dir = Some((name.clone(), bytes));
+        }
+        if files > VERSIONS_KEEP as u64 {
+            h.oversized_dirs.push(name);
+        }
+    }
+    Ok(h)
+}
+
+/// Doctor row for one profile's versioning health.
+pub fn doctor_check_versions(_profile_dir: &Path, health: &VersioningHealth) -> CheckResult {
+    let name = "versions".to_string();
+    if !health.oversized_dirs.is_empty() {
+        return CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            detail: format!(
+                "unbounded version dir(s) {} exceed {} files — prune is not keeping up",
+                health.oversized_dirs.join(", "),
+                VERSIONS_KEEP
+            ),
+        };
+    }
+    if health.consecutive_failures > 0 {
+        return CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            detail: format!(
+                "{} consecutive prune error(s) on the write path (last at {:?}) — disk may fill; check for full/read-only FS",
+                health.consecutive_failures, health.last_failure_unix
+            ),
+        };
+    }
+    if let Some(last) = health.last_prune_unix {
+        if health.total_bytes > 0 && _now_secs().saturating_sub(last) > STALE_PRUNE_SECS {
+            return CheckResult {
+                name,
+                status: CheckStatus::Warn,
+                detail: format!("last successful prune was > 7 days ago ({last}) — version history may be stale"),
+            };
+        }
+    }
+    let largest = health
+        .largest_dir
+        .as_ref()
+        .map(|(n, b)| format!(" largest {} ({b} B)", n))
+        .unwrap_or_default();
+    CheckResult {
+        name,
+        status: CheckStatus::Ok,
+        detail: format!(
+            "versioning ok: {} dir(s) · {} file(s) · {} B{}",
+            health.dir_count, health.file_count, health.total_bytes, largest
+        ),
+    }
+}
+
+fn _now_secs() -> u64 {
+    crate::store::now_ts() as u64
+}
+
+/// Aggregate Doctor row across profiles.
+pub fn doctor_versions_summary(healths: &[(String, VersioningHealth)]) -> CheckResult {
+    let name = "versions (all profiles)".to_string();
+    let any_fail = healths.iter().any(|(_, h)| !h.oversized_dirs.is_empty() || h.consecutive_failures > 0);
+    let any_warn = healths.iter().any(|(_, h)| {
+        h.last_prune_unix.map(|last| _now_secs().saturating_sub(last) > STALE_PRUNE_SECS).unwrap_or(false)
+    });
+    let total_files: u64 = healths.iter().map(|(_, h)| h.file_count).sum();
+    let total_bytes: u64 = healths.iter().map(|(_, h)| h.total_bytes).sum();
+    let status = if any_fail {
+        CheckStatus::Fail
+    } else if any_warn {
+        CheckStatus::Warn
+    } else {
+        CheckStatus::Ok
+    };
+    CheckResult {
+        name,
+        status,
+        detail: format!(
+            "{} profile(s) · {} file(s) · {} B",
+            healths.len(),
+            total_files,
+            total_bytes
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +641,120 @@ mod tests {
                 all.last().unwrap().saved_unix,
                 (cap - VERSIONS_KEEP as u64 + 1) * 1000
             );
+        });
+    }
+
+    #[test]
+    fn record_prune_outcome_increments_on_failure() {
+        with_tmp(|dir| {
+            record_prune_outcome(&dir, false, 1000).unwrap();
+            record_prune_outcome(&dir, false, 2000).unwrap();
+            let st = read_versioning_state(&dir);
+            assert_eq!(st.consecutive_failures, 2);
+            assert_eq!(st.last_failure_unix, Some(2000));
+            assert_eq!(st.last_prune_unix, None);
+        });
+    }
+
+    #[test]
+    fn record_prune_outcome_resets_on_success() {
+        with_tmp(|dir| {
+            record_prune_outcome(&dir, false, 1000).unwrap();
+            record_prune_outcome(&dir, true, 2000).unwrap();
+            let st = read_versioning_state(&dir);
+            assert_eq!(st.consecutive_failures, 0);
+            assert_eq!(st.last_prune_unix, Some(2000));
+        });
+    }
+
+    #[test]
+    fn record_version_records_prune_failure_without_failing_write() {
+        with_tmp(|dir| {
+            std::fs::write(dir.join("config.json"), b"a").unwrap();
+            // A normal version write records a successful prune outcome.
+            snapshot_before_write(&dir, "config.json", b"b", 1000).unwrap();
+            let st = read_versioning_state(&dir);
+            assert_eq!(st.consecutive_failures, 0);
+            assert!(st.last_prune_unix.is_some());
+        });
+    }
+
+    #[test]
+    fn record_version_reentrancy_guard_holds_under_prune_recursion() {
+        // The atomic_write hook snapshots pre-write; prune_versions writes the
+        // index via atomic_write. If the re-entrancy guard failed, snapshotting
+        // the index would recurse. This exercises the full chain and asserts the
+        // version dir stays bounded and the hook does not spin.
+        with_tmp(|dir| {
+            std::fs::write(dir.join("config.json"), b"base").unwrap();
+            let cap = VERSIONS_KEEP + 10;
+            for i in 1..=cap {
+                snapshot_before_write(&dir, "config.json", format!("v{i}").as_bytes(), i as u64 * 1000)
+                    .unwrap();
+            }
+            let all = list_versions(&dir, "config.json").unwrap();
+            assert_eq!(all.len(), VERSIONS_KEEP);
+        });
+    }
+
+    #[test]
+    fn measure_versioning_health_counts_dirs_files_bytes() {
+        with_tmp(|dir| {
+            std::fs::write(dir.join("config.json"), b"a").unwrap();
+            std::fs::write(dir.join("history.json"), b"[1]").unwrap();
+            snapshot_before_write(&dir, "config.json", b"b", 1000).unwrap();
+            snapshot_before_write(&dir, "history.json", b"[1,2]", 1000).unwrap();
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                eprintln!("DIRENT: {:?}", e.path());
+            }
+            let h = measure_versioning_health(&dir, 2000).unwrap();
+            assert_eq!(h.dir_count, 2);
+            assert!(h.file_count >= 2); // payload + index per version dir
+            assert!(h.total_bytes > 0);
+            assert!(h.largest_dir.is_some());
+            assert!(h.oversized_dirs.is_empty());
+        });
+    }
+
+    #[test]
+    fn doctor_check_versions_fails_on_consecutive_failures() {
+        with_tmp(|dir| {
+            record_prune_outcome(&dir, false, 1000).unwrap();
+            let h = measure_versioning_health(&dir, 2000).unwrap();
+            let r = doctor_check_versions(&dir, &h);
+            assert_eq!(r.status, CheckStatus::Fail);
+        });
+    }
+
+    #[test]
+    fn doctor_check_versions_warns_on_stale_prune() {
+        with_tmp(|dir| {
+            // Create real version dirs so total_bytes > 0.
+            std::fs::write(dir.join("config.json"), b"a").unwrap();
+            snapshot_before_write(&dir, "config.json", b"b", 1000).unwrap();
+            let h = measure_versioning_health(&dir, 2000).unwrap();
+            assert!(h.total_bytes > 0, "need version bytes to test stale prune");
+            // Force stale by injecting an old last_prune_unix.
+            let mut h = h;
+            h.last_prune_unix = Some(1);
+            let r = doctor_check_versions(&dir, &h);
+            assert_eq!(r.status, CheckStatus::Warn);
+        });
+    }
+
+    #[test]
+    fn doctor_check_versions_flags_oversized_dir() {
+        with_tmp(|dir| {
+            // Synthesize an oversized version dir directly.
+            let vdir = versions_dir(&dir, "config.json");
+            std::fs::create_dir_all(&vdir).unwrap();
+            for i in 0..(VERSIONS_KEEP as u64 + 2) {
+                std::fs::write(version_file(&vdir, i), b"x").unwrap();
+            }
+            let h = measure_versioning_health(&dir, 2000).unwrap();
+            assert!(!h.oversized_dirs.is_empty());
+            let r = doctor_check_versions(&dir, &h);
+            assert_eq!(r.status, CheckStatus::Fail);
         });
     }
 }

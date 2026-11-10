@@ -116,7 +116,7 @@ pub struct ProfileManifest {
 }
 
 /// The runtime-only filenames that are never tracked as integrity artifacts.
-pub const RUNTIME_EXCLUDED_PATTERNS: [&str; 7] = [
+pub const RUNTIME_EXCLUDED_PATTERNS: [&str; 8] = [
     "manifest.json",
     "health.json",
     "daemon.pid",
@@ -124,6 +124,7 @@ pub const RUNTIME_EXCLUDED_PATTERNS: [&str; 7] = [
     "daemon.log",
     "daemon-state.json",
     "journal.json",
+    "versioning_state.json",
 ];
 
 /// Whether a filename is a runtime-only file excluded from integrity checks.

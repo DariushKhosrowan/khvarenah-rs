@@ -500,6 +500,12 @@ pub fn run_doctor(opts: &DoctorOptions) -> DoctorReport {
     let profile_dir = crate::store::profiles::profile_dir(&opts.profile_id);
     results.extend(crate::ledger_guard::doctor_check_ledger_integrity(&profile_dir));
 
+    // Per-artifact versioning health (hot-path prune outcomes + dir sizes).
+    // Surfaces silent prune failures before version dirs exhaust disk.
+    if let Ok(health) = crate::artifact_versions::measure_versioning_health(&profile_dir, opts.now_unix as u64) {
+        results.push(crate::artifact_versions::doctor_check_versions(&profile_dir, &health));
+    }
+
     DoctorReport {
         checked_at_unix: opts.now_unix as u64,
         results,

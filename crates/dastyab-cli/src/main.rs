@@ -426,6 +426,8 @@ pub enum VersionsAction {
         #[arg(long, default_value_t = 20)]
         keep: usize,
     },
+    /// Show per-artifact versioning health (dirs, files, bytes, prune state).
+    Health,
 }
 
 #[derive(Subcommand)]

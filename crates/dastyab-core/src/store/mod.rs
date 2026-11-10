@@ -129,11 +129,17 @@ fn maybe_snapshot_before_write(path: &Path, bytes: &[u8]) {
     let Some((profile_dir, rel)) = profile_rel_from_path(path) else {
         return;
     };
-    // Skip volatile/derived files — versioning them would be noise or recurse
-    // (the .versions payloads we are about to write live under a ".versions" dir).
+    // Skip volatile/derived files — versioning them would be noise or recurse.
+    // Guard on the FULL path: any `.versions` segment means we are inside a
+    // version store (payload or index write) and must not snapshot it, even
+    // when called directly (not via the outer hook).
+    if path.components().any(|c| {
+        matches!(c, std::path::Component::Normal(s) if s.to_string_lossy().ends_with(".versions"))
+    }) {
+        return;
+    }
     if rel.starts_with(".dyb_tmp_")
         || rel.starts_with('.')
-        || rel.contains(".versions")
         || crate::manifest::is_runtime_excluded(&rel)
         || rel == "manifest.json"
         || rel == "ledger_hw.json"
