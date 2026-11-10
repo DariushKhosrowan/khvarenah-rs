@@ -152,6 +152,24 @@ impl CarrierRefresher {
         self.post_ctl_raw(&body).map(|_| ())
     }
 
+    /// Query the worker's last self-ping timestamp (the `_ping` KV key that
+    /// the worker's `scheduled` cron handler writes every 6h). Lets the daemon
+    /// surface whether the worker tier is staying active (i.e. not drifting
+    /// toward Cloudflare inactivity deactivation during a long blackout).
+    pub fn query_self_ping(&self) -> Result<Option<u64>, RefreshError> {
+        let body = serde_json::json!({ "flag": 6 });
+        let raw: serde_json::Value = self.post_ctl_raw(&body)?;
+        match raw.get("ping_ts") {
+            Some(serde_json::Value::String(s)) => s.parse::<u64>().map(Some).map_err(|e| {
+                RefreshError::Transport(format!("non-numeric ping_ts: {e}"))
+            }),
+            Some(serde_json::Value::Null) | None => Ok(None),
+            Some(other) => Err(RefreshError::Transport(format!(
+                "unexpected ping_ts type: {other}"
+            ))),
+        }
+    }
+
     /// POST a control-plane request to `{worker_url}/ctl`.
     fn post_ctl<T: Serialize, R: for<'de> Deserialize<'de>>(
         &self,
@@ -684,5 +702,21 @@ mod tests {
             PushOutcome::Pushed { endpoints: 1 }
         ));
         assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn query_self_ping_returns_timestamp() {
+        let (url, _log) = mock_worker(|_| {
+            (200, serde_json::json!({ "ping_ts": "1700000000000" }))
+        });
+        let ping = refresher(&url).query_self_ping().unwrap();
+        assert_eq!(ping, Some(1700000000000u64));
+    }
+
+    #[test]
+    fn query_self_ping_none_when_absent() {
+        let (url, _log) = mock_worker(|_| (200, serde_json::json!({})));
+        let ping = refresher(&url).query_self_ping().unwrap();
+        assert_eq!(ping, None);
     }
 }
