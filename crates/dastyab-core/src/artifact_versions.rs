@@ -146,6 +146,13 @@ fn record_version(
     let mut all = read_index(profile_dir, rel_path);
     all.push(version.clone());
     write_index(profile_dir, rel_path, &all)?;
+
+    // Bound the retained history on every version write: the atomic_write hook
+    // is the hot path, and without this the per-artifact version dirs would
+    // grow without limit (disk exhaustion exactly when the user needs a write
+    // to succeed). prune_versions is deterministic and keeps the newest N.
+    let _ = prune_versions(profile_dir, rel_path, VERSIONS_KEEP);
+
     Ok(version)
 }
 
@@ -418,6 +425,28 @@ mod tests {
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].saved_unix, 5000);
         assert_eq!(all[2].saved_unix, 3000);
+        });
+    }
+
+    #[test]
+    fn write_path_prunes_to_versions_keep() {
+        // The atomic_write hook path (via record_version) must never grow a
+        // version dir past VERSIONS_KEEP — the architect's disk-exhaustion
+        // concern. Exceed the cap and assert only the newest survive.
+        with_tmp(|dir| {
+            std::fs::write(dir.join("config.json"), b"base").unwrap();
+            let cap: u64 = VERSIONS_KEEP as u64 + 5;
+            for i in 1..=cap {
+                snapshot_before_write(&dir, "config.json", format!("v{i}").as_bytes(), i * 1000)
+                    .unwrap();
+            }
+            let all = list_versions(&dir, "config.json").unwrap();
+            assert_eq!(all.len(), VERSIONS_KEEP, "must cap at VERSIONS_KEEP");
+            // The oldest versions are the ones pruned.
+            assert_eq!(
+                all.last().unwrap().saved_unix,
+                (cap - VERSIONS_KEEP as u64 + 1) * 1000
+            );
         });
     }
 }
