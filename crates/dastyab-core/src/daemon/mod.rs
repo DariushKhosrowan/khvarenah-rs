@@ -21,6 +21,7 @@
 //! daemon *know* when it is in a total blackout and fast-fail to the worker
 //! bootstrap + reselect carriers from the offline pool — no human.
 pub mod blackout;
+pub mod reselect;
 
 use crate::error::CFError;
 use std::future::Future;
@@ -620,6 +621,38 @@ pub fn push_carriers_via_worker_tunnel(
     Ok(())
 }
 
+/// Execute a carrier reselection: select up to `n` endpoints of `kind` from
+/// the offline pool, open them in order via [`reselect::RealTunnelOpener`],
+/// and persist the first that works as the active tunnel. Returns the host of
+/// the winning endpoint, or `None` when nothing worked. This is what makes the
+/// blackout state machine's `ReselectCarrier` decision actually change the
+/// active tunnel (previously it was logged and discarded).
+pub fn exec_reselection(
+    profile: &str,
+    kind: crate::carrier_pool::CarrierKind,
+    n: usize,
+    log: &mut dyn FnMut(&str),
+) -> Option<String> {
+    let cfg = crate::store::profiles::load_profile(profile).config;
+    let pool = crate::carrier_pool::open_profile_pool(&cfg).ok()?;
+    let candidates = pool.select(kind, n).ok()?;
+    if candidates.is_empty() {
+        log("reselect: pool has no candidates");
+        return None;
+    }
+    let mut opener = crate::daemon::reselect::RealTunnelOpener::new(profile);
+    match crate::daemon::reselect::execute_reselection(&candidates, &mut opener) {
+        Some((ep, opened)) => {
+            log(&format!("reselect: switched active tunnel to {} (tried {opened})", ep.host));
+            Some(ep.host)
+        }
+        None => {
+            log("reselect: no candidate opened");
+            None
+        }
+    }
+}
+
 /// The result of an automatic token rotation: `(old_label, new_label)`.
 pub type RotationOutcome = (String, String);
 
@@ -977,6 +1010,39 @@ pub async fn daemon_tick(
         if tunnel_ok {
             if let Err(e) = crate::daemon::refresh_carriers_via_worker_tunnel(profile, log) {
                 log(&log_line("WARN", &format!("carrier refresh via worker failed: {e}")));
+            }
+        }
+        // Execute a carrier reselection: try worker-data endpoints (then
+        // worker-tunnel) from the offline pool and switch the active tunnel to
+        // the first that opens. This turns the blackout state machine's
+        // `ReselectCarrier` decision into an actual tunnel switch (it was
+        // previously logged and discarded). Best-effort and cheap: each probe
+        // is bounded, and an empty pool is a no-op.
+        {
+            let cfg_local = crate::store::profiles::load_profile(profile).config;
+            let pool =
+                crate::carrier_pool::open_profile_pool(&cfg_local).ok();
+            let data_count = pool
+                .as_ref()
+                .and_then(|p| {
+                    p.select(crate::carrier_pool::CarrierKind::WorkerData, 1).ok()
+                })
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if data_count > 0 {
+                crate::daemon::exec_reselection(
+                    profile,
+                    crate::carrier_pool::CarrierKind::WorkerData,
+                    8,
+                    log,
+                );
+            } else {
+                crate::daemon::exec_reselection(
+                    profile,
+                    crate::carrier_pool::CarrierKind::WorkerTunnel,
+                    8,
+                    log,
+                );
             }
         }
         // Network down → skip cycle, don't burn rescue budget. Sleep the
