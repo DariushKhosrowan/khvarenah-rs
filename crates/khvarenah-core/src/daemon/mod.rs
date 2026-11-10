@@ -140,6 +140,10 @@ pub struct DaemonState {
     /// blackout. Drives escalation (`daemon/escalation.rs`).
     #[serde(default)]
     pub blackout_since_unix: i64,
+    /// Last epoch-seconds we queried the worker self-ping freshness (throttled
+    /// to ~once per 6h off the hot path).
+    #[serde(default)]
+    pub last_self_ping_ts: i64,
 }
 
 fn default_interval() -> u64 {
@@ -167,6 +171,7 @@ impl Default for DaemonState {
             last_drill_ts: 0,
             account_rotate_exhausted_notified: false,
             blackout_since_unix: 0,
+            last_self_ping_ts: 0,
         }
     }
 }
@@ -593,7 +598,11 @@ pub fn refresh_carriers_via_worker_tunnel(
     let (Some(url), Some(secret)) = (cfg.worker_url.as_deref(), cfg.shared_secret.as_deref()) else {
         return Ok(());
     };
-    daemon_refresh_carriers(profile, url, secret, crate::store::now_ts() as u64, log)
+    // Per-worker secret resolution: prefer the per-worker current secret over
+    // the legacy shared secret when the profile has a per-worker entry.
+    let pcfg = crate::store::profiles::load_profile(profile).config;
+    let resolved = crate::worker_tunnel::secret::resolve_worker_secret(&pcfg, url, secret);
+    daemon_refresh_carriers(profile, url, &resolved, crate::store::now_ts() as u64, log)
 }
 
 /// Try to push the profile's carrier snapshot to the worker relay when the
@@ -615,8 +624,10 @@ pub fn push_carriers_via_worker_tunnel(
     let (Some(url), Some(secret)) = (cfg.worker_url.as_deref(), cfg.shared_secret.as_deref()) else {
         return Ok(());
     };
+    let pcfg = crate::store::profiles::load_profile(profile).config;
+    let resolved = crate::worker_tunnel::secret::resolve_worker_secret(&pcfg, url, secret);
     let pool = crate::carrier_pool::open_profile_pool(&crate::store::profiles::load_profile(profile).config)?;
-    let refresher = crate::carrier_refresh::CarrierRefresher::new(url, secret);
+    let refresher = crate::carrier_refresh::CarrierRefresher::new(url, resolved.as_ref());
     match refresher.push_snapshot_if_identity_changed(&pool)? {
         crate::carrier_refresh::PushOutcome::Pushed { endpoints } => {
             log(&format!("carrier push: {endpoints} endpoints to worker"));
@@ -625,6 +636,92 @@ pub fn push_carriers_via_worker_tunnel(
             log(&format!("carrier push skipped: {reason:?}"));
         }
     }
+    Ok(())
+}
+
+/// Query the deployed worker's last self-ping freshness (the `_ping` KV key
+/// written by the worker's cron `scheduled` handler). Returns `None` when the
+/// profile is not a Worker-mode tunnel, or when the worker has never pinged.
+/// Best-effort: any failure logs and returns `None` (callers treat non-`None`
+/// as the only signal worth surfacing).
+pub fn query_worker_self_ping(
+    profile: &str,
+    log: &mut dyn FnMut(&str),
+) -> Option<u64> {
+    let cfg = crate::vps_deploy::load_tunnel_client_config(profile)?;
+    let crate::vps_deploy::TunnelMode::Worker = cfg.mode else {
+        return None;
+    };
+    let (url, secret) = (cfg.worker_url.as_deref()?, cfg.shared_secret.as_deref()?);
+    let pcfg = crate::store::profiles::load_profile(profile).config;
+    let resolved = crate::worker_tunnel::secret::resolve_worker_secret(&pcfg, url, secret);
+    let refresher = crate::carrier_refresh::CarrierRefresher::new(url, resolved.as_ref());
+    match refresher.query_self_ping() {
+        Ok(ping) => ping,
+        Err(e) => {
+            log(&format!("self-ping query failed: {e}"));
+            None
+        }
+    }
+}
+
+/// Two-phase worker-secret rotation (pending → current). Stages a pending
+/// secret in the profile, redeploys the worker with it, then verifies via
+/// `query_self_ping` authenticated with the pending secret; only on success
+/// promotes pending → current. On any failure the current secret stays active
+/// and the pending one is retained for a retry (or cleared when stale).
+///
+/// Callers must gate with [`secret::rotation_eligible`] (e.g. only when the
+/// network is up) — this function does not re-check net state.
+pub async fn rotate_worker_secret(
+    cf: &crate::cf::Client,
+    account_id: &str,
+    profile: &str,
+) -> Result<(), CFError> {
+    let Some(tcfg) = crate::vps_deploy::load_tunnel_client_config(profile) else {
+        return Ok(());
+    };
+    let crate::vps_deploy::TunnelMode::Worker = tcfg.mode else {
+        return Ok(());
+    };
+    let Some(worker_url) = tcfg.worker_url.as_deref() else {
+        return Ok(());
+    };
+    // Stage a fresh pending secret.
+    let mut prof = crate::store::profiles::load_profile(profile);
+    let now = crate::store::now_ts() as u64;
+    crate::worker_tunnel::secret::assign_new_secret(&mut prof.config, worker_url, now)?;
+    crate::store::profiles::save_profile(&prof)?;
+
+    // Redeploy with the pending secret.
+    let opts = crate::worker_tunnel::WorkerTunnelDeployOpts {
+        worker_name: tcfg.worker_name.clone(),
+        session_seed: tcfg.session.clone(),
+        compat_date: "2026-07-01".into(),
+        retries: 2,
+        vless_upstream: tcfg.worker_vless_upstream.clone(),
+    };
+    crate::worker_tunnel::deploy::deploy_worker_tunnel(cf, account_id, profile, &opts).await?;
+
+    // Verify via self-ping authenticated with the pending secret.
+    let mut prof2 = crate::store::profiles::load_profile(profile);
+    let pending = prof2
+        .config
+        .worker_secrets
+        .get(worker_url)
+        .and_then(|ws| ws.pending_secret.clone());
+    let Some(pending_secret) = pending else {
+        // No pending yet (e.g. very first deploy) — nothing to promote.
+        return Ok(());
+    };
+    let refresher = crate::carrier_refresh::CarrierRefresher::new(worker_url, &pending_secret);
+    if refresher.query_self_ping().is_ok() {
+        crate::worker_tunnel::secret::promote_pending(&mut prof2.config, worker_url, now)?;
+    } else {
+        // Verification failed — keep current active; leave pending for retry.
+        crate::worker_tunnel::secret::clear_pending(&mut prof2.config, worker_url);
+    }
+    crate::store::profiles::save_profile(&prof2)?;
     Ok(())
 }
 
@@ -983,6 +1080,36 @@ pub async fn daemon_tick(
         // most ticks. This is the counterpart to the blackout-side pull above.
         if let Err(e) = crate::daemon::push_carriers_via_worker_tunnel(profile, log) {
             log(&log_line("WARN", &format!("carrier push to worker failed: {e}")));
+        }
+        // Warm-up surface: query the worker's self-ping freshness once per 6h
+        // (off the hot path) and record the last check so the Autonomy panel
+        // can show the worker is staying active (not drifting toward CF
+        // inactivity deactivation).
+        {
+            let now = crate::store::now_ts() as i64;
+            const SELF_PING_INTERVAL_SECS: i64 = 21600; // 6h
+            if now - state.last_self_ping_ts >= SELF_PING_INTERVAL_SECS {
+                match crate::daemon::query_worker_self_ping(profile, log) {
+                    Some(ping_ms) => {
+                        let ping_secs = ping_ms / 1000;
+                        let age = (now as u64).saturating_sub(ping_secs);
+                        let active = age < SELF_PING_INTERVAL_SECS as u64;
+                        log(&log_line(
+                            "INFO",
+                            &format!(
+                                "worker self-ping {}h ago ({})",
+                                age / 3600,
+                                if active { "active" } else { "stale" }
+                            ),
+                        ));
+                        state.last_self_ping_ts = now;
+                    }
+                    None => {
+                        log(&log_line("INFO", "worker self-ping: none (no worker tunnel)"));
+                        state.last_self_ping_ts = now;
+                    }
+                }
+            }
         }
     }
 

@@ -10,6 +10,7 @@ use crate::error::CFError;
 use crate::vps_deploy::TunnelMode;
 use crate::worker_tunnel::KHV_TUNNEL_BASE;
 use crate::worker_tunnel::bundle::{WORKER_CRON_SCHEDULE, WORKER_TUNNEL_JS};
+use crate::worker_tunnel::secret;
 
 /// Options for a worker-tunnel deploy.
 #[derive(Debug, Clone)]
@@ -64,7 +65,28 @@ pub async fn deploy_worker_tunnel(
         Some(n) if !n.trim().is_empty() => n.trim().to_string(),
         _ => format!("khv-tun-{}", hex4(seed)),
     };
-    let shared_secret = session_secret(&opts.session_seed);
+    let worker_url = cf.workers_dev_url(account_id, &worker_name, &subdomain);
+
+    // Per-worker secret resolution (two-phase rotation aware). On first deploy
+    // a fresh secret is assigned and promoted immediately; on rotation the
+    // pending (new) secret is staged and used for the deploy while the client
+    // keeps talking on the current secret until the caller verifies + promotes.
+    let mut profile = crate::store::profiles::load_profile(profile_id);
+    let now = crate::store::now_ts() as u64;
+    let entry = profile.config.worker_secrets.entry(worker_url.clone()).or_default();
+    entry.worker_url = worker_url.clone();
+    if entry.secret.is_empty() && entry.pending_secret.is_none() {
+        entry.secret = secret::generate_secret();
+        entry.rotated_unix = now;
+        entry.version = 1;
+    }
+    let deploy_secret = entry
+        .pending_secret
+        .clone()
+        .unwrap_or_else(|| entry.secret.clone());
+    // The client-facing shared_secret stays the current (never pending).
+    let client_secret = entry.secret.clone();
+    crate::store::profiles::save_profile(&profile)?;
 
     // Ensure a KV namespace for the carrier-snapshot relay and bind it. The
     // worker bundle reads `env.KHV_CARRIER_SNAPSHOT` (flags 4/5). Creating it
@@ -93,11 +115,11 @@ pub async fn deploy_worker_tunnel(
     )
     .await?;
 
-    // Set the shared-secret worker var.
+    // Set the per-worker secret var.
     let mut vars = serde_json::Map::new();
     vars.insert(
         "KHV_SESSION_SECRET".to_string(),
-        serde_json::Value::String(shared_secret.clone()),
+        serde_json::Value::String(deploy_secret.clone()),
     );
     vars.insert(
         "KHV_TUNNEL_BASE".to_string(),
@@ -111,9 +133,9 @@ pub async fn deploy_worker_tunnel(
     }
     cf.set_vars(account_id, &worker_name, vars).await?;
 
-    let worker_url = cf.workers_dev_url(account_id, &worker_name, &subdomain);
-
-    // Persist the client config (mode=Worker) via the existing writer.
+    // Persist the client config (mode=Worker) via the existing writer. It
+    // always carries the current secret (never pending) so in-flight traffic
+    // keeps working until a verified promotion.
     let cfg = crate::vps_deploy::TunnelClientConfig {
         host: worker_url.clone(),
         base_domain: KHV_TUNNEL_BASE.to_string(),
@@ -122,7 +144,7 @@ pub async fn deploy_worker_tunnel(
         mode: TunnelMode::Worker,
         worker_url: Some(worker_url.clone()),
         worker_name: Some(worker_name.clone()),
-        shared_secret: Some(shared_secret.clone()),
+        shared_secret: Some(client_secret.clone()),
         worker_vless_upstream: opts.vless_upstream.clone(),
     };
     crate::vps_deploy::write_tunnel_client_config(profile_id, &cfg)?;
@@ -130,7 +152,7 @@ pub async fn deploy_worker_tunnel(
     Ok(WorkerTunnelDeploy {
         worker_name,
         worker_url,
-        shared_secret,
+        shared_secret: client_secret,
         account_id: account_id.to_string(),
         subdomain,
     })
@@ -141,18 +163,6 @@ fn hex4(seed: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let h = Sha256::digest(seed);
     hex(&h[..4])
-}
-
-/// Shared secret for the worker tunnel: `hex(blake3(seed ∥ "worker-tunnel-v1"))[..32]`.
-/// Uses SHA-256 (the repo's already-present hash) in place of blake3, kept to
-/// 32 hex chars to match the spec.
-fn session_secret(seed: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(seed.as_bytes());
-    hasher.update(b"worker-tunnel-v1");
-    let h = hasher.finalize();
-    hex(&h[..16])
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -318,7 +328,13 @@ mod tests {
         let cf = Client::with_base("tok", &base);
         let res = deploy_worker_tunnel(&cf, "acc1", "p_secvar", &opts()).await.unwrap();
         assert_eq!(res.shared_secret.len(), 32);
-        assert_eq!(res.shared_secret, session_secret("test-seed"));
+        // The per-worker secret is persisted in the profile config keyed by the
+        // worker URL, and versioned at 1 on first deploy.
+        let prof = crate::store::profiles::load_profile("p_secvar");
+        let ws = prof.config.worker_secrets.get(&res.worker_url).unwrap();
+        assert_eq!(ws.secret, res.shared_secret);
+        assert_eq!(ws.version, 1);
+        assert!(ws.pending_secret.is_none());
     }
 
     #[tokio::test]

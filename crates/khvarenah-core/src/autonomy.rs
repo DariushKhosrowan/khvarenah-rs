@@ -348,6 +348,43 @@ pub fn run_audit(profile: &Profile) -> AutonomyReport {
         fix_action: None,
     });
 
+    // 12. Worker self-ping freshness — Info-only. Surfaces whether the worker
+    // tier is staying active (self-ping cron running) or drifting toward
+    // Cloudflare inactivity deactivation. Reads the daemon's last recorded
+    // self-ping check (no network call here).
+    {
+        let now = crate::store::now_ts() as i64;
+        let last_check = daemon.last_self_ping_ts;
+        let (detail, status) = if last_check <= 0 {
+            (
+                "worker self-ping: not yet queried (daemon will check every 6h)".into(),
+                CheckStatus::Info,
+            )
+        } else {
+            // age = how long since the last check; active if < 6h.
+            let age = now.saturating_sub(last_check);
+            if age < 21600 {
+                (
+                    format!("worker self-ping checked {age}s ago (active)"),
+                    CheckStatus::Ok,
+                )
+            } else {
+                (
+                    format!("worker self-ping stale ({age}s ago) — worker may be deactivated"),
+                    CheckStatus::Info,
+                )
+            }
+        };
+        items.push(CheckItem {
+            code: "worker_self_ping".into(),
+            status,
+            title: "Worker self-ping".into(),
+            detail,
+            fix: String::new(),
+            fix_action: None,
+        });
+    }
+
     AutonomyReport { items }
 }
 
@@ -491,6 +528,7 @@ mod tests {
             "backup",
             "mutation",
             "tunnel",
+            "worker_self_ping",
         ] {
             assert!(codes.contains(&expected), "missing check {expected}");
         }
