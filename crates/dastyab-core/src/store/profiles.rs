@@ -324,6 +324,46 @@ pub struct TokenEntry {
     pub ts: String,
 }
 
+/// One recorded event in a profile's token lifecycle (added / removed /
+/// made-active / verified / rotated). This is the durable "history of added
+/// tokens" ledger the GUI renders on the Tokens tab.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenEvent {
+    pub id: String,
+    pub ts: String,
+    pub epoch: f64,
+    pub label: String,
+    /// "added" | "removed" | "made_active" | "verified" | "rotated" | "auto_rotate"
+    pub kind: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// Provenance metadata for one saved clean IP (source + verification times).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CleanIpMeta {
+    /// "scan" | "import" | "manual"
+    #[serde(default = "default_cleanip_source")]
+    pub source: String,
+    /// Port parsed from the endpoint string (defaults to 443).
+    #[serde(default = "default_cleanip_port")]
+    pub port: u16,
+    /// ISO timestamp of the first time this endpoint was recorded.
+    #[serde(default)]
+    pub first_verified_at: String,
+    /// ISO timestamp of the most recent verification / touch.
+    #[serde(default)]
+    pub last_verified_at: String,
+}
+
+fn default_cleanip_source() -> String {
+    "scan".to_string()
+}
+
+fn default_cleanip_port() -> u16 {
+    443
+}
+
 /// The complete per-profile state.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Profile {
@@ -333,6 +373,12 @@ pub struct Profile {
     pub history: Vec<VlessRecord>,
     pub clean_ips: Vec<String>,
     pub config: ProfileConfig,
+    /// Durable ledger of token-lifecycle events (added/removed/active/verify).
+    #[serde(default)]
+    pub token_history: Vec<TokenEvent>,
+    /// Per-endpoint provenance metadata, keyed by the saved endpoint string.
+    #[serde(default)]
+    pub clean_ip_meta: BTreeMap<String, CleanIpMeta>,
 }
 
 /// List all profiles (sorted by name). Never fails; empty on error.
@@ -413,6 +459,9 @@ pub fn load_profile(id: &str) -> Profile {
     let history = read_or_default::<Vec<VlessRecord>>(&dir.join("history.json"));
     let clean_ips = read_or_default::<Vec<String>>(&dir.join("cleanips.json"));
     let config = read_or_default::<ProfileConfig>(&dir.join("config.json"));
+    let token_history = read_or_default::<Vec<TokenEvent>>(&dir.join("token_history.json"));
+    let clean_ip_meta =
+        read_or_default::<BTreeMap<String, CleanIpMeta>>(&dir.join("cleanip_meta.json"));
     Profile {
         meta,
         tokens,
@@ -420,6 +469,8 @@ pub fn load_profile(id: &str) -> Profile {
         history,
         clean_ips,
         config,
+        token_history,
+        clean_ip_meta,
     }
 }
 
@@ -440,6 +491,8 @@ pub fn save_profile(p: &Profile) -> Result<(), CFError> {
     write_json(&dir.join("history.json"), &p.history)?;
     write_json(&dir.join("cleanips.json"), &p.clean_ips)?;
     write_json(&dir.join("config.json"), &p.config)?;
+    write_json(&dir.join("token_history.json"), &p.token_history)?;
+    write_json(&dir.join("cleanip_meta.json"), &p.clean_ip_meta)?;
     Ok(())
 }
 
@@ -529,6 +582,14 @@ pub fn import_profile(json: &serde_json::Value) -> Result<String, CFError> {
         write_json(&dir.join("config.json"), cfg)?;
         wrote_any = true;
     }
+    if let Some(th) = json.get("token_history") {
+        write_json(&dir.join("token_history.json"), th)?;
+        wrote_any = true;
+    }
+    if let Some(cim) = json.get("clean_ip_meta") {
+        write_json(&dir.join("cleanip_meta.json"), cim)?;
+        wrote_any = true;
+    }
     if !wrote_any {
         return Err(CFError::new(
             "Import error",
@@ -558,13 +619,17 @@ pub fn add_token(id: &str, label: &str, token: &str) -> Result<(), CFError> {
             ts: crate::store::now_iso(),
         },
     );
+    push_token_event(&mut p, "added", label, "saved to profile");
     save_profile(&p)
 }
 
 /// Remove a token from a profile.
 pub fn remove_token(id: &str, label: &str) -> Result<(), CFError> {
     let mut p = load_profile(id);
-    p.tokens.remove(label);
+    let had = p.tokens.remove(label).is_some();
+    if had {
+        push_token_event(&mut p, "removed", label, "removed from profile");
+    }
     save_profile(&p)
 }
 
@@ -598,7 +663,7 @@ pub fn get_active_token(profile_id: &str) -> Result<Option<String>, CFError> {
 
 /// Persist the active token label for a profile.
 pub fn set_active_token(profile_id: &str, label: &str) -> Result<(), CFError> {
-    let p = load_profile(profile_id);
+    let mut p = load_profile(profile_id);
     if !p.tokens.contains_key(label) {
         return Err(CFError::new(
             "Storage error",
@@ -606,6 +671,8 @@ pub fn set_active_token(profile_id: &str, label: &str) -> Result<(), CFError> {
             "Save the token first, then select it as active.",
         ));
     }
+    push_token_event(&mut p, "made_active", label, "selected as the active token");
+    save_profile(&p)?;
     write_json(&active_token_path(profile_id), &label.trim().to_string())
 }
 
@@ -668,11 +735,42 @@ pub fn clear_history(id: &str) -> Result<(), CFError> {
 
 /// Add a clean IP string (dedup, keep list ordered by insertion).
 pub fn remember_clean_ip(id: &str, ip: &str) -> Result<(), CFError> {
+    remember_clean_ip_with_source(id, ip, "scan")
+}
+
+/// Add a clean IP string with a provenance source ("scan" | "import" |
+/// "manual"). Records first/last verified timestamps for the manager view.
+pub fn remember_clean_ip_with_source(id: &str, ip: &str, source: &str) -> Result<(), CFError> {
     let mut p = load_profile(id);
-    if !p.clean_ips.contains(&ip.to_string()) {
-        p.clean_ips.push(ip.to_string());
+    let ep = ip.trim().to_string();
+    if ep.is_empty() {
+        return Ok(());
+    }
+    let now = crate::store::now_iso();
+    let port = parse_ip_port(&ep);
+    if !p.clean_ips.contains(&ep) {
+        p.clean_ips.push(ep.clone());
+        let meta = CleanIpMeta {
+            source: source.to_string(),
+            port,
+            first_verified_at: now.clone(),
+            last_verified_at: now,
+        };
+        p.clean_ip_meta.insert(ep.clone(), meta);
+    } else if let Some(m) = p.clean_ip_meta.get_mut(&ep) {
+        m.last_verified_at = now;
+        m.port = port;
+        if m.source == "scan" {
+            m.source = source.to_string();
+        }
     }
     save_profile(&p)
+}
+
+fn parse_ip_port(ep: &str) -> u16 {
+    ep.rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .unwrap_or(443)
 }
 
 /// Remove a single saved clean IP. Returns `Ok(false)` when it was not
@@ -681,6 +779,7 @@ pub fn remove_clean_ip(id: &str, ip: &str) -> Result<bool, CFError> {
     let mut p = load_profile(id);
     let before = p.clean_ips.len();
     p.clean_ips.retain(|x| x != ip);
+    p.clean_ip_meta.remove(ip);
     let removed = p.clean_ips.len() != before;
     save_profile(&p)?;
     Ok(removed)
@@ -691,6 +790,51 @@ pub fn remove_clean_ip(id: &str, ip: &str) -> Result<bool, CFError> {
 pub fn clear_clean_ips(id: &str) -> Result<(), CFError> {
     let mut p = load_profile(id);
     p.clean_ips.clear();
+    p.clean_ip_meta.clear();
+    save_profile(&p)
+}
+
+/// Record a token-lifecycle event on a profile (in-memory; caller saves).
+fn push_token_event(p: &mut Profile, kind: &str, label: &str, note: &str) {
+    let now = crate::store::now_iso();
+    p.token_history.insert(
+        0,
+        TokenEvent {
+            id: crate::store::new_id(),
+            ts: now.clone(),
+            epoch: crate::store::now_ts(),
+            label: label.to_string(),
+            kind: kind.to_string(),
+            note: note.to_string(),
+        },
+    );
+    if p.token_history.len() > 300 {
+        p.token_history.truncate(300);
+    }
+}
+
+/// Record a "verified" token event and persist it. Used by the GUI verify
+/// flow so the history ledger reflects real checks.
+pub fn record_token_verified(id: &str, label: &str, note: &str) -> Result<(), CFError> {
+    let mut p = load_profile(id);
+    push_token_event(&mut p, "verified", label, note);
+    save_profile(&p)
+}
+
+/// The token-lifecycle ledger for a profile (newest first).
+pub fn token_history(id: &str) -> Vec<TokenEvent> {
+    load_profile(id).token_history
+}
+
+/// The per-endpoint provenance map for a profile.
+pub fn clean_ip_meta(id: &str) -> BTreeMap<String, CleanIpMeta> {
+    load_profile(id).clean_ip_meta
+}
+
+/// Clear the token-lifecycle ledger for a profile.
+pub fn clear_token_history(id: &str) -> Result<(), CFError> {
+    let mut p = load_profile(id);
+    p.token_history.clear();
     save_profile(&p)
 }
 
@@ -1455,6 +1599,66 @@ mod tests {
             assert_eq!(load_profile(&id).history.len(), 1);
             clear_history(&id).unwrap();
             assert!(load_profile(&id).history.is_empty());
+        });
+    }
+
+    #[test]
+    fn token_ledger_records_add_remove_active() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            add_token(&id, "cf-main", "cf_live_secret_abcdefgh").unwrap();
+            let th = token_history(&id);
+            assert_eq!(th.len(), 1);
+            assert_eq!(th[0].kind, "added");
+            assert_eq!(th[0].label, "cf-main");
+
+            set_active_token(&id, "cf-main").unwrap();
+            let th = token_history(&id);
+            assert_eq!(th[0].kind, "made_active");
+
+            remove_token(&id, "cf-main").unwrap();
+            let th = token_history(&id);
+            assert_eq!(th[0].kind, "removed");
+            assert_eq!(th.len(), 3);
+
+            clear_token_history(&id).unwrap();
+            assert!(token_history(&id).is_empty());
+        });
+    }
+
+    #[test]
+    fn clean_ip_provenance_tracks_source_and_port() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            remember_clean_ip_with_source(&id, "104.16.1.1:2053", "import").unwrap();
+            let p = load_profile(&id);
+            let meta = p.clean_ip_meta.get("104.16.1.1:2053").unwrap();
+            assert_eq!(meta.source, "import");
+            assert_eq!(meta.port, 2053);
+            assert!(!meta.first_verified_at.is_empty());
+            assert!(!meta.last_verified_at.is_empty());
+
+            // duplicate add is a no-op for the list, updates last_verified_at
+            remember_clean_ip_with_source(&id, "104.16.1.1:2053", "scan").unwrap();
+            let p = load_profile(&id);
+            assert_eq!(p.clean_ips.len(), 1);
+            assert_eq!(p.clean_ip_meta["104.16.1.1:2053"].source, "import");
+
+            remove_clean_ip(&id, "104.16.1.1:2053").unwrap();
+            let p = load_profile(&id);
+            assert!(p.clean_ips.is_empty());
+            assert!(p.clean_ip_meta.is_empty());
+        });
+    }
+
+    #[test]
+    fn bare_clean_ip_defaults_to_port_443() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            remember_clean_ip_with_source(&id, "104.16.1.1", "manual").unwrap();
+            let meta = load_profile(&id).clean_ip_meta["104.16.1.1"].clone();
+            assert_eq!(meta.source, "manual");
+            assert_eq!(meta.port, 443);
         });
     }
 }

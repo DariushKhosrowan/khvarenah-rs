@@ -44,6 +44,19 @@ fn journal_kind_color(kind: &JournalKind) -> egui::Color32 {
     }
 }
 
+/// Label + accent for a token-ledger event kind.
+fn token_kind(kind: &str) -> (&'static str, egui::Color32) {
+    match kind {
+        "added" => ("token added", egui::Color32::from_rgb(90, 210, 120)),
+        "removed" => ("token removed", egui::Color32::from_rgb(220, 120, 120)),
+        "made_active" => ("made active", GOLD),
+        "verified" => ("verified", egui::Color32::from_rgb(140, 200, 255)),
+        "rotated" => ("rotated", egui::Color32::from_rgb(200, 160, 255)),
+        "auto_rotate" => ("auto-rotate", egui::Color32::from_rgb(255, 170, 90)),
+        _ => ("token event", GOLD_DIM),
+    }
+}
+
 /// One unified timeline row.
 struct Item {
     epoch: i64,
@@ -71,6 +84,7 @@ pub fn show(
             (HistoryFilter::All, "All"),
             (HistoryFilter::Deploys, "Deploys"),
             (HistoryFilter::CleanIps, "Clean IPs"),
+            (HistoryFilter::Tokens, "Tokens"),
             (HistoryFilter::Journal, "Journal"),
         ] {
             if ui
@@ -107,6 +121,10 @@ pub fn show(
     let want_journal = matches!(
         app.history_filter,
         HistoryFilter::All | HistoryFilter::Journal
+    );
+    let want_tokens = matches!(
+        app.history_filter,
+        HistoryFilter::All | HistoryFilter::Tokens
     );
 
     let mut items: Vec<Item> = Vec::new();
@@ -159,19 +177,55 @@ pub fn show(
         }
     }
 
+    // Token-lifecycle ledger (adds/removes/active/verify/rotate).
+    if want_tokens {
+        for e in &app.state.token_ledger {
+            let (label, color) = token_kind(&e.kind);
+            let mut title = e.label.clone();
+            if !e.note.is_empty() {
+                title.push_str(&format!(" — {}", e.note));
+            }
+            items.push(Item {
+                epoch: e.epoch,
+                tag: label,
+                tag_color: color,
+                title,
+                detail: String::new(),
+                link: None,
+                rec_id: None,
+            });
+        }
+    }
+
     items.sort_unstable_by_key(|it| std::cmp::Reverse(it.epoch));
 
     // Stats chips.
     {
         let deploys = items.iter().filter(|it| it.tag == "workers.dev").count();
         let clean = items.iter().filter(|it| it.tag == "clean-IP").count();
-        let journal = items.len().saturating_sub(deploys + clean);
+        let tokens = items
+            .iter()
+            .filter(|it| {
+                matches!(
+                    it.tag,
+                    "token added"
+                        | "token removed"
+                        | "made active"
+                        | "verified"
+                        | "rotated"
+                        | "auto-rotate"
+                        | "token event"
+                )
+            })
+            .count();
+        let journal = items.len().saturating_sub(deploys + clean + tokens);
         stat_chips(
             ui,
             &[
                 ("entries", &items.len().to_string()),
                 ("deploys", &deploys.to_string()),
                 ("clean-IP", &clean.to_string()),
+                ("tokens", &tokens.to_string()),
                 ("journal", &journal.to_string()),
             ],
         );

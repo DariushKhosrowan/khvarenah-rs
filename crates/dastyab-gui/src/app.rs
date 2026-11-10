@@ -93,6 +93,7 @@ pub enum HistoryFilter {
     Deploys,
     CleanIps,
     Journal,
+    Tokens,
 }
 
 pub struct DastYabApp {
@@ -209,6 +210,11 @@ pub struct DastYabApp {
     pub history_search: String,
     // settings section open state (true = expanded)
     pub sec_backups: bool,
+    // clean-IP manager probe output + manual-add draft
+    pub cleanip_test_output: String,
+    pub cleanip_add_draft: String,
+    // token-history ledger search filter
+    pub token_history_search: String,
 }
 
 /// What to do when the open dialog submits.
@@ -222,6 +228,7 @@ pub enum PendingDialogAction {
     ClearCleanIps,
     ClearHistory,
     DeleteHistoryRecord(String),
+    ClearTokenHistory,
 }
 
 impl DastYabApp {
@@ -431,6 +438,9 @@ impl DastYabApp {
             token_search: String::new(),
             history_search: String::new(),
             sec_backups: true,
+            cleanip_test_output: String::new(),
+            cleanip_add_draft: String::new(),
+            token_history_search: String::new(),
         };
         app.refresh_diagnostics();
         app
@@ -1079,6 +1089,10 @@ impl DastYabApp {
                         self.refresh_diagnostics();
                     } else if task == "blackout-drill" {
                         self.drill_output = summary.clone();
+                    } else if task.starts_with("probe-") || task == "probe-all" {
+                        self.cleanip_test_output = summary.clone();
+                        self.note = summary.clone();
+                        self.state.reload_pending = true;
                     } else {
                         self.note = format!("✓ {task}: {summary}");
                     }
@@ -1233,6 +1247,19 @@ impl DastYabApp {
                                 Ok(_) => {
                                     self.state.reload_pending = true;
                                     self.note = "History entry deleted.".to_string();
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::ClearTokenHistory) => {
+                        if let DialogPayload::Confirm = payload {
+                            match dastyab_core::store::profiles::clear_token_history(
+                                &self.profile_id,
+                            ) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note = "Token history cleared.".to_string();
                                 }
                                 Err(e) => self.note = e.brief(),
                             }
@@ -1932,15 +1959,74 @@ impl DastYabApp {
         )
     }
 
-    fn settings_panel(&mut self, ui: &mut egui::Ui, _p: &dastyab_core::store::profiles::Profile) {
+    fn settings_panel(&mut self, ui: &mut egui::Ui, p: &dastyab_core::store::profiles::Profile) {
         ui.heading(egui::RichText::new("Settings").color(GOLD));
-        ui.checkbox(&mut self.scan_gentle, "gentle scan");
-        ui.checkbox(&mut self.stealth_enabled, "stealth pacing");
+        ui.label(
+            egui::RichText::new(
+                "Every knob is per-profile, persisted instantly, and read live by the daemon.",
+            )
+            .color(GOLD_DIM),
+        );
         ui.add_space(6.0);
-        if ui.button("Save settings").clicked() {
-            self.save_scan_params();
-            self.note = "Settings saved to profile.".to_string();
-        }
+
+        // Scan & behavior defaults.
+        crate::views::section_card(ui, "Scan & behavior defaults", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Scan count:");
+                ui.add(egui::DragValue::new(&mut self.scan_count).range(1..=20000));
+                ui.label("Workers:");
+                ui.add(egui::DragValue::new(&mut self.scan_workers).range(1..=1000));
+                ui.label("Timeout (s):");
+                ui.add(egui::DragValue::new(&mut self.scan_timeout).range(1..=30));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Ports:");
+                ui.add(egui::TextEdit::singleline(&mut self.scan_ports).desired_width(90.0));
+                ui.checkbox(&mut self.scan_gentle, "gentle scan");
+                ui.checkbox(&mut self.stealth_enabled, "stealth pacing");
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Save scan defaults").clicked() {
+                    self.save_scan_params();
+                    self.note = "Scan defaults saved to profile.".to_string();
+                }
+                ui.label(
+                    egui::RichText::new("Used by Deploy & Scan and the automatic monitor.")
+                        .color(GOLD_DIM)
+                        .small(),
+                );
+            });
+        });
+
+        // Active profile / account summary.
+        crate::views::section_card(ui, "Profile & account", |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Active profile:").color(GOLD_DIM));
+                ui.label(egui::RichText::new(&self.profile_id).color(TEXT).strong());
+            });
+            let active_account = &p.config.active_account;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Cloudflare account:").color(GOLD_DIM));
+                if active_account.is_empty() {
+                    ui.label(
+                        egui::RichText::new("none saved yet — deploy once to remember it")
+                            .color(GOLD_DIM),
+                    );
+                } else {
+                    ui.label(egui::RichText::new(active_account).color(TEXT).monospace());
+                }
+            });
+            let worker_count = p.config.worker_set.workers.len();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Workers in set:").color(GOLD_DIM));
+                ui.label(
+                    egui::RichText::new(format!("{worker_count}"))
+                        .color(TEXT)
+                        .strong(),
+                );
+            });
+        });
+
         ui.add_space(10.0);
         ui.separator();
         ui.heading(egui::RichText::new("Backup / restore").color(GOLD));
