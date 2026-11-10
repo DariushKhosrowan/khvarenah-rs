@@ -1,14 +1,15 @@
 //! Profiles view — a scrollable list of saved configs with create / switch /
-//! rename / delete actions, plus per-profile token counts and creation time.
+//! rename / delete actions, plus per-profile token counts, creation time, and
+//! a one-click backup/export for the selected profile.
 
 use eframe::egui;
 use khvarenah_core::store::profiles::set_active_profile;
 
 use crate::app::KhvarenahApp;
 use crate::state::ProfileSummary;
-use crate::views::{GOLD, GOLD_DIM, PANEL, TEXT};
+use crate::views::{tag, CARD, CARD_STROKE, GOLD, GOLD_DIM, SUCCESS, TEXT};
 
-/// One row of the profile list, rendered with the gold-` stroke when active.
+/// One row of the profile list, rendered with the gold-accent stroke when active.
 fn profile_row(ui: &mut egui::Ui, p: &ProfileSummary) {
     let name = if p.is_active {
         egui::RichText::new(&p.name).color(GOLD).strong()
@@ -16,14 +17,14 @@ fn profile_row(ui: &mut egui::Ui, p: &ProfileSummary) {
         egui::RichText::new(&p.name).color(TEXT)
     };
 
-    // left-edge stroke for the active row
     let frame = egui::Frame::new()
-        .fill(PANEL)
-        .inner_margin(egui::Margin::symmetric(8, 6))
+        .fill(CARD)
+        .inner_margin(egui::Margin::symmetric(8, 8))
+        .corner_radius(6.0)
         .stroke(if p.is_active {
             egui::Stroke::new(2.0, GOLD)
         } else {
-            egui::Stroke::new(0.0, egui::Color32::TRANSPARENT)
+            egui::Stroke::new(1.0, CARD_STROKE)
         });
 
     frame.show(ui, |ui| {
@@ -32,9 +33,19 @@ fn profile_row(ui: &mut egui::Ui, p: &ProfileSummary) {
                 ui.label(egui::RichText::new("●").color(GOLD).strong());
             }
             ui.label(name);
-            if p.token_count > 0 {
-                ui.label(egui::RichText::new(format!("[{}]", p.token_count)).color(GOLD_DIM));
+            if p.is_active {
+                ui.add_space(4.0);
+                tag(ui, "ACTIVE", SUCCESS);
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if p.token_count > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("[{} token(s)]", p.token_count))
+                            .color(GOLD_DIM)
+                            .small(),
+                    );
+                }
+            });
         });
         if !p.description.is_empty() {
             ui.label(egui::RichText::new(&p.description).color(GOLD_DIM).small());
@@ -60,6 +71,8 @@ pub enum ProfilesAction {
     Rename(String),
     /// Request the "delete" confirmation dialog for this profile.
     Delete(String),
+    /// Back up / export the selected profile to a JSON bundle.
+    Backup(String),
 }
 
 pub fn show(
@@ -72,7 +85,7 @@ pub fn show(
     ui.heading(egui::RichText::new("Profiles").color(GOLD));
     ui.label(
         egui::RichText::new(
-            "Saved configs — switch, rename, or delete. Everything is per-profile.",
+            "Saved configs — switch, rename, backup, or delete. Everything is per-profile.",
         )
         .color(GOLD_DIM),
     );
@@ -112,6 +125,13 @@ pub fn show(
             if let Some(p) = app.state.profiles.get(i) {
                 if ui.button("Rename").clicked() {
                     action = Some(ProfilesAction::Rename(p.id.clone()));
+                }
+                if ui
+                    .button("💾 Backup")
+                    .on_hover_text("Export this profile to a JSON bundle")
+                    .clicked()
+                {
+                    action = Some(ProfilesAction::Backup(p.id.clone()));
                 }
                 if ui.button("Delete").clicked() {
                     action = Some(ProfilesAction::Delete(p.id.clone()));
@@ -162,6 +182,15 @@ pub fn run_action(
                 format!("Delete profile '{id}'? This cannot be undone."),
                 true,
             ))
+        }
+        ProfilesAction::Backup(id) => {
+            match khvarenah_core::backup::export_profile_to_file(&id, None) {
+                Ok(path) => {
+                    app.note = format!("✓ Backed up profile -> {}", path.display());
+                }
+                Err(e) => app.note = e.explain(),
+            }
+            None
         }
     }
 }

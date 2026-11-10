@@ -61,7 +61,7 @@ pub fn should_run_audit(state: &crate::daemon::DaemonState, now_unix: u64) -> bo
 /// Fingerprint the current set of ACTION-status check items: stable-sorted
 /// codes, then SHA-256. Used to detect clean→dirty regressions.
 pub fn action_digest(codes: &[&str]) -> [u8; 32] {
-    let mut sorted: Vec<&str> = codes.iter().copied().collect();
+    let mut sorted: Vec<&str> = codes.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
     let mut hasher = Sha256::new();

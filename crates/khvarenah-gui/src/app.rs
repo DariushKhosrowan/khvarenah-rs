@@ -26,6 +26,10 @@ pub const GOLD_DIM: egui::Color32 = egui::Color32::from_rgb(150, 120, 40);
 pub const DARK: egui::Color32 = egui::Color32::from_rgb(10, 7, 5); // #0a0705
 pub const PANEL: egui::Color32 = egui::Color32::from_rgb(24, 20, 14);
 pub const TEXT: egui::Color32 = egui::Color32::from_rgb(235, 228, 200);
+/// Card surface — slightly lighter than the base panel for elevation.
+pub const CARD: egui::Color32 = egui::Color32::from_rgb(30, 26, 18);
+/// Subtle border used on cards.
+pub const CARD_STROKE: egui::Color32 = egui::Color32::from_rgb(52, 44, 30);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -62,6 +66,21 @@ impl View {
             View::Tools => "Tools",
             View::Settings => "Settings",
             View::Autonomy => "Autonomy",
+        }
+    }
+
+    /// A short glyph shown before the label in the sidebar (and in the top
+    /// heading), so the navigation reads at a glance.
+    fn glyph(self) -> &'static str {
+        match self {
+            View::DeployScan => "🛰",
+            View::Profiles => "📁",
+            View::Tokens => "🔑",
+            View::CleanIps => "🌐",
+            View::History => "🕘",
+            View::Tools => "🧰",
+            View::Settings => "⚙",
+            View::Autonomy => "🤖",
         }
     }
 }
@@ -185,6 +204,11 @@ pub struct KhvarenahApp {
     pub mutation_interval: u64,
     pub mutation_rotate_path: bool,
     pub mutation_note: String,
+    // live search filters (tokens / history)
+    pub token_search: String,
+    pub history_search: String,
+    // settings section open state (true = expanded)
+    pub sec_backups: bool,
 }
 
 /// What to do when the open dialog submits.
@@ -215,8 +239,19 @@ impl KhvarenahApp {
                 bg_fill: GOLD_DIM,
                 stroke: egui::Stroke::new(1.0, GOLD),
             },
+            // Modern rounded window + a soft drop shadow.
+            window_corner_radius: egui::CornerRadius::same(10),
+            window_shadow: egui::epaint::Shadow {
+                offset: [0, 4],
+                blur: 18,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(160),
+            },
             ..Default::default()
         };
+        // Slightly roomier spacing for a premium feel.
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 4.0);
         cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
 
         // touch profile data
@@ -393,6 +428,9 @@ impl KhvarenahApp {
             mw_note: String::new(),
             view: View::DeployScan,
             history_filter: HistoryFilter::default(),
+            token_search: String::new(),
+            history_search: String::new(),
+            sec_backups: true,
         };
         app.refresh_diagnostics();
         app
@@ -1275,27 +1313,52 @@ impl KhvarenahApp {
     /// view name shown in gold.
     fn render_shell(&mut self, ui: &mut egui::Ui, p: &khvarenah_core::store::profiles::Profile) {
         ui.horizontal(|ui| {
-            // Left sidebar with the six views.
+            // Left sidebar with the eight views.
             ui.vertical(|ui| {
-                ui.set_width(170.0);
+                ui.set_width(180.0);
+                ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new("KHVARENAH")
                         .color(GOLD)
                         .strong()
-                        .size(16.0),
+                        .size(17.0),
                 );
                 ui.add_space(4.0);
                 for v in View::ALL {
                     let active = self.view == v;
                     let text = if active {
-                        egui::RichText::new(v.label()).color(GOLD).strong()
+                        egui::RichText::new(format!("{}  {}", v.glyph(), v.label()))
+                            .color(GOLD)
+                            .strong()
                     } else {
-                        egui::RichText::new(v.label()).color(TEXT)
+                        egui::RichText::new(format!("{}  {}", v.glyph(), v.label())).color(TEXT)
                     };
                     let resp = ui.selectable_label(active, text);
                     if resp.clicked() {
                         self.view = v;
                     }
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                // Compact status footer: active profile + pending beacon alerts.
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("profile").color(GOLD_DIM).small());
+                let prof_label = if self.profile_id.is_empty() {
+                    "default".to_string()
+                } else {
+                    self.profile_id.clone()
+                };
+                ui.label(egui::RichText::new(prof_label).color(TEXT).strong().small());
+                if self.state.beacon_outbox > 0 {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "⚠ {} queued alerts",
+                            self.state.beacon_outbox
+                        ))
+                        .color(egui::Color32::from_rgb(230, 160, 60))
+                        .small(),
+                    );
                 }
             });
 
@@ -1303,12 +1366,19 @@ impl KhvarenahApp {
 
             // Main content area.
             ui.vertical(|ui| {
-                // active view name in gold
-                ui.heading(
-                    egui::RichText::new(self.view.label())
-                        .color(GOLD)
-                        .size(22.0),
-                );
+                // active view name in gold, with glyph
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(self.view.glyph())
+                            .color(GOLD)
+                            .size(20.0),
+                    );
+                    ui.heading(
+                        egui::RichText::new(self.view.label())
+                            .color(GOLD)
+                            .size(22.0),
+                    );
+                });
                 ui.separator();
                 match self.view {
                     View::DeployScan => self.deploy_panel(ui, p),
@@ -1684,10 +1754,27 @@ impl KhvarenahApp {
     fn cleanip_panel(&mut self, ui: &mut egui::Ui, _p: &khvarenah_core::store::profiles::Profile) {
         if let Some(act) = cleanip::show(ui, self) {
             match act {
-                cleanip::CleanipAction::Copy(ip) => {
-                    let s = ip.clone();
-                    ui.ctx().copy_text(s);
-                    self.note = format!("Copied {ip}.");
+                cleanip::CleanipAction::CopyAll => {
+                    let all = self.state.clean_ips.join("\n");
+                    if !all.is_empty() {
+                        ui.ctx().copy_text(all);
+                        self.note = format!("Copied {} clean IP(s).", self.state.clean_ips.len());
+                    } else {
+                        self.note = "No clean IPs to copy.".to_string();
+                    }
+                }
+                cleanip::CleanipAction::Export => {
+                    let all = self.state.clean_ips.join("\n");
+                    if all.is_empty() {
+                        self.note = "No clean IPs to export.".to_string();
+                    } else {
+                        ui.ctx().copy_text(all.clone());
+                        self.note = format!(
+                            "Exported {} clean IP(s) to clipboard.",
+                            self.state.clean_ips.len()
+                        );
+                        self.last_link = all;
+                    }
                 }
                 other => {
                     if let Some(dlg) = cleanip::run_action(self, other) {
@@ -1875,6 +1962,125 @@ impl KhvarenahApp {
                     .font(egui::TextStyle::Monospace),
             );
         }
+
+        // ── Saved Configs manager ─────────────────────────────────────
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let caret = if self.sec_backups { "▾" } else { "▸" };
+            if ui
+                .button(
+                    egui::RichText::new(format!("{caret} Saved Configs"))
+                        .color(GOLD)
+                        .strong(),
+                )
+                .on_hover_text("Toggle the saved-configs manager")
+                .clicked()
+            {
+                self.sec_backups = !self.sec_backups;
+            }
+            ui.label(
+                egui::RichText::new("everything per-profile, snapshot as a JSON bundle")
+                    .color(GOLD_DIM)
+                    .small(),
+            );
+            if ui
+                .button("➕ Snapshot now")
+                .on_hover_text("Back up the current profile to the backup folder")
+                .clicked()
+            {
+                match khvarenah_core::backup::export_profile_to_file(&self.profile_id, None) {
+                    Ok(path) => {
+                        self.backup_output = format!("✓ Snapshot saved → {}", path.display())
+                    }
+                    Err(e) => self.backup_output = e.explain(),
+                }
+            }
+        });
+        if self.sec_backups {
+            ui.separator();
+
+            // list saved configs (backups)
+            let backups = khvarenah_core::backup::list_backups();
+            if backups.is_empty() {
+                ui.label(
+                    egui::RichText::new("No saved configs yet — take a snapshot above.")
+                        .color(GOLD_DIM),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!("{} saved config(s)", backups.len()))
+                        .color(GOLD_DIM)
+                        .small(),
+                );
+                egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for b in &backups {
+                        egui::Frame::new()
+                            .fill(PANEL)
+                            .inner_margin(egui::Margin::symmetric(8, 6))
+                            .corner_radius(6.0)
+                            .stroke(egui::Stroke::new(1.0, crate::views::CARD_STROKE))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&b.profile_name)
+                                                .color(TEXT)
+                                                .strong(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} · {}",
+                                                khvarenah_core::backup::human_size(b.size),
+                                                b.created_at
+                                            ))
+                                            .color(GOLD_DIM)
+                                            .small(),
+                                        );
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.button("🗑").on_hover_text("Delete this snapshot").clicked() {
+                                                match khvarenah_core::backup::delete_backup(
+                                                    std::path::Path::new(&b.path),
+                                                ) {
+                                                    Ok(_) => {
+                                                        self.backup_output = format!(
+                                                            "Deleted snapshot {}.",
+                                                            b.path
+                                                        );
+                                                        self.state.reload_pending = true;
+                                                    }
+                                                    Err(e) => {
+                                                        self.backup_output = e.explain()
+                                                    }
+                                                }
+                                            }
+                                            if ui.button("Restore").on_hover_text("Restore this snapshot into a new profile").clicked() {
+                                                match khvarenah_core::backup::import_profile_from_file(
+                                                    std::path::Path::new(&b.path),
+                                                ) {
+                                                    Ok(pid) => {
+                                                        self.backup_output = format!(
+                                                            "✓ Restored into new profile '{pid}'."
+                                                        );
+                                                        self.state.reload_pending = true;
+                                                    }
+                                                    Err(e) => self.backup_output = e.explain(),
+                                                }
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        ui.add_space(4.0);
+                    }
+                });
+            }
+        } // if self.sec_backups
 
         ui.add_space(10.0);
         ui.separator();
@@ -2489,10 +2695,11 @@ impl KhvarenahApp {
                             ));
                         }
                     }
-                    "tunnel" if item.status == CheckStatus::Action => {
-                        if ui.button("⚙ Configure DNS tunnel in app").clicked() {
-                            self.view = View::Settings;
-                        }
+                    "tunnel"
+                        if item.status == CheckStatus::Action
+                            && ui.button("⚙ Configure DNS tunnel in app").clicked() =>
+                    {
+                        self.view = View::Settings;
                     }
                     _ => {}
                 }

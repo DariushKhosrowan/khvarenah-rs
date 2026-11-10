@@ -488,6 +488,7 @@ impl Client {
     /// `crons` are scheduled-trigger cron strings embedded as
     /// `triggers.crons` (used for the worker self-ping keep-alive). Empty
     /// `crons` omits the triggers block entirely.
+    #[allow(clippy::too_many_arguments)]
     pub async fn deploy_script_with_bindings(
         &self,
         account_id: &str,

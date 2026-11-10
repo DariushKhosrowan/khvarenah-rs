@@ -3,7 +3,8 @@
 //! blackout/rescue journal. Each entry shows its type, a readable local
 //! timestamp, the resolved host/endpoint, and (for VlessRecords that carry a
 //! share link) a one-click copy button. Entries can be deleted individually
-//! or the whole VlessRecord stream cleared.
+//! or the whole VlessRecord stream cleared. Stats, search, and export
+//! round out the view.
 
 use eframe::egui;
 use khvarenah_core::journal::JournalKind;
@@ -11,9 +12,7 @@ use khvarenah_core::journal::JournalKind;
 use crate::app::{HistoryFilter, KhvarenahApp, PendingDialogAction};
 use crate::dialogs;
 use crate::state::format_ts;
-use crate::views::{GOLD, GOLD_DIM, PANEL, TEXT};
-
-/// Short label for a journal entry kind.
+use crate::views::{section_card, stat_chips, tag, CARD, CARD_STROKE, GOLD, GOLD_DIM, TEXT};
 fn journal_kind_label(kind: &JournalKind) -> &'static str {
     match kind {
         JournalKind::NetworkDown => "network-down",
@@ -162,6 +161,22 @@ pub fn show(
 
     items.sort_unstable_by_key(|it| std::cmp::Reverse(it.epoch));
 
+    // Stats chips.
+    {
+        let deploys = items.iter().filter(|it| it.tag == "workers.dev").count();
+        let clean = items.iter().filter(|it| it.tag == "clean-IP").count();
+        let journal = items.len().saturating_sub(deploys + clean);
+        stat_chips(
+            ui,
+            &[
+                ("entries", &items.len().to_string()),
+                ("deploys", &deploys.to_string()),
+                ("clean-IP", &clean.to_string()),
+                ("journal", &journal.to_string()),
+            ],
+        );
+    }
+
     if items.is_empty() {
         ui.add_space(8.0);
         ui.label(
@@ -173,73 +188,127 @@ pub fn show(
         return;
     }
 
+    // Live search filter.
+    let query = {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Search:").color(GOLD_DIM));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.history_search)
+                    .hint_text("filter entries…")
+                    .desired_width(220.0),
+            );
+            if ui
+                .button("📋 Export")
+                .on_hover_text("Copy all entries to clipboard")
+                .clicked()
+            {
+                let mut buf = String::new();
+                for it in &items {
+                    buf.push_str(&format!(
+                        "[{}] {} — {}\n",
+                        it.tag,
+                        it.title,
+                        format_ts(it.epoch)
+                    ));
+                    if !it.detail.is_empty() {
+                        buf.push_str(&format!("    {}\n", it.detail));
+                    }
+                }
+                ui.ctx().copy_text(buf.clone());
+                app.note = format!("Exported {} history entries to clipboard.", items.len());
+            }
+        });
+        app.history_search.trim().to_lowercase()
+    };
+    ui.add_space(4.0);
+
+    let shown = items
+        .iter()
+        .filter(|it| {
+            query.is_empty()
+                || it.title.to_lowercase().contains(&query)
+                || it.tag.to_lowercase().contains(&query)
+                || it.detail.to_lowercase().contains(&query)
+        })
+        .count();
+
+    if shown == 0 {
+        ui.label(egui::RichText::new("No entries match that search.").color(GOLD_DIM));
+        return;
+    }
+
     ui.label(
-        egui::RichText::new(format!("{} entries", items.len()))
+        egui::RichText::new(format!("{shown} entries"))
             .color(GOLD_DIM)
             .small(),
     );
     ui.add_space(4.0);
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .max_height(520.0)
-        .show(ui, |ui| {
-            for it in &items {
-                egui::Frame::new()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(10, 7))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
+    section_card(ui, "Timeline", |ui| {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(520.0)
+            .show(ui, |ui| {
+                for it in items.iter().filter(|it| {
+                    query.is_empty()
+                        || it.title.to_lowercase().contains(&query)
+                        || it.tag.to_lowercase().contains(&query)
+                        || it.detail.to_lowercase().contains(&query)
+                }) {
+                    egui::Frame::new()
+                        .fill(CARD)
+                        .inner_margin(egui::Margin::symmetric(10, 7))
+                        .corner_radius(6.0)
+                        .stroke(egui::Stroke::new(1.0, CARD_STROKE))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                tag(ui, it.tag, it.tag_color);
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(&it.title).color(TEXT));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if let Some(rec_id) = &it.rec_id {
+                                            if ui
+                                                .button("🗑")
+                                                .on_hover_text("Delete this entry")
+                                                .clicked()
+                                            {
+                                                app.pending_action =
+                                                    Some(PendingDialogAction::DeleteHistoryRecord(
+                                                        rec_id.clone(),
+                                                    ));
+                                                app.dialog = Some(dialogs::confirm(
+                                                    "Delete history entry",
+                                                    "Delete this history entry?",
+                                                    true,
+                                                ));
+                                            }
+                                        }
+                                        if let Some(link) = &it.link {
+                                            if ui
+                                                .button("📋")
+                                                .on_hover_text("Copy share link")
+                                                .clicked()
+                                            {
+                                                ui.ctx().copy_text(link.clone());
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                            if !it.detail.is_empty() {
+                                ui.add_space(2.0);
+                                ui.label(egui::RichText::new(&it.detail).color(GOLD_DIM).small());
+                            }
                             ui.label(
-                                egui::RichText::new(it.tag)
-                                    .color(it.tag_color)
-                                    .strong()
+                                egui::RichText::new(format_ts(it.epoch))
+                                    .color(GOLD_DIM)
                                     .small(),
                             );
-                            ui.add_space(6.0);
-                            ui.label(egui::RichText::new(&it.title).color(TEXT));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if let Some(rec_id) = &it.rec_id {
-                                        if ui
-                                            .button("🗑")
-                                            .on_hover_text("Delete this entry")
-                                            .clicked()
-                                        {
-                                            app.pending_action =
-                                                Some(PendingDialogAction::DeleteHistoryRecord(
-                                                    rec_id.clone(),
-                                                ));
-                                            app.dialog = Some(dialogs::confirm(
-                                                "Delete history entry",
-                                                "Delete this history entry?",
-                                                true,
-                                            ));
-                                        }
-                                    }
-                                    if let Some(link) = &it.link {
-                                        if ui
-                                            .button("📋")
-                                            .on_hover_text("Copy share link")
-                                            .clicked()
-                                        {
-                                            ui.ctx().copy_text(link.clone());
-                                        }
-                                    }
-                                },
-                            );
                         });
-                        if !it.detail.is_empty() {
-                            ui.label(egui::RichText::new(&it.detail).color(GOLD_DIM).small());
-                        }
-                        ui.label(
-                            egui::RichText::new(format_ts(it.epoch))
-                                .color(GOLD_DIM)
-                                .small(),
-                        );
-                    });
-                ui.add_space(4.0);
-            }
-        });
+                    ui.add_space(4.0);
+                }
+            });
+    });
 }

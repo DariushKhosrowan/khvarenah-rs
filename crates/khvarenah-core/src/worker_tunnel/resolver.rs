@@ -116,16 +116,24 @@ mod tests {
     /// Spawn a one-shot HTTP server that returns `body` with `status`, and
     /// captures the request line + headers into a shared log file so tests can
     /// assert the qname param and session header were sent.
-    fn mock_worker(status: u16, body: String) -> String {
+    fn mock_worker(status: u16, body: String) -> (String, std::path::PathBuf) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        // Per-server unique log path so parallel tests never clobber each
+        // other's captured request (the old shared /tmp/ file was a race).
+        let log_path = std::env::temp_dir().join(format!(
+            "kv_resolver_log_{}_{}.txt",
+            std::process::id(),
+            addr.port()
+        ));
+        let log_path_clone = log_path.clone();
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 use std::io::{Read, Write};
                 let mut buf = [0u8; 8192];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                let _ = std::fs::write("/tmp/kv_resolver_log.txt", req);
+                let _ = std::fs::write(&log_path_clone, req);
                 let reason = if status == 200 { "OK" } else { "Error" };
                 let resp = format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -135,7 +143,7 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), log_path)
     }
 
     fn ping_qname() -> String {
@@ -161,11 +169,11 @@ mod tests {
 
     #[test]
     fn test_resolver_sends_qname_as_query_param() {
-        let server = mock_worker(200, pong_reply());
+        let (server, log_path) = mock_worker(200, pong_reply());
         let r = WorkerTunnelResolver::new(server, "secret");
         let replied = r.query_txt(&ping_qname()).unwrap();
         assert!(replied.ends_with(&format!(".{KHV_TUNNEL_BASE}")));
-        let req = std::fs::read_to_string("/tmp/kv_resolver_log.txt").unwrap();
+        let req = std::fs::read_to_string(&log_path).unwrap();
         assert!(
             req.contains("?q="),
             "qname must be sent as query param: {req}"
@@ -175,10 +183,10 @@ mod tests {
 
     #[test]
     fn test_resolver_sends_session_header() {
-        let server = mock_worker(200, pong_reply());
+        let (server, log_path) = mock_worker(200, pong_reply());
         let r = WorkerTunnelResolver::new(server, "my-secret");
         let _ = r.query_txt(&ping_qname());
-        let req = std::fs::read_to_string("/tmp/kv_resolver_log.txt").unwrap();
+        let req = std::fs::read_to_string(&log_path).unwrap();
         let lower = req.to_ascii_lowercase();
         assert!(
             lower.contains("x-khvarenah-session: my-secret"),
@@ -188,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_resolver_returns_body_on_200() {
-        let server = mock_worker(200, pong_reply());
+        let (server, _log) = mock_worker(200, pong_reply());
         let r = WorkerTunnelResolver::new(server, "s");
         let body = r.query_txt(&ping_qname()).unwrap();
         let decoded =
@@ -199,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_resolver_errors_on_401() {
-        let server = mock_worker(401, "{}".to_string());
+        let (server, _log) = mock_worker(401, "{}".to_string());
         let r = WorkerTunnelResolver::new(server, "wrong");
         let err = r.query_txt(&ping_qname()).unwrap_err();
         assert!(err.detail.contains("session secret rejected"));
@@ -209,7 +217,7 @@ mod tests {
     #[test]
     fn test_resolver_ping_roundtrip() {
         // Full ping → pong round-trip through the resolver (sync path) + decode.
-        let server = mock_worker(200, pong_reply());
+        let (server, _log) = mock_worker(200, pong_reply());
         let r = WorkerTunnelResolver::new(server, "s");
         let qname = ping_qname();
         let body = r.query_txt(&qname).unwrap();

@@ -211,7 +211,7 @@ impl CarrierRefresher {
                 if status == 401 {
                     return Err(RefreshError::Auth);
                 }
-                if status < 200 || status >= 300 {
+                if !(200..300).contains(&status) {
                     return Err(RefreshError::Transport(format!("http {status}")));
                 }
                 resp.json::<serde_json::Value>()
