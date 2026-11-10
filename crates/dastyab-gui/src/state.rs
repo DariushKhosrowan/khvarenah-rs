@@ -61,6 +61,8 @@ pub struct GuiState {
     pub seeds: Vec<String>,
     /// Token-lifecycle ledger (newest first).
     pub token_ledger: Vec<TokenLedgerRow>,
+    /// Saved config snapshots (backup bundles) for the Saved Configs manager.
+    pub backups: Vec<dastyab_core::backup::BackupRecord>,
     /// Number of undelivered beacon alerts (outbox) for the active profile.
     pub beacon_outbox: usize,
     /// Set when a background mutation completes; the next frame calls reload.
@@ -134,6 +136,7 @@ impl GuiState {
             .collect();
 
         self.beacon_outbox = dastyab_core::remote_beacon::load_outbox(&active).len();
+        self.backups = dastyab_core::backup::list_backups();
 
         self.reload_pending = false;
     }
@@ -194,6 +197,24 @@ pub fn format_ts(epoch: i64) -> String {
     }
 }
 
+/// Format a UNIX-epoch seconds value as a short relative string ("3d ago",
+/// "2h ago", "just now"), falling back to [`format_ts`] for very old events.
+pub fn relative_ts(epoch: i64) -> String {
+    let Some(dt) = chrono::DateTime::from_timestamp(epoch, 0) else {
+        return format!("{epoch}");
+    };
+    let now = chrono::Local::now().naive_local();
+    let dt = dt.with_timezone(&chrono::Local).naive_local();
+    let secs = (now - dt).num_seconds().max(0);
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => format!("{}h ago", secs / 3600),
+        86400..=2591999 => format!("{}d ago", secs / 86400),
+        _ => format_ts(epoch),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +249,21 @@ mod tests {
         let out = format_ts(1_705_322_600);
         assert_ne!(out, "1705322600");
         assert!(out.len() >= 13, "unexpected output: {out}");
+    }
+
+    #[test]
+    fn relative_ts_recent_and_old() {
+        let now = chrono::Local::now().timestamp();
+        // 30s ago -> "just now"
+        assert_eq!(relative_ts(now - 30), "just now");
+        // 2 days ago (172800s) -> "2d ago"
+        assert_eq!(relative_ts(now - 172_800), "2d ago");
+        // 3 hours ago -> "3h ago"
+        assert_eq!(relative_ts(now - 10_800), "3h ago");
+        // far in the past -> absolute timestamp
+        let ancient = relative_ts(1_000_000);
+        assert_ne!(ancient, "just now");
+        assert!(ancient.len() >= 13, "unexpected output: {ancient}");
     }
 
     #[test]

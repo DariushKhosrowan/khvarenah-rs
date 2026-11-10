@@ -210,6 +210,25 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<TokensAction> {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
+                    .button("📋 Export")
+                    .on_hover_text("Copy the whole token-history ledger to clipboard")
+                    .clicked()
+                {
+                    let mut buf = String::new();
+                    for e in &app.state.token_ledger {
+                        buf.push_str(&format!(
+                            "[{}] {} — {} ({})\n",
+                            e.kind,
+                            e.label,
+                            e.note,
+                            crate::state::format_ts(e.epoch)
+                        ));
+                    }
+                    ui.ctx().copy_text(buf.clone());
+                    app.note =
+                        format!("Exported {} token-history events to clipboard.", app.state.token_ledger.len());
+                }
+                if ui
                     .button("🗑 Clear ledger")
                     .on_hover_text("Delete the whole token-history ledger")
                     .clicked()
@@ -260,9 +279,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<TokensAction> {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         ui.label(
-                                            egui::RichText::new(crate::state::format_ts(e.epoch))
-                                                .color(GOLD_DIM)
-                                                .small(),
+                                            egui::RichText::new(format!(
+                                                "{} · {}",
+                                                crate::state::relative_ts(e.epoch),
+                                                crate::state::format_ts(e.epoch)
+                                            ))
+                                            .color(GOLD_DIM)
+                                            .small(),
                                         );
                                     },
                                 );

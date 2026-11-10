@@ -11,7 +11,7 @@ use dastyab_core::journal::JournalKind;
 
 use crate::app::{HistoryFilter, DastYabApp, PendingDialogAction};
 use crate::dialogs;
-use crate::state::format_ts;
+use crate::state::{format_ts, relative_ts};
 use crate::views::{section_card, stat_chips, tag, CARD, CARD_STROKE, GOLD, GOLD_DIM, TEXT};
 fn journal_kind_label(kind: &JournalKind) -> &'static str {
     match kind {
@@ -356,9 +356,13 @@ pub fn show(
                                 ui.label(egui::RichText::new(&it.detail).color(GOLD_DIM).small());
                             }
                             ui.label(
-                                egui::RichText::new(format_ts(it.epoch))
-                                    .color(GOLD_DIM)
-                                    .small(),
+                                egui::RichText::new(format!(
+                                    "{} · {}",
+                                    relative_ts(it.epoch),
+                                    format_ts(it.epoch)
+                                ))
+                                .color(GOLD_DIM)
+                                .small(),
                             );
                         });
                     ui.add_space(4.0);

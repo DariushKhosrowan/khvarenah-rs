@@ -69,6 +69,8 @@ pub enum ProfilesAction {
     New,
     /// Request the "rename" text dialog for this profile.
     Rename(String),
+    /// Request the "set description" text dialog for this profile.
+    Describe(String),
     /// Request the "delete" confirmation dialog for this profile.
     Delete(String),
     /// Back up / export the selected profile to a JSON bundle.
@@ -127,6 +129,13 @@ pub fn show(
                     action = Some(ProfilesAction::Rename(p.id.clone()));
                 }
                 if ui
+                    .button("📝 Describe")
+                    .on_hover_text("Set a note/description for this profile")
+                    .clicked()
+                {
+                    action = Some(ProfilesAction::Describe(p.id.clone()));
+                }
+                if ui
                     .button("💾 Backup")
                     .on_hover_text("Export this profile to a JSON bundle")
                     .clicked()
@@ -174,6 +183,13 @@ pub fn run_action(
         ProfilesAction::Rename(id) => {
             app.pending_action = Some(PendingDialogAction::RenameProfile(id));
             Some(crate::dialogs::prompt_text("Rename profile", "New name"))
+        }
+        ProfilesAction::Describe(id) => {
+            app.pending_action = Some(PendingDialogAction::DescribeProfile(id));
+            Some(crate::dialogs::prompt_text(
+                "Profile description",
+                "A short note about this profile",
+            ))
         }
         ProfilesAction::Delete(id) => {
             app.pending_action = Some(PendingDialogAction::DeleteProfile(id.clone()));

@@ -120,6 +120,10 @@ pub struct DastYabApp {
     pub selected_profile: Option<usize>,
     /// Live search filter for the Clean IPs manager.
     pub cleanip_search: String,
+    /// Sort mode for the Clean IPs list.
+    pub cleanip_sort: crate::views::cleanip::CleanipSort,
+    /// Live search filter for the Saved Configs manager.
+    pub backups_search: String,
     // inputs
     pub new_profile_name: String,
     // scan params
@@ -222,6 +226,7 @@ pub struct DastYabApp {
 pub enum PendingDialogAction {
     CreateProfile,
     RenameProfile(String),
+    DescribeProfile(String),
     DeleteProfile(String),
     AddToken,
     ImportSeeds,
@@ -295,6 +300,8 @@ impl DastYabApp {
             pending_action: None,
             selected_profile: None,
             cleanip_search: String::new(),
+            cleanip_sort: crate::views::cleanip::CleanipSort::default(),
+            backups_search: String::new(),
             new_profile_name: String::new(),
             scan_count: profile.config.scan_count.max(1),
             scan_workers: profile.config.scan_workers.max(1),
@@ -1177,6 +1184,19 @@ impl DastYabApp {
                             }
                         }
                     }
+                    Some(PendingDialogAction::DescribeProfile(id)) => {
+                        if let DialogPayload::Text(desc) = payload {
+                            let mut p = dastyab_core::store::profiles::load_profile(&id);
+                            p.meta.description = desc.trim().to_string();
+                            match dastyab_core::store::profiles::save_profile(&p) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note = format!("Description saved for profile '{id}'.");
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
                     Some(PendingDialogAction::DeleteProfile(id)) => {
                         if let DialogPayload::Confirm = payload {
                             match delete_profile(&id) {
@@ -1376,6 +1396,17 @@ impl DastYabApp {
                     self.profile_id.clone()
                 };
                 ui.label(egui::RichText::new(prof_label).color(TEXT).strong().small());
+                // Compact live counts for the active profile.
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "🔑 {} · 🌐 {}",
+                        self.state.tokens.len(),
+                        self.state.clean_ips.len()
+                    ))
+                    .color(GOLD_DIM)
+                    .small(),
+                );
                 if self.state.beacon_outbox > 0 {
                     ui.add_space(4.0);
                     ui.label(
@@ -2085,86 +2116,138 @@ impl DastYabApp {
         if self.sec_backups {
             ui.separator();
 
-            // list saved configs (backups)
-            let backups = dastyab_core::backup::list_backups();
+            // Search + refresh row.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Search:").color(GOLD_DIM));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.backups_search)
+                        .hint_text("filter saved configs…")
+                        .desired_width(200.0),
+                );
+                if ui
+                    .button("⟳")
+                    .on_hover_text("Refresh the saved-configs list")
+                    .clicked()
+                {
+                    self.state.reload_pending = true;
+                }
+                if ui
+                    .button("📂 Open folder")
+                    .on_hover_text("Open the backup folder in your file manager")
+                    .clicked()
+                {
+                    open_folder(&dastyab_core::backup::backup_dir());
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} saved config(s)",
+                        self.state.backups.len()
+                    ))
+                    .color(GOLD_DIM)
+                    .small(),
+                );
+            });
+
+            let query = self.backups_search.trim().to_lowercase();
+            let backups: Vec<_> = self
+                .state
+                .backups
+                .iter()
+                .filter(|b| {
+                    query.is_empty()
+                        || b.profile_name.to_lowercase().contains(&query)
+                        || b.profile_id.to_lowercase().contains(&query)
+                })
+                .collect();
+
             if backups.is_empty() {
                 ui.label(
-                    egui::RichText::new("No saved configs yet — take a snapshot above.")
-                        .color(GOLD_DIM),
+                    egui::RichText::new(
+                        if query.is_empty() {
+                            "No saved configs yet — take a snapshot above."
+                        } else {
+                            "No saved config matches that search."
+                        },
+                    )
+                    .color(GOLD_DIM),
                 );
             } else {
-                ui.label(
-                    egui::RichText::new(format!("{} saved config(s)", backups.len()))
-                        .color(GOLD_DIM)
-                        .small(),
-                );
                 egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .max_height(180.0)
-                .show(ui, |ui| {
-                    for b in &backups {
-                        egui::Frame::new()
-                            .fill(PANEL)
-                            .inner_margin(egui::Margin::symmetric(8, 6))
-                            .corner_radius(6.0)
-                            .stroke(egui::Stroke::new(1.0, crate::views::CARD_STROKE))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(&b.profile_name)
-                                                .color(TEXT)
-                                                .strong(),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{} · {}",
-                                                dastyab_core::backup::human_size(b.size),
-                                                b.created_at
-                                            ))
-                                            .color(GOLD_DIM)
-                                            .small(),
+                    .auto_shrink([false, false])
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for b in backups {
+                            egui::Frame::new()
+                                .fill(PANEL)
+                                .inner_margin(egui::Margin::symmetric(8, 6))
+                                .corner_radius(6.0)
+                                .stroke(egui::Stroke::new(1.0, crate::views::CARD_STROKE))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(&b.profile_name)
+                                                    .color(TEXT)
+                                                    .strong(),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} · {} · {}",
+                                                    dastyab_core::backup::human_size(b.size),
+                                                    crate::state::relative_ts(
+                                                        chrono::NaiveDateTime::parse_from_str(
+                                                            &b.created_at,
+                                                            "%Y-%m-%d %H:%M:%S"
+                                                        )
+                                                        .ok()
+                                                        .map(|d| d.and_utc().timestamp())
+                                                        .unwrap_or(0)
+                                                    ),
+                                                    b.created_at
+                                                ))
+                                                .color(GOLD_DIM)
+                                                .small(),
+                                            );
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("🗑").on_hover_text("Delete this snapshot").clicked() {
+                                                    match dastyab_core::backup::delete_backup(
+                                                        std::path::Path::new(&b.path),
+                                                    ) {
+                                                        Ok(_) => {
+                                                            self.backup_output = format!(
+                                                                "Deleted snapshot {}.",
+                                                                b.path
+                                                            );
+                                                            self.state.reload_pending = true;
+                                                        }
+                                                        Err(e) => {
+                                                            self.backup_output = e.explain()
+                                                        }
+                                                    }
+                                                }
+                                                if ui.button("Restore").on_hover_text("Restore this snapshot into a new profile").clicked() {
+                                                    match dastyab_core::backup::import_profile_from_file(
+                                                        std::path::Path::new(&b.path),
+                                                    ) {
+                                                        Ok(pid) => {
+                                                            self.backup_output = format!(
+                                                                "✓ Restored into new profile '{pid}'."
+                                                            );
+                                                            self.state.reload_pending = true;
+                                                        }
+                                                        Err(e) => self.backup_output = e.explain(),
+                                                    }
+                                                }
+                                            },
                                         );
                                     });
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui.button("🗑").on_hover_text("Delete this snapshot").clicked() {
-                                                match dastyab_core::backup::delete_backup(
-                                                    std::path::Path::new(&b.path),
-                                                ) {
-                                                    Ok(_) => {
-                                                        self.backup_output = format!(
-                                                            "Deleted snapshot {}.",
-                                                            b.path
-                                                        );
-                                                        self.state.reload_pending = true;
-                                                    }
-                                                    Err(e) => {
-                                                        self.backup_output = e.explain()
-                                                    }
-                                                }
-                                            }
-                                            if ui.button("Restore").on_hover_text("Restore this snapshot into a new profile").clicked() {
-                                                match dastyab_core::backup::import_profile_from_file(
-                                                    std::path::Path::new(&b.path),
-                                                ) {
-                                                    Ok(pid) => {
-                                                        self.backup_output = format!(
-                                                            "✓ Restored into new profile '{pid}'."
-                                                        );
-                                                        self.state.reload_pending = true;
-                                                    }
-                                                    Err(e) => self.backup_output = e.explain(),
-                                                }
-                                            }
-                                        },
-                                    );
                                 });
-                            });
-                        ui.add_space(4.0);
-                    }
-                });
+                            ui.add_space(4.0);
+                        }
+                    });
             }
         } // if self.sec_backups
 

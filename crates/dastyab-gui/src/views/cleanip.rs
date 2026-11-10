@@ -33,6 +33,28 @@ pub enum CleanipAction {
     ProbeAll,
 }
 
+/// How the Clean IPs list is sorted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CleanipSort {
+    /// Original save order (newest last).
+    #[default]
+    Added,
+    /// Numerically by port (lowest first).
+    Port,
+    /// Grouped by source (manual → imported → scanned).
+    Source,
+}
+
+impl CleanipSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            CleanipSort::Added => "added",
+            CleanipSort::Port => "port",
+            CleanipSort::Source => "source",
+        }
+    }
+}
+
 /// Accent for a clean-IP source.
 fn source_color(source: &str) -> egui::Color32 {
     match source {
@@ -90,8 +112,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
             ui.add(
                 egui::TextEdit::singleline(&mut app.cleanip_search)
                     .hint_text("filter IPs…")
-                    .desired_width(200.0),
+                    .desired_width(160.0),
             );
+            // Sort selector.
+            egui::ComboBox::from_id_salt("cleanip_sort")
+                .selected_text(format!("sort: {}", app.cleanip_sort.label()))
+                .show_ui(ui, |ui| {
+                    for mode in [CleanipSort::Added, CleanipSort::Port, CleanipSort::Source] {
+                        ui.selectable_value(&mut app.cleanip_sort, mode, mode.label());
+                    }
+                });
             if ui
                 .button("📋 Copy all")
                 .on_hover_text("Copy every saved IP")
@@ -127,14 +157,43 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
         );
     } else {
         let query = app.cleanip_search.trim().to_lowercase();
-        let matched: Vec<&String> = ips
+        let mut matched: Vec<&String> = ips
             .iter()
             .filter(|ip| query.is_empty() || ip.to_lowercase().contains(&query))
             .collect();
 
+        // Apply the selected sort (stable — preserves save order within a key).
+        match app.cleanip_sort {
+            CleanipSort::Added => {}
+            CleanipSort::Port => matched.sort_by_key(|ip| {
+                ip.rsplit_once(':')
+                    .and_then(|(_, p)| p.parse::<u16>().ok())
+                    .unwrap_or(443)
+            }),
+            CleanipSort::Source => matched.sort_by_key(|ip| {
+                let meta = app.state.clean_ip_meta.get(ip.as_str());
+                let src = meta.and_then(|m| m.split(':').next()).unwrap_or("scan");
+                match src {
+                    "manual" => 0,
+                    "import" => 1,
+                    _ => 2,
+                }
+            }),
+        }
+
         if matched.is_empty() {
             ui.label(egui::RichText::new("No saved IP matches that search.").color(GOLD_DIM));
         } else {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} of {} saved IP(s)",
+                    matched.len(),
+                    ips.len()
+                ))
+                .color(GOLD_DIM)
+                .small(),
+            );
+            ui.add_space(2.0);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .max_height(380.0)
