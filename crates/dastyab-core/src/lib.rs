@@ -40,6 +40,7 @@ pub mod autonomy;
 pub mod autopilot;
 pub mod backup;
 pub mod backup_autosync;
+pub mod carrier_pool;
 pub mod blackout;
 pub mod blackout_bridge;
 pub mod bootstrap;

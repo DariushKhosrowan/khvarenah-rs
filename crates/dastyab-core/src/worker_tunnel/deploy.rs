@@ -152,19 +152,20 @@ mod tests {
     use crate::cf::Client;
 
     /// A minimal mock CF API server that scripts the workers-dev-subdomain,
-    /// deploy, and set-vars calls, capturing the request paths so tests can
-    /// assert sequencing. Returns the base URL to point the Client at.
+    /// deploy, and set-vars calls, capturing the request lines in memory so
+    /// tests can assert sequencing without a shared file (parallel-safe).
+    /// Returns `(base_url, log)` — `log` is appended per request.
     ///
     /// Endpoints served (any method):
     /// - GET /accounts/{id}/workers/subdomain → { result: { subdomain: "sub" } }
     /// - PUT /accounts/{id}/workers/scripts/{name} → { success: true }
     /// - PATCH /accounts/{id}/workers/scripts/{name}/settings → { success: true }
-    fn mock_cf_server() -> String {
+    fn mock_cf_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log2 = log.clone();
         std::thread::spawn(move || {
-            // Serve a handful of requests, echoing request lines to a shared log.
-            let mut log: Vec<String> = Vec::new();
             for _ in 0..6 {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -179,33 +180,31 @@ mod tests {
                         } else {
                             String::new()
                         };
-                        log.push(first_line.clone());
-                        if !body_capture.is_empty() {
-                            log.push(body_capture.trim_end().to_string());
+                        {
+                            let mut log = log2.lock().unwrap();
+                            log.push(first_line.clone());
+                            if !body_capture.is_empty() {
+                                log.push(body_capture.trim_end().to_string());
+                            }
                         }
                         let body = if first_line.contains("/workers/subdomain") {
                             r#"{"success":true,"result":{"subdomain":"sub"}}"#
                         } else {
                             r#"{"success":true,"result":{}}"#
                         };
-                        let status = if first_line.starts_with("PATCH") { 200 } else { 200 };
+                        let status = 200;
                         let resp = format!(
                             "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         );
                         let _ = stream.write_all(resp.as_bytes());
                         let _ = stream.flush();
-                        // Flush the request log after every request so tests can read
-                        // it without waiting for the accept-loop to drain.
-                        let _ = std::fs::write("/tmp/kv_cf_mock_log.txt", log.join("\n"));
                     }
                     Err(_) => break,
                 }
             }
-            // Persist the request log for assertion.
-            let _ = std::fs::write("/tmp/kv_cf_mock_log.txt", log.join("\n"));
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), log)
     }
 
     fn opts() -> WorkerTunnelDeployOpts {
@@ -220,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deploy_worker_tunnel_auto_names_worker() {
-        let base = mock_cf_server();
+        let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
         let res = deploy_worker_tunnel(&cf, "acc1", "p1", &opts()).await.unwrap();
         assert!(res.worker_name.starts_with("dyb-tun-"));
@@ -230,7 +229,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deploy_worker_tunnel_persists_worker_mode_config() {
-        let base = mock_cf_server();
+        let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
         let _ = deploy_worker_tunnel(&cf, "acc1", "p_worker_mode", &opts()).await.unwrap();
         let cfg = crate::vps_deploy::load_tunnel_client_config("p_worker_mode").unwrap();
@@ -242,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deploy_worker_tunnel_sets_session_secret_var() {
-        let base = mock_cf_server();
+        let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
         let res = deploy_worker_tunnel(&cf, "acc1", "p_secvar", &opts()).await.unwrap();
         assert_eq!(res.shared_secret.len(), 32);
@@ -251,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deploy_worker_tunnel_returns_workers_dev_url() {
-        let base = mock_cf_server();
+        let (base, _log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
         let res = deploy_worker_tunnel(&cf, "acc1", "p_url", &opts()).await.unwrap();
         assert!(res.worker_url.starts_with("https://"));
@@ -261,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deploy_worker_tunnel_persists_vless_upstream() {
-        let base = mock_cf_server();
+        let (base, log) = mock_cf_server();
         let cf = Client::with_base("tok", &base);
         let mut o = opts();
         o.vless_upstream = Some("203.0.113.10:443".into());
@@ -269,7 +268,7 @@ mod tests {
         let cfg = crate::vps_deploy::load_tunnel_client_config("p_upstream").unwrap();
         assert_eq!(cfg.worker_vless_upstream.as_deref(), Some("203.0.113.10:443"));
         // The deploy PUT and set_vars requests must both carry the upstream.
-        let log = std::fs::read_to_string("/tmp/kv_cf_mock_log.txt").unwrap_or_default();
+        let log = log.lock().unwrap().join("\n");
         assert!(log.contains("DYB_VLESS_UPSTREAM"), "log: {log}");
     }
 
