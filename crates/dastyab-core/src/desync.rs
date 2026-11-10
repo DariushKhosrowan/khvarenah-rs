@@ -99,38 +99,6 @@ pub fn fragment_plan(len: usize, rng: &mut impl Rng, cfg: &DesyncConfig) -> Vec<
     plan
 }
 
-/// Write `data` fragmented through `stream` (must be `Unpin`). Each fragment is
-/// written then flushed so it leaves as its own TLS record / TCP segment.
-/// When `cfg.enabled` is false, this is a single write (identical behavior).
-#[deprecated(note = "use plan_for_strategy + apply_plan for strategy-aware fragmentation")]
-pub async fn write_fragmented<W>(
-    stream: &mut W,
-    data: &[u8],
-    cfg: &DesyncConfig,
-) -> Result<(), std::io::Error>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    if !cfg.enabled || data.is_empty() {
-        stream.write_all(data).await?;
-        stream.flush().await?;
-        return Ok(());
-    }
-    let mut rng = rand::rngs::StdRng::from_entropy();
-    let plan = fragment_plan(data.len(), &mut rng, cfg);
-    let mut off = 0;
-    for frag in plan {
-        let end = off + frag;
-        stream.write_all(&data[off..end]).await?;
-        stream.flush().await?;
-        if cfg.inter_fragment_delay_us > 0 {
-            tokio::time::sleep(Duration::from_micros(cfg.inter_fragment_delay_us)).await;
-        }
-        off = end;
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Desync strategy ladder (round: anti-DPI connector)
 //
@@ -473,30 +441,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_fragmented_disabled_single_write() {
+    async fn test_write_none_strategy_single_chunk_single_flush() {
         let mut sink = Sink::new();
         let data = vec![b'x'; 300];
-        write_fragmented(&mut sink, &data, &DesyncConfig::default())
-            .await
-            .unwrap();
+        let plan = plan_for_strategy(
+            DesyncStrategy::None,
+            &data,
+            &DesyncConfig::default(),
+            &mut rand::rngs::StdRng::seed_from_u64(15),
+        );
+        assert_eq!(plan.len(), 1, "None strategy must produce one chunk");
+        apply_plan(&mut sink, &plan).await.unwrap();
         assert_eq!(
             sink.buf, data,
-            "disabled path must deliver identical bytes in one write"
+            "None strategy must deliver identical bytes in one write"
         );
         assert_eq!(
             sink.flushes, 1,
-            "disabled path must flush exactly once (single segment)"
+            "None strategy must flush exactly once (single segment)"
         );
     }
 
     #[tokio::test]
-    async fn test_write_fragmented_enabled_sends_exact_bytes() {
+    async fn test_apply_plan_fragmented_sends_exact_bytes() {
         let mut sink = Sink::new();
         let data =
             b"GET /api/abcdefghijkl HTTP/1.1\r\nHost: x.workers.dev\r\nUpgrade: websocket\r\n\r\n"
                 .to_vec();
         let cfg = cfg_on();
-        write_fragmented(&mut sink, &data, &cfg).await.unwrap();
+        let plan = plan_for_strategy(
+            DesyncStrategy::SplitTwo,
+            &data,
+            &cfg,
+            &mut rand::rngs::StdRng::seed_from_u64(16),
+        );
+        assert!(plan.len() > 1, "SplitTwo must produce multiple chunks");
+        apply_plan(&mut sink, &plan).await.unwrap();
         assert_eq!(
             sink.buf, data,
             "fragmented write must deliver the identical byte stream"
