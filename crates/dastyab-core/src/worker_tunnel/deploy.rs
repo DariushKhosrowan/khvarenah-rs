@@ -66,13 +66,27 @@ pub async fn deploy_worker_tunnel(
     };
     let shared_secret = session_secret(&opts.session_seed);
 
-    // Deploy the worker bundle.
-    cf.deploy_script(
+    // Ensure a KV namespace for the carrier-snapshot relay and bind it. The
+    // worker bundle reads `env.DYB_CARRIER_SNAPSHOT` (flags 4/5). Creating it
+    // here removes the last manual step — the token minted by the app already
+    // carries the KV scope (see create_api_token).
+    let kv_ns_id = cf
+        .ensure_kv_namespace(account_id, "dastyab-carrier-snapshot")
+        .await?;
+    let binding = serde_json::json!({
+        "type": "kv_namespace",
+        "name": "DYB_CARRIER_SNAPSHOT",
+        "namespace_id": kv_ns_id,
+    });
+
+    // Deploy the worker bundle (with the KV binding in metadata).
+    cf.deploy_script_with_bindings(
         account_id,
         &worker_name,
         WORKER_TUNNEL_JS.as_bytes().to_vec(),
         &opts.compat_date,
         opts.retries,
+        vec![binding],
     )
     .await?;
 
@@ -170,13 +184,62 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         use std::io::{Read, Write};
-                        let mut buf = [0u8; 8192];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let first_line = req.lines().next().unwrap_or("").to_string();
-                        // Capture the PATCH settings body (carries the vars JSON).
-                        let body_capture = if first_line.starts_with("PATCH") {
-                            req.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
+                        // Read headers first, then exactly Content-Length body
+                        // bytes. A single read() is racy for the large multipart
+                        // deploy body; reading to EOF deadlocks because the client
+                        // waits for our response before closing.
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        // Read until the header terminator is present.
+                        let mut header_end = None;
+                        while header_end.is_none() {
+                            let n = match stream.read(&mut chunk) {
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                header_end = Some(pos + 4);
+                            }
+                        }
+                        let Some(end) = header_end else {
+                            return;
+                        };
+                        // Parse Content-Length from the header section.
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        let clen: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.to_lowercase();
+                                l.strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse().ok())
+                            })
+                            .unwrap_or(0);
+                        while buf.len() < end + clen {
+                            let n = match stream.read(&mut chunk) {
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
+                        let req = String::from_utf8_lossy(&buf).to_string();
+                        let first_line = head.lines().next().unwrap_or("").to_string();
+                        // Capture the PATCH settings body (carries the vars JSON)
+                        // and the PUT deploy multipart body (carries metadata with
+                        // bindings) so tests can assert on both.
+                        let body_capture = if first_line.starts_with("PATCH")
+                            || first_line.starts_with("PUT")
+                        {
+                            // Start after the header terminator.
+                            buf.get(end..)
+                                .map(|b| String::from_utf8_lossy(b).to_string())
+                                .unwrap_or_default()
                         } else {
                             String::new()
                         };
@@ -189,6 +252,13 @@ mod tests {
                         }
                         let body = if first_line.contains("/workers/subdomain") {
                             r#"{"success":true,"result":{"subdomain":"sub"}}"#
+                        } else if first_line.contains("/storage/kv/namespaces") && first_line.starts_with("GET") {
+                            // List KV namespaces → empty on first call so the
+                            // ensure path creates one.
+                            r#"{"success":true,"result":[]}"#
+                        } else if first_line.contains("/storage/kv/namespaces") && first_line.starts_with("POST") {
+                            // Create KV namespace → return a synthetic id.
+                            r#"{"success":true,"result":{"id":"kv-ns-1","title":"dastyab-carrier-snapshot"}}"#
                         } else {
                             r#"{"success":true,"result":{}}"#
                         };
@@ -270,6 +340,21 @@ mod tests {
         // The deploy PUT and set_vars requests must both carry the upstream.
         let log = log.lock().unwrap().join("\n");
         assert!(log.contains("DYB_VLESS_UPSTREAM"), "log: {log}");
+    }
+
+    #[tokio::test]
+    async fn test_deploy_worker_tunnel_ensures_and_binds_kv_namespace() {
+        let (base, log) = mock_cf_server();
+        let cf = Client::with_base("tok", &base);
+        let _ = deploy_worker_tunnel(&cf, "acc1", "p_kv", &opts()).await.unwrap();
+        let log = log.lock().unwrap().join("\n");
+        // The KV list + create must both have happened (ensure path).
+        assert!(log.contains("/storage/kv/namespaces"), "log: {log}");
+        // The deploy PUT metadata must bind DYB_CARRIER_SNAPSHOT to the created
+        // namespace id.
+        assert!(log.contains("kv_namespace"), "log: {log}");
+        assert!(log.contains("DYB_CARRIER_SNAPSHOT"), "log: {log}");
+        assert!(log.contains("kv-ns-1"), "log: {log}");
     }
 
     #[tokio::test]

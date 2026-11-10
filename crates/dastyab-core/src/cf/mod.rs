@@ -79,6 +79,15 @@ pub struct WorkerRoute {
     pub script: String,
 }
 
+/// A Cloudflare KV namespace (the worker's carrier-snapshot relay store).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct KvNamespace {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+}
+
 /// Result of verifying a Cloudflare API token.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct VerifyResult {
@@ -451,6 +460,67 @@ impl Client {
         .await
     }
 
+    /// Deploy a worker with KV namespace bindings in its metadata. This is the
+    /// same upload as [`deploy_script`] but sets `bindings` (e.g. a
+    /// `kv_namespace` binding the bundle reads as `env.DYB_CARRIER_SNAPSHOT`).
+    pub async fn deploy_script_with_bindings(
+        &self,
+        account_id: &str,
+        name: &str,
+        js: Vec<u8>,
+        compat_date: &str,
+        retries: u32,
+        bindings: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, CFError> {
+        let metadata = serde_json::json!({
+            "main_module": "_worker.js",
+            "compatibility_date": compat_date,
+            "compatibility_flags": ["nodejs_compat"],
+            "bindings": bindings,
+        });
+        let metadata_str = metadata.to_string();
+
+        let mut last_err: Option<CFError> = None;
+        for attempt in 0..=retries {
+            let form = multipart::Form::new()
+                .part(
+                    "metadata",
+                    multipart::Part::text(metadata_str.clone())
+                        .mime_str("application/json")
+                        .unwrap(),
+                )
+                .part(
+                    "_worker.js",
+                    multipart::Part::bytes(js.clone())
+                        .mime_str("application/javascript")
+                        .unwrap(),
+                );
+
+            match self
+                .request(
+                    "PUT",
+                    &format!("/accounts/{account_id}/workers/scripts/{name}"),
+                    None,
+                    Some(form),
+                    "deploy worker",
+                    Some(std::time::Duration::from_secs(120)),
+                )
+                .await
+            {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    last_err = Some(e.clone());
+                    let retryable = e.status.map(|s| s == 429 || s >= 500).unwrap_or(false);
+                    if !retryable || attempt >= retries {
+                        return Err(e);
+                    }
+                    retry_backoff(attempt).await;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| CFError::new("Deploy", "unknown", "")))
+    }
+
     /// Delete a worker script.
     pub async fn delete_script(
         &self,
@@ -466,6 +536,74 @@ impl Client {
             None,
         )
         .await
+    }
+
+    // ------------------------------------------------------------------
+    // KV namespaces (worker carrier-snapshot relay store)
+    // ------------------------------------------------------------------
+
+    /// Create a KV namespace, returning its id. Errors if the title already
+    /// exists (the caller should list first or treat 4000-ish as pre-existing).
+    pub async fn create_kv_namespace(
+        &self,
+        account_id: &str,
+        title: &str,
+    ) -> Result<String, CFError> {
+        let body = serde_json::json!({ "title": title });
+        let resp = self
+            .request(
+                "POST",
+                &format!("/accounts/{account_id}/storage/kv/namespaces"),
+                Some(body),
+                None,
+                "create kv namespace",
+                None,
+            )
+            .await?;
+        resp.get("result")
+            .and_then(|r| r.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                CFError::new(
+                    "create-kv-namespace",
+                    "API response missing the namespace id",
+                    "The KV namespace may have been created but its id was not returned.",
+                )
+            })
+    }
+
+    /// List KV namespaces in the account.
+    pub async fn list_kv_namespaces(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<KvNamespace>, CFError> {
+        let body = self
+            .request(
+                "GET",
+                &format!("/accounts/{account_id}/storage/kv/namespaces?per_page=100"),
+                None,
+                None,
+                "list kv namespaces",
+                None,
+            )
+            .await?;
+        Ok(parse_list::<KvNamespace>(body, "result"))
+    }
+
+    /// Find a KV namespace by title, else create it. Idempotent; returns the
+    /// namespace id either way.
+    pub async fn ensure_kv_namespace(
+        &self,
+        account_id: &str,
+        title: &str,
+    ) -> Result<String, CFError> {
+        for ns in self.list_kv_namespaces(account_id).await? {
+            if ns.title == title {
+                return Ok(ns.id);
+            }
+        }
+        self.create_kv_namespace(account_id, title).await
     }
 
     // ------------------------------------------------------------------
