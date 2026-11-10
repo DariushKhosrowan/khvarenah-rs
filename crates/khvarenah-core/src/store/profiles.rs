@@ -197,6 +197,11 @@ pub struct ProfileConfig {
     /// degrades. 0 = system default (`daemon::DRILL_INTERVAL_SECS`, 86400).
     #[serde(default)]
     pub drill_interval_secs: u64,
+    /// Path to the durable offline carrier pool (the "which endpoints can I
+    /// try with zero network" substrate). Relative to the profile store unless
+    /// absolute. Defaults to `<mem_dir>/carrier_pool.json`.
+    #[serde(default)]
+    pub carrier_pool_path: Option<PathBuf>,
 }
 
 fn default_auto_rotate_on_blocked() -> bool {
@@ -300,6 +305,7 @@ impl Default for ProfileConfig {
             auto_rotate_on_blocked: true,
             network_down_sleep_secs: 0,
             drill_interval_secs: 0,
+            carrier_pool_path: None,
         }
     }
 }
