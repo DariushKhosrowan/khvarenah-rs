@@ -36,6 +36,15 @@ pub struct TokenSummary {
     pub is_active: bool,
 }
 
+/// One entry in the token-lifecycle ledger (adds/removes/active/verify).
+#[derive(Debug, Clone)]
+pub struct TokenLedgerRow {
+    pub kind: String,
+    pub label: String,
+    pub note: String,
+    pub epoch: i64,
+}
+
 /// Cached snapshot of what the sidebar + token view need to render.
 #[derive(Debug, Clone, Default)]
 pub struct GuiState {
@@ -46,6 +55,12 @@ pub struct GuiState {
     pub active_token_label: Option<String>,
     /// Saved clean IPs for the active profile (cached for fast rendering).
     pub clean_ips: Vec<String>,
+    /// Per-endpoint provenance metadata for the active profile.
+    pub clean_ip_meta: std::collections::BTreeMap<String, String>,
+    /// Manual known-good seed endpoints (imported, not yet verified).
+    pub seeds: Vec<String>,
+    /// Token-lifecycle ledger (newest first).
+    pub token_ledger: Vec<TokenLedgerRow>,
     /// Number of undelivered beacon alerts (outbox) for the active profile.
     pub beacon_outbox: usize,
     /// Set when a background mutation completes; the next frame calls reload.
@@ -93,6 +108,30 @@ impl GuiState {
         self.active_token_label = active_token;
 
         self.clean_ips = prof.clean_ips.clone();
+        self.clean_ip_meta = prof
+            .clean_ip_meta
+            .iter()
+            .map(|(k, m)| {
+                let port = if m.port == 443 {
+                    String::new()
+                } else {
+                    format!(":{}", m.port)
+                };
+                (k.clone(), format!("{}{port}", m.source))
+            })
+            .collect();
+
+        self.seeds = khvarenah_core::cf::ips::load_manual_seeds(&active);
+        self.token_ledger = prof
+            .token_history
+            .iter()
+            .map(|e| TokenLedgerRow {
+                kind: e.kind.clone(),
+                label: e.label.clone(),
+                note: e.note.clone(),
+                epoch: e.epoch as i64,
+            })
+            .collect();
 
         self.beacon_outbox = khvarenah_core::remote_beacon::load_outbox(&active).len();
 

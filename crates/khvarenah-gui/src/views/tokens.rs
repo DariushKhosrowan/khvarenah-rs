@@ -1,16 +1,25 @@
 //! Tokens view — a per-profile list of API tokens with add / remove /
 //! verify, an active-token marker, live search, and one-click "make active".
 //!
+//! Below the token list sits the **token-history ledger**: a durable timeline
+//! of every lifecycle event (added / removed / made-active / verified) so
+//! the user always knows who/what happened to their keys.
+//!
 //! Design: a gold-rule header, a stats chip row, a live filter box, then a
 //! scrollable card list. Active tokens get a gold stroke and a "● ACTIVE"
 //! badge; secondary tokens offer Make-active / Verify / Remove actions.
 
 use eframe::egui;
-use khvarenah_core::store::profiles::{get_token, remove_token, set_active_token};
+use khvarenah_core::store::profiles::{
+    get_token, record_token_verified, remove_token, set_active_token,
+};
 
 use crate::app::KhvarenahApp;
 use crate::bridge;
-use crate::views::{stat_chips, tag, CARD, CARD_STROKE, GOLD, GOLD_DIM, SUCCESS, TEXT};
+use crate::dialogs;
+use crate::views::{
+    section_card, stat_chips, tag, CARD, CARD_STROKE, GOLD, GOLD_DIM, SUCCESS, TEXT,
+};
 use khvarenah_core::CFError;
 
 /// Render the tokens panel. Returns an action the app should handle.
@@ -24,6 +33,19 @@ pub enum TokensAction {
     Verify(String),
     /// Mark this token as the profile's active token.
     MakeActive(String),
+}
+
+/// Label + accent for a token-ledger event kind.
+fn ledger_kind(kind: &str) -> (&str, egui::Color32) {
+    match kind {
+        "added" => ("added", egui::Color32::from_rgb(90, 210, 120)),
+        "removed" => ("removed", egui::Color32::from_rgb(220, 120, 120)),
+        "made_active" => ("made active", GOLD),
+        "verified" => ("verified", egui::Color32::from_rgb(140, 200, 255)),
+        "rotated" => ("rotated", egui::Color32::from_rgb(200, 160, 255)),
+        "auto_rotate" => ("auto-rotate", egui::Color32::from_rgb(255, 170, 90)),
+        other => (other, GOLD_DIM),
+    }
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<TokensAction> {
@@ -44,7 +66,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<TokensAction> {
             .active_token_label
             .clone()
             .unwrap_or_else(|| "—".to_string());
-        stat_chips(ui, &[("tokens", &total.to_string()), ("active", &active)]);
+        let events = app.state.token_ledger.len();
+        stat_chips(
+            ui,
+            &[
+                ("tokens", &total.to_string()),
+                ("active", &active),
+                ("events", &events.to_string()),
+            ],
+        );
     }
 
     if app.state.tokens.is_empty() {
@@ -83,7 +113,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<TokensAction> {
         } else {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .max_height(440.0)
+                .max_height(340.0)
                 .show(ui, |ui| {
                     for t in matched {
                         let is_active = t.is_active;
@@ -159,8 +189,95 @@ pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<TokensAction> {
         action = Some(TokensAction::Add);
     }
 
+    // ── Token-history ledger ───────────────────────────────────────
+    ui.add_space(10.0);
+    section_card(ui, "Token history", |ui| {
+        if app.state.token_ledger.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "No token events recorded yet — add, remove, or verify a token to build the ledger.",
+                )
+                .color(GOLD_DIM),
+            );
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Search:").color(GOLD_DIM));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.token_history_search)
+                    .hint_text("filter events…")
+                    .desired_width(200.0),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("🗑 Clear ledger")
+                    .on_hover_text("Delete the whole token-history ledger")
+                    .clicked()
+                {
+                    app.pending_action = Some(crate::app::PendingDialogAction::ClearTokenHistory);
+                    app.dialog = Some(dialogs::confirm(
+                        "Clear token history",
+                        "Delete the entire token-history ledger for this profile? Tokens themselves are not touched.",
+                        true,
+                    ));
+                }
+            });
+        });
+        ui.add_space(4.0);
+        let q = app.token_history_search.trim().to_lowercase();
+        let shown = app
+            .state
+            .token_ledger
+            .iter()
+            .filter(|e| {
+                q.is_empty()
+                    || e.label.to_lowercase().contains(&q)
+                    || e.kind.to_lowercase().contains(&q)
+                    || e.note.to_lowercase().contains(&q)
+            })
+            .collect::<Vec<_>>();
+        if shown.is_empty() {
+            ui.label(egui::RichText::new("No events match that search.").color(GOLD_DIM));
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(220.0)
+            .show(ui, |ui| {
+                for e in shown {
+                    let (label, color) = ledger_kind(&e.kind);
+                    egui::Frame::new()
+                        .fill(PANEL_ROW)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .corner_radius(6.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                tag(ui, label, color);
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(&e.label).color(TEXT).strong());
+                                ui.label(egui::RichText::new(&e.note).color(GOLD_DIM).small());
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(crate::state::format_ts(e.epoch))
+                                                .color(GOLD_DIM)
+                                                .small(),
+                                        );
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+            });
+    });
+
     action
 }
+
+/// Row surface for ledger entries (slightly darker than card).
+const PANEL_ROW: egui::Color32 = egui::Color32::from_rgb(20, 17, 12);
 
 /// Run a token action. Returns the dialog to open, if any.
 pub fn run_action(app: &mut KhvarenahApp, action: TokensAction) -> Option<crate::dialogs::Dialog> {
@@ -190,6 +307,7 @@ pub fn run_action(app: &mut KhvarenahApp, action: TokensAction) -> Option<crate:
                 Some(token) => {
                     let tx = app.tx.clone();
                     let run_label = label.clone();
+                    let pid2 = pid.clone();
                     bridge::spawn(&format!("verify-{label}"), tx, async move {
                         let client = khvarenah_core::cf::Client::new(&token);
                         let res = client.verify_token().await?;
@@ -199,6 +317,11 @@ pub fn run_action(app: &mut KhvarenahApp, action: TokensAction) -> Option<crate:
                             res.status
                         };
                         if status == "active" {
+                            let _ = record_token_verified(
+                                &pid2,
+                                &run_label,
+                                "verified active on Cloudflare",
+                            );
                             Ok::<String, CFError>(format!(
                                 "✓ token '{run_label}' verified (active)."
                             ))

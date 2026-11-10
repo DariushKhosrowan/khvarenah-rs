@@ -1,12 +1,16 @@
 //! Clean IPs view — a fast, searchable manager for the profile's saved
-//! clean-IP endpoints. Includes copy/delete per entry, search, stats,
-//! copy-all, clear-all, and import of known-good seeds.
+//! clean-IP endpoints. Includes per-entry provenance (source + port), copy /
+//! delete, search, stats, copy-all, clear-all, manual add, import of
+//! known-good seeds, and a live per-entry reachability probe.
 
 use eframe::egui;
-use khvarenah_core::store::profiles::remove_clean_ip;
+use khvarenah_core::store::profiles::{remember_clean_ip_with_source, remove_clean_ip};
 
 use crate::app::KhvarenahApp;
-use crate::views::{mono_copy_row, stat_chips, CARD, CARD_STROKE, GOLD, GOLD_DIM};
+use crate::views::{
+    mono_copy_row, section_card, stat_chips, tag, CARD, CARD_STROKE, GOLD, GOLD_DIM, SUCCESS,
+};
+use khvarenah_core::CFError;
 
 /// Actions the Clean IPs view can request.
 #[derive(Debug)]
@@ -21,6 +25,29 @@ pub enum CleanipAction {
     CopyAll,
     /// Export all endpoints as text (handled inline).
     Export,
+    /// Add one endpoint manually.
+    AddManual(String),
+    /// Probe one saved clean IP for reachability (spawns a bridge task).
+    Probe(String),
+    /// Probe every saved clean IP in sequence.
+    ProbeAll,
+}
+
+/// Accent for a clean-IP source.
+fn source_color(source: &str) -> egui::Color32 {
+    match source {
+        "manual" => GOLD,
+        "import" => egui::Color32::from_rgb(140, 200, 255),
+        _ => SUCCESS,
+    }
+}
+
+fn source_label(source: &str) -> &'static str {
+    match source {
+        "manual" => "manual",
+        "import" => "seeded",
+        _ => "scanned",
+    }
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<CleanipAction> {
@@ -28,24 +55,42 @@ pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<CleanipAction> 
 
     ui.heading(egui::RichText::new("Clean IPs").color(GOLD));
     ui.label(
-        egui::RichText::new("Verified endpoints saved per profile — search, copy, or prune.")
-            .color(GOLD_DIM),
+        egui::RichText::new(
+            "Verified endpoints saved per profile — search, copy, probe, or prune.",
+        )
+        .color(GOLD_DIM),
     );
     ui.add_space(6.0);
 
     let ips = &app.state.clean_ips;
 
     // Stats chip row (always visible, even when empty).
-    stat_chips(ui, &[("saved", &ips.len().to_string())]);
+    let mut ports: std::collections::BTreeSet<u16> = Default::default();
+    for ip in ips {
+        if let Some((_, p)) = ip.rsplit_once(':') {
+            if let Ok(p) = p.parse::<u16>() {
+                ports.insert(p);
+            }
+        }
+    }
+    let seeds = app.state.seeds.len();
+    stat_chips(
+        ui,
+        &[
+            ("saved", &ips.len().to_string()),
+            ("ports", &ports.len().to_string()),
+            ("seeds", &seeds.to_string()),
+        ],
+    );
 
-    // Search box (only when there is anything to search).
+    // Search + bulk action row (only when there is anything to search).
     if !ips.is_empty() {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Search:").color(GOLD_DIM));
             ui.add(
                 egui::TextEdit::singleline(&mut app.cleanip_search)
                     .hint_text("filter IPs…")
-                    .desired_width(220.0),
+                    .desired_width(200.0),
             );
             if ui
                 .button("📋 Copy all")
@@ -61,6 +106,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<CleanipAction> 
             {
                 action = Some(CleanipAction::Export);
             }
+            if ui
+                .button("⚡ Probe all")
+                .on_hover_text("Reachability-test every saved IP")
+                .clicked()
+            {
+                action = Some(CleanipAction::ProbeAll);
+            }
         });
         ui.add_space(4.0);
     }
@@ -69,7 +121,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<CleanipAction> 
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new(
-                "No clean IPs found yet — scan from Deploy & Scan, or import known-good seeds below.",
+                "No clean IPs found yet — scan from Deploy & Scan, add one below, or import known-good seeds.",
             )
             .color(GOLD_DIM),
         );
@@ -85,9 +137,17 @@ pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<CleanipAction> 
         } else {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .max_height(420.0)
+                .max_height(380.0)
                 .show(ui, |ui| {
                     for ip in matched {
+                        let meta = app.state.clean_ip_meta.get(ip.as_str());
+                        let (src_label, src_color) = match meta {
+                            Some(m) => {
+                                let s = m.split(':').next().unwrap_or("scan");
+                                (source_label(s), source_color(s))
+                            }
+                            None => ("scanned", source_color("scan")),
+                        };
                         egui::Frame::new()
                             .fill(CARD)
                             .inner_margin(egui::Margin::symmetric(10, 8))
@@ -97,15 +157,27 @@ pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<CleanipAction> 
                                 ui.horizontal(|ui| {
                                     ui.vertical(|ui| {
                                         mono_copy_row(ui, ip);
-                                        ui.label(
-                                            egui::RichText::new("verified clean-IP")
-                                                .color(GOLD_DIM)
-                                                .small(),
-                                        );
+                                        ui.horizontal(|ui| {
+                                            tag(ui, src_label, src_color);
+                                            if let Some(m) = meta {
+                                                if let Some((_, p)) = m.rsplit_once(':') {
+                                                    if let Ok(p) = p.parse::<u16>() {
+                                                        tag(ui, &format!(":{p}"), GOLD_DIM);
+                                                    }
+                                                }
+                                            }
+                                        });
                                     });
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
+                                            if ui
+                                                .button("⚡")
+                                                .on_hover_text("Probe reachability")
+                                                .clicked()
+                                            {
+                                                action = Some(CleanipAction::Probe(ip.clone()));
+                                            }
                                             if ui
                                                 .button("🗑")
                                                 .on_hover_text("Remove this clean IP")
@@ -126,6 +198,40 @@ pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<CleanipAction> 
     ui.add_space(8.0);
     ui.separator();
 
+    // Manual add box.
+    ui.horizontal(|ui| {
+        let mut add_text = String::new();
+        add_text.push_str(&app.cleanip_add_draft);
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut add_text)
+                .hint_text("Add one endpoint manually, e.g. 104.16.1.1:443")
+                .desired_width(300.0),
+        );
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let v = add_text.trim().to_string();
+            if !v.is_empty() {
+                action = Some(CleanipAction::AddManual(v));
+            }
+        }
+        if ui.button("➕ Add").clicked() {
+            let v = add_text.trim().to_string();
+            if !v.is_empty() {
+                action = Some(CleanipAction::AddManual(v));
+            }
+        }
+    });
+
+    // Probe output line (from a background probe task).
+    if !app.cleanip_test_output.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(&app.cleanip_test_output)
+                .color(GOLD)
+                .small(),
+        );
+    }
+    ui.add_space(4.0);
+
     // Action row.
     ui.horizontal(|ui| {
         if ui.button("📥 Import known-good IPs").clicked() {
@@ -138,6 +244,40 @@ pub fn show(ui: &mut egui::Ui, app: &mut KhvarenahApp) -> Option<CleanipAction> 
             action = Some(CleanipAction::ClearAll);
         }
     });
+
+    ui.add_space(6.0);
+
+    // Seeds sub-list (imported known-good endpoints, not yet verified).
+    if !app.state.seeds.is_empty() {
+        section_card(ui, "Known-good seeds (imported)", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "These are saved as scan seeds — promote the ones you want saved as verified clean IPs.",
+                )
+                .color(GOLD_DIM)
+                .small(),
+            );
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    for s in app.state.seeds.clone() {
+                        ui.horizontal(|ui| {
+                            mono_copy_row(ui, &s);
+                            if ui
+                                .button("★ Save as IP")
+                                .on_hover_text("Promote this seed to a saved clean IP")
+                                .clicked()
+                            {
+                                action = Some(CleanipAction::AddManual(s));
+                            }
+                        });
+                        ui.add_space(2.0);
+                    }
+                });
+        });
+    }
 
     action
 }
@@ -154,6 +294,48 @@ pub fn run_action(app: &mut KhvarenahApp, action: CleanipAction) -> Option<crate
                 }
                 Err(e) => app.note = e.brief(),
             }
+            None
+        }
+        CleanipAction::AddManual(ip) => {
+            match remember_clean_ip_with_source(&app.state.active_profile_id, &ip, "manual") {
+                Ok(_) => {
+                    app.state.reload_pending = true;
+                    app.note = format!("Saved clean IP {ip}.");
+                }
+                Err(e) => app.note = e.brief(),
+            }
+            None
+        }
+        CleanipAction::Probe(ip) => {
+            let pid = app.state.active_profile_id.clone();
+            let tx = app.tx.clone();
+            bridge_probe(pid, ip.clone(), tx);
+            app.cleanip_test_output = format!("Probing {ip}…");
+            None
+        }
+        CleanipAction::ProbeAll => {
+            let ips = app.state.clean_ips.clone();
+            let pid = app.state.active_profile_id.clone();
+            let tx = app.tx.clone();
+            let total = ips.len();
+            crate::bridge::spawn("probe-all", tx, async move {
+                let mut ok = 0usize;
+                let mut out = String::new();
+                for ip in &ips {
+                    let reachable = probe_endpoint(ip).await;
+                    out.push_str(&format!(
+                        "  {ip} -> {}\n",
+                        if reachable { "OK" } else { "FAIL" }
+                    ));
+                    if reachable {
+                        ok += 1;
+                        let _ = remember_clean_ip_with_source(&pid, ip, "scan");
+                    }
+                }
+                out.push_str(&format!("{ok}/{} reachable", ips.len()));
+                Ok::<String, CFError>(out)
+            });
+            app.cleanip_test_output = format!("Probing {total} endpoint(s)…");
             None
         }
         CleanipAction::CopyAll => {
@@ -188,4 +370,43 @@ pub fn run_action(app: &mut KhvarenahApp, action: CleanipAction) -> Option<crate
             ))
         }
     }
+}
+
+/// Spawn a single-endpoint reachability probe (bridge task).
+fn bridge_probe(pid: String, ip: String, tx: crate::bridge::Tx) {
+    let ip2 = ip.clone();
+    crate::bridge::spawn(&format!("probe-{ip2}"), tx, async move {
+        let ok = probe_endpoint(&ip).await;
+        if ok {
+            let _ = remember_clean_ip_with_source(&pid, &ip, "scan");
+            Ok::<String, CFError>(format!("{ip} reachable ✓"))
+        } else {
+            Err(CFError::new(
+                "Probe failed",
+                format!("{ip} did not respond on the given port."),
+                "It may be blocked from this network, or the port is wrong.",
+            ))
+        }
+    });
+}
+
+/// Best-effort TCP reachability probe for an `ip[:port]` endpoint.
+async fn probe_endpoint(ep: &str) -> bool {
+    let (host, port) = match ep.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(443)),
+        None => (ep.to_string(), 443),
+    };
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+    let addr = match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(mut it) => match it.next() {
+            Some(a) => a,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(&addr))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
 }
