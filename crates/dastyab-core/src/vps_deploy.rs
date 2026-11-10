@@ -113,16 +113,52 @@ impl DeployStep {
 }
 
 /// Client-side tunnel config, persisted per-profile.
+/// How a DNS tunnel is hosted.
+///
+/// `Vps` (default) is the legacy dnstt-style authoritative DNS server on a
+/// VPS, probed via raw UDP:53. `Worker` is the newer Cloudflare-Worker-hosted
+/// control-plane tunnel (HTTPS/DoH-style), probed via HTTPS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelMode {
+    /// Legacy VPS-hosted dnstt server.
+    #[default]
+    Vps,
+    /// Cloudflare-Worker-hosted tunnel (no VPS).
+    Worker,
+}
+
+/// Per-profile DNS-tunnel client configuration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TunnelClientConfig {
-    /// The VPS host the tunnel server lives on.
+    /// The server host — for `Vps` the VPS IP/hostname; for `Worker` the
+    /// workers.dev URL. `#[serde(default)]` + the `mode` field keep legacy
+    /// JSON (host/base_domain/session/resolver only) deserializing as Vps.
+    #[serde(default)]
     pub host: String,
-    /// DNS zone the server authoritatively answers (or forwards) for.
+    /// DNS zone the server authoritatively answers (or forwards) for. For a
+    /// worker tunnel this is set to the same workers.dev URL so existing
+    /// callers that key off it keep working.
+    #[serde(default)]
     pub base_domain: String,
     /// Session id shared with the server.
+    #[serde(default)]
     pub session: String,
     /// Which resolver transport to use (e.g. "doh" | "dot").
+    #[serde(default)]
     pub resolver: String,
+    /// Hosting mode. Defaults to Vps so legacy configs need no migration.
+    #[serde(default)]
+    pub mode: TunnelMode,
+    /// Worker tunnel: the workers.dev URL (also stored in `host`).
+    #[serde(default)]
+    pub worker_url: Option<String>,
+    /// Worker tunnel: deployed worker script name.
+    #[serde(default)]
+    pub worker_name: Option<String>,
+    /// Worker tunnel: shared-secret gate (X-DastYab-Session header).
+    #[serde(default)]
+    pub shared_secret: Option<String>,
 }
 
 impl Default for TunnelClientConfig {
@@ -132,7 +168,18 @@ impl Default for TunnelClientConfig {
             base_domain: String::new(),
             session: String::new(),
             resolver: "doh".into(),
+            mode: TunnelMode::default(),
+            worker_url: None,
+            worker_name: None,
+            shared_secret: None,
         }
+    }
+}
+
+impl TunnelClientConfig {
+    /// Whether this config describes a worker-hosted tunnel.
+    pub fn is_worker_mode(&self) -> bool {
+        self.mode == TunnelMode::Worker
     }
 }
 
@@ -383,6 +430,10 @@ WantedBy=multi-user.target
         base_domain: base_domain.to_string(),
         session,
         resolver: "doh".into(),
+        mode: TunnelMode::default(),
+        worker_url: None,
+        worker_name: None,
+        shared_secret: None,
     };
     write_tunnel_client_config(profile_id, &client)?;
     emit(DeployStep::ExportClientConfig, &mut completed);
@@ -517,6 +568,10 @@ mod tests {
             base_domain: "t.example.com".into(),
             session: "abc123".into(),
             resolver: "doh".into(),
+            mode: TunnelMode::default(),
+            worker_url: None,
+            worker_name: None,
+            shared_secret: None,
         };
         write_tunnel_client_config(&profile, &cfg).unwrap();
         let loaded = load_tunnel_client_config(&profile).unwrap();

@@ -9,6 +9,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::dnstunnel::Resolver as _;
+
 /// Ordered transport tiers, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Tier {
@@ -278,6 +280,10 @@ async fn probe_tunnel(profile: &str) -> ProbeVerdict {
     match crate::vps_deploy::load_tunnel_client_config(profile) {
         None => ProbeVerdict::down("no tunnel configured"),
         Some(cfg) => {
+            // Worker-hosted tunnel → HTTPS liveness probe (no raw UDP).
+            if cfg.is_worker_mode() {
+                return probe_worker_tunnel_live(&cfg, std::time::Duration::from_millis(TUNNEL_PROBE_TIMEOUT_MS));
+            }
             // Live round-trip against the authoritative tunnel server. This
             // replaces the old "config presence only" check, so a dead /
             // unreachable VPS no longer reports a false "tunnel up" during a
@@ -294,6 +300,46 @@ async fn probe_tunnel(profile: &str) -> ProbeVerdict {
                 ProbeVerdict::down("dns-tunnel unreachable")
             }
         }
+    }
+}
+
+/// Probe a worker-hosted DNS tunnel: send a ping frame to the deployed worker
+/// over HTTPS and require a valid pong reply within `timeout`. Returns `Up`
+/// only on a successful round-trip.
+pub fn probe_worker_tunnel_live(
+    cfg: &crate::vps_deploy::TunnelClientConfig,
+    timeout: std::time::Duration,
+) -> ProbeVerdict {
+    let Some(url) = &cfg.worker_url else {
+        return ProbeVerdict::down("worker tunnel missing url");
+    };
+    let Some(secret) = &cfg.shared_secret else {
+        return ProbeVerdict::down("worker tunnel missing secret");
+    };
+    let resolver = crate::worker_tunnel::resolver::WorkerTunnelResolver::with_timeout(
+        url,
+        secret,
+        timeout,
+    );
+    let frame = crate::dnstunnel::TunnelFrame {
+        session: cfg.session.clone(),
+        seq: 1,
+        flags: 1, // ping
+        payload: b"alive".to_vec(),
+    };
+    let qname = frame.encode_name(&cfg.base_domain, rand::random::<u32>() & 0xFFFF);
+    match resolver.query_txt(&qname) {
+        Ok(reply) => match crate::dnstunnel::TunnelFrame::decode_name(
+            reply.trim_end_matches('.'),
+            &cfg.base_domain,
+        ) {
+            Ok(r) if r.flags == 0x81 && r.payload == b"pong" => {
+                ProbeVerdict::up("worker tunnel live")
+            }
+            Ok(_) => ProbeVerdict::down("worker tunnel bad reply"),
+            Err(_) => ProbeVerdict::down("worker tunnel decode failed"),
+        },
+        Err(_) => ProbeVerdict::down("worker tunnel unreachable"),
     }
 }
 
@@ -366,6 +412,87 @@ pub async fn drill_all_tiers<P: Probe>(probe: P) -> Vec<(Tier, ProbeVerdict)> {
 
 #[cfg(test)]
 mod tests {
+
+    // ── worker-mode tunnel probe tests ──
+    // A worker-mode tunnel with no reachable worker resolves by exercising the
+    // resolve worker tunnel live probe against a mock worker. These verify the
+    // dispatch (worker vs vps) and the live-probe verdict logic.
+
+    #[test]
+    fn worker_mode_config_roundtrips() {
+        use crate::vps_deploy::{TunnelClientConfig, TunnelMode};
+        let cfg = TunnelClientConfig {
+            host: "https://w.sub.workers.dev".into(),
+            base_domain: "t.un.dastyab.dev".into(),
+            session: "s".into(),
+            resolver: "https".into(),
+            mode: TunnelMode::Worker,
+            worker_url: Some("https://w.sub.workers.dev".into()),
+            worker_name: Some("w".into()),
+            shared_secret: Some("0123456789abcdef0123456789abcdef".into()),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: TunnelClientConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.is_worker_mode());
+        assert_eq!(back.worker_url.as_deref(), Some("https://w.sub.workers.dev"));
+    }
+
+    #[test]
+    fn legacy_json_defaults_to_vps_mode() {
+        use crate::vps_deploy::{TunnelClientConfig, TunnelMode};
+        // Legacy config: no `mode` field → must deserialize as Vps.
+        let legacy = r#"{"host":"1.2.3.4","base_domain":"t.example.com","session":"s","resolver":"doh"}"#;
+        let cfg: TunnelClientConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg.mode, TunnelMode::Vps);
+        assert!(!cfg.is_worker_mode());
+    }
+
+    #[test]
+    fn probe_worker_tunnel_live_down_when_url_missing() {
+        use crate::vps_deploy::{TunnelClientConfig, TunnelMode};
+        let cfg = TunnelClientConfig {
+            host: "".into(),
+            base_domain: "t.example.com".into(),
+            session: "s".into(),
+            resolver: "https".into(),
+            mode: TunnelMode::Worker,
+            worker_url: None,
+            worker_name: None,
+            shared_secret: None,
+        };
+        let v = probe_worker_tunnel_live(&cfg, std::time::Duration::from_millis(500));
+        assert!(!v.ok);
+        assert!(v.note.contains("missing"));
+    }
+
+    #[tokio::test]
+    async fn probe_tunnel_dispatches_worker_mode() {
+        use crate::vps_deploy::{TunnelClientConfig, TunnelMode};
+        // Isolate to a temp store so we never touch the real default profile.
+        let base = tempfile::tempdir().unwrap().path().join(".dastyab");
+        crate::store::set_mem_dir_override(base.clone());
+        let id = crate::store::profiles::create_profile("kv_probe_worker", "test").unwrap();
+        // A worker-mode config pointing at a dead URL (port 1 closed) → down,
+        // and the note should reflect the worker path (not raw UDP).
+        crate::vps_deploy::write_tunnel_client_config(
+            &id,
+            &TunnelClientConfig {
+                host: "http://127.0.0.1:1".into(),
+                base_domain: "t.example.com".into(),
+                session: "s".into(),
+                resolver: "https".into(),
+                mode: TunnelMode::Worker,
+                worker_url: Some("http://127.0.0.1:1".into()),
+                worker_name: Some("w".into()),
+                shared_secret: Some("a".into()),
+            },
+        )
+        .unwrap();
+        let v = probe_tunnel(&id).await;
+        assert!(!v.ok);
+        assert!(v.note.contains("worker"), "note was: {}", v.note);
+        let _ = std::fs::remove_dir_all(base);
+    }
     use super::*;
     use std::collections::HashMap;
 

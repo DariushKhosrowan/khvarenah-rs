@@ -124,6 +124,8 @@ pub struct DastYabApp {
     pub vps_port: u16,
     pub vps_domain: String,
     pub vps_note: String,
+    /// Worker-hosted DNS tunnel (no VPS) note/status line.
+    pub worker_tunnel_note: String,
     // zero-touch Hetzner VPS provisioning config
     pub hz_token: String,
     pub hz_location: String,
@@ -320,6 +322,7 @@ impl DastYabApp {
             vps_port: 22,
             vps_domain: String::new(),
             vps_note: String::new(),
+            worker_tunnel_note: String::new(),
             desync_enabled: profile.config.desync.enabled,
             desync_min: profile.config.desync.min_fragment,
             desync_max: profile.config.desync.max_fragment,
@@ -624,6 +627,10 @@ impl DastYabApp {
             base_domain: self.vps_domain.trim().to_string(),
             session: String::new(),
             resolver: "doh".to_string(),
+            mode: dastyab_core::vps_deploy::TunnelMode::default(),
+            worker_url: None,
+            worker_name: None,
+            shared_secret: None,
         };
         match dastyab_core::vps_deploy::write_tunnel_client_config(&self.profile_id, &cfg) {
             Ok(()) => {
@@ -689,6 +696,87 @@ impl DastYabApp {
                 }
             }
             Ok::<String, CFError>("dns-tunnel done".to_string())
+        });
+    }
+
+    /// Deploy the Worker-hosted DNS tunnel (no VPS) using the profile's active
+    /// Cloudflare token. Fully automatic — no VPS/SSH credentials needed.
+    fn deploy_worker_tunnel_gui(&mut self) {
+        // Grab the profile's first token.
+        let token = match dastyab_core::store::profiles::load_profile(&self.profile_id)
+            .tokens
+            .values()
+            .next()
+        {
+            Some(t) => t.token.clone(),
+            None => {
+                self.worker_tunnel_note =
+                    "No Cloudflare token on this profile — add one first on the Token tab.".to_string();
+                return;
+            }
+        };
+        let pid = self.profile_id.clone();
+        let tx = self.tx.clone();
+        self.running.push("dns-tunnel-worker".to_string());
+        self.worker_tunnel_note = "Deploying Worker DNS tunnel (no VPS)…".to_string();
+        let tx2 = tx.clone();
+        bridge::spawn("dns-tunnel-worker", tx.clone(), async move {
+            let client = dastyab_core::cf::Client::new(&token);
+            let accs = match client.list_accounts().await {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
+                        task: "dns-tunnel-worker".to_string(),
+                        error: e,
+                    });
+                    return Ok::<String, CFError>("worker-tunnel done".to_string());
+                }
+            };
+            let acc = match accs.first() {
+                Some(a) => a.clone(),
+                None => {
+                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
+                        task: "dns-tunnel-worker".to_string(),
+                        error: CFError::new(
+                            "No account",
+                            "No Cloudflare account accessible.",
+                            "Check token permissions.",
+                        ),
+                    });
+                    return Ok::<String, CFError>("worker-tunnel done".to_string());
+                }
+            };
+            let opts = dastyab_core::worker_tunnel::WorkerTunnelDeployOpts {
+                worker_name: None,
+                session_seed: format!("dyb-gui-{}", pid),
+                compat_date: "2026-07-01".into(),
+                retries: 2,
+            };
+            match dastyab_core::worker_tunnel::deploy_worker_tunnel(
+                &client,
+                &acc.id,
+                &pid,
+                &opts,
+            )
+            .await
+            {
+                Ok(res) => {
+                    let _ = tx2.send(crate::bridge::UiEvent::Log {
+                        task: "dns-tunnel-worker".to_string(),
+                        line: format!(
+                            "[worker-tunnel] deployed {} — the fallback ladder can now use it",
+                            res.worker_url
+                        ),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
+                        task: "dns-tunnel-worker".to_string(),
+                        error: CFError::new("Worker tunnel", e.brief(), "Check the CF token."),
+                    });
+                }
+            }
+            Ok::<String, CFError>("worker-tunnel done".to_string())
         });
     }
 
@@ -1862,12 +1950,20 @@ impl DastYabApp {
             if ui.button("Save VPS config").clicked() {
                 self.save_vps();
             }
-            if ui.button("Deploy DNS tunnel").clicked() {
+            if ui.button("Deploy DNS tunnel (VPS)").clicked() {
                 self.deploy_vps_tunnel();
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("⚡ Deploy Worker tunnel (no VPS)").clicked() {
+                self.deploy_worker_tunnel_gui();
             }
         });
         if !self.vps_note.is_empty() {
             ui.colored_label(GOLD, &self.vps_note);
+        }
+        if !self.worker_tunnel_note.is_empty() {
+            ui.colored_label(GOLD, &self.worker_tunnel_note);
         }
 
         ui.add_space(6.0);

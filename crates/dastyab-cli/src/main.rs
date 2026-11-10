@@ -342,6 +342,15 @@ pub enum DnsTunnelAction {
     },
     /// Show whether a DNS tunnel is deployed for the active profile.
     Status,
+    /// Deploy the Worker-hosted DNS tunnel (no VPS) with the profile's token.
+    Worker {
+        /// Explicit worker name (default: auto dyb-tun-<hex>).
+        #[arg(long)]
+        worker_name: Option<String>,
+        /// Cloudflare worker compatibility date.
+        #[arg(long, default_value = "2026-07-01")]
+        compat_date: String,
+    },
     /// Provision a fresh Hetzner Cloud VPS, then deploy the DNS tunnel to it.
     Provision {
         /// Hetzner Cloud API token.
