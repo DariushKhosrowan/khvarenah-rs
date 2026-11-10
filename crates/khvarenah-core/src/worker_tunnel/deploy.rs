@@ -9,7 +9,7 @@ use crate::cf::Client;
 use crate::error::CFError;
 use crate::vps_deploy::TunnelMode;
 use crate::worker_tunnel::KHV_TUNNEL_BASE;
-use crate::worker_tunnel::bundle::WORKER_TUNNEL_JS;
+use crate::worker_tunnel::bundle::{WORKER_CRON_SCHEDULE, WORKER_TUNNEL_JS};
 
 /// Options for a worker-tunnel deploy.
 #[derive(Debug, Clone)]
@@ -79,7 +79,9 @@ pub async fn deploy_worker_tunnel(
         "namespace_id": kv_ns_id,
     });
 
-    // Deploy the worker bundle (with the KV binding in metadata).
+    // Deploy the worker bundle (with the KV binding and self-ping cron
+    // trigger in metadata). The cron trigger keeps the worker alive during
+    // long blackouts so Cloudflare does not deactivate it as idle.
     cf.deploy_script_with_bindings(
         account_id,
         &worker_name,
@@ -87,6 +89,7 @@ pub async fn deploy_worker_tunnel(
         &opts.compat_date,
         opts.retries,
         vec![binding],
+        &[WORKER_CRON_SCHEDULE],
     )
     .await?;
 
@@ -355,6 +358,20 @@ mod tests {
         assert!(log.contains("kv_namespace"), "log: {log}");
         assert!(log.contains("KHV_CARRIER_SNAPSHOT"), "log: {log}");
         assert!(log.contains("kv-ns-1"), "log: {log}");
+    }
+
+    #[tokio::test]
+    async fn test_deploy_worker_tunnel_includes_self_ping_cron_trigger() {
+        let (base, log) = mock_cf_server();
+        let cf = Client::with_base("tok", &base);
+        let _ = deploy_worker_tunnel(&cf, "acc1", "p_cron", &opts()).await.unwrap();
+        let log = log.lock().unwrap().join("\n");
+        // The deploy PUT metadata must carry the self-ping cron trigger so the
+        // worker is scheduled to ping itself every 6h (keeps it from being
+        // deactivated as idle during a long blackout).
+        assert!(log.contains("triggers"), "log: {log}");
+        assert!(log.contains("crons"), "log: {log}");
+        assert!(log.contains(WORKER_CRON_SCHEDULE), "log: {log}");
     }
 
     #[tokio::test]
