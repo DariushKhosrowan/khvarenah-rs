@@ -336,21 +336,28 @@ pub enum LearningSignal {
 /// Classify a budgeted light-phase endpoint outcome into a [`LearningSignal`].
 /// The light phase aggregates across ports, so we map the *bucket* the sweep
 /// settled on. `TcpTimeoutAllPorts` = transport-level host unreachable (no
-/// handshake ever started) → `HostDown`. TLS/WS/route buckets imply the TCP
-/// layer at least connected → strategy-attributable. `BudgetExceeded` is
-/// ambiguous (could be host-down OR a slow-but-live peer) → `Unclassifiable`.
+/// handshake ever started) → `HostDown`. Note: the light aggregate carries NO
+/// HTTP status histogram, so the `WsUpgradeAllPorts`/`WorkerBytesAllPorts`
+/// buckets are ambiguous (they could be a strategy-attributable DPI/WAF reject,
+/// or an origin-unavailable worker behind a live TCP port). Per the "ambiguous
+/// ⇒ no learning" rule, those map to `Unclassifiable` and hold — the deeper
+/// per-probe path (which has the status) is the authority for the split.
+/// `TlsResetAllPorts` is a clear TLS-layer DPI signature → `StrategyFailure`.
+/// `BudgetExceeded` is ambiguous → `Unclassifiable`.
 pub fn classify_endpoint_outcome(
     stage: Option<crate::health::EndpointFailureStage>,
 ) -> LearningSignal {
     match stage {
         None => LearningSignal::Success,
         Some(crate::health::EndpointFailureStage::TcpTimeoutAllPorts) => LearningSignal::HostDown,
-        Some(crate::health::EndpointFailureStage::TlsResetAllPorts)
-        | Some(crate::health::EndpointFailureStage::WsUpgradeAllPorts)
-        | Some(crate::health::EndpointFailureStage::WorkerBytesAllPorts) => {
+        Some(crate::health::EndpointFailureStage::TlsResetAllPorts) => {
             LearningSignal::StrategyFailure
         }
-        Some(crate::health::EndpointFailureStage::BudgetExceeded) => LearningSignal::Unclassifiable,
+        Some(crate::health::EndpointFailureStage::WsUpgradeAllPorts)
+        | Some(crate::health::EndpointFailureStage::WorkerBytesAllPorts)
+        | Some(crate::health::EndpointFailureStage::BudgetExceeded) => {
+            LearningSignal::Unclassifiable
+        }
     }
 }
 
@@ -364,6 +371,24 @@ pub fn http_status_is_origin_unavailable(code: u16) -> bool {
     (500..600).contains(&code)
 }
 
+/// Classify an HTTP status from a WS-upgrade response into a [`LearningSignal`].
+/// Not all 4xx are strategy-attributable:
+/// - 401/403: auth/WAF/DPI fingerprint rejections → strategy-attributable.
+/// - 404: ambiguous (dead route vs config) → no learning (hold).
+/// - 408: request timeout → not strategy → no learning (hold).
+/// - 421: misdirected request → dead route/config → no learning (hold).
+/// - 429: rate limiting / throttling → not strategy → no learning (hold).
+/// - 5xx: origin unavailable → no learning (hold).
+/// - anything else: treat as ambiguous → no learning (safe default).
+pub fn http_status_learning_signal(code: u16) -> LearningSignal {
+    match code {
+        401 | 403 => LearningSignal::StrategyFailure,
+        404 | 408 | 421 | 429 => LearningSignal::Unclassifiable,
+        _ if http_status_is_origin_unavailable(code) => LearningSignal::Unclassifiable,
+        _ => LearningSignal::Unclassifiable,
+    }
+}
+
 /// Classify a single `WsProbe` failure reason (used by deeper per-probe paths)
 /// into a [`LearningSignal`]. `ConnectFailed`/`ConnectTimeout` are transport-
 /// level (never reached TLS) → `HostDown`. Everything after a successful TCP
@@ -375,17 +400,12 @@ pub fn classify_probe_failure(reason: Option<crate::health::WsFailureReason>) ->
         None => LearningSignal::Success,
         Some(crate::health::WsFailureReason::ConnectFailed)
         | Some(crate::health::WsFailureReason::ConnectTimeout) => LearningSignal::HostDown,
-        Some(crate::health::WsFailureReason::HttpStatus(code))
-            if http_status_is_origin_unavailable(code) =>
-        {
-            LearningSignal::Unclassifiable
-        }
+        Some(crate::health::WsFailureReason::HttpStatus(code)) => http_status_learning_signal(code),
         Some(
             crate::health::WsFailureReason::TlsAlert
             | crate::health::WsFailureReason::TlsTimeout
             | crate::health::WsFailureReason::WriteFailed
             | crate::health::WsFailureReason::ResponseIncomplete
-            | crate::health::WsFailureReason::HttpStatus(_)
             | crate::health::WsFailureReason::DeadRoute,
         ) => LearningSignal::StrategyFailure,
     }
@@ -1052,24 +1072,59 @@ mod tests {
             classify_endpoint_outcome(Some(S::TcpTimeoutAllPorts)),
             HostDown
         );
-        // Connected-then-failed buckets → strategy-attributable.
+        // Clear TLS-layer DPI signature → strategy-attributable.
         assert_eq!(
             classify_endpoint_outcome(Some(S::TlsResetAllPorts)),
             StrategyFailure
         );
+        // Ambiguous without an HTTP status histogram (could be DPI/WAF OR an
+        // origin-unavailable worker behind a live TCP port) → no learning.
         assert_eq!(
             classify_endpoint_outcome(Some(S::WsUpgradeAllPorts)),
-            StrategyFailure
+            Unclassifiable
         );
         assert_eq!(
             classify_endpoint_outcome(Some(S::WorkerBytesAllPorts)),
-            StrategyFailure
+            Unclassifiable
         );
         // Ambiguous / unknown → unclassifiable.
         assert_eq!(
             classify_endpoint_outcome(Some(S::BudgetExceeded)),
             Unclassifiable
         );
+    }
+
+    /// DeepSeek's light-path residual (A69–A71): a light sweep whose aggregate
+    /// is WorkerBytes/WsUpgrade — which carries NO HTTP status histogram — must
+    /// HOLD (not demote), because it could be an origin-unavailable worker
+    /// behind a live TCP port, indistinguishable from a DPI/WAF reject at this
+    /// aggregation level. Both are Unclassifiable ⇒ no learning.
+    #[test]
+    fn light_path_ambiguous_aggregates_hold_not_demote() {
+        use crate::health::EndpointFailureStage as S;
+        assert_eq!(
+            classify_endpoint_outcome(Some(S::WorkerBytesAllPorts)),
+            LearningSignal::Unclassifiable
+        );
+        assert_eq!(
+            classify_endpoint_outcome(Some(S::WsUpgradeAllPorts)),
+            LearningSignal::Unclassifiable
+        );
+        // Neither feeds the learner.
+        assert!(!should_learn(classify_endpoint_outcome(Some(
+            S::WorkerBytesAllPorts
+        ))));
+        assert!(!should_learn(classify_endpoint_outcome(Some(
+            S::WsUpgradeAllPorts
+        ))));
+        // The clear TLS-layer DPI signature still demotes.
+        assert_eq!(
+            classify_endpoint_outcome(Some(S::TlsResetAllPorts)),
+            LearningSignal::StrategyFailure
+        );
+        assert!(should_learn(classify_endpoint_outcome(Some(
+            S::TlsResetAllPorts
+        ))));
     }
 
     #[test]
@@ -1108,6 +1163,29 @@ mod tests {
         assert_eq!(
             classify_probe_failure(Some(R::HttpStatus(504))),
             Unclassifiable
+        );
+        // Non-strategy 4xx must NOT demote: 404 (ambiguous dead-route vs
+        // config), 408 (timeout), 421 (misdirected), 429 (rate limit).
+        assert_eq!(
+            classify_probe_failure(Some(R::HttpStatus(404))),
+            Unclassifiable
+        );
+        assert_eq!(
+            classify_probe_failure(Some(R::HttpStatus(408))),
+            Unclassifiable
+        );
+        assert_eq!(
+            classify_probe_failure(Some(R::HttpStatus(421))),
+            Unclassifiable
+        );
+        assert_eq!(
+            classify_probe_failure(Some(R::HttpStatus(429))),
+            Unclassifiable
+        );
+        // WAF/DPI 4xx stay strategy-attributable.
+        assert_eq!(
+            classify_probe_failure(Some(R::HttpStatus(401))),
+            StrategyFailure
         );
         assert!(http_status_is_origin_unavailable(502));
         assert!(http_status_is_origin_unavailable(503));
