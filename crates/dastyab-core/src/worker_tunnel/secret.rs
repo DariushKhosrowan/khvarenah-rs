@@ -1367,6 +1367,14 @@ mod tests {
             classify_light_sweep(0, 5, Some(&hist(&[(R::HttpStatus(403), 5)]))),
             StrategyFailure
         );
+        // Above-floor boundary pin: dead fraction JUST over the floor (3/6 =
+        // 0.5 > 1/3) with DPI-dominant failures → demote. Without this, a bug
+        // that made the gate <= 1.0 (hold everything) would pass the whole
+        // suite.
+        assert_eq!(
+            classify_light_sweep(3, 6, Some(&hist(&[(R::TlsAlert, 3)]))),
+            StrategyFailure
+        );
     }
 
     #[test]
