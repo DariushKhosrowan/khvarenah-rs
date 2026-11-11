@@ -487,15 +487,12 @@ mod linger_tests {
 
     #[test]
     fn parses_yes_no_and_weird_whitespace() {
-        #[test]
-        fn parses_yes_no_and_weird_whitespace() {
-            assert!(parse_linger(b"yes\n"));
-            assert!(parse_linger(b"yes"));
-            assert!(parse_linger(b" YES \n"));
-            assert!(!parse_linger(b"no\n"));
-            assert!(!parse_linger(b""));
-            assert!(!parse_linger(b"nonsense"));
-        }
+        assert!(parse_linger(b"yes\n"));
+        assert!(parse_linger(b"yes"));
+        assert!(parse_linger(b" YES \n"));
+        assert!(!parse_linger(b"no\n"));
+        assert!(!parse_linger(b""));
+        assert!(!parse_linger(b"nonsense"));
     }
 }
 

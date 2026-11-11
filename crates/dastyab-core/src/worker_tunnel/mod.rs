@@ -269,7 +269,10 @@ mod tests {
 
         // Resolve before any history exists → the durable link wins.
         let resolved = resolve_deployed_base_link(&pid).unwrap();
-        assert!(resolved.contains("11111111-2222-3333-4444-555555555555"), "resolved: {resolved}");
+        assert!(
+            resolved.contains("11111111-2222-3333-4444-555555555555"),
+            "resolved: {resolved}"
+        );
 
         // Add some unrelated (clean) history then clear it — the durable link
         // must still resolve. This is the core regression: previously, once
@@ -278,7 +281,9 @@ mod tests {
         // generating broken configs.
         crate::store::profiles::remember_clean_ip(&pid, "104.16.1.1").unwrap();
         crate::store::profiles::clear_history(&pid).unwrap();
-        assert!(crate::store::profiles::load_profile(&pid).history.is_empty());
+        assert!(crate::store::profiles::load_profile(&pid)
+            .history
+            .is_empty());
 
         let after = resolve_deployed_base_link(&pid).expect("base link after history clear");
         assert_eq!(

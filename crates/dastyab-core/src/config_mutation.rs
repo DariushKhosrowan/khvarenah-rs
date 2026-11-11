@@ -178,7 +178,6 @@ pub async fn run_mutation_if_due<M: MutationPeer>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     fn with_home() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();

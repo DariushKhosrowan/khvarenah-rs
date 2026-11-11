@@ -324,9 +324,16 @@ mod tests {
     #[test]
     fn standard_vless_worker_validates_and_is_compact() {
         let js = crate::presets::standard_vless_worker_js();
-        assert!(js.len() < 10_000, "standard worker should be compact ({} bytes)", js.len());
+        assert!(
+            js.len() < 10_000,
+            "standard worker should be compact ({} bytes)",
+            js.len()
+        );
         assert!(js.contains("export default"));
-        assert!(js.contains("cloudflare:sockets"), "must use the sockets binding");
+        assert!(
+            js.contains("cloudflare:sockets"),
+            "must use the sockets binding"
+        );
         assert!(js.contains("WebSocketPair"), "must do WebSocket upgrade");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("_worker.js");
@@ -351,7 +358,14 @@ mod tests {
         let bytes = resolve_deploy_worker_bytes();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("export default"), "must be a module worker");
-        assert!(s.contains("cloudflare:sockets"), "must be the standard VLESS worker");
-        assert!(bytes.len() < 20_000, "fallback should be compact, got {} bytes", bytes.len());
+        assert!(
+            s.contains("cloudflare:sockets"),
+            "must be the standard VLESS worker"
+        );
+        assert!(
+            bytes.len() < 20_000,
+            "fallback should be compact, got {} bytes",
+            bytes.len()
+        );
     }
 }

@@ -10,9 +10,7 @@ use dastyab_core::store::profiles::{
     set_active_token, VlessRecord,
 };
 use dastyab_core::vless::VlessProfile;
-use dastyab_core::worker::{
-    generate_uuid, safe_worker_name, worker_name_from_account,
-};
+use dastyab_core::worker::{generate_uuid, safe_worker_name, worker_name_from_account};
 use dastyab_core::{CFError, BRAND, VERSION};
 use std::path::PathBuf;
 
@@ -1596,11 +1594,7 @@ fn desync_worker_line(
         .desync_strategy
         .map(|s| s.label().to_string())
         .unwrap_or_else(|| "ladder".to_string());
-    let failed: Vec<&str> = ws
-        .failed_strategies
-        .iter()
-        .map(|s| s.label())
-        .collect();
+    let failed: Vec<&str> = ws.failed_strategies.iter().map(|s| s.label()).collect();
     let down = if ws.host_down {
         let since = ws.host_down_since_unix as i64;
         let dur = if since > 0 {
@@ -1831,8 +1825,7 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                 let lnow = dastyab_core::store::now_ts() as i64;
                 if !store_live.config.worker_secrets.is_empty() {
                     println!("  Desync learning (per worker):");
-                    let mut workers: Vec<_> =
-                        store_live.config.worker_secrets.iter().collect();
+                    let mut workers: Vec<_> = store_live.config.worker_secrets.iter().collect();
                     workers.sort_by(|a, b| a.0.cmp(b.0));
                     for (url, ws) in workers {
                         println!("    {}", desync_worker_line(url, ws, lnow));
@@ -3758,9 +3751,7 @@ mod tests {
             pending_secret: None,
             pending_since_unix: 0,
             desync_strategy: Some(dastyab_core::desync::DesyncStrategy::SplitTwo),
-            failed_strategies: vec![
-                dastyab_core::desync::DesyncStrategy::SplitClientHello,
-            ],
+            failed_strategies: vec![dastyab_core::desync::DesyncStrategy::SplitClientHello],
             host_down: true,
             host_down_since_unix: 1_700_000_000,
         };
@@ -3777,7 +3768,10 @@ mod tests {
         let ws = WorkerSecret::default(); // no strategy learned, host up
         let line = desync_worker_line("https://w.workers.dev", &ws, 1_700_000_000);
         assert!(line.contains("eff=ladder"), "line: {line}");
-        assert!(line.contains(" up ") || line.ends_with(" up"), "line: {line}");
+        assert!(
+            line.contains(" up ") || line.ends_with(" up"),
+            "line: {line}"
+        );
         assert!(line.contains("failed=[]"), "line: {line}");
     }
 }

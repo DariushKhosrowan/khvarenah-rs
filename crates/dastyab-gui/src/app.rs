@@ -1422,8 +1422,7 @@ impl DastYabApp {
                 if h != self.banner_hash {
                     self.banner_hash = h;
                     self.banner_since = now;
-                } else if now.duration_since(self.banner_since)
-                    > std::time::Duration::from_secs(25)
+                } else if now.duration_since(self.banner_since) > std::time::Duration::from_secs(25)
                 {
                     self.error_banner = None;
                     self.banner_hash = 0;
@@ -2051,7 +2050,8 @@ impl DastYabApp {
         // outcome is always reachable from home regardless of which tab was
         // active when it finished.
         crate::views::section_card(ui, "Deploy status", |ui| {
-            let deployed_link = dastyab_core::worker_tunnel::resolve_deployed_base_link(&self.profile_id);
+            let deployed_link =
+                dastyab_core::worker_tunnel::resolve_deployed_base_link(&self.profile_id);
             // Combine every deploy note into one line (worker tunnel + VPS +
             // multi-worker), newest non-empty wins.
             let status_line = if !self.worker_tunnel_note.is_empty() {
@@ -2067,8 +2067,7 @@ impl DastYabApp {
                 ui.label(egui::RichText::new(line).color(TEXT));
             } else {
                 ui.label(
-                    egui::RichText::new("No deploy performed yet in this session.")
-                        .color(GOLD_DIM),
+                    egui::RichText::new("No deploy performed yet in this session.").color(GOLD_DIM),
                 );
             }
             ui.add_space(4.0);
@@ -2869,14 +2868,20 @@ impl DastYabApp {
         // learned it from a scan / config creation) and render a fresh config
         // set for it immediately. This is the concrete realization of the
         // deploy-once → configure-many model.
-        let ready = dastyab_core::worker_tunnel::resolve_deployed_base_link(&self.profile_id).is_some();
+        let ready =
+            dastyab_core::worker_tunnel::resolve_deployed_base_link(&self.profile_id).is_some();
         let learned = self.state.clean_ips.clone();
         if ready && !learned.is_empty() {
-            crate::views::section_card(ui, "Create config from a learned clean IP (no redeploy)", |ui| {
-                if self.configs_selected_ip.is_empty() || !learned.contains(&self.configs_selected_ip) {
-                    self.configs_selected_ip = learned[0].clone();
-                }
-                ui.horizontal(|ui| {
+            crate::views::section_card(
+                ui,
+                "Create config from a learned clean IP (no redeploy)",
+                |ui| {
+                    if self.configs_selected_ip.is_empty()
+                        || !learned.contains(&self.configs_selected_ip)
+                    {
+                        self.configs_selected_ip = learned[0].clone();
+                    }
+                    ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Clean IP:").color(GOLD_DIM));
                     egui::ComboBox::from_id_salt("cfg_fast_ip")
                         .selected_text(&self.configs_selected_ip)
@@ -2896,13 +2901,14 @@ impl DastYabApp {
                         self.create_config_from_ip(&ep);
                     }
                 });
-                ui.add_space(2.0);
-                ui.label(
+                    ui.add_space(2.0);
+                    ui.label(
                     egui::RichText::new("Learned from previous scans/configs — the more you scan, the more IPs appear here.")
                         .color(GOLD_DIM)
                         .small(),
                 );
-            });
+                },
+            );
             ui.add_space(6.0);
         }
 
@@ -4125,7 +4131,8 @@ async fn deploy_worker_with_client(
         vars: vec![("UUID".to_string(), uuid.clone())],
     };
     let deployed =
-        dastyab_core::wrangler::deploy_worker_via_wrangler(client.token(), &acc.id, &js, &wopts).await?;
+        dastyab_core::wrangler::deploy_worker_via_wrangler(client.token(), &acc.id, &js, &wopts)
+            .await?;
     // The deployed URL is authoritative; fall back to constructing it if a
     // wrangler version prints a bare hostname.
     let host = if deployed.contains(".workers.dev") {
@@ -4474,7 +4481,9 @@ mod tests {
         // The deploy_busy() helper must report busy while a deploy task is
         // running and idle otherwise — this is what prevents concurrent
         // deploys (deploy-once semantics).
-        with_running("test", vec!["deploy".into()], |app| assert!(app.deploy_busy()));
+        with_running("test", vec!["deploy".into()], |app| {
+            assert!(app.deploy_busy())
+        });
         with_running("test", vec!["dns-tunnel-worker".into()], |app| {
             assert!(app.deploy_busy())
         });
@@ -4703,11 +4712,8 @@ mod tests {
         with_home(|pid| {
             simulate_deploy(pid);
             let ledger = dastyab_core::generated_configs::load_generated_configs(pid);
-            let fmts: std::collections::BTreeSet<&str> = ledger
-                .records
-                .iter()
-                .map(|r| r.fmt.label())
-                .collect();
+            let fmts: std::collections::BTreeSet<&str> =
+                ledger.records.iter().map(|r| r.fmt.label()).collect();
             for want in ["share-link", "v2rayN", "sing-box", "Clash"] {
                 assert!(fmts.contains(want), "missing {want} in ledger: {fmts:?}");
             }
@@ -4855,8 +4861,22 @@ mod tests {
             assert_eq!(get_active_token(pid).unwrap().as_deref(), Some("second"));
             // In-memory view state flipped.
             assert_eq!(app.state.active_token_label.as_deref(), Some("second"));
-            assert!(app.state.tokens.iter().find(|t| t.label == "second").unwrap().is_active);
-            assert!(!app.state.tokens.iter().find(|t| t.label == "first").unwrap().is_active);
+            assert!(
+                app.state
+                    .tokens
+                    .iter()
+                    .find(|t| t.label == "second")
+                    .unwrap()
+                    .is_active
+            );
+            assert!(
+                !app.state
+                    .tokens
+                    .iter()
+                    .find(|t| t.label == "first")
+                    .unwrap()
+                    .is_active
+            );
             // A reload is scheduled so the store-driven view stays consistent.
             assert!(app.state.reload_pending);
         });
@@ -5321,11 +5341,8 @@ mod tests {
         // The full config set landed in the ledger (share-link/v2rayN/
         // sing-box/Clash), all sharing the deployed worker identity.
         let ledger = dastyab_core::generated_configs::load_generated_configs(&pid);
-        let fmts: std::collections::BTreeSet<&str> = ledger
-            .records
-            .iter()
-            .map(|r| r.fmt.label())
-            .collect();
+        let fmts: std::collections::BTreeSet<&str> =
+            ledger.records.iter().map(|r| r.fmt.label()).collect();
         for want in ["share-link", "v2rayN", "sing-box", "Clash"] {
             assert!(fmts.contains(want), "missing {want} in ledger: {fmts:?}");
         }
@@ -5418,10 +5435,12 @@ mod tests {
         // write (hash mismatch) must reset the timer and keep the note.
         let mut text = "Deploy failed: brand new".to_string();
         let mut hash = 0u64; // never seen → treated as a fresh write
-        let mut since = std::time::Instant::now()
-            - std::time::Duration::from_secs(200); // stale "startup" anchor
+        let mut since = std::time::Instant::now() - std::time::Duration::from_secs(200); // stale "startup" anchor
         DastYabApp::expire_status_note(&mut text, &mut hash, &mut since, true, 90);
-        assert_eq!(text, "Deploy failed: brand new", "fresh write must not expire immediately");
+        assert_eq!(
+            text, "Deploy failed: brand new",
+            "fresh write must not expire immediately"
+        );
         assert_ne!(hash, 0, "hash must be captured after the fresh write");
         // Identical text within the TTL (now anchored at the write) stays.
         DastYabApp::expire_status_note(&mut text, &mut hash, &mut since, true, 90);
