@@ -815,6 +815,39 @@ pub fn set_active_token(profile_id: &str, label: &str) -> Result<(), CFError> {
     write_json(&active_token_path(profile_id), &label.trim().to_string())
 }
 
+/// Ensure the profile has a valid active-token marker. This is the self-heal
+/// for the empty-`active_token` marker bug: if the marker is missing, empty, or
+/// stale but the profile still has tokens, repopulate it (atomically, via
+/// `write_json`) by selecting the *default* token if present, else the
+/// lexicographically-first remaining token. Logs a warning when it heals.
+///
+/// Returns `Some(label)` when an active token resolves (either pre-existing or
+/// self-healed) and `Ok(None)` only when the profile has no tokens at all —
+/// in which case there is genuinely nothing to select. Consumers that need a
+/// token for redeploy/account-probe should call this instead of `get_active_token`
+/// so an empty marker never blocks them while valid tokens exist (which is the
+/// condition that previously drove the daemon to a 21600s backoff).
+pub fn ensure_active_token(profile_id: &str) -> Result<Option<String>, CFError> {
+    if let Ok(Some(label)) = get_active_token(profile_id) {
+        return Ok(Some(label));
+    }
+    let p = load_profile(profile_id);
+    if p.tokens.is_empty() {
+        return Ok(None);
+    }
+    let next = if p.tokens.contains_key("default") {
+        "default".to_string()
+    } else {
+        // BTreeMap keys are sorted → deterministic selection.
+        p.tokens.keys().next().cloned().unwrap_or_default()
+    };
+    eprintln!(
+        "[dastyab] warn: active-token marker for '{profile_id}' was empty/stale; self-healed to '{next}'"
+    );
+    set_active_token(profile_id, &next)?;
+    Ok(Some(next))
+}
+
 /// Clear the active token marker for a profile.
 pub fn clear_active_token(profile_id: &str) -> Result<(), CFError> {
     write_json(&active_token_path(profile_id), &String::new())
@@ -2076,6 +2109,63 @@ mod tests {
             assert_eq!(get_active_token(&id).unwrap(), None);
             // No lingering stale marker: get_active_token is stable (no warn).
             assert_eq!(get_active_token(&id).unwrap(), None);
+        });
+    }
+
+    /// Self-heal: an empty active-token marker with valid tokens present is
+    /// repopulated (default token preferred) so redeploy/account-probe never
+    /// stall on "No active token".
+    #[test]
+    fn ensure_active_token_repopulates_empty_marker_with_default() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            add_token(&id, "default", "cf_secret_default").unwrap();
+            add_token(&id, "cf-b", "cf_secret_b").unwrap();
+            // empty marker (simulates the bug)
+            write_json(&active_token_path(&id), &String::new()).unwrap();
+            assert_eq!(get_active_token(&id).unwrap(), None);
+            let healed = ensure_active_token(&id).unwrap();
+            assert_eq!(healed.as_deref(), Some("default"));
+            assert_eq!(get_active_token(&id).unwrap().as_deref(), Some("default"));
+            let marker = read_opt::<String>(&active_token_path(&id)).unwrap_or_default();
+            assert!(!marker.is_empty());
+        });
+    }
+
+    /// Self-heal: no "default" token → picks the lexicographically-first token.
+    #[test]
+    fn ensure_active_token_repopulates_first_token_when_no_default() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            add_token(&id, "cf-b", "cf_secret_b").unwrap();
+            add_token(&id, "cf-a", "cf_secret_a").unwrap();
+            write_json(&active_token_path(&id), &String::new()).unwrap();
+            let healed = ensure_active_token(&id).unwrap();
+            assert_eq!(healed.as_deref(), Some("cf-a"));
+            assert_eq!(get_active_token(&id).unwrap().as_deref(), Some("cf-a"));
+        });
+    }
+
+    /// Self-heal: a valid existing marker is left untouched.
+    #[test]
+    fn ensure_active_token_preserves_valid_marker() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            add_token(&id, "default", "cf_secret_default").unwrap();
+            add_token(&id, "cf-b", "cf_secret_b").unwrap();
+            set_active_token(&id, "cf-b").unwrap();
+            let healed = ensure_active_token(&id).unwrap();
+            assert_eq!(healed.as_deref(), Some("cf-b"));
+            assert_eq!(get_active_token(&id).unwrap().as_deref(), Some("cf-b"));
+        });
+    }
+
+    /// Self-heal: no tokens at all → Ok(None), no marker written.
+    #[test]
+    fn ensure_active_token_none_when_no_tokens() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            assert_eq!(ensure_active_token(&id).unwrap(), None);
         });
     }
 

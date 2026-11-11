@@ -181,11 +181,11 @@ pub async fn probe_account_state(profile_id: &str) -> AccountState {
     // actual token string. `get_active_token` returns the *label* (e.g.
     // "default"), not the secret — passing the label to `Client::new` would
     // make Cloudflare validate the literal string "default" and always fail.
-    let label = match crate::store::profiles::get_active_token(profile_id) {
+    let label = match crate::store::profiles::ensure_active_token(profile_id) {
         Ok(Some(l)) => l,
         Ok(None) => {
-            // No token → nothing to verify. Treat as Unknown rather than
-            // blocking the daemon (a token may be added later on).
+            // No tokens at all → nothing to verify. Treat as Unknown rather
+            // than blocking the daemon (a token may be added later on).
             return AccountState::Unknown;
         }
         Err(_) => return AccountState::Unknown,

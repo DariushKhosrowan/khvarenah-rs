@@ -1575,6 +1575,13 @@ pub async fn daemon_tick(
     cycle: &dyn CycleRunner,
     log: &mut dyn FnMut(&str),
 ) -> u64 {
+    // Startup/periodic self-heal for the empty-active_token-marker bug: if
+    // the marker is empty/stale but the profile has tokens, repopulate it so
+    // a valid token is always selected (no "No active token" stall that used
+    // to drive the daemon to a 21600s backoff). Best-effort — never fail the
+    // tick if the marker is genuinely unusable.
+    let _ = crate::store::profiles::ensure_active_token(profile);
+
     // b. Network liveness probe (full fallback ladder: direct → DoH → DoT
     // → DNS tunnel). `status` carries the best tier actually reachable.
     let status = probe.liveness().await;

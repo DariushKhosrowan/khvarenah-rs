@@ -2278,7 +2278,7 @@ async fn redeploy_worker_core(
     profile_id: &str,
     override_uuid: Option<&str>,
 ) -> Result<(), CFError> {
-    let label = match crate::store::profiles::get_active_token(profile_id)? {
+    let label = match crate::store::profiles::ensure_active_token(profile_id)? {
         Some(l) => l,
         None => {
             return Err(CFError::new(
