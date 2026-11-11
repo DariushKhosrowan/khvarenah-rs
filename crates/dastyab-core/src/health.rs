@@ -683,6 +683,12 @@ pub struct EndpointLiveResult {
     pub rtt_ms: Option<u32>,
     /// Bucketed reason when not alive.
     pub failure_stage: Option<EndpointFailureStage>,
+    /// Per-failure-reason histogram across every probe of this sweep. This is
+    /// the light-path analogue of the deep path's phase-2 histogram: it lets
+    /// the light classifier distinguish strategy-attributable (DPI/401/403)
+    /// from origin-unavailable (5xx) failures instead of collapsing them into
+    /// an ambiguous bucket. Empty when alive (winner aborted the sweep).
+    pub failure_histogram: std::collections::HashMap<WsFailureReason, u32>,
     /// Wall-clock time the whole sweep took.
     pub elapsed_ms: u64,
     /// Number of probes launched.
@@ -754,6 +760,7 @@ pub async fn probe_ports_budgeted(
                 responding_port: Some(probe.port),
                 rtt_ms: Some(probe.rtt_ms),
                 failure_stage: None,
+                failure_histogram: std::collections::HashMap::new(),
                 elapsed_ms,
                 probes_attempted: attempted,
                 probes_completed: completed,
@@ -774,6 +781,7 @@ pub async fn probe_ports_budgeted(
             responding_port: None,
             rtt_ms: None,
             failure_stage: Some(EndpointFailureStage::BudgetExceeded),
+            failure_histogram: failure_histogram_of(&probes),
             elapsed_ms,
             probes_attempted: attempted,
             probes_completed: completed,
@@ -786,10 +794,23 @@ pub async fn probe_ports_budgeted(
         responding_port: None,
         rtt_ms: None,
         failure_stage: Some(failure_stage),
+        failure_histogram: failure_histogram_of(&probes),
         elapsed_ms,
         probes_attempted: attempted,
         probes_completed: completed,
     }
+}
+
+/// Build a `{WsFailureReason: count}` histogram from a sweep's probes.
+/// Probes that succeeded (None reason) are excluded — they carry no signal.
+pub fn failure_histogram_of(probes: &[WsProbe]) -> std::collections::HashMap<WsFailureReason, u32> {
+    let mut h: std::collections::HashMap<WsFailureReason, u32> = std::collections::HashMap::new();
+    for p in probes {
+        if let Some(r) = p.failure_reason {
+            *h.entry(r).or_insert(0) += 1;
+        }
+    }
+    h
 }
 
 /// Aggregate the per-probe failure reasons into one `EndpointFailureStage`.

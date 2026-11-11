@@ -1853,6 +1853,12 @@ impl AutopilotEngine {
         let mut saw_strategy_failure = false;
         let mut saw_host_down = false;
         let mut any_probed = false;
+        // Aggregate failure histogram across all non-alive endpoints of this
+        // sweep. This feeds `classify_light_sweep` (option c) so light can
+        // classify DPI-dominant vs origin-5xx-dominant failures — including
+        // the healthy-but-muted case where some endpoints stay alive.
+        let mut light_hist: std::collections::HashMap<crate::health::WsFailureReason, u32> =
+            std::collections::HashMap::new();
         mark_stage(&self.profile_id, CycleStage::LightCheck)?;
         for ep in ledger.iter_mut() {
             let res = crate::health::endpoint_live_with_budget(
@@ -1873,6 +1879,11 @@ impl AutopilotEngine {
                 // strategy signal. TLS/WS/route failures imply the host is
                 // reachable → strategy-attributable.
                 any_probed = true;
+                // Fold this endpoint's failure histogram into the sweep-wide
+                // histogram (option c) for the aggregate verdict.
+                for (r, n) in &res.failure_histogram {
+                    *light_hist.entry(*r).or_insert(0) += *n;
+                }
                 match crate::worker_tunnel::secret::classify_endpoint_outcome(res.failure_stage) {
                     crate::worker_tunnel::secret::LearningSignal::StrategyFailure => {
                         saw_strategy_failure = true;
@@ -1889,19 +1900,23 @@ impl AutopilotEngine {
         // store (serialized persist so deep-discovery and light sweeps cannot
         // lose an update). Only record when there was at least one probe; an
         // empty ledger means no signal and must not demote. Classification:
-        // - alive > 0 → Success (promote + clear any host-down hold).
-        // - else any strategy-level failure → demote (host was reachable).
-        // - else all failures host-unreachable → hold ladder (record host-down).
+        // - all alive → Success (promote + clear any host-down hold).
+        // - some alive → `classify_light_sweep` with the sweep histogram
+        //   (healthy-but-muted DPI-dominant → demote; origin-5xx-dominant → hold).
+        // - none alive, strategy-level failure → demote (host was reachable).
+        // - none alive, host-unreachable → hold ladder (record host-down).
         // - else (only unclassifiable) → no learning.
         if ledger_len > 0 {
-            let sig = if alive > 0 {
+            let sig = if alive == ledger_len {
                 crate::worker_tunnel::secret::LearningSignal::Success
+            } else if alive > 0 {
+                crate::worker_tunnel::secret::classify_light_sweep(true, Some(&light_hist))
             } else if saw_strategy_failure {
                 crate::worker_tunnel::secret::LearningSignal::StrategyFailure
             } else if saw_host_down && any_probed {
                 crate::worker_tunnel::secret::LearningSignal::HostDown
             } else {
-                crate::worker_tunnel::secret::LearningSignal::Unclassifiable
+                crate::worker_tunnel::secret::classify_light_sweep(false, Some(&light_hist))
             };
             crate::worker_tunnel::secret::learn_from_discovery_persisted_signal(
                 &self.profile_id,

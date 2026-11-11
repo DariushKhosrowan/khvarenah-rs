@@ -361,6 +361,89 @@ pub fn classify_endpoint_outcome(
     }
 }
 
+/// Split a failure histogram into strategy-attributable (DPI/401/403) vs
+/// origin-unavailable (5xx) counts. Shared by the light sweep and the deep
+/// discovery path so the two cannot disagree on the same histogram (parity).
+/// `dpi` = TLS reset/timeout/write-failed (DPI signature) + 401/403 (WAF/DPI
+/// fingerprint rejection). `origin` = HTTP 5xx (worker/origin unavailable).
+pub fn histogram_attribution(
+    hist: &std::collections::HashMap<crate::health::WsFailureReason, u32>,
+) -> (u32, u32) {
+    let mut dpi = 0u32;
+    let mut origin = 0u32;
+    for (r, n) in hist {
+        match r {
+            crate::health::WsFailureReason::HttpStatus(c) => {
+                if *c == 401 || *c == 403 {
+                    dpi += *n;
+                } else if http_status_is_origin_unavailable(*c) {
+                    origin += *n;
+                }
+            }
+            crate::health::WsFailureReason::TlsAlert
+            | crate::health::WsFailureReason::TlsTimeout
+            | crate::health::WsFailureReason::WriteFailed => dpi += *n,
+            _ => {}
+        }
+    }
+    (dpi, origin)
+}
+
+/// Classify a *light sweep* aggregate outcome. Unlike
+/// [`classify_endpoint_outcome`] (which works on a single status-less bucket),
+/// this consumes the sweep's HTTP-status/failure histogram so light can reach
+/// the same verdict deep would, including the healthy-but-muted case:
+///
+/// - All endpoints alive → `Success` (nothing to learn).
+/// - Some alive AND the failures are DPI/401/403-dominant → `StrategyFailure`
+///   (healthy-but-muted: a live fallback is masking a muted worker; learn the
+///   demotion). This is the case deep never sees (it only runs on NeedDeep),
+///   so light learning it closes the silent gap.
+/// - Some alive AND failures are origin-5xx-dominant or mixed → `Unclassifiable`
+///   (origin-degraded → hold; don't demote on a worker outage).
+/// - None alive, DPI/401/403-dominant → `StrategyFailure`.
+/// - None alive, origin-5xx-dominant → `Unclassifiable` (hold).
+/// - No histogram (status-less aggregates / empty) → fall back to legacy:
+///   `Success` when alive, `Unclassifiable` otherwise. This is the regression
+///   guard for the option-(a) fix — the histogram is additive where present.
+pub fn classify_light_sweep(
+    alive: bool,
+    hist: Option<&std::collections::HashMap<crate::health::WsFailureReason, u32>>,
+) -> LearningSignal {
+    let Some(h) = hist else {
+        return if alive {
+            LearningSignal::Success
+        } else {
+            LearningSignal::Unclassifiable
+        };
+    };
+    if h.is_empty() {
+        return if alive {
+            LearningSignal::Success
+        } else {
+            LearningSignal::Unclassifiable
+        };
+    }
+    let (dpi, origin) = histogram_attribution(h);
+    if alive {
+        // healthy-but-muted: only a strategy-attributable signature demotes.
+        if dpi > origin {
+            LearningSignal::StrategyFailure
+        } else {
+            LearningSignal::Unclassifiable
+        }
+    } else {
+        // all failed: parity with deep (origin-dominant → hold, else demote).
+        if origin > 0 && origin >= dpi {
+            LearningSignal::Unclassifiable
+        } else if dpi > 0 {
+            LearningSignal::StrategyFailure
+        } else {
+            LearningSignal::Unclassifiable
+        }
+    }
+}
+
 /// Whether an HTTP status from a WS-upgrade response means the *origin/worker*
 /// is unavailable (as opposed to the edge/DPI rejecting the connection on our
 /// wire shape). Cloudflare 5xx statuses (502/503/504/520/521/522/524/530) are
@@ -441,25 +524,11 @@ pub fn classify_discovery_outcome(
         // strategy-attributable failure (TLS alert/reset dominant) from an
         // unavailable worker behind a live TCP port (origin 5xx dominant).
         // Per DeepSeek's gate: only the former demotes; the latter holds.
+        // Parity: uses the same `histogram_attribution` split as the light
+        // sweep (`classify_light_sweep`) so both paths cannot disagree.
         if let Some(h) = ws_failure_histogram {
-            let origin_unavail: u32 = h
-                .iter()
-                .filter(|(r, _)| matches!(r, crate::health::WsFailureReason::HttpStatus(c) if http_status_is_origin_unavailable(*c)))
-                .map(|(_, n)| *n)
-                .sum();
-            let dpi: u32 = h
-                .iter()
-                .filter(|(r, _)| {
-                    matches!(
-                        r,
-                        crate::health::WsFailureReason::TlsAlert
-                            | crate::health::WsFailureReason::TlsTimeout
-                            | crate::health::WsFailureReason::WriteFailed
-                    )
-                })
-                .map(|(_, n)| *n)
-                .sum();
-            if origin_unavail > 0 && origin_unavail >= dpi {
+            let (dpi, origin) = histogram_attribution(h);
+            if origin > 0 && origin >= dpi {
                 return LearningSignal::Unclassifiable;
             }
         }
@@ -1258,6 +1327,101 @@ mod tests {
             classify_discovery_outcome(1, 1, false, None),
             Unclassifiable
         );
+    }
+
+    /// Option c light-path status histogram — acceptance tests reflecting the
+    /// architect's brief (2c5b58b round): the light sweep now carries an HTTP
+    /// status histogram so it can classify DPI-dominant vs origin-5xx-dominant
+    /// failures, matching deep's verdict, including the healthy-but-muted case.
+    #[test]
+    fn light_sweep_acceptance_dpi_dominant_demotes_even_when_alive() {
+        use crate::health::WsFailureReason as R;
+        use std::collections::HashMap;
+        use LearningSignal::*;
+        let hist = |pairs: &[(R, u32)]| -> HashMap<R, u32> { pairs.iter().cloned().collect() };
+        // (a) Alive + DPI-dominant failures on OTHER endpoints → demote
+        // (healthy-but-muted now learns). Previously alive>0 forced Success.
+        assert_eq!(
+            classify_light_sweep(
+                true,
+                Some(&hist(&[(R::TlsAlert, 6), (R::HttpStatus(502), 1)]))
+            ),
+            StrategyFailure
+        );
+        assert_eq!(
+            classify_light_sweep(true, Some(&hist(&[(R::HttpStatus(403), 5)]))),
+            StrategyFailure
+        );
+    }
+
+    #[test]
+    fn light_sweep_acceptance_origin_dominant_holds_when_alive() {
+        use crate::health::WsFailureReason as R;
+        use std::collections::HashMap;
+        use LearningSignal::*;
+        let hist = |pairs: &[(R, u32)]| -> HashMap<R, u32> { pairs.iter().cloned().collect() };
+        // (b) Alive + origin-5xx-dominant → hold (do not demote on a worker outage).
+        assert_eq!(
+            classify_light_sweep(
+                true,
+                Some(&hist(&[(R::HttpStatus(502), 6), (R::TlsAlert, 1)]))
+            ),
+            Unclassifiable
+        );
+        // mixed/inconclusive with alive → hold.
+        assert_eq!(
+            classify_light_sweep(
+                true,
+                Some(&hist(&[(R::HttpStatus(502), 3), (R::TlsAlert, 3)]))
+            ),
+            Unclassifiable
+        );
+    }
+
+    #[test]
+    fn light_and_deep_share_classification_for_same_histogram() {
+        // (c) Parity: light and deep must return the same verdict for the same
+        // synthetic histogram. Both now route through `histogram_attribution`.
+        use crate::health::WsFailureReason as R;
+        use std::collections::HashMap;
+        use LearningSignal::*;
+        let hist = |pairs: &[(R, u32)]| -> HashMap<R, u32> { pairs.iter().cloned().collect() };
+        // origin-dominant → both hold
+        let origin_dom = hist(&[(R::HttpStatus(502), 7), (R::TlsAlert, 1)]);
+        assert_eq!(
+            classify_light_sweep(false, Some(&origin_dom)),
+            Unclassifiable
+        );
+        assert_eq!(
+            classify_discovery_outcome(10, 0, false, Some(&origin_dom)),
+            Unclassifiable
+        );
+        // DPI-dominant → both demote
+        let dpi_dom = hist(&[(R::TlsAlert, 7), (R::HttpStatus(502), 1)]);
+        assert_eq!(classify_light_sweep(false, Some(&dpi_dom)), StrategyFailure);
+        assert_eq!(
+            classify_discovery_outcome(10, 0, false, Some(&dpi_dom)),
+            StrategyFailure
+        );
+        // empty histogram (aggressive) → light holds (no histogram, no learn)
+        assert_eq!(
+            classify_light_sweep(false, Some(&hist(&[]))),
+            Unclassifiable
+        );
+        assert_eq!(classify_light_sweep(false, None), Unclassifiable);
+    }
+
+    #[test]
+    fn light_sweep_all_alive_is_success_and_no_histogram_regression() {
+        // all alive → Success (nothing to learn); no-histogram fallback keeps
+        // legacy behavior (Success when alive, Unclassifiable when not).
+        use LearningSignal::*;
+        assert_eq!(classify_light_sweep(true, None), Success);
+        assert_eq!(
+            classify_light_sweep(true, Some(&std::collections::HashMap::new())),
+            Success
+        );
+        assert_eq!(classify_light_sweep(false, None), Unclassifiable);
     }
 
     /// (a) deep-discovery host-unreachable (zero phase-1 TCP success) does not
