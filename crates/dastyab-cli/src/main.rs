@@ -427,7 +427,8 @@ enum Command {
 
 #[derive(Subcommand)]
 pub enum ConfigsAction {
-    /// List generated configs (optionally filtered).
+    /// List generated configs (optionally filtered). `--json` emits the
+    /// matching records as a machine-readable array.
     List {
         /// Filter by export format (v2rayn | singbox | clash | link).
         #[arg(long)]
@@ -438,6 +439,9 @@ pub enum ConfigsAction {
         /// Text substring to search for in the config content.
         #[arg(long)]
         search: Option<String>,
+        /// Emit the matching records as JSON instead of a human table.
+        #[arg(long)]
+        json: bool,
     },
     /// Show one generated config by id.
     Show {
@@ -450,6 +454,32 @@ pub enum ConfigsAction {
         id: u64,
         #[arg(long)]
         output: String,
+    },
+    /// Rename a generated config's label (display name).
+    Rename {
+        #[arg()]
+        id: u64,
+        /// New label text. Use "" to clear the label.
+        #[arg(long)]
+        label: String,
+    },
+    /// Edit a generated config's content in place (re-hashes it). Provide the
+    /// new content inline with `--content` or read it from a file with
+    /// `--file` (at most one).
+    Edit {
+        #[arg()]
+        id: u64,
+        /// New config content, inline.
+        #[arg(long, conflicts_with = "file")]
+        content: Option<String>,
+        /// Read the new config content from this file path.
+        #[arg(long, conflicts_with = "content")]
+        file: Option<String>,
+    },
+    /// Delete a generated config from the ledger (destructive).
+    Delete {
+        #[arg()]
+        id: u64,
     },
 }
 
@@ -622,9 +652,37 @@ pub enum JournalAction {
 /// Per-profile blackout-resilience knob actions.
 #[derive(Subcommand)]
 pub enum ConfigAction {
-    /// Show the effective (resolved) monitor budgets and backoff ceiling, plus
-    /// the raw configured values and the system defaults behind them.
-    Show,
+    /// Show the effective (resolved) per-profile configuration: monitor
+    /// budgets, backoff ceiling, scan defaults, toggles, cadences — plus the
+    /// raw configured values and the system defaults behind them. `--json`
+    /// emits the whole resolved profile as a machine-readable object.
+    Show {
+        /// Emit the resolved configuration as JSON (instead of a human table).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set one named knob to a value. Keys are the snake_case field names:
+    /// scan_count, scan_workers, scan_timeout, scan_ports, scan_gentle,
+    /// stealth_enabled, protection_enabled, auto_rotate_on_blocked,
+    /// light_interval_secs, light_timeout_secs, deep_timeout_secs,
+    /// max_backoff_secs, network_down_sleep_secs, drill_interval_secs.
+    /// Booleans accept true/false/1/0/on/off/yes/no.
+    Set {
+        /// Knob name (snake_case, see help text).
+        #[arg()]
+        key: String,
+        /// Value to assign (boolean or unsigned integer).
+        #[arg()]
+        value: String,
+    },
+    /// Restore a single knob to its system default. With no key, reset the
+    /// whole profile config to defaults (equivalent to the GUI's "Reset
+    /// settings to defaults"). Never touches tokens or clean IPs.
+    Unset {
+        /// Knob name to reset. Omit to reset the entire config.
+        #[arg()]
+        key: Option<String>,
+    },
     /// Set the monitor phase budgets and the daemon backoff ceiling. Only the
     /// flags you pass are changed; 0 / omitted keeps the system default.
     Timeouts {

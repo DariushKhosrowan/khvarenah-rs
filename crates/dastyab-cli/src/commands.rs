@@ -266,10 +266,10 @@ fn cmd_bundle(profile: &str, action: crate::BundleAction) -> Result<(), CFError>
     }
 }
 
-/// Inspect / tune the per-profile blackout-resilience knobs.
+/// Inspect / tune the per-profile configuration knobs.
 fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError> {
     match action {
-        crate::ConfigAction::Show => {
+        crate::ConfigAction::Show { json } => {
             let p = dastyab_core::store::profiles::load_profile(profile);
             let c = &p.config;
             let eff_light = dastyab_core::store::profiles::effective_light_timeout_secs(c);
@@ -277,7 +277,42 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
             let eff_backoff = dastyab_core::store::profiles::effective_max_backoff_secs(c);
             let eff_blackout =
                 dastyab_core::store::profiles::effective_network_down_sleep_secs(c);
+            if json {
+                let obj = serde_json::json!({
+                    "profile": profile,
+                    "scan_count": c.scan_count,
+                    "scan_workers": c.scan_workers,
+                    "scan_timeout": c.scan_timeout,
+                    "scan_ports": c.scan_ports,
+                    "scan_gentle": c.scan_gentle,
+                    "stealth_enabled": c.stealth_enabled,
+                    "protection_enabled": c.protection_enabled,
+                    "auto_rotate_on_blocked": c.auto_rotate_on_blocked,
+                    "light_interval_secs": c.light_interval_secs,
+                    "light_timeout_secs": c.light_timeout_secs,
+                    "deep_timeout_secs": c.deep_timeout_secs,
+                    "max_backoff_secs": c.max_backoff_secs,
+                    "network_down_sleep_secs": c.network_down_sleep_secs,
+                    "drill_interval_secs": c.drill_interval_secs,
+                    "effective_light_timeout_secs": eff_light,
+                    "effective_deep_timeout_secs": eff_deep,
+                    "effective_max_backoff_secs": eff_backoff,
+                    "effective_network_down_sleep_secs": eff_blackout,
+                    "beacon_enabled": c.beacon.as_ref().is_some_and(|b| b.enabled),
+                });
+                println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+                return Ok(());
+            }
             println!("Profile: {profile}");
+            println!("  scan count                  : {}", c.scan_count);
+            println!("  scan workers                : {}", c.scan_workers);
+            println!("  scan timeout (s)            : {}", c.scan_timeout);
+            println!("  scan ports                  : {}", c.scan_ports);
+            println!("  scan gentle                 : {}", if c.scan_gentle { "yes" } else { "no" });
+            println!("  stealth pacing              : {}", if c.stealth_enabled { "ON" } else { "OFF" });
+            println!("  protection                  : {}", if c.protection_enabled { "ON" } else { "OFF" });
+            println!("  auto token-rotate on blocked : {}", if c.auto_rotate_on_blocked { "ON" } else { "OFF" });
+            println!("  light monitor cadence (s)   : {}", c.light_interval_secs);
             println!(
                 "  monitor light phase budget : {}s (configured {}s, system default 120s)",
                 eff_light, c.light_timeout_secs
@@ -294,26 +329,34 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
                 "  blackout poll cadence      : {}s (configured {}s, system default 60s)",
                 eff_blackout, c.network_down_sleep_secs
             );
-            println!(
-                "  protection                  : {}",
-                if c.protection_enabled { "ON" } else { "OFF" }
-            );
-            println!(
-                "  auto token-rotate on blocked : {}",
-                if c.auto_rotate_on_blocked {
-                    "ON"
-                } else {
-                    "OFF"
-                }
-            );
+            println!("  blackout self-test cadence : {}s (configured {}s, system default 86400s)", c.drill_interval_secs, c.drill_interval_secs);
             println!(
                 "  beacon notifications         : {}",
-                if c.beacon.as_ref().is_some_and(|b| b.enabled) {
-                    "ON"
-                } else {
-                    "OFF"
-                }
+                if c.beacon.as_ref().is_some_and(|b| b.enabled) { "ON" } else { "OFF" }
             );
+            Ok(())
+        }
+        crate::ConfigAction::Set { key, value } => {
+            let mut p = dastyab_core::store::profiles::load_profile(profile);
+            apply_config_set(&mut p, &key, &value)?;
+            dastyab_core::store::profiles::save_profile(&p)?;
+            println!("config set {key}={value} (profile {profile})");
+            Ok(())
+        }
+        crate::ConfigAction::Unset { key } => {
+            let mut p = dastyab_core::store::profiles::load_profile(profile);
+            match key {
+                Some(k) => {
+                    reset_one_config_key(&mut p, &k)?;
+                    dastyab_core::store::profiles::save_profile(&p)?;
+                    println!("config unset {k} → system default (profile {profile})");
+                }
+                None => {
+                    p.config = dastyab_core::store::profiles::ProfileConfig::default();
+                    dastyab_core::store::profiles::save_profile(&p)?;
+                    println!("config reset for profile {profile} → defaults");
+                }
+            }
             Ok(())
         }
         crate::ConfigAction::Timeouts {
@@ -351,6 +394,105 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
             Ok(())
         }
     }
+}
+
+/// Parse a human boolean token (true/false/1/0/on/off/yes/no/enable/disable).
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.trim().to_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "enable" | "enabled" => Some(true),
+        "0" | "false" | "off" | "no" | "disable" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+/// Apply one named knob change to a profile config. Returns a descriptive error
+/// for unknown keys or unparsable values.
+fn apply_config_set(
+    p: &mut dastyab_core::store::profiles::Profile,
+    key: &str,
+    value: &str,
+) -> Result<(), CFError> {
+    let bad = |ty: &str| {
+        CFError::new(
+            "Bad config value",
+            format!("cannot parse '{value}' as {ty}"),
+            "Use a non-negative integer, or true/false/1/0/on/off for booleans.",
+        )
+    };
+    match key {
+        "scan_count" => p.config.scan_count = value.parse::<u32>().map_err(|_| bad("u32"))?,
+        "scan_workers" => p.config.scan_workers = value.parse::<u32>().map_err(|_| bad("u32"))?,
+        "scan_timeout" => p.config.scan_timeout = value.parse::<u32>().map_err(|_| bad("u32"))?,
+        "scan_ports" => p.config.scan_ports = value.to_string(),
+        "scan_gentle" => p.config.scan_gentle = parse_bool(value).ok_or_else(|| bad("bool"))?,
+        "stealth_enabled" => {
+            p.config.stealth_enabled = parse_bool(value).ok_or_else(|| bad("bool"))?
+        }
+        "protection_enabled" => {
+            p.config.protection_enabled = parse_bool(value).ok_or_else(|| bad("bool"))?
+        }
+        "auto_rotate_on_blocked" => {
+            p.config.auto_rotate_on_blocked = parse_bool(value).ok_or_else(|| bad("bool"))?
+        }
+        "light_interval_secs" => {
+            p.config.light_interval_secs = value.parse::<u64>().map_err(|_| bad("u64"))?
+        }
+        "light_timeout_secs" => {
+            p.config.light_timeout_secs = value.parse::<u64>().map_err(|_| bad("u64"))?
+        }
+        "deep_timeout_secs" => {
+            p.config.deep_timeout_secs = value.parse::<u64>().map_err(|_| bad("u64"))?
+        }
+        "max_backoff_secs" => {
+            p.config.max_backoff_secs = value.parse::<u64>().map_err(|_| bad("u64"))?
+        }
+        "network_down_sleep_secs" => {
+            p.config.network_down_sleep_secs = value.parse::<u64>().map_err(|_| bad("u64"))?
+        }
+        "drill_interval_secs" => {
+            p.config.drill_interval_secs = value.parse::<u64>().map_err(|_| bad("u64"))?
+        }
+        _ => {
+            return Err(CFError::new(
+                "Unknown config key",
+                format!("no such knob '{key}'"),
+                "See `dastyab config show` for valid keys.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Restore a single knob to its system default.
+fn reset_one_config_key(
+    p: &mut dastyab_core::store::profiles::Profile,
+    key: &str,
+) -> Result<(), CFError> {
+    let d = dastyab_core::store::profiles::ProfileConfig::default();
+    match key {
+        "scan_count" => p.config.scan_count = d.scan_count,
+        "scan_workers" => p.config.scan_workers = d.scan_workers,
+        "scan_timeout" => p.config.scan_timeout = d.scan_timeout,
+        "scan_ports" => p.config.scan_ports = d.scan_ports,
+        "scan_gentle" => p.config.scan_gentle = d.scan_gentle,
+        "stealth_enabled" => p.config.stealth_enabled = d.stealth_enabled,
+        "protection_enabled" => p.config.protection_enabled = d.protection_enabled,
+        "auto_rotate_on_blocked" => p.config.auto_rotate_on_blocked = d.auto_rotate_on_blocked,
+        "light_interval_secs" => p.config.light_interval_secs = d.light_interval_secs,
+        "light_timeout_secs" => p.config.light_timeout_secs = d.light_timeout_secs,
+        "deep_timeout_secs" => p.config.deep_timeout_secs = d.deep_timeout_secs,
+        "max_backoff_secs" => p.config.max_backoff_secs = d.max_backoff_secs,
+        "network_down_sleep_secs" => p.config.network_down_sleep_secs = d.network_down_sleep_secs,
+        "drill_interval_secs" => p.config.drill_interval_secs = d.drill_interval_secs,
+        _ => {
+            return Err(CFError::new(
+                "Unknown config key",
+                format!("no such knob '{key}'"),
+                "See `dastyab config show` for valid keys.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Read and render the per-cycle health beacon. `--json` emits the raw
@@ -792,7 +934,12 @@ fn configs_cmd(profile: &str, action: crate::ConfigsAction) -> Result<(), CFErro
     use dastyab_core::generated_configs::ConfigQuery;
     let ledger = dastyab_core::generated_configs::load_generated_configs(profile);
     match action {
-        crate::ConfigsAction::List { fmt, since, search } => {
+        crate::ConfigsAction::List {
+            fmt,
+            since,
+            search,
+            json,
+        } => {
             let fmt = fmt.as_deref().and_then(ExportFormat::parse);
             let q = ConfigQuery {
                 fmt,
@@ -803,6 +950,23 @@ fn configs_cmd(profile: &str, action: crate::ConfigsAction) -> Result<(), CFErro
                 text_substring: search,
             };
             let hits = ledger.search(&q);
+            if json {
+                let arr: Vec<serde_json::Value> = hits
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "created_unix": r.created_unix,
+                            "format": r.fmt.label(),
+                            "source": r.source.label(),
+                            "label": r.label.as_deref().unwrap_or(""),
+                            "sha256": hex(&r.content_sha256),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr).unwrap());
+                return Ok(());
+            }
             if hits.is_empty() {
                 println!("No generated configs match in profile '{profile}'.");
                 return Ok(());
@@ -857,6 +1021,38 @@ fn configs_cmd(profile: &str, action: crate::ConfigsAction) -> Result<(), CFErro
                     "List configs with `dastyab configs list`.",
                 )),
             }
+        }
+        crate::ConfigsAction::Rename { id, label } => {
+            dastyab_core::generated_configs::update_config_label(profile, id, Some(label))?;
+            println!("Renamed generated config #{id} (profile {profile})");
+            Ok(())
+        }
+        crate::ConfigsAction::Edit { id, content, file } => {
+            let new_content = match (content, file) {
+                (Some(c), _) => c,
+                (None, Some(path)) => std::fs::read_to_string(&path).map_err(|e| {
+                    CFError::new("Read error", format!("{e}"), "Check the file path.")
+                })?,
+                (None, None) => {
+                    return Err(CFError::new(
+                        "Missing content",
+                        "provide --content or --file",
+                        "Example: dastyab configs edit <id> --file config.txt",
+                    ));
+                }
+            };
+            dastyab_core::generated_configs::update_config_content(profile, id, new_content)?;
+            println!("Edited generated config #{id} (profile {profile})");
+            Ok(())
+        }
+        crate::ConfigsAction::Delete { id } => {
+            let removed = dastyab_core::generated_configs::delete_config(profile, id)?;
+            if removed {
+                println!("Deleted generated config #{id} (profile {profile})");
+            } else {
+                println!("No generated config with id {id} in profile '{profile}'.");
+            }
+            Ok(())
         }
     }
 }
