@@ -945,14 +945,11 @@ impl DastYabApp {
                     });
                 }
                 Err(e) => {
-                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
-                        task: "dns-tunnel".to_string(),
-                        error: CFError::new(
-                            "DNS tunnel",
-                            e.brief(),
-                            "Check VPS connectivity / SSH key / domain.",
-                        ),
-                    });
+                    return Err(CFError::new(
+                        "DNS tunnel",
+                        e.brief(),
+                        "Check VPS connectivity / SSH key / domain.",
+                    ));
                 }
             }
             Ok::<String, CFError>("dns-tunnel done".to_string())
@@ -1140,26 +1137,20 @@ impl DastYabApp {
                             });
                         }
                         Err(e) => {
-                            let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
-                                task: "hz-provision".to_string(),
-                                error: CFError::new(
-                                    "Hetzner",
-                                    format!("VPS provisioned but tunnel deploy failed: {}", e.brief()),
-                                    "Check the VPS is reachable and the tunnel server install succeeded.",
-                                ),
-                            });
+                            return Err(CFError::new(
+                                "Hetzner",
+                                format!("VPS provisioned but tunnel deploy failed: {}", e.brief()),
+                                "Check the VPS is reachable and the tunnel server install succeeded.",
+                            ));
                         }
                     }
                 }
                 Err(e) => {
-                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
-                        task: "hz-provision".to_string(),
-                        error: CFError::new(
-                            "Hetzner",
-                            e.brief(),
-                            "Check the API token is read/write and the location/server-type are valid.",
-                        ),
-                    });
+                    return Err(CFError::new(
+                        "Hetzner",
+                        e.brief(),
+                        "Check the API token is read/write and the location/server-type are valid.",
+                    ));
                 }
             }
             Ok::<String, CFError>("hz-provision done".to_string())
@@ -1209,14 +1200,11 @@ impl DastYabApp {
                     });
                 }
                 Err(e) => {
-                    let _ = tx2.send(crate::bridge::UiEvent::TaskErr {
-                        task: "multi-worker".to_string(),
-                        error: CFError::new(
-                            "multi-worker",
-                            e.brief(),
-                            "Check the active token/account.",
-                        ),
-                    });
+                    return Err(CFError::new(
+                        "multi-worker",
+                        e.brief(),
+                        "Check the active token/account.",
+                    ));
                 }
             }
             Ok::<String, CFError>("multi-worker done".to_string())
@@ -1597,6 +1585,7 @@ impl DastYabApp {
                                 &raw,
                             ) {
                                 Ok(n) => {
+                                    self.state.reload_pending = true;
                                     self.note = format!(
                                         "Imported {n} known-good IP(s) — next scan will use them as seeds."
                                     );
