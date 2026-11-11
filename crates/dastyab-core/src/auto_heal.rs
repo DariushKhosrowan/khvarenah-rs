@@ -221,6 +221,15 @@ pub fn required_fields_ok(kind: &ArtifactKind, bytes: &[u8]) -> bool {
 /// stops auto-heal from rewinding a newer deploy alongside genuinely-corrupt
 /// files. Returns the content unchanged when there is nothing to preserve or
 /// either side fails to parse.
+///
+/// INVARIANT: the live `config.json`'s `last_deployed_base_link` is written
+/// on every successful deploy, so it always reflects the most recent deploy and
+/// is ≥ any backup snapshot's (backups are only taken from prior states). Given
+/// that, preferring the live link unconditionally is correct: a backup can never
+/// hold a NEWER link than the live file, so discarding the backup's value never
+/// blocks a heal that should happen. If that invariant were ever violated (e.g.
+/// a manual config.json edit rewinds the live link), the backup's newer link
+/// would be dropped — but that state is out-of-contract and self-inflicted.
 fn preserve_live_base_link(dest: &std::path::Path, backup_content: &str) -> String {
     let Ok(live_bytes) = std::fs::read(dest) else {
         return backup_content.to_string();

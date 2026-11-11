@@ -4018,4 +4018,130 @@ mod tests {
         );
         assert!(line.contains("failed=[]"), "line: {line}");
     }
+
+    /// Scratch-home helper for store-backed CLI tests. The mem-dir override is
+    /// thread-local, so parallel tests running in the same process never
+    /// clobber each other.
+    fn config_test_home(f: impl FnOnce(String)) {
+        let tmp = tempfile::tempdir().unwrap();
+        dastyab_core::store::set_mem_dir_override(tmp.path().join(".dastyab"));
+        let id = dastyab_core::store::profiles::create_profile("clitest", "").unwrap();
+        f(id);
+    }
+
+    #[test]
+    fn config_manager_set_show_json_roundtrip() {
+        config_test_home(|id| {
+            // Set a knob.
+            cmd_config(
+                &id,
+                crate::ConfigAction::Set {
+                    key: "scan_count".into(),
+                    value: "42".into(),
+                },
+            )
+            .unwrap();
+            // Show as JSON and assert it persisted + effective values present.
+            cmd_config(&id, crate::ConfigAction::Show { json: true }).unwrap();
+            let p = dastyab_core::store::profiles::load_profile(&id);
+            assert_eq!(p.config.scan_count, 42);
+        });
+    }
+
+    #[test]
+    fn config_manager_set_rejects_bad_value_and_unknown_key() {
+        config_test_home(|id| {
+            assert!(cmd_config(
+                &id,
+                crate::ConfigAction::Set {
+                    key: "scan_count".into(),
+                    value: "banana".into(),
+                },
+            )
+            .is_err());
+            assert!(cmd_config(
+                &id,
+                crate::ConfigAction::Set {
+                    key: "no_such_knob".into(),
+                    value: "1".into(),
+                },
+            )
+            .is_err());
+            // Failed set must not have mutated the stored config (default
+            // scan_count is 2000).
+            let p = dastyab_core::store::profiles::load_profile(&id);
+            assert_eq!(p.config.scan_count, 2000);
+        });
+    }
+
+    #[test]
+    fn config_manager_unset_key_resets_to_default() {
+        config_test_home(|id| {
+            cmd_config(
+                &id,
+                crate::ConfigAction::Set {
+                    key: "light_timeout_secs".into(),
+                    value: "999".into(),
+                },
+            )
+            .unwrap();
+            cmd_config(
+                &id,
+                crate::ConfigAction::Unset {
+                    key: Some("light_timeout_secs".into()),
+                },
+            )
+            .unwrap();
+            let p = dastyab_core::store::profiles::load_profile(&id);
+            assert_eq!(p.config.light_timeout_secs, 0, "unset → system default 0");
+        });
+    }
+
+    #[test]
+    fn config_manager_unset_all_resets_whole_config() {
+        config_test_home(|id| {
+            cmd_config(
+                &id,
+                crate::ConfigAction::Set {
+                    key: "scan_count".into(),
+                    value: "7".into(),
+                },
+            )
+            .unwrap();
+            cmd_config(
+                &id,
+                crate::ConfigAction::Set {
+                    key: "protection_enabled".into(),
+                    value: "on".into(),
+                },
+            )
+            .unwrap();
+            cmd_config(&id, crate::ConfigAction::Unset { key: None }).unwrap();
+            let p = dastyab_core::store::profiles::load_profile(&id);
+            assert_eq!(p.config.scan_count, 2000, "scan_count reset to default");
+            assert!(
+                !p.config.protection_enabled,
+                "protection_enabled reset to default"
+            );
+        });
+    }
+
+    #[test]
+    fn config_manager_timeouts_writes_only_flagged() {
+        config_test_home(|id| {
+            cmd_config(
+                &id,
+                crate::ConfigAction::Timeouts {
+                    light: 200,
+                    deep: 0,
+                    max_backoff: 0,
+                    network_down_sleep: 0,
+                },
+            )
+            .unwrap();
+            let p = dastyab_core::store::profiles::load_profile(&id);
+            assert_eq!(p.config.light_timeout_secs, 200);
+            assert_eq!(p.config.deep_timeout_secs, 0, "unflagged keeps default");
+        });
+    }
 }

@@ -2288,6 +2288,7 @@ dependencies = [
  "clap",
  "dastyab-core",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",
