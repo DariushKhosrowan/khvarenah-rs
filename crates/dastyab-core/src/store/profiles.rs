@@ -810,7 +810,20 @@ pub fn get_active_token(profile_id: &str) -> Result<Option<String>, CFError> {
 }
 
 /// Persist the active token label for a profile.
+///
+/// Rejects empty/whitespace labels so a valid `active_token` marker can never
+/// be replaced by an empty one through the validated setter (the root-cause
+/// guard for the empty-marker bug — see the writer table in
+/// `docs/ops/runbook.md`).
 pub fn set_active_token(profile_id: &str, label: &str) -> Result<(), CFError> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Err(CFError::new(
+            "Storage error",
+            "Active-token label cannot be empty or whitespace.",
+            "Select a real token label to mark it active.",
+        ));
+    }
     let mut p = load_profile(profile_id);
     if !p.tokens.contains_key(label) {
         return Err(CFError::new(
@@ -821,7 +834,7 @@ pub fn set_active_token(profile_id: &str, label: &str) -> Result<(), CFError> {
     }
     push_token_event(&mut p, "made_active", label, "selected as the active token");
     save_profile(&p)?;
-    write_json(&active_token_path(profile_id), &label.trim().to_string())
+    write_json(&active_token_path(profile_id), &label.to_string())
 }
 
 /// Ensure the profile has a valid active-token marker. This is the self-heal
@@ -2201,6 +2214,25 @@ mod tests {
         with_home(|| {
             let id = create_profile("work", "").unwrap();
             assert_eq!(ensure_active_token(&id).unwrap(), None);
+        });
+    }
+
+    /// Root-cause guard: the validated setter rejects empty/whitespace labels,
+    /// so a valid `active_token` marker can never be replaced by an empty one
+    /// through `set_active_token` (the only writer that takes arbitrary input).
+    #[test]
+    fn set_active_token_rejects_empty_and_whitespace_labels() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            add_token(&id, "default", "cf_secret_default").unwrap();
+            // empty label → Err, marker untouched
+            assert!(set_active_token(&id, "").is_err());
+            // whitespace-only label → Err, marker untouched
+            assert!(set_active_token(&id, "   ").is_err());
+            assert_eq!(get_active_token(&id).unwrap(), None);
+            // valid label still works
+            set_active_token(&id, "default").unwrap();
+            assert_eq!(get_active_token(&id).unwrap().as_deref(), Some("default"));
         });
     }
 
