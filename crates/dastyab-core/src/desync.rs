@@ -523,7 +523,7 @@ mod tests {
         let data = b"GET /abcdefghijklmnopqrstuvwxyz HTTP/1.1\r\nHost: x\r\n\r\n";
         let plan = plan_for_strategy(DesyncStrategy::SplitClientHello, data, &cfg, &mut rng);
         assert_eq!(plan.len(), 2);
-        assert!(plan[0].data.len() >= 1 && plan[0].data.len() <= 24);
+        assert!(!plan[0].data.is_empty() && plan[0].data.len() <= 24);
         let joined: Vec<u8> = plan.iter().flat_map(|c| c.data.iter().copied()).collect();
         assert_eq!(joined, data);
     }

@@ -291,7 +291,7 @@ mod tests {
                             }
                             buf.extend_from_slice(&chunk[..n]);
                         }
-                        let req = String::from_utf8_lossy(&buf).to_string();
+                        let _req = String::from_utf8_lossy(&buf).to_string();
                         let first_line = head.lines().next().unwrap_or("").to_string();
                         // Capture the PATCH settings body (carries the vars JSON)
                         // and the PUT deploy multipart body (carries metadata with

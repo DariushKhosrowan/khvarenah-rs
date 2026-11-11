@@ -3393,29 +3393,6 @@ fn fmt_ts(ts: i64) -> String {
     out
 }
 
-#[cfg(test)]
-
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_verify_passes_when_ips_differ() {
-        assert!(cmd_verify("1.2.3.4", "5.6.7.8").is_ok());
-    }
-
-    #[test]
-    fn test_verify_fails_when_ips_match() {
-        assert!(cmd_verify("1.2.3.4", "1.2.3.4").is_err());
-    }
-
-    #[test]
-    fn test_verify_fails_on_empty_ip() {
-        assert!(cmd_verify("", "1.2.3.4").is_err());
-        assert!(cmd_verify("1.2.3.4", "").is_err());
-        assert!(cmd_verify("", "").is_err());
-    }
-}
-
 /// `inventory` subcommand — render the configs inventory.
 fn inventory_cmd(
     profile_filter: Option<String>,
@@ -3698,4 +3675,27 @@ fn workspace_cmd(action: WorkspaceAction) -> Result<(), CFError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_passes_when_ips_differ() {
+        assert!(cmd_verify("1.2.3.4", "5.6.7.8").is_ok());
+    }
+
+    #[test]
+    fn test_verify_fails_when_ips_match() {
+        assert!(cmd_verify("1.2.3.4", "1.2.3.4").is_err());
+    }
+
+    #[test]
+    fn test_verify_fails_on_empty_ip() {
+        assert!(cmd_verify("", "1.2.3.4").is_err());
+        assert!(cmd_verify("1.2.3.4", "").is_err());
+        assert!(cmd_verify("", "").is_err());
+    }
 }

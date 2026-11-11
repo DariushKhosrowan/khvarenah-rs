@@ -395,7 +395,7 @@ mod tests {
             let id = fresh_profile_id();
             seed_artifacts(&id);
             let backup = make_verifying_backup(&id, "b");
-            let verify = crate::manifest::verify_profile(&id);
+            let _verify = crate::manifest::verify_profile(&id);
             // No drift → plan says NoAction; force a heal of token.json directly.
             let action = HealAction::HealFiles {
                 backup_path: backup.path.clone(),

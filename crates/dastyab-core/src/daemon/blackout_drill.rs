@@ -250,7 +250,7 @@ mod tests {
         // The cooldown is exercised at the carrier-pool level; verify the
         // escalation escalation_plan and backoff_secs cooperate.
         let dir = tempfile::tempdir().unwrap();
-        let mut pool =
+        let pool =
             crate::carrier_pool::CarrierPool::open(dir.path().join("drill_pool.json")).unwrap();
         let mut snap = crate::carrier_pool::CarrierSnapshot::new_empty(1000);
         snap.endpoints.push(crate::carrier_pool::CarrierEndpoint {

@@ -178,7 +178,7 @@ pub async fn run_mutation_if_due<M: MutationPeer>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::profiles;
+    
 
     fn with_home() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();

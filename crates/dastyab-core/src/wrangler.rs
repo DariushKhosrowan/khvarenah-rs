@@ -236,7 +236,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn deploy_worker_via_wrangler_rejects_missing_binary() {
         // Force a nonexistent binary by shadowing PATH with an empty dir.
-        let empty = tempfile::tempdir().unwrap();
+        let _empty = tempfile::tempdir().unwrap();
         let result = deploy_worker_via_wrangler(
             "tok",
             "acc",

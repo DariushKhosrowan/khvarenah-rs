@@ -3396,7 +3396,7 @@ mod tests {
         // Newest outcome is last; the two oldest were trimmed.
         assert_eq!(
             *s.recent_outcomes.last().unwrap(),
-            (STRATEGY_WINDOW + 1) % 2 == 0
+            (STRATEGY_WINDOW + 1).is_multiple_of(2)
         );
         assert_eq!(s.cycles_since_rotation, (STRATEGY_WINDOW + 2) as u32);
     }
@@ -4336,7 +4336,7 @@ mod tests {
                 Box::new(AliveWorkerProbe),
             );
             let err = engine
-                .monitor_cycle_guarded(timeouts.clone())
+                .monitor_cycle_guarded(timeouts)
                 .await
                 .expect_err("hanging deep phase must time out");
             assert!(err.brief().contains("deep phase"));
@@ -4345,7 +4345,7 @@ mod tests {
             // n is 0-indexed, so rotation happens when n == THRESHOLD-1.
             if n < STRATEGY_EARLY_DEAD_CYCLES - 1 {
                 let st = crate::autopilot::resolve_strategy_v2(&id);
-                assert_eq!(st.recent_outcomes.len(), n as usize + 1);
+                assert_eq!(st.recent_outcomes.len(), n + 1);
                 assert!(st.recent_outcomes.iter().all(|&w| !w));
             }
         }

@@ -827,7 +827,7 @@ mod tests {
         Box::new(move |ip: &str, _sni: &str, _path: &str, _to: u64| {
             let out = {
                 let n: usize = ip.trim_start_matches("candidate-").parse().unwrap_or(0);
-                if n % every_kth == 0 {
+                if n.is_multiple_of(every_kth) {
                     vec![ws_accepted(443, 4096)]
                 } else {
                     vec![ws_rejected(443)]
@@ -1301,7 +1301,7 @@ mod tests {
         // under (profile, SniLayer).
         let p2: Phase2Fn = Box::new(move |ip: &str, _sni, _path, _to| {
             let n: usize = ip.trim_start_matches("candidate-").parse().unwrap_or(0);
-            let out = if n % 2 == 0 {
+            let out = if n.is_multiple_of(2) {
                 vec![ws_accepted(443, 4096)]
             } else {
                 vec![ws_rejected(443)]
@@ -1344,7 +1344,7 @@ mod tests {
         // 6 of 12 candidates are accepted (even indices); each accepted probe
         // uses Chrome120 under the worker SNI.
         assert!(
-            counted >= 3 && counted <= 6,
+            (3..=6).contains(&counted),
             "expected Chrome120/Worker success buckets, got {m:?}"
         );
         // No success recorded under any other profile (only ws_accepted ran).

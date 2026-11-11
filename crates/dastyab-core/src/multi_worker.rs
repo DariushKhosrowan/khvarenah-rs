@@ -461,7 +461,7 @@ mod tests {
         p.config.worker_set = set;
         crate::store::profiles::save_profile(&p).unwrap();
         let peer = FakeWorkerPeer {
-            alive_hosts: vec![format!("b.sub.workers.dev")],
+            alive_hosts: vec!["b.sub.workers.dev".to_string()],
             deploy_ok: true,
             saved: std::sync::Mutex::new(None),
         };
@@ -488,7 +488,7 @@ mod tests {
         p.config.worker_set = set;
         crate::store::profiles::save_profile(&p).unwrap();
         let peer = FakeWorkerPeer {
-            alive_hosts: vec![format!("a.sub.workers.dev"), format!("b.sub.workers.dev")],
+            alive_hosts: vec!["a.sub.workers.dev".to_string(), "b.sub.workers.dev".to_string()],
             deploy_ok: true,
             saved: std::sync::Mutex::new(None),
         };

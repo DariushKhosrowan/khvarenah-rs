@@ -1351,7 +1351,7 @@ mod tests {
         // any-port probe finds it even though the first ALT_PORTS entries
         // are closed.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let _port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = [0u8; 16];

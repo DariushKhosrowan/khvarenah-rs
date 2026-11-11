@@ -2234,7 +2234,7 @@ mod tests {
             "backup timestamp should be recorded"
         );
         assert!(
-            crate::backup::list_backups().len() >= 1,
+            !crate::backup::list_backups().is_empty(),
             "a backup file should exist"
         );
         assert!(
@@ -2397,8 +2397,8 @@ mod tests {
         // Write a big file, then append a line → rotation happens.
         std::fs::write(&log_path, vec![b'x'; LOG_ROTATE_BYTES as usize]).unwrap();
         daemon_log_append(&log_path, "info line");
-        assert_eq!(log_suffix(&log_path, 1).exists(), true);
-        assert_eq!(log_suffix(&log_path, 2).exists(), false);
+        assert!(log_suffix(&log_path, 1).exists());
+        assert!(!log_suffix(&log_path, 2).exists());
     }
 
     // ── daemon_tick loop behavior (established NetworkProbe/CycleRunner) ──
