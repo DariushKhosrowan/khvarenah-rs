@@ -17,7 +17,7 @@ pub struct CFErrorTemplate {
 /// Error codes we know how to explain. (code → template)
 pub const KNOWN_CODES: &[(u32, CFErrorTemplate)] = &[
     (10000, CFErrorTemplate { title: "Authentication failure", fix: "The API token was rejected. Re-enter it (or create a new one in the Cloudflare dashboard)." }),
-    (9109, CFErrorTemplate { title: "Invalid API token", fix: "The token is malformed or empty. Paste a full token from Cloudflare → My Profile → API Tokens." }),
+    (9109, CFErrorTemplate { title: "Cloudflare account deactivated", fix: "Your Cloudflare account is currently deactivated (CF error 9109) — this is an account-level block, not a token problem. Reactivate it at dash.cloudflare.com, then retry the deploy." }),
     (6003, CFErrorTemplate { title: "Insufficient permission", fix: "The token lacks a required permission. Recreate it with at least: Account-Settings-Read, Workers-Scripts-Edit, Workers-KV-Storage-Edit, Workers-Scripts-Read." }),
     (10021, CFErrorTemplate { title: "Too many requests", fix: "You hit a rate limit. Wait ~30s and retry." }),
     (10022, CFErrorTemplate { title: "Not authenticated", fix: "Token missing/expired. Re-authenticate." }),
@@ -232,6 +232,22 @@ mod tests {
             assert_eq!(e.code, Some(*code));
             assert_eq!(&e.title, tpl.title);
         }
+    }
+
+    #[test]
+    fn code_9109_is_labeled_account_deactivated_not_token_invalid() {
+        // CF 9109 = "User was deactivated" (account-level), NOT a bad token.
+        // The deploy error message must point at the suspended account, not
+        // blame the token as malformed (the old template did).
+        let e = explain_response(
+            403,
+            Some(&serde_json::json!({"errors":[{"code":9109,"message":"User was deactivated"}]})),
+            "deploy",
+        );
+        assert_eq!(e.code, Some(9109));
+        assert_eq!(e.title, "Cloudflare account deactivated");
+        assert!(e.fix.to_lowercase().contains("reactivate"));
+        assert!(!e.fix.to_lowercase().contains("malformed"));
     }
 
     #[test]
