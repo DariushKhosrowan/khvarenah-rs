@@ -154,6 +154,9 @@ pub struct DastYabApp {
     worker_tunnel_note_since: std::time::Instant,
     vps_note_since: std::time::Instant,
     mw_note_since: std::time::Instant,
+    worker_tunnel_note_hash: u64,
+    vps_note_hash: u64,
+    mw_note_hash: u64,
     view: View,
     // async bridge
     pub tx: bridge::Tx,
@@ -382,6 +385,9 @@ impl DastYabApp {
             worker_tunnel_note_since: std::time::Instant::now(),
             vps_note_since: std::time::Instant::now(),
             mw_note_since: std::time::Instant::now(),
+            worker_tunnel_note_hash: 0,
+            vps_note_hash: 0,
+            mw_note_hash: 0,
             tx,
             rx,
             running: Vec::new(),
@@ -955,7 +961,12 @@ impl DastYabApp {
         // Use the profile's ACTIVE token (not the first token added) — a
         // stale "first token" pick silently deploys with the wrong credential
         // and the worker never comes up.
-        let token = match dastyab_core::store::profiles::get_active_token(&self.profile_id)
+        // Resolve the active token with self-heal: `ensure_active_token`
+        // repopulates an empty/stale marker from any valid token on the
+        // profile (instead of returning None and silently refusing to deploy),
+        // which keeps "Make active" + deploy working even if the marker was
+        // ever left blank.
+        let token = match dastyab_core::store::profiles::ensure_active_token(&self.profile_id)
             .unwrap_or(None)
         {
             Some(label) => {
@@ -1426,9 +1437,27 @@ impl DastYabApp {
         // "Deploying…" note visible).
         let busy = self.deploy_busy();
         let idle = !busy;
-        Self::expire_status_note(&mut self.worker_tunnel_note, &mut self.worker_tunnel_note_since, idle, 90);
-        Self::expire_status_note(&mut self.vps_note, &mut self.vps_note_since, idle, 90);
-        Self::expire_status_note(&mut self.mw_note, &mut self.mw_note_since, idle, 90);
+        Self::expire_status_note(
+            &mut self.worker_tunnel_note,
+            &mut self.worker_tunnel_note_hash,
+            &mut self.worker_tunnel_note_since,
+            idle,
+            90,
+        );
+        Self::expire_status_note(
+            &mut self.vps_note,
+            &mut self.vps_note_hash,
+            &mut self.vps_note_since,
+            idle,
+            90,
+        );
+        Self::expire_status_note(
+            &mut self.mw_note,
+            &mut self.mw_note_hash,
+            &mut self.mw_note_since,
+            idle,
+            90,
+        );
     }
 
     /// Helper for auto-expiring a single status note string with its own
@@ -1436,12 +1465,27 @@ impl DastYabApp {
     /// identical for the TTL AND the guard (no matching in-flight task)
     /// permits it. A fresh write resets the timer because the caller must
     /// update `*since` when it changes the note.
-    fn expire_status_note(text: &mut String, since: &mut std::time::Instant, guard: bool, ttl_secs: u64) {
-        if text.is_empty() || !guard {
+    fn expire_status_note(
+        text: &mut String,
+        hash: &mut u64,
+        since: &mut std::time::Instant,
+        guard: bool,
+        ttl_secs: u64,
+    ) {
+        if text.is_empty() {
+            *hash = 0;
             return;
         }
-        if std::time::Instant::now().duration_since(*since) > std::time::Duration::from_secs(ttl_secs) {
+        let h = Self::fnv1a(text.as_bytes());
+        if h != *hash {
+            *hash = h;
+            *since = std::time::Instant::now();
+        } else if guard
+            && std::time::Instant::now().duration_since(*since)
+                > std::time::Duration::from_secs(ttl_secs)
+        {
             text.clear();
+            *hash = 0;
         }
     }
 
@@ -4284,6 +4328,9 @@ mod tests {
             worker_tunnel_note_since: std::time::Instant::now(),
             vps_note_since: std::time::Instant::now(),
             mw_note_since: std::time::Instant::now(),
+            worker_tunnel_note_hash: 0,
+            vps_note_hash: 0,
+            mw_note_hash: 0,
             view: View::DeployScan,
             tx: crate::bridge::channel().0,
             rx: crate::bridge::channel().1,
@@ -4493,6 +4540,9 @@ mod tests {
                 worker_tunnel_note_since: std::time::Instant::now(),
                 vps_note_since: std::time::Instant::now(),
                 mw_note_since: std::time::Instant::now(),
+                worker_tunnel_note_hash: 0,
+                vps_note_hash: 0,
+                mw_note_hash: 0,
                 view: View::Tokens,
                 tx: crate::bridge::channel().0,
                 rx: crate::bridge::channel().1,
@@ -4626,6 +4676,9 @@ mod tests {
                 worker_tunnel_note_since: std::time::Instant::now(),
                 vps_note_since: std::time::Instant::now(),
                 mw_note_since: std::time::Instant::now(),
+                worker_tunnel_note_hash: 0,
+                vps_note_hash: 0,
+                mw_note_hash: 0,
                 view: View::Dashboard, // user switched away mid-deploy
                 tx,
                 rx,
@@ -4758,6 +4811,9 @@ mod tests {
                 worker_tunnel_note_since: std::time::Instant::now(),
                 vps_note_since: std::time::Instant::now(),
                 mw_note_since: std::time::Instant::now(),
+                worker_tunnel_note_hash: 0,
+                vps_note_hash: 0,
+                mw_note_hash: 0,
                 view: View::DeployScan,
                 tx,
                 rx,
@@ -4912,34 +4968,60 @@ mod tests {
     /// one process env).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Helper: a status note whose `hash` already matches its text (so no
+    /// reset fires) and whose `since` is older than the TTL.
+    fn stale_status_note(text: &str) -> (String, u64, std::time::Instant) {
+        (
+            text.to_string(),
+            DastYabApp::fnv1a(text.as_bytes()),
+            std::time::Instant::now() - std::time::Duration::from_secs(200),
+        )
+    }
+
     /// Auto-expiry of deploy-status notes: a stale "Deploy failed" text is
     /// cleared after the TTL when idle, but is retained while a deploy task is
     /// still in flight (guard = false).
     #[test]
     fn status_note_expires_after_ttl_when_idle() {
-        let mut text = "Deploy failed: something".to_string();
-        let mut since = std::time::Instant::now()
-            - std::time::Duration::from_secs(200); // older than TTL
+        let (mut text, mut hash, mut since) = stale_status_note("Deploy failed: something");
         // idle=true → should clear.
-        DastYabApp::expire_status_note(&mut text, &mut since, true, 90);
+        DastYabApp::expire_status_note(&mut text, &mut hash, &mut since, true, 90);
         assert!(text.is_empty());
     }
 
     #[test]
     fn status_note_retained_while_busy() {
-        let mut text = "Deploying…".to_string();
-        let mut since = std::time::Instant::now()
-            - std::time::Duration::from_secs(200);
+        let (mut text, mut hash, mut since) = stale_status_note("Deploying…");
         // guard=false (a deploy is in flight) → must NOT clear.
-        DastYabApp::expire_status_note(&mut text, &mut since, false, 90);
+        DastYabApp::expire_status_note(&mut text, &mut hash, &mut since, false, 90);
         assert_eq!(text, "Deploying…");
     }
 
     #[test]
     fn status_note_not_expired_before_ttl() {
         let mut text = "Deploy failed: x".to_string();
+        let mut hash = DastYabApp::fnv1a(text.as_bytes());
         let mut since = std::time::Instant::now(); // fresh
-        DastYabApp::expire_status_note(&mut text, &mut since, true, 90);
+        DastYabApp::expire_status_note(&mut text, &mut hash, &mut since, true, 90);
         assert_eq!(text, "Deploy failed: x");
+    }
+
+    #[test]
+    fn status_note_fresh_write_resets_timer() {
+        // Regression for the deploy-status expiry bug: the timer used to be
+        // anchored at app startup (the `_since` fields were never reset when
+        // the note text changed), so a freshly-written "Deploy failed" could
+        // vanish instantly if the app had been open past the TTL. A fresh
+        // write (hash mismatch) must reset the timer and keep the note.
+        let mut text = "Deploy failed: brand new".to_string();
+        let mut hash = 0u64; // never seen → treated as a fresh write
+        let mut since = std::time::Instant::now()
+            - std::time::Duration::from_secs(200); // stale "startup" anchor
+        DastYabApp::expire_status_note(&mut text, &mut hash, &mut since, true, 90);
+        assert_eq!(text, "Deploy failed: brand new", "fresh write must not expire immediately");
+        assert_ne!(hash, 0, "hash must be captured after the fresh write");
+        // Identical text within the TTL (now anchored at the write) stays.
+        DastYabApp::expire_status_note(&mut text, &mut hash, &mut since, true, 90);
+        assert_eq!(text, "Deploy failed: brand new");
     }
 }

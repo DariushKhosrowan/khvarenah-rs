@@ -367,7 +367,11 @@ pub fn run_action(app: &mut DastYabApp, action: TokensAction) -> Option<crate::d
         TokensAction::Verify(label) => {
             // Real verification: read the token from the store by label and
             // run it through the CF verify_token endpoint on the bridge.
-            let pid = app.state.active_profile_id.clone();
+            // Target the profile the user is actually viewing (`profile_id`),
+            // not the possibly-stale cached `state.active_profile_id` (same
+            // rule as MakeActive/Add/Remove) so a stale cache can never verify
+            // against the wrong profile.
+            let pid = app.profile_id.clone();
             let token = get_token(&pid, &label).ok().flatten();
             match token {
                 Some(token) => {
