@@ -3911,7 +3911,7 @@ mod tests {
 
     /// Run a closure against an isolated mem-dir home so the store writes to a
     /// throwaway directory and never touches the user's real ~/.dastyab.
-    fn with_home(f: impl FnOnce(&str) -> ()) {
+    fn with_home(f: impl FnOnce(&str)) {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join(".dastyab");
         dastyab_core::store::set_mem_dir_override(base);
