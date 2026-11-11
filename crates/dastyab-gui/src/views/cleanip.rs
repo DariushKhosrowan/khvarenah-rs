@@ -375,7 +375,8 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
                 Ok(_) => {
                     // Learn as a persistent seed too, so future scans bias
                     // toward this known-good IP (and its /24 neighbourhood).
-                    let _ = remember_clean_ip_with_source(&app.profile_id, &ip, "manual");
+                    // NOTE: remember_clean_ip_with_source already persisted it;
+                    // only learn the bare IP as a seed here (no duplicate write).
                     if let Some(bare) = ip.split(':').next() {
                         let _ = dastyab_core::cf::ips::learn_clean_ip(&app.profile_id, bare);
                     }

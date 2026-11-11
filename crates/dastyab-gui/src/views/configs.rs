@@ -152,9 +152,18 @@ pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<Confi
                 action = Some(ConfigsAction::ExportAll);
             }
             ui.add_space(6.0);
+            // Create-config-from-IP is the "deploy once, configure many"
+            // entry point: it only works after a worker has been deployed
+            // once (a durable base link exists). Until then, keep the button
+            // disabled with an explanatory tooltip so the user is never
+            // nudged into a pointless redeploy — config creation is fully
+            // decoupled from deploying after that single deploy.
+            let can_create = ready.is_some();
             if ui
-                .button("🧭 Create config from IP")
-                .on_hover_text("Point a fresh v2rayN/sing-box/Clash config at a clean IP — no redeploy (reuses the last deployed worker uuid/path)")
+                .add_enabled(can_create, egui::Button::new("🧭 Create config from IP"))
+                .on_hover_text(
+                    "Point a fresh v2rayN/sing-box/Clash config at a clean IP — no redeploy (reuses the last deployed worker uuid/path)",
+                )
                 .clicked()
             {
                 action = Some(ConfigsAction::CreateFromIp);

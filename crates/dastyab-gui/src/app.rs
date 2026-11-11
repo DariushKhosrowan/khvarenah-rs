@@ -1026,10 +1026,14 @@ impl DastYabApp {
                     })?;
             // Record a non-clean base deploy link in history so the Configs
             // tab's "create from IP" and scanning always have a vless://
-            // skeleton to build on — no redeploy needed. Also persist it
-            // durably (survives history clears) so config-from-IP always
+            // skeleton to build on — no redeploy needed. Build it straight
+            // from the authoritative deployed URL the worker-tunnel deploy
+            // just returned (never rely on later re-resolution), then persist
+            // it durably (survives history clears) so config-from-IP always
             // resolves the actually-deployed identity.
-            if let Some(base) = dastyab_core::worker_tunnel::resolve_deployed_base_link(&pid) {
+            if let Some(base) =
+                dastyab_core::worker_tunnel::vless_link_for_worker(&pid, &res.worker_url)
+            {
                 let _ = dastyab_core::store::profiles::set_last_deployed_base_link(&pid, &base);
                 let rec = dastyab_core::store::profiles::VlessRecord {
                     id: dastyab_core::store::new_id(),
@@ -1232,8 +1236,16 @@ impl DastYabApp {
         self.push_log("[autopilot] ON — starting discovery + monitor loop");
         ctx.request_repaint();
 
+        // Learn from what we already know: bias discovery toward every
+        // previously-found clean IP (and its neighbourhood) so each successful
+        // find teaches the next cycle where to look — the self-improving loop.
+        let learned = autopilot_learned_seeds(&pid);
+
         bridge::spawn("autopilot", tx.clone(), async move {
-            let params = dastyab_core::autopilot::DiscoveryParams::default();
+            let params = dastyab_core::autopilot::DiscoveryParams {
+                seed_ips: learned,
+                ..Default::default()
+            };
             let interval = std::time::Duration::from_secs(300);
             let engine = dastyab_core::autopilot::AutopilotEngine::new(pid, params, interval);
             // Run a full cycle first (so the UI gets a quick result), then
@@ -4043,6 +4055,22 @@ async fn deploy_worker(token: &str, pid: &str) -> Result<(String, String), CFErr
     Ok((host, link))
 }
 
+/// Collect learned clean-IP seeds to bias autopilot discovery toward
+/// known-good neighborhoods (the self-improving loop). Mirrors the manual
+/// scanner's `scan_seed_ips` feed: manual seeds plus verified seed
+/// endpoints, deduplicated, capped.
+fn autopilot_learned_seeds(pid: &str) -> Vec<String> {
+    let mut seeds = dastyab_core::cf::ips::load_manual_seeds(pid);
+    seeds.extend(
+        dastyab_core::cf::ips::load_seed_endpoints(pid, 200)
+            .iter()
+            .filter_map(|s| s.split(':').next().map(|i| i.to_string())),
+    );
+    seeds.dedup();
+    seeds.truncate(400);
+    seeds
+}
+
 /// Create fresh client configs (all formats) from a user-supplied clean IP
 /// endpoint, reusing the profile's most recently deployed worker link — no
 /// redeploy. `endpoint` may be a bare IP or "ip:port". Returns the number of
@@ -4268,6 +4296,32 @@ mod tests {
             std::fs::write(dir.join("autopilot/endpoints.json"), endpoint.to_string()).unwrap();
             let eps = dastyab_core::cf::ips::load_seed_endpoints(pid, 200);
             assert!(eps.iter().any(|s| s.starts_with(found)), "seeds: {eps:?}");
+        });
+    }
+
+    #[test]
+    fn autopilot_learned_seeds_include_manual_and_verified() {
+        // The "clean IP found → app must learn and find more" complaint:
+        // autopilot must seed its discovery with previously-learned clean IPs
+        // (manual + verified), so each successful find biases the next cycle.
+        with_home(|pid| {
+            dastyab_core::cf::ips::learn_clean_ip(pid, "104.16.1.1").unwrap();
+            dastyab_core::store::profiles::remember_clean_ip(pid, "104.16.1.1").unwrap();
+            // A verified endpoint record (autopilot ledger feed).
+            let endpoint = serde_json::json!([{
+                "ip": "172.64.0.5",
+                "port": 443,
+                "verified": true,
+                "ts": "2026-11-09T00:00:00Z",
+                "last_checked": "2026-11-09T00:00:00Z"
+            }]);
+            let dir = dastyab_core::store::profiles::profile_dir(pid);
+            std::fs::create_dir_all(dir.join("autopilot")).unwrap();
+            std::fs::write(dir.join("autopilot/endpoints.json"), endpoint.to_string()).unwrap();
+
+            let learned = autopilot_learned_seeds(pid);
+            assert!(learned.iter().any(|s| s == "104.16.1.1"), "{learned:?}");
+            assert!(learned.iter().any(|s| s == "172.64.0.5"), "{learned:?}");
         });
     }
 
