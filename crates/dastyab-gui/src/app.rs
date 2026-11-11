@@ -609,6 +609,16 @@ impl DastYabApp {
         seeds
     }
 
+    /// True when any kind of deploy (edgetunnel worker or worker-hosted
+    /// tunnel) is still in flight. Guards every deploy button so a second
+    /// deploy can never clobber a running one — deploy is a one-at-a-time
+    /// operation (deploy once, then configure from clean IPs many times).
+    fn deploy_busy(&self) -> bool {
+        self.running
+            .iter()
+            .any(|t| t == "deploy" || t == "dns-tunnel-worker")
+    }
+
     fn save_scan_params(&mut self) {
         let cfg = ProfileConfig {
             scan_count: self.scan_count,
@@ -2438,8 +2448,8 @@ impl DastYabApp {
 
         if ui
             .add_enabled(
-                !self.running.contains(&"deploy".to_string()),
-                egui::Button::new(if self.running.contains(&"deploy".to_string()) {
+                !self.deploy_busy(),
+                egui::Button::new(if self.deploy_busy() {
                     "Deploying…"
                 } else {
                     "Deploy worker & make config"
@@ -3227,7 +3237,17 @@ impl DastYabApp {
             }
         });
         ui.horizontal(|ui| {
-            if ui.button("⚡ Deploy Worker tunnel (no VPS)").clicked() {
+            if ui
+                .add_enabled(
+                    !self.deploy_busy(),
+                    egui::Button::new(if self.deploy_busy() {
+                        "Deploying…"
+                    } else {
+                        "⚡ Deploy Worker tunnel (no VPS)"
+                    }),
+                )
+                .clicked()
+            {
                 self.deploy_worker_tunnel_gui();
             }
         });
@@ -3868,6 +3888,26 @@ fn create_configs_from_ip(profile_id: &str, endpoint: &str) -> Result<(usize, St
     if ep.is_empty() {
         return Err("Enter an IP (e.g. 104.16.1.1 or 104.16.1.1:443).".to_string());
     }
+    // Reject obviously-invalid endpoints before parsing (a typo must never
+    // silently render a broken config). Accept bare IPv4 or ip:port.
+    let (ip_check, port_check) = match ep.rsplit_once(':') {
+        Some((ip, port)) if port.chars().all(|c| c.is_ascii_digit()) => (ip, Some(port)),
+        Some(_) => return Err(
+            "Invalid endpoint — use an IPv4 address, optionally with a port (e.g. 104.16.1.1:443)."
+                .to_string(),
+        ),
+        None => (ep, None),
+    };
+    if ip_check.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(format!(
+            "'{ep}' is not a valid IPv4 address — use e.g. 104.16.1.1 or 104.16.1.1:443."
+        ));
+    }
+    if let Some(p) = port_check {
+        if p.parse::<u16>().is_err() {
+            return Err(format!("Port '{p}' is out of range (1..65535)."));
+        }
+    }
     // Reuse the profile's deployed worker base link (non-clean history
     // record, falling back to the persisted worker-tunnel config). This is
     // fully decoupled from deploying: after the one-time deploy, the user
@@ -4063,7 +4103,139 @@ mod tests {
             assert!(err.contains("Enter an IP"), "got: {err}");
         });
     }
+    #[test]
+    fn config_from_ip_rejects_invalid_ipv4() {
+        with_home(|pid| {
+            simulate_deploy(pid);
+            // Not an IP at all.
+            let err = create_configs_from_ip(pid, "garbage").unwrap_err();
+            assert!(err.contains("not a valid IPv4"), "got: {err}");
+            // Non-numeric port.
+            let err = create_configs_from_ip(pid, "104.16.1.1:abc").unwrap_err();
+            assert!(err.contains("Invalid endpoint"), "got: {err}");
+            // Out-of-range port.
+            let err = create_configs_from_ip(pid, "104.16.1.1:99999").unwrap_err();
+            assert!(err.contains("out of range"), "got: {err}");
+            // Valid input still works after a deploy.
+            let (n, base) = create_configs_from_ip(pid, "104.16.1.1:2053").unwrap();
+            assert!(n >= 4);
+            assert!(base.starts_with("vless://"));
+        });
+    }
 
+    #[test]
+    fn deploy_busy_reflects_inflight_deploy() {
+        // The deploy_busy() helper must report busy while a deploy task is
+        // running and idle otherwise — this is what prevents concurrent
+        // deploys (deploy-once semantics).
+        with_running(vec!["deploy".into()], |app| assert!(app.deploy_busy()));
+        with_running(vec!["dns-tunnel-worker".into()], |app| {
+            assert!(app.deploy_busy())
+        });
+        with_running(vec!["scan".into()], |app| {
+            assert!(!app.deploy_busy(), "a scan is not a deploy")
+        });
+        with_running(vec![], |app| assert!(!app.deploy_busy()));
+    }
+
+    /// Run a closure with an app instance whose `running` list is set to a
+    /// fixed value, so deploy_busy() can be asserted without an eframe context.
+    fn with_running(running: Vec<String>, f: impl FnOnce(&DastYabApp)) {
+        let mut app = DastYabApp {
+            profile_id: "test".into(),
+            profiles: vec!["test".into()],
+            note: String::new(),
+            error_banner: None,
+            view: View::DeployScan,
+            tx: crate::bridge::channel().0,
+            rx: crate::bridge::channel().1,
+            running,
+            log_lines: Vec::new(),
+            state: crate::state::GuiState::default(),
+            history_filter: HistoryFilter::All,
+            dialog: None,
+            pending_action: None,
+            selected_profile: None,
+            cleanip_search: String::new(),
+            cleanip_sort: crate::views::cleanip::CleanipSort::default(),
+            backups_search: String::new(),
+            backup_sort: BackupSort::Newest,
+            configs_search: String::new(),
+            configs_fmt_filter: String::new(),
+            configs_sort: crate::views::configs::ConfigsSort::Newest,
+            token_history_filter: String::new(),
+            log_auto_scroll: true,
+            new_profile_name: String::new(),
+            scan_count: 2000,
+            scan_workers: 50,
+            scan_timeout: 8,
+            scan_ports: "443".into(),
+            scan_gentle: true,
+            stealth_enabled: false,
+            last_link: String::new(),
+            autopilot_on: false,
+            autopilot_status: String::new(),
+            autopilot_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_cause: None,
+            last_action_label: String::new(),
+            audit_output: String::new(),
+            backup_output: String::new(),
+            export_output: String::new(),
+            beacon_enabled: false,
+            beacon_channel: "Telegram".into(),
+            beacon_token: String::new(),
+            beacon_target: String::new(),
+            beacon_rate_limit: 900,
+            beacon_note: String::new(),
+            beacon_failover_enabled: false,
+            beacon_failover_channel: "Webhook".into(),
+            beacon_failover_token: String::new(),
+            beacon_failover_target: String::new(),
+            vps_host: String::new(),
+            vps_user: String::new(),
+            vps_key: String::new(),
+            vps_port: 22,
+            vps_domain: String::new(),
+            vps_note: String::new(),
+            worker_tunnel_note: String::new(),
+            hz_token: String::new(),
+            hz_location: String::new(),
+            hz_server_type: String::new(),
+            mw_count: 1,
+            mw_note: String::new(),
+            desync_enabled: false,
+            desync_min: 0,
+            desync_max: 0,
+            desync_delay_us: 0,
+            desync_note: String::new(),
+            drill_output: String::new(),
+            daemon_note: String::new(),
+            light_timeout_s: 0,
+            deep_timeout_s: 0,
+            max_backoff_s: 0,
+            network_down_sleep_s: 0,
+            light_check_interval_s: 0,
+            drill_interval_s: 0,
+            timeouts_note: String::new(),
+            auto_rotate_enabled: false,
+            auto_rotate_note: String::new(),
+            backup_auto_enabled: false,
+            backup_auto_interval: 0,
+            backup_auto_keep: 0,
+            backup_auto_note: String::new(),
+            mutation_enabled: false,
+            mutation_interval: 0,
+            mutation_rotate_path: false,
+            mutation_note: String::new(),
+            token_search: String::new(),
+            history_search: String::new(),
+            sec_backups: false,
+            cleanip_test_output: String::new(),
+            cleanip_add_draft: String::new(),
+            token_history_search: String::new(),
+        };
+        f(&mut app);
+    }
     #[test]
     fn scan_seed_ips_includes_saved_clean_ips() {
         // A saved clean IP (from the clean-IP manager) must feed the scan seed

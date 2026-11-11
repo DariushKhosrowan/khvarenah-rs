@@ -908,14 +908,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_token_maps_to_account_deactivated() {
-        // 403 + CF code 9109 -> "Invalid API token" title (KNOWN_CODES)
+        // 403 + CF code 9109 -> CF 9109 is an *account-level* block
+        // ("User was deactivated"), NOT a bad token. KNOWN_CODES maps it to
+        // "Cloudflare account deactivated".
         let base = mock_server(
             403,
             r#"{"success":false,"errors":[{"code":9109,"message":"Invalid API Token"}]}"#,
         );
         let client = Client::with_base("abc", &base);
         let err = client.verify_token().await.unwrap_err();
-        assert_eq!(err.title, "Invalid API token");
+        assert_eq!(err.title, "Cloudflare account deactivated");
         assert_eq!(err.code, Some(9109));
         assert_eq!(err.status, Some(403));
     }

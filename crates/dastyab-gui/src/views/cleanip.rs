@@ -373,6 +373,12 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
         CleanipAction::AddManual(ip) => {
             match remember_clean_ip_with_source(&app.profile_id, &ip, "manual") {
                 Ok(_) => {
+                    // Learn as a persistent seed too, so future scans bias
+                    // toward this known-good IP (and its /24 neighbourhood).
+                    let _ = remember_clean_ip_with_source(&app.profile_id, &ip, "manual");
+                    if let Some(bare) = ip.split(':').next() {
+                        let _ = dastyab_core::cf::ips::learn_clean_ip(&app.profile_id, bare);
+                    }
                     app.state.reload_pending = true;
                     app.note = format!("Saved clean IP {ip}.");
                 }
@@ -404,6 +410,9 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
                     if reachable {
                         ok += 1;
                         let _ = remember_clean_ip_with_source(&pid, ip, "scan");
+                        if let Some(bare) = ip.split(':').next() {
+                            let _ = dastyab_core::cf::ips::learn_clean_ip(&pid, bare);
+                        }
                     }
                 }
                 out.push_str(&format!("{ok}/{} reachable", ips.len()));
@@ -435,6 +444,9 @@ pub fn run_action(app: &mut DastYabApp, action: CleanipAction) -> Option<crate::
             for s in seeds {
                 if remember_clean_ip_with_source(&pid, &s, "import").is_ok() {
                     added += 1;
+                    if let Some(bare) = s.split(':').next() {
+                        let _ = dastyab_core::cf::ips::learn_clean_ip(&pid, bare);
+                    }
                 }
             }
             app.state.reload_pending = true;
@@ -487,6 +499,9 @@ fn bridge_probe(pid: String, ip: String, tx: crate::bridge::Tx) {
         let ok = probe_endpoint(&ip).await;
         if ok {
             let _ = remember_clean_ip_with_source(&pid, &ip, "scan");
+            if let Some(bare) = ip.split(':').next() {
+                let _ = dastyab_core::cf::ips::learn_clean_ip(&pid, bare);
+            }
             Ok::<String, CFError>(format!("{ip} reachable ✓"))
         } else {
             Err(CFError::new(
