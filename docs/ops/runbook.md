@@ -42,26 +42,22 @@ whether it can ever produce an empty/whitespace marker:
 
 | Writer | Location | What it writes | Can it write empty? |
 |---|---|---|---|---|
-| `set_active_token` | `store/profiles.rs` | validated label (rejects empty/whitespace, rejects unknown label) | **No** (guarded, round 26) |
+| `set_active_token` | `store/profiles.rs` | validated label (rejects empty/whitespace, rejects unknown label) | **No** (guarded) |
 | `ensure_active_token` | `store/profiles.rs` | repopulates empty/stale marker from default or first token | **No** — writes only a real label; returns `Ok(None)` when there are no tokens (writes nothing) |
 | `remove_token` | `store/profiles.rs` | promotes next token when the removed one was active | No (promotes a real remaining label) |
 | `remove_token` (no remainder) | `store/profiles.rs` | writes empty string when the last token is removed | **Yes** — by design (no token left to be active) |
-| `get_active_token` (stale cleanup) | `store/profiles.rs` | clears a stale marker whose token no longer exists | **Yes** — writes empty string in a *best-effort* stale-cleanup (ignored error) |
-| `clear_active_token` | `store/profiles.rs` | writes empty string | **Yes** — explicit clear (only used by tests today) |
+| `get_active_token` | `store/profiles.rs` | **pure** — never writes; reports `Ok(None)` for a stale marker | **No** (getter made pure) |
+| `clear_active_token` | `store/profiles.rs` | writes empty string | **Yes** — explicit clear, `#[cfg(test)]`-only |
 | `write_json` direct callers | (GUI/CLI call `set_/ensure_` — never write the marker file directly) | — | — |
 
-Guards in place (round 26):
+Guards in place:
 
-1. `set_active_token` now rejects empty/whitespace labels, so no *validated*
+1. `set_active_token` rejects empty/whitespace labels, so no *validated*
    writer can blank the marker while a token is meant to be active. (`set_active_token_rejects_empty_and_whitespace_labels`)
-2. `ensure_active_token` is the single entry point for redeploy/account-probe;
+2. `get_active_token` is **pure** — it never writes. A stale marker is
+   reported as `Ok(None)` and left untouched (a read can never turn a
+   transient miss into a persistent empty marker). (`get_active_token_is_pure_and_leaves_stale_marker_untouched`)
+3. `ensure_active_token` is the single entry point for redeploy/account-probe;
    it repopulates an empty/stale marker from a real token when any exist, so
    the daemon never stalls on "No active token" while tokens exist.
-3. `get_active_token`'s stale cleanup is the one production path that can write
-   empty — but only when the recorded label no longer exists (token deleted),
-   which is a correct state, not a bug. It is best-effort and followed by
-   `Ok(None)`.
-
-Net: the empty-marker *bug* (blank marker while a valid token exists) can no
-longer be produced by `set_active_token`; remaining empty writes are all
-denoting a genuinely "no active token" state (no tokens, or stale label).
+4. `clear_active_token` is `#[cfg(test)]`-only — not reachable in production builds.
