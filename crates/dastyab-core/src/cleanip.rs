@@ -126,7 +126,10 @@ pub fn write_user_bundle(
             continue;
         }
         let (ip, port) = split_endpoint(link);
-        fb.push_str(&format!("# {ip}:{port} ({rtt}ms)\n{link}\n"));
+        fb.push_str(&format!(
+            "# {ip}:{port} ({rtt}ms){}\n{link}\n",
+            country_comment(&ip)
+        ));
     }
     if fb.is_empty() {
         fb.push_str("# No fallbacks yet — run autopilot to discover more clean IPs.\n");
@@ -163,6 +166,20 @@ fn split_endpoint(link: &str) -> (String, String) {
         return (hostport.to_string(), "443".to_string());
     }
     ("unknown".to_string(), "443".to_string())
+}
+
+/// Resolve an ISO-3166 alpha-2 country code for a bare IP and render it as a
+/// comment suffix (`" [US]"`) when known, else `""`. Used to annotate the
+/// user-facing fallbacks.txt so a non-technical user can pick a client's
+/// country by location.
+fn country_comment(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(addr) => match crate::geoip::GeoDB::load(None).country_code(&addr) {
+            Some(cc) => format!(" [{cc}]"),
+            None => String::new(),
+        },
+        Err(_) => String::new(),
+    }
 }
 
 fn storage_err(path: &std::path::Path, e: std::io::Error) -> CFError {
@@ -507,6 +524,29 @@ mod tests {
         );
         // and the score-5 one appears after
         assert!(content.contains("104.16.2.2"));
+    }
+
+    #[test]
+    fn write_user_bundle_fallbacks_annotate_country_when_known() {
+        with_mem_dir();
+        // 104.x first octet → US in the builtin geo table; 99.x is unknown.
+        let eps = vec![
+            sample_endpoint("104.16.2.2", 5.0, 200),
+            sample_endpoint("99.99.99.99", 6.0, 120),
+            sample_endpoint("104.16.1.1", 7.0, 48),
+        ];
+        let b = write_user_bundle("default", &sample_vless(), &eps).unwrap();
+        let content = std::fs::read_to_string(&b.fallbacks_path).unwrap();
+        // The score-6 fallback (99.99.99.99) is unknown → no country suffix.
+        assert!(
+            content.contains("# 99.99.99.99:443 (120ms)\n"),
+            "unknown-country fallback should have no suffix: {content}"
+        );
+        // The score-5 fallback (104.16.2.2) resolves to US → annotated.
+        assert!(
+            content.contains("# 104.16.2.2:443 (200ms) [US]\n"),
+            "known-country fallback should be annotated: {content}"
+        );
     }
 
     #[test]

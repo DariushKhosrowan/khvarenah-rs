@@ -47,6 +47,8 @@ pub enum CleanipSort {
     Port,
     /// Grouped by source (manual → imported → scanned).
     Source,
+    /// Grouped by country code (ISO-3166 alpha-2) when known; unknown last.
+    Country,
 }
 
 impl CleanipSort {
@@ -55,6 +57,7 @@ impl CleanipSort {
             CleanipSort::Added => "added",
             CleanipSort::Port => "port",
             CleanipSort::Source => "source",
+            CleanipSort::Country => "country",
         }
     }
 }
@@ -122,7 +125,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
             egui::ComboBox::from_id_salt("cleanip_sort")
                 .selected_text(format!("sort: {}", app.cleanip_sort.label()))
                 .show_ui(ui, |ui| {
-                    for mode in [CleanipSort::Added, CleanipSort::Port, CleanipSort::Source] {
+                    for mode in [
+                        CleanipSort::Added,
+                        CleanipSort::Port,
+                        CleanipSort::Source,
+                        CleanipSort::Country,
+                    ] {
                         ui.selectable_value(&mut app.cleanip_sort, mode, mode.label());
                     }
                 });
@@ -182,6 +190,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
                     "import" => 1,
                     _ => 2,
                 }
+            }),
+            CleanipSort::Country => matched.sort_by_key(|ip| {
+                let meta = app.state.clean_ip_meta.get(ip.as_str());
+                // meta = "source[:port][:cc]" — country is the last segment.
+                let cc = meta
+                    .and_then(|m| m.split(':').next_back())
+                    .filter(|cc| cc.len() == 2)
+                    .unwrap_or("");
+                (cc.is_empty(), cc.to_uppercase())
             }),
         }
 
