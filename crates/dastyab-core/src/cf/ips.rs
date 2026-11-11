@@ -416,14 +416,19 @@ pub fn seeded_candidates(
     };
 
     // 1) seeds that still fall inside the current ranges (from a retired range
-    //    is garbage — drop it and let uniform sampling take over).
-    let live: Vec<&str> = seeds
+    //    is garbage — drop it and let uniform sampling take over). Normalize
+    //    each seed to its bare IPv4 first: seeds may arrive as "ip:port"
+    //    (from a scan / `learn_clean_ip`, which stores the endpoint verbatim),
+    //    so parse the IP prefix. Dropping them here would silently break the
+    //    self-improving loop (a found clean IP would never bias later scans).
+    let live: Vec<String> = seeds
         .iter()
-        .map(|s| s.as_str())
-        .filter(|s| {
-            s.parse::<Ipv4Addr>()
-                .map(|ip| ranges.iter().any(|c| c.contains(ip)))
-                .unwrap_or(false)
+        .filter_map(|s| {
+            let bare = s.trim().split(':').next().unwrap_or("").trim();
+            bare.parse::<Ipv4Addr>()
+                .ok()
+                .filter(|ip| ranges.iter().any(|c| c.contains(*ip)))
+                .map(|_| bare.to_string())
         })
         .collect();
     for s in live.iter() {
@@ -905,6 +910,27 @@ not-an-ip
         let seeds = vec!["8.8.8.8".to_string()];
         let out = seeded_candidates(&seeds, &cidrs, 200, 24);
         assert!(!out.contains(&"8.8.8.8".to_string()));
+    }
+
+    #[test]
+    fn seeded_candidates_accepts_port_bearing_learned_seeds() {
+        // `learn_clean_ip` / the scanner store seeds verbatim as "ip:port".
+        // These are exactly what feeds the self-improving loop, so they must
+        // be normalized to their bare IPv4 and used as seeds + neighborhoods,
+        // not silently dropped (a found clean IP must bias later scans).
+        let cidrs = vec![Cidr::parse("104.16.0.0/13").unwrap()];
+        let seeds = vec!["104.16.1.1:443".to_string(), "104.16.2.2".to_string()];
+        let out = seeded_candidates(&seeds, &cidrs, 20, 24);
+        assert!(
+            out.contains(&"104.16.1.1".to_string()),
+            "port seed dropped: {out:?}"
+        );
+        assert!(out.contains(&"104.16.2.2".to_string()));
+        // neighbors of the port-bearing seed must be present too
+        assert!(
+            out.contains(&"104.16.1.2".to_string()),
+            "no neighbors for seed: {out:?}"
+        );
     }
 
     #[test]

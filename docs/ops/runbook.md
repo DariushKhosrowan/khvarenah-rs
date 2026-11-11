@@ -61,3 +61,14 @@ Guards in place:
    it repopulates an empty/stale marker from a real token when any exist, so
    the daemon never stalls on "No active token" while tokens exist.
 4. `clear_active_token` is `#[cfg(test)]`-only — not reachable in production builds.
+
+## Commit-header honesty note (2026-11-11)
+
+Commit `611bea4` was titled "style: rustfmt normalization ... ; fix nested-test in
+daemon" with `single-concern=yes (style)`. That label was not accurate: the
+nested-test fix is a behavior change in a test, not style, and the commit held
+two concerns (fmt + test fix). The work itself was verified green, but the header
+overstated its scope. Rule from here: a commit that changes test behavior gets its
+own commit and is never labeled "style only". If a sweep-in occurs, verify with
+`git show <hash> --stat` + `git log -1 --format='%an <%ae> %s'` and paste both
+in the report.

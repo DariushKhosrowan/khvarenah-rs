@@ -1355,7 +1355,13 @@ impl DastYabApp {
                 UiEvent::TaskErr { task, error } => {
                     self.running.retain(|t| t != &task);
                     if task == "dns-tunnel-worker" || task == "deploy" {
+                        // Surface the failure on the durable deploy-status line
+                        // (readable from every tab) AND on the red auto-expiring
+                        // banner so it is unmissable and then disappears on its
+                        // own (or on any successful redeploy). Both clear via
+                        // `expire_notices` / the successful-Done path.
                         self.worker_tunnel_note = format!("Deploy failed: {}", error.brief());
+                        self.error_banner = Some(error.explain());
                     }
                     if task == "autopilot" {
                         self.autopilot_on = false;
@@ -5051,7 +5057,9 @@ mod tests {
             }
 
             // A deploy failure must land on the same durable line (so it is
-            // visible from any tab) and NOT be lost to a transient notice.
+            // visible from any tab) and NOT be lost to a transient notice —
+            // and it must ALSO raise the red auto-expiring error banner so the
+            // failure is unmissable and then disappears on its own.
             {
                 let (mut app, tx) = test_app(pid, vec!["deploy".to_string()]);
                 tx.send(crate::bridge::UiEvent::TaskErr {
@@ -5067,6 +5075,11 @@ mod tests {
                 app.poll_bridge(&ctx);
                 assert!(app.worker_tunnel_note.contains("Deploy failed"));
                 assert!(app.running.is_empty());
+                let banner = app.error_banner.as_deref().unwrap_or_default().to_string();
+                assert!(
+                    banner.contains("Wrangler deploy failed"),
+                    "deploy failure must raise the red banner; got: {banner}"
+                );
             }
         });
     }
