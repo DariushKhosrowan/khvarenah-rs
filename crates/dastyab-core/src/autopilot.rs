@@ -665,22 +665,42 @@ async fn discover_native(
     });
     verified.truncate(target_n);
 
+    // Classify the discovery cycle's aggregate WS outcome by transport layer so
+    // a down host never demotes a good strategy (DeepSeek ranked #1). The
+    // pipeline stage counters split the signal: phase-1 TCP success proves the
+    // host is reachable, so a pure phase-2 failure is strategy-attributable;
+    // zero phase-1 success means the host never answered (hold the ladder
+    // instead of demoting).
+    let sig = match &diagnostics {
+        Some(d) => crate::worker_tunnel::secret::classify_discovery_outcome(
+            d.phase1_pass,
+            d.phase2_pass,
+            !verified.is_empty(),
+        ),
+        // No diagnostics (defensive) → preserve the legacy boolean mapping.
+        None => {
+            if verified.is_empty() {
+                crate::worker_tunnel::secret::LearningSignal::StrategyFailure
+            } else {
+                crate::worker_tunnel::secret::LearningSignal::Success
+            }
+        }
+    };
+
     // Persist diagnostics so the GUI/CLI can explain a zero result.
     if let Some(d) = diagnostics {
         let _ = crate::store::profiles::save_last_diagnostics(profile_id, &d);
     }
 
-    // Record the discovery cycle's aggregate WS outcome into the per-worker
-    // desync store. If any verified endpoint was found the strategy worked and
-    // is promoted to effective; otherwise the strategy is demoted so the next
-    // discovery advances the ladder. The persist path is serialized across
-    // concurrent monitor paths (deep discovery + GUI light sweep).
-    let had_ws_success = !verified.is_empty();
-    crate::worker_tunnel::secret::learn_from_discovery_persisted(
+    // Record the classified signal into the per-worker desync store. The
+    // persist path is serialized across concurrent monitor paths (deep discovery
+    // + GUI light sweep).
+    crate::worker_tunnel::secret::learn_from_discovery_persisted_signal(
         profile_id,
         &worker_host,
         cycle_strategy,
-        had_ws_success,
+        sig,
+        store::now_ts() as u64,
     );
 
     Ok(verified)

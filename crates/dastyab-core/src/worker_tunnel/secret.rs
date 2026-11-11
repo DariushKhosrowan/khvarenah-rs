@@ -374,6 +374,34 @@ pub fn classify_probe_failure(reason: Option<crate::health::WsFailureReason>) ->
     }
 }
 
+/// Classify a deep-discovery cycle's aggregate outcome into a [`LearningSignal`]
+/// from the pipeline's stage counters. This is the deep-path counterpart to
+/// [`classify_endpoint_outcome`] (light sweep): it splits host-unreachable from
+/// strategy-attributable failure so a down host never demotes a good strategy.
+///
+/// | phase1_pass | phase2_pass | verified | signal | meaning |
+/// |---|---|---|---|---|
+/// | any | any | non-empty | `Success` | strategy worked; promote + clear host-down |
+/// | 0 | — | empty | `HostDown` | no TCP handshake succeeded → host unreachable, hold ladder |
+/// | >0 | 0 | empty | `StrategyFailure` | TCP connected, WS failed → demote strategy used |
+/// | >0 | >0 | empty | `Unclassifiable` | WS worked (strategy fine); E2E/score gate filtered → no learning |
+pub fn classify_discovery_outcome(
+    phase1_pass: u32,
+    phase2_pass: u32,
+    verified_nonempty: bool,
+) -> LearningSignal {
+    if verified_nonempty {
+        return LearningSignal::Success;
+    }
+    if phase1_pass == 0 {
+        LearningSignal::HostDown
+    } else if phase2_pass == 0 {
+        LearningSignal::StrategyFailure
+    } else {
+        LearningSignal::Unclassifiable
+    }
+}
+
 /// Decide whether a [`LearningSignal`] should feed the strategy learner at all.
 /// `Success` and `StrategyFailure` are attributable; `HostDown` and
 /// `Unclassifiable` must NOT demote (no signal is safer than a wrong demotion).
@@ -1025,6 +1053,104 @@ mod tests {
         assert!(should_learn(StrategyFailure));
         assert!(!should_learn(HostDown));
         assert!(!should_learn(Unclassifiable));
+    }
+
+    /// Deep-discovery classification table (DeepSeek ranked #1 discriminator):
+    /// phase-1 TCP success proves the host is reachable, so the signal split is
+    /// host-unreachable (zero phase-1) vs strategy-attributable (phase-2 fail).
+    #[test]
+    fn classify_discovery_outcome_table() {
+        use LearningSignal::*;
+        // Verified → success (promote + clear host-down).
+        assert_eq!(classify_discovery_outcome(0, 0, true), Success);
+        assert_eq!(classify_discovery_outcome(100, 50, true), Success);
+        // Zero phase-1 → never connected → host-down (hold ladder, no demote).
+        assert_eq!(classify_discovery_outcome(0, 0, false), HostDown);
+        assert_eq!(classify_discovery_outcome(0, 0, false), HostDown);
+        // Phase-1 connected, phase-2 failed → strategy-attributable → demote.
+        assert_eq!(classify_discovery_outcome(10, 0, false), StrategyFailure);
+        assert_eq!(classify_discovery_outcome(1, 0, false), StrategyFailure);
+        // Phase-2 passed but no verified → E2E/score gate filtered, not a
+        // strategy failure → unclassifiable (no learning).
+        assert_eq!(classify_discovery_outcome(10, 5, false), Unclassifiable);
+        assert_eq!(classify_discovery_outcome(1, 1, false), Unclassifiable);
+    }
+
+    /// (a) deep-discovery host-unreachable (zero phase-1 TCP success) does not
+    /// demote and does not pollute the strategy record: the effective strategy
+    /// is held and the failed-set is untouched, while host_down records.
+    #[test]
+    fn discovery_host_down_holds_strategy_and_does_not_demote() {
+        let mut c = cfg();
+        record_worker_desync_success(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitClientHello,
+        );
+        let before_failed = c.worker_secrets["http://w"].failed_strategies.clone();
+        let before_effective = c.worker_secrets["http://w"].desync_strategy;
+
+        let changed = apply_learning_signal(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitClientHello,
+            classify_discovery_outcome(0, 0, false),
+            1_700_000_000,
+        );
+        assert!(changed);
+        let ws = &c.worker_secrets["http://w"];
+        assert!(ws.host_down);
+        assert_eq!(ws.host_down_since_unix, 1_700_000_000);
+        // Not polluted: effective unchanged, failed-set unchanged.
+        assert_eq!(ws.desync_strategy, before_effective);
+        assert_eq!(ws.failed_strategies, before_failed);
+        // Held strategy: select keeps the effective, does NOT walk the ladder.
+        assert_eq!(
+            strategy_for_worker(&c, "http://w", 0),
+            crate::desync::DesyncStrategy::SplitClientHello
+        );
+    }
+
+    /// (b) deep-discovery strategy-level WS failure (phase-1 connected, phase-2
+    /// failed) still demotes — regression guard on the promote/demote behavior.
+    #[test]
+    fn discovery_strategy_failure_still_demotes() {
+        let mut c = cfg();
+        record_worker_desync_success(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitClientHello,
+        );
+        let changed = apply_learning_signal(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitClientHello,
+            classify_discovery_outcome(10, 0, false),
+            1_700_000_100,
+        );
+        assert!(changed);
+        let ws = &c.worker_secrets["http://w"];
+        assert!(ws
+            .failed_strategies
+            .contains(&crate::desync::DesyncStrategy::SplitClientHello));
+        // Host not marked down — the host was reachable (phase-1 connected).
+        assert!(!ws.host_down);
+    }
+
+    /// (d) deep-discovery unclassifiable (phase-2 passed but no verified — the
+    /// E2E/score gate filtered them, not a strategy failure) ⇒ no learning.
+    #[test]
+    fn discovery_unclassifiable_produces_no_learning() {
+        let mut c = cfg();
+        let changed = apply_learning_signal(
+            &mut c,
+            "http://w",
+            crate::desync::DesyncStrategy::SplitClientHello,
+            classify_discovery_outcome(10, 5, false),
+            1_700_000_300,
+        );
+        assert!(!changed);
+        assert!(!c.worker_secrets.contains_key("http://w"));
     }
 
     /// (a) host-unreachable does not demote and does not pollute the strategy
