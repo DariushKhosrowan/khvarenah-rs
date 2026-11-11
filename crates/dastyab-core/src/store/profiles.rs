@@ -363,6 +363,11 @@ pub struct CleanIpMeta {
     /// ISO timestamp of the most recent verification / touch.
     #[serde(default)]
     pub last_verified_at: String,
+    /// ISO-3166 alpha-2 country code inferred from the endpoint's IP
+    /// (via the bundled geoip lookup), when one is known. `None` when the
+    /// address is unknown to the built-in table.
+    #[serde(default)]
+    pub country: Option<String>,
 }
 
 fn default_cleanip_source() -> String {
@@ -1001,6 +1006,7 @@ pub fn remember_clean_ip_with_source(id: &str, ip: &str, source: &str) -> Result
     };
     let now = crate::store::now_iso();
     let port = parse_ip_port(&ep);
+    let country = clean_ip_country(&ep);
     if !p.clean_ips.contains(&ep) {
         p.clean_ips.push(ep.clone());
         let meta = CleanIpMeta {
@@ -1008,11 +1014,15 @@ pub fn remember_clean_ip_with_source(id: &str, ip: &str, source: &str) -> Result
             port,
             first_verified_at: now.clone(),
             last_verified_at: now,
+            country,
         };
         p.clean_ip_meta.insert(ep.clone(), meta);
     } else if let Some(m) = p.clean_ip_meta.get_mut(&ep) {
         m.last_verified_at = now;
         m.port = port;
+        if m.country.is_none() {
+            m.country = clean_ip_country(&ep);
+        }
         if m.source == "scan" {
             m.source = source.to_string();
         }
@@ -1031,6 +1041,15 @@ fn parse_ip_port(ep: &str) -> u16 {
     ep.rsplit_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok())
         .unwrap_or(443)
+}
+
+/// Resolve a clean-IP endpoint to an ISO-3166 alpha-2 country code using the
+/// bundled geoip lookup (first-octet table). Returns `None` when the IP is
+/// unknown / not an IPv4 address.
+fn clean_ip_country(ep: &str) -> Option<String> {
+    let ip_part = ep.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(ep);
+    let ip: std::net::IpAddr = ip_part.parse().ok()?;
+    crate::geoip::GeoDB::load(None).country_code(&ip)
 }
 
 /// Normalize and validate a clean-IP endpoint string.
@@ -1671,6 +1690,24 @@ mod tests {
                     "104.16.1.1:443".to_string()
                 ]
             );
+        });
+    }
+
+    #[test]
+    fn remember_clean_ip_populates_country_from_geoip() {
+        with_home(|| {
+            let id = create_profile("geo", "").unwrap();
+            // 81.0.0.1 == first octet 81 → IR in the builtin geo table.
+            remember_clean_ip(&id, "81.0.0.1:443").unwrap();
+            // 104.16.55.1 == first octet 104 → US in the builtin geo table.
+            remember_clean_ip(&id, "104.16.55.1:443").unwrap();
+            // 1.1.1.1 → unknown to the builtin table → country None.
+            remember_clean_ip(&id, "1.1.1.1:443").unwrap();
+            let p = load_profile(&id);
+            let m = &p.clean_ip_meta;
+            assert_eq!(m.get("81.0.0.1:443").unwrap().country.as_deref(), Some("IR"));
+            assert_eq!(m.get("104.16.55.1:443").unwrap().country.as_deref(), Some("US"));
+            assert_eq!(m.get("1.1.1.1:443").unwrap().country.as_deref(), None);
         });
     }
 

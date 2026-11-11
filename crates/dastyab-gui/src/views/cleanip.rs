@@ -219,9 +219,17 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
                                         ui.horizontal(|ui| {
                                             tag(ui, src_label, src_color);
                                             if let Some(m) = meta {
-                                                if let Some((_, p)) = m.rsplit_once(':') {
+                                                let parts: Vec<&str> = m.split(':').collect();
+                                                // parts[0] = source, parts[1] = port (maybe),
+                                                // parts[2] = country (maybe).
+                                                if let Some(p) = parts.get(1) {
                                                     if let Ok(p) = p.parse::<u16>() {
                                                         tag(ui, &format!(":{p}"), GOLD_DIM);
+                                                    }
+                                                }
+                                                if let Some(cc) = parts.get(2) {
+                                                    if !cc.is_empty() {
+                                                        tag(ui, cc, egui::Color32::from_rgb(141, 168, 190));
                                                     }
                                                 }
                                             }

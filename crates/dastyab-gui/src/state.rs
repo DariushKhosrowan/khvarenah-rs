@@ -134,7 +134,12 @@ impl GuiState {
                 } else {
                     format!(":{}", m.port)
                 };
-                (k.clone(), format!("{}{port}", m.source))
+                let cc = m
+                    .country
+                    .as_ref()
+                    .map(|c| format!(":{}", c))
+                    .unwrap_or_default();
+                (k.clone(), format!("{}{port}{cc}", m.source))
             })
             .collect();
 
