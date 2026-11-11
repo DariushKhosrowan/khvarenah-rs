@@ -187,6 +187,9 @@ pub struct DastYabApp {
     pub configs_fmt_filter: String,
     /// Sort order for the generated-configs manager.
     pub configs_sort: crate::views::configs::ConfigsSort,
+    /// Selected learned clean IP for the Configs view's one-click
+    /// \"create config from this clean IP\" (no redeploy).
+    pub configs_selected_ip: String,
     /// Kind filter for the token-history ledger (empty = all).
     pub token_history_filter: String,
     /// Auto-scroll the Log view to the newest line.
@@ -402,6 +405,7 @@ impl DastYabApp {
             configs_search: String::new(),
             configs_fmt_filter: String::new(),
             configs_sort: crate::views::configs::ConfigsSort::Newest,
+            configs_selected_ip: String::new(),
             new_profile_name: String::new(),
             scan_count: profile.config.scan_count.max(1),
             scan_workers: profile.config.scan_workers.max(1),
@@ -1330,13 +1334,12 @@ impl DastYabApp {
                     // "Deploy failed" banner.
                     self.error_banner = None;
                     match task.as_str() {
-                        "dns-tunnel-worker" => {
-                            // Deploy of the worker DNS tunnel: surface the
-                            // outcome on the deploy note line (visible from
-                            // every tab via the sidebar), refresh the store
-                            // cache, and log. This must NOT depend on which
-                            // tab is active — switching tabs mid-deploy must
-                            // not hide or drop the result.
+                        "dns-tunnel-worker" | "deploy" => {
+                            // Deploy outcome (worker DNS tunnel OR the Deploy
+                            // tab's deploy-&-config action): surface it on the
+                            // durable deploy-status line so it is visible from
+                            // every tab (sidebar footer, Dashboard, Tools) and
+                            // switching tabs mid-deploy never hides or drops it.
                             self.worker_tunnel_note = summary.clone();
                             self.state.reload_pending = true;
                             self.push_log(&format!("[done] {task}: {summary}"));
@@ -1363,7 +1366,7 @@ impl DastYabApp {
                 }
                 UiEvent::TaskErr { task, error } => {
                     self.running.retain(|t| t != &task);
-                    if task == "dns-tunnel-worker" {
+                    if task == "dns-tunnel-worker" || task == "deploy" {
                         self.worker_tunnel_note = format!("Deploy failed: {}", error.brief());
                     }
                     if task == "autopilot" {
@@ -2053,6 +2056,65 @@ impl DastYabApp {
             }
         });
 
+        // ── Deploy status card ───────────────────────────────────
+        // The durable, tab-independent view of where the worker deploy stands.
+        // It mirrors the sidebar footer and the Tools panel, so a deploy's
+        // outcome is always reachable from home regardless of which tab was
+        // active when it finished.
+        crate::views::section_card(ui, "Deploy status", |ui| {
+            let deployed_link = dastyab_core::worker_tunnel::resolve_deployed_base_link(&self.profile_id);
+            // Combine every deploy note into one line (worker tunnel + VPS +
+            // multi-worker), newest non-empty wins.
+            let status_line = if !self.worker_tunnel_note.is_empty() {
+                Some(&self.worker_tunnel_note)
+            } else if !self.vps_note.is_empty() {
+                Some(&self.vps_note)
+            } else if !self.mw_note.is_empty() {
+                Some(&self.mw_note)
+            } else {
+                None
+            };
+            if let Some(line) = status_line {
+                ui.label(egui::RichText::new(line).color(TEXT));
+            } else {
+                ui.label(
+                    egui::RichText::new("No deploy performed yet in this session.")
+                        .color(GOLD_DIM),
+                );
+            }
+            ui.add_space(4.0);
+            match &deployed_link {
+                Some(_) => {
+                    ui.label(
+                        egui::RichText::new(
+                            "✅ Worker deployed — create configs from any clean IP any number of times (Configs tab).",
+                        )
+                        .color(egui::Color32::from_rgb(140, 230, 160)),
+                    );
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(
+                            "⚠ No deployed worker base link yet. Deploy once, then configure many times from clean IPs without redeploying.",
+                        )
+                        .color(egui::Color32::from_rgb(250, 190, 110)),
+                    );
+                }
+            }
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("🚀 Deploy / scan").clicked() {
+                    self.view = View::DeployScan;
+                }
+                if ui.button("📄 Configs").clicked() {
+                    self.view = View::Configs;
+                }
+                if deployed_link.is_none() && ui.button("🔑 Manage token").clicked() {
+                    self.view = View::Tokens;
+                }
+            });
+        });
+
         // ── Quick actions card ────────────────────────────────────
         crate::views::section_card(ui, "Quick actions", |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -2295,9 +2357,7 @@ impl DastYabApp {
                 }
                 // Live background-task status — visible from every tab so a
                 // deploy/scan in progress is never "lost" when the user
-                // switches views. Shows the task names AND the live deploy
-                // progress line so switching tabs never hides what a deploy
-                // is doing.
+                // switches views. Shows the task names while they run.
                 if !self.running.is_empty() {
                     ui.add_space(4.0);
                     ui.label(
@@ -2305,24 +2365,26 @@ impl DastYabApp {
                             .color(egui::Color32::from_rgb(120, 200, 255))
                             .small(),
                     );
-                    // Surface the live deploy note (worker tunnel / VPS) right
-                    // here in the sidebar so a running deploy is visible and
-                    // legible from every view, not just the Deploy tab.
-                    let deploy_note = if !self.worker_tunnel_note.is_empty() {
-                        Some(&self.worker_tunnel_note)
-                    } else if !self.vps_note.is_empty() {
-                        Some(&self.vps_note)
-                    } else {
-                        None
-                    };
-                    if let Some(note) = deploy_note {
-                        ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new(note)
-                                .color(egui::Color32::from_rgb(250, 210, 140))
-                                .small(),
-                        );
-                    }
+                }
+                // Durable deploy-status line — the last deploy outcome (or a
+                // live "Deploying…" progress line) is ALWAYS shown here, on
+                // every tab, independent of which view is active. A deploy's
+                // result never disappears just because the user switched tabs
+                // mid-deploy. It auto-expires on its own after its TTL.
+                let deploy_note = if !self.worker_tunnel_note.is_empty() {
+                    Some(&self.worker_tunnel_note)
+                } else if !self.vps_note.is_empty() {
+                    Some(&self.vps_note)
+                } else {
+                    None
+                };
+                if let Some(note) = deploy_note {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(note)
+                            .color(egui::Color32::from_rgb(250, 210, 140))
+                            .small(),
+                    );
                 }
             });
 
@@ -2805,6 +2867,48 @@ impl DastYabApp {
     }
 
     fn configs_panel(&mut self, ui: &mut egui::Ui) {
+        // One-click fast path for "create a new config with a specific IP
+        // without redeploying": pick a previously-learned clean IP (the app
+        // learned it from a scan / config creation) and render a fresh config
+        // set for it immediately. This is the concrete realization of the
+        // deploy-once → configure-many model.
+        let ready = dastyab_core::worker_tunnel::resolve_deployed_base_link(&self.profile_id).is_some();
+        let learned = self.state.clean_ips.clone();
+        if ready && !learned.is_empty() {
+            crate::views::section_card(ui, "Create config from a learned clean IP (no redeploy)", |ui| {
+                if self.configs_selected_ip.is_empty() || !learned.contains(&self.configs_selected_ip) {
+                    self.configs_selected_ip = learned[0].clone();
+                }
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Clean IP:").color(GOLD_DIM));
+                    egui::ComboBox::from_id_salt("cfg_fast_ip")
+                        .selected_text(&self.configs_selected_ip)
+                        .show_ui(ui, |ui| {
+                            for ip in &learned {
+                                ui.selectable_value(&mut self.configs_selected_ip, ip.clone(), ip);
+                            }
+                        });
+                    if ui
+                        .button("🧭 Create config from this clean IP")
+                        .on_hover_text(
+                            "Render share-link / v2rayN / sing-box / Clash configs pointing at this clean IP — no redeploy.",
+                        )
+                        .clicked()
+                    {
+                        let ep = self.configs_selected_ip.clone();
+                        self.create_config_from_ip(&ep);
+                    }
+                });
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("Learned from previous scans/configs — the more you scan, the more IPs appear here.")
+                        .color(GOLD_DIM)
+                        .small(),
+                );
+            });
+            ui.add_space(6.0);
+        }
+
         if let Some(act) = configs::show(ui, self) {
             if let Some(dlg) = configs::run_action(self, act) {
                 self.dialog = Some(dlg);
@@ -4370,7 +4474,16 @@ mod tests {
     /// Run a closure with an app instance whose `profile_id` and `running`
     /// list are set, so state-flows can be asserted without an eframe context.
     fn with_running(pid: &str, running: Vec<String>, f: impl FnOnce(&DastYabApp)) {
-        let mut app = DastYabApp {
+        let (mut app, _tx) = test_app(pid, running);
+        f(&mut app);
+    }
+
+    /// Build a minimal `DastYabApp` for tests (no eframe context needed).
+    /// Returns the app and its bridge sender so tests can inject background
+    /// events (`UiEvent`) and then drain them via `poll_bridge`.
+    fn test_app(pid: &str, running: Vec<String>) -> (DastYabApp, crate::bridge::Tx) {
+        let (tx, rx) = crate::bridge::channel();
+        let app = DastYabApp {
             profile_id: pid.into(),
             profiles: vec![pid.into()],
             note: String::new(),
@@ -4386,8 +4499,8 @@ mod tests {
             vps_note_hash: 0,
             mw_note_hash: 0,
             view: View::DeployScan,
-            tx: crate::bridge::channel().0,
-            rx: crate::bridge::channel().1,
+            tx: tx.clone(),
+            rx,
             running,
             log_lines: Vec::new(),
             state: crate::state::GuiState::default(),
@@ -4402,6 +4515,7 @@ mod tests {
             configs_search: String::new(),
             configs_fmt_filter: String::new(),
             configs_sort: crate::views::configs::ConfigsSort::Newest,
+            configs_selected_ip: String::new(),
             token_history_filter: String::new(),
             log_auto_scroll: true,
             new_profile_name: String::new(),
@@ -4473,7 +4587,7 @@ mod tests {
             cleanip_add_draft: String::new(),
             token_history_search: String::new(),
         };
-        f(&mut app);
+        (app, tx)
     }
     #[test]
     fn scan_seed_ips_includes_saved_clean_ips() {
@@ -4614,6 +4728,7 @@ mod tests {
                 configs_search: String::new(),
                 configs_fmt_filter: String::new(),
                 configs_sort: crate::views::configs::ConfigsSort::Newest,
+                configs_selected_ip: String::new(),
                 token_history_filter: String::new(),
                 log_auto_scroll: true,
                 new_profile_name: String::new(),
@@ -4750,6 +4865,7 @@ mod tests {
                 configs_search: String::new(),
                 configs_fmt_filter: String::new(),
                 configs_sort: crate::views::configs::ConfigsSort::Newest,
+                configs_selected_ip: String::new(),
                 token_history_filter: String::new(),
                 log_auto_scroll: true,
                 new_profile_name: String::new(),
@@ -4847,6 +4963,53 @@ mod tests {
     }
 
     #[test]
+    fn deploy_tab_task_done_routes_to_persistent_status_note() {
+        // Both deploy entry points — the Deploy tab's "Deploy worker & make
+        // config" (task "deploy") and the worker-tunnel deploy (task
+        // "dns-tunnel-worker") — must route their outcome to the durable,
+        // tab-independent deploy-status line (`worker_tunnel_note`), so the
+        // user sees the result from any tab and it never disappears the moment
+        // they switch away.
+        with_home(|pid| {
+            dastyab_core::store::profiles::set_active_profile(pid).unwrap();
+
+            for task in ["deploy", "dns-tunnel-worker"] {
+                let (mut app, tx) = test_app(pid, vec![task.to_string()]);
+                app.view = View::Dashboard; // switched away mid-deploy
+                tx.send(crate::bridge::UiEvent::Done {
+                    task: task.to_string(),
+                    summary: "Worker deployed at https://x.sub.workers.dev".into(),
+                })
+                .unwrap();
+                let ctx = egui::Context::default();
+                app.poll_bridge(&ctx);
+                assert!(app.worker_tunnel_note.contains("Worker deployed"), "{task}");
+                assert!(app.running.is_empty(), "{task}");
+                assert!(app.error_banner.is_none(), "{task}");
+            }
+
+            // A deploy failure must land on the same durable line (so it is
+            // visible from any tab) and NOT be lost to a transient notice.
+            {
+                let (mut app, tx) = test_app(pid, vec!["deploy".to_string()]);
+                tx.send(crate::bridge::UiEvent::TaskErr {
+                    task: "deploy".into(),
+                    error: dastyab_core::CFError::new(
+                        "Wrangler deploy failed",
+                        "network unreachable",
+                        "retry",
+                    ),
+                })
+                .unwrap();
+                let ctx = egui::Context::default();
+                app.poll_bridge(&ctx);
+                assert!(app.worker_tunnel_note.contains("Deploy failed"));
+                assert!(app.running.is_empty());
+            }
+        });
+    }
+
+    #[test]
     fn successful_redeploy_clears_stale_error_banner() {
         // The "errors must disappear" complaint: a failed deploy sets the red
         // banner; a subsequent successful deploy must clear it (not keep the
@@ -4885,6 +5048,7 @@ mod tests {
                 configs_search: String::new(),
                 configs_fmt_filter: String::new(),
                 configs_sort: crate::views::configs::ConfigsSort::Newest,
+                configs_selected_ip: String::new(),
                 token_history_filter: String::new(),
                 log_auto_scroll: true,
                 new_profile_name: String::new(),
