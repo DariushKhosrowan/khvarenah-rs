@@ -1910,13 +1910,21 @@ impl AutopilotEngine {
             let sig = if alive == ledger_len {
                 crate::worker_tunnel::secret::LearningSignal::Success
             } else if alive > 0 {
-                crate::worker_tunnel::secret::classify_light_sweep(true, Some(&light_hist))
+                crate::worker_tunnel::secret::classify_light_sweep(
+                    alive,
+                    ledger_len,
+                    Some(&light_hist),
+                )
             } else if saw_strategy_failure {
                 crate::worker_tunnel::secret::LearningSignal::StrategyFailure
             } else if saw_host_down && any_probed {
                 crate::worker_tunnel::secret::LearningSignal::HostDown
             } else {
-                crate::worker_tunnel::secret::classify_light_sweep(false, Some(&light_hist))
+                crate::worker_tunnel::secret::classify_light_sweep(
+                    alive,
+                    ledger_len,
+                    Some(&light_hist),
+                )
             };
             crate::worker_tunnel::secret::learn_from_discovery_persisted_signal(
                 &self.profile_id,
