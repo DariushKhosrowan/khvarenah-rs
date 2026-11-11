@@ -162,6 +162,40 @@ impl GeneratedConfigsLedger {
     pub const FILE: &'static str = "generated_configs.json";
 }
 
+/// Record all rendered config formats for a profile into the generated-configs
+/// ledger and persist it. This is the single "config creation" primitive used
+/// by every deploy/learn path (edgetunnel deploy, worker-tunnel deploy, and
+/// config-from-clean-IP), so a deploy always produces a usable, durable config.
+///
+/// Returns the number of formats recorded.
+pub fn record_profile_configs(
+    id: &str,
+    profile: &crate::vless::VlessProfile,
+    source: ConfigSource,
+    label: Option<String>,
+) -> usize {
+    let all = crate::export::render_all(profile);
+    if all.is_empty() {
+        return 0;
+    }
+    let mut ledger = load_generated_configs(id);
+    let now = crate::store::now_ts() as u64;
+    let mut n = 0usize;
+    for (fmt_label, content) in &all {
+        let Some(fmt) = ExportFormat::parse(fmt_label) else {
+            continue;
+        };
+        if ledger
+            .push(now, fmt, source, label.clone(), content.clone())
+            .is_ok()
+        {
+            n += 1;
+        }
+    }
+    let _ = save_generated_configs(id, &ledger);
+    n
+}
+
 /// Persist the generated-configs ledger for a profile.
 ///
 /// The write goes through the ledger append-only guard (high-water) so the
@@ -324,5 +358,49 @@ mod tests {
         save_generated_configs(&id, &l).unwrap();
         let loaded = load_generated_configs(&id);
         assert_eq!(loaded.records.len(), 2);
+    }
+
+    #[test]
+    fn record_profile_configs_renders_all_formats_into_ledger() {
+        crate::store::set_mem_dir_override(test_mem_dir());
+        let id = crate::store::profiles::create_profile("g3", "gen").unwrap();
+        let prof = crate::vless::VlessProfile {
+            uuid: "12345678-1234-1234-1234-123456789abc".into(),
+            address: "104.16.1.1".into(),
+            port: 443,
+            path: "/".into(),
+            transport: "ws".into(),
+            security: "tls".into(),
+            name: "test-worker".into(),
+            ..Default::default()
+        };
+        let n = record_profile_configs(
+            &id,
+            &prof,
+            ConfigSource::WorkerVless,
+            Some("deploy test-worker".into()),
+        );
+        // share-link, v2rayN, sing-box, Clash.
+        assert!(n >= 4, "expected >=4 formats, got {n}");
+        let loaded = load_generated_configs(&id);
+        assert!(loaded.records.len() >= 4);
+        // Every record must carry the deployed worker identity and be usable.
+        for r in &loaded.records {
+            assert!(
+                r.content.contains(&prof.uuid),
+                "missing uuid in {}",
+                r.fmt.label()
+            );
+            assert!(
+                r.content.contains("104.16.1.1"),
+                "missing address in {}",
+                r.fmt.label()
+            );
+        }
+        // Calling it again appends (never overwrites) — config creation is
+        // repeatable and additive.
+        record_profile_configs(&id, &prof, ConfigSource::WorkerVless, Some("again".into()));
+        let total = load_generated_configs(&id);
+        assert_eq!(total.records.len(), loaded.records.len() * 2);
     }
 }

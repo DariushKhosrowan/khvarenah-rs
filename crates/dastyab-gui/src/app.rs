@@ -959,6 +959,9 @@ impl DastYabApp {
         let pid = self.profile_id.clone();
         let tx = self.tx.clone();
         self.running.push("dns-tunnel-worker".to_string());
+        // A fresh deploy attempt clears any stale deploy error so the old
+        // failure disappears the moment the user retries.
+        self.error_banner = None;
         self.worker_tunnel_note = "Deploying Worker DNS tunnel (no VPS)…".to_string();
         let tx2 = tx.clone();
         bridge::spawn("dns-tunnel-worker", tx.clone(), async move {
@@ -1008,6 +1011,18 @@ impl DastYabApp {
                     note: "deployed via worker tunnel".into(),
                 };
                 let _ = dastyab_core::store::profiles::remember_vless(&pid, rec);
+                // Also generate the whole set of client configs (share-link,
+                // v2rayN, sing-box, Clash) from the freshly-deployed worker
+                // identity right now, so the Configs tab has a complete,
+                // usable config the moment a deploy finishes — no extra step.
+                if let Ok(prof) = dastyab_core::vless::VlessProfile::parse(&base) {
+                    let _ = dastyab_core::generated_configs::record_profile_configs(
+                        &pid,
+                        &prof,
+                        dastyab_core::generated_configs::ConfigSource::WorkerVless,
+                        Some(format!("deploy {}", res.worker_name)),
+                    );
+                }
             }
             let _ = tx2.send(crate::bridge::UiEvent::Log {
                 task: "dns-tunnel-worker".to_string(),
@@ -1017,7 +1032,7 @@ impl DastYabApp {
                 ),
             });
             Ok::<String, CFError>(format!(
-                "Worker tunnel deployed at {} ({}). You can now create configs from any clean IP in the Configs tab without redeploying.",
+                "Worker tunnel deployed at {} ({}). Configs created in the Configs tab — you can now create more from any clean IP without ever redeploying.",
                 res.worker_url, res.worker_name
             ))
         });
@@ -2113,7 +2128,9 @@ impl DastYabApp {
                 }
                 // Live background-task status — visible from every tab so a
                 // deploy/scan in progress is never "lost" when the user
-                // switches views.
+                // switches views. Shows the task names AND the live deploy
+                // progress line so switching tabs never hides what a deploy
+                // is doing.
                 if !self.running.is_empty() {
                     ui.add_space(4.0);
                     ui.label(
@@ -2121,6 +2138,24 @@ impl DastYabApp {
                             .color(egui::Color32::from_rgb(120, 200, 255))
                             .small(),
                     );
+                    // Surface the live deploy note (worker tunnel / VPS) right
+                    // here in the sidebar so a running deploy is visible and
+                    // legible from every view, not just the Deploy tab.
+                    let deploy_note = if !self.worker_tunnel_note.is_empty() {
+                        Some(&self.worker_tunnel_note)
+                    } else if !self.vps_note.is_empty() {
+                        Some(&self.vps_note)
+                    } else {
+                        None
+                    };
+                    if let Some(note) = deploy_note {
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(note)
+                                .color(egui::Color32::from_rgb(250, 210, 140))
+                                .small(),
+                        );
+                    }
                 }
             });
 
@@ -3852,27 +3887,12 @@ async fn deploy_worker(token: &str, pid: &str) -> Result<(String, String), CFErr
     // Record every rendered config format (share-link, v2rayN, sing-box,
     // Clash) into the generated-configs ledger so the Configs tab reflects
     // the fresh deployment without a separate export step.
-    let mut ledger = dastyab_core::generated_configs::load_generated_configs(pid);
-    let now = dastyab_core::store::now_ts() as u64;
-    use dastyab_core::export::{render, ExportFormat};
-    use dastyab_core::generated_configs::ConfigSource;
-    for fmt in [
-        ExportFormat::ShareLink,
-        ExportFormat::V2rayN,
-        ExportFormat::SingBox,
-        ExportFormat::Clash,
-    ] {
-        if let Ok(content) = render(&vless, fmt) {
-            let _ = ledger.push(
-                now,
-                fmt,
-                ConfigSource::WorkerVless,
-                Some(format!("deploy {worker_name}")),
-                content,
-            );
-        }
-    }
-    let _ = dastyab_core::generated_configs::save_generated_configs(pid, &ledger);
+    let _ = dastyab_core::generated_configs::record_profile_configs(
+        pid,
+        &vless,
+        dastyab_core::generated_configs::ConfigSource::WorkerVless,
+        Some(format!("deploy {worker_name}")),
+    );
 
     // Persist the canonical base link durably so config-from-IP and scanning
     // keep resolving the *actual* deployed identity even after history is
@@ -3938,33 +3958,24 @@ fn create_configs_from_ip(profile_id: &str, endpoint: &str) -> Result<(usize, St
     prof.port = port;
     prof.name = format!("clean-{ep}");
 
-    // Render all formats and write them into the generated-configs ledger.
-    let all = dastyab_core::export::render_all(&prof);
-    if all.is_empty() {
+    // Render all formats and write them into the generated-configs ledger via
+    // the shared "config creation" primitive (same path every deploy uses).
+    let n = dastyab_core::generated_configs::record_profile_configs(
+        profile_id,
+        &prof,
+        dastyab_core::generated_configs::ConfigSource::WorkerVless,
+        Some(format!("clean {ep}")),
+    );
+    if n == 0 {
         return Err("Could not render any config for that endpoint.".to_string());
     }
-    let mut ledger = dastyab_core::generated_configs::load_generated_configs(profile_id);
-    let now = dastyab_core::store::now_ts() as u64;
-    use dastyab_core::generated_configs::ConfigSource;
-    for (fmt_label, content) in &all {
-        let fmt = dastyab_core::export::ExportFormat::parse(fmt_label);
-        let Some(fmt) = fmt else { continue };
-        let _ = ledger.push(
-            now,
-            fmt,
-            ConfigSource::WorkerVless,
-            Some(format!("clean {ep}")),
-            content.clone(),
-        );
-    }
-    let _ = dastyab_core::generated_configs::save_generated_configs(profile_id, &ledger);
 
     // Also remember it as a saved clean IP + learn it as a seed (so future
     // scans bias toward this proven-good IP and its neighborhood).
     let _ = remember_clean_ip(profile_id, ep);
     let _ = dastyab_core::cf::ips::learn_clean_ip(profile_id, &ip);
 
-    Ok((all.len(), base_link))
+    Ok((n, base_link))
 }
 
 /// Open a folder in the platform file manager.
@@ -4011,9 +4022,19 @@ mod tests {
         };
         dastyab_core::vps_deploy::write_tunnel_client_config(pid, &cfg).unwrap();
         // Persist the durable base link too, exactly as the real deploy paths
-        // do now (`deploy_worker` / `deploy_worker_tunnel_gui`).
+        // do now (`deploy_worker` / `deploy_worker_tunnel_gui`), and record
+        // the full rendered config set in the ledger the way the real deploy
+        // now does (a deploy leaves a complete, usable config behind).
         if let Some(base) = dastyab_core::worker_tunnel::resolve_deployed_base_link(pid) {
             dastyab_core::store::profiles::set_last_deployed_base_link(pid, &base).unwrap();
+            if let Ok(prof) = dastyab_core::vless::VlessProfile::parse(&base) {
+                let _ = dastyab_core::generated_configs::record_profile_configs(
+                    pid,
+                    &prof,
+                    dastyab_core::generated_configs::ConfigSource::WorkerVless,
+                    Some("deploy dyb-tun-cccc".into()),
+                );
+            }
         }
         worker_url
     }
@@ -4141,22 +4162,22 @@ mod tests {
         // The deploy_busy() helper must report busy while a deploy task is
         // running and idle otherwise — this is what prevents concurrent
         // deploys (deploy-once semantics).
-        with_running(vec!["deploy".into()], |app| assert!(app.deploy_busy()));
-        with_running(vec!["dns-tunnel-worker".into()], |app| {
+        with_running("test", vec!["deploy".into()], |app| assert!(app.deploy_busy()));
+        with_running("test", vec!["dns-tunnel-worker".into()], |app| {
             assert!(app.deploy_busy())
         });
-        with_running(vec!["scan".into()], |app| {
+        with_running("test", vec!["scan".into()], |app| {
             assert!(!app.deploy_busy(), "a scan is not a deploy")
         });
-        with_running(vec![], |app| assert!(!app.deploy_busy()));
+        with_running("test", vec![], |app| assert!(!app.deploy_busy()));
     }
 
-    /// Run a closure with an app instance whose `running` list is set to a
-    /// fixed value, so deploy_busy() can be asserted without an eframe context.
-    fn with_running(running: Vec<String>, f: impl FnOnce(&DastYabApp)) {
+    /// Run a closure with an app instance whose `profile_id` and `running`
+    /// list are set, so state-flows can be asserted without an eframe context.
+    fn with_running(pid: &str, running: Vec<String>, f: impl FnOnce(&DastYabApp)) {
         let mut app = DastYabApp {
-            profile_id: "test".into(),
-            profiles: vec!["test".into()],
+            profile_id: pid.into(),
+            profiles: vec![pid.into()],
             note: String::new(),
             error_banner: None,
             view: View::DeployScan,
@@ -4310,6 +4331,162 @@ mod tests {
 
             let ledger = dastyab_core::generated_configs::load_generated_configs(pid);
             assert!(ledger.records.len() >= 4, "ledger missing records");
+        });
+    }
+
+    #[test]
+    fn deploy_records_full_config_set_in_ledger() {
+        // The "deploy worker doesn't create configs well" complaint: a deploy
+        // must leave behind the full set of client configs in the Configs
+        // ledger (share-link/v2rayN/sing-box/Clash), not just a history row.
+        with_home(|pid| {
+            simulate_deploy(pid);
+            let ledger = dastyab_core::generated_configs::load_generated_configs(pid);
+            let fmts: std::collections::BTreeSet<&str> = ledger
+                .records
+                .iter()
+                .map(|r| r.fmt.label())
+                .collect();
+            for want in ["share-link", "v2rayN", "sing-box", "Clash"] {
+                assert!(fmts.contains(want), "missing {want} in ledger: {fmts:?}");
+            }
+            // They must share one worker identity (durable base link).
+            let base = dastyab_core::worker_tunnel::resolve_deployed_base_link(pid).unwrap();
+            let prof = dastyab_core::vless::VlessProfile::parse(&base).unwrap();
+            for r in &ledger.records {
+                assert!(
+                    r.content.contains(&prof.uuid),
+                    "record missing worker uuid in {}",
+                    r.fmt.label()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn gui_make_active_run_action_targets_and_reflects_profile() {
+        // Drive the exact GUI call path (tokens::run_action -> MakeActive) on
+        // a real profile and verify the store marker AND the in-memory view
+        // state both flip, and a reload is requested. This is the bug where
+        // clicking "Make active" appeared to do nothing.
+        with_home(|pid| {
+            use dastyab_core::store::profiles::{
+                add_token, get_active_token, set_active_profile,
+            };
+            set_active_profile(pid).unwrap();
+            add_token(pid, "first", "token-a-very-long-value").unwrap();
+            add_token(pid, "second", "token-b-very-long-value").unwrap();
+
+            let mut app = DastYabApp {
+                profile_id: pid.into(),
+                profiles: vec![pid.into()],
+                note: String::new(),
+                error_banner: None,
+                view: View::Tokens,
+                tx: crate::bridge::channel().0,
+                rx: crate::bridge::channel().1,
+                running: vec![],
+                log_lines: Vec::new(),
+                state: crate::state::GuiState::default(),
+                history_filter: HistoryFilter::All,
+                dialog: None,
+                pending_action: None,
+                selected_profile: None,
+                cleanip_search: String::new(),
+                cleanip_sort: crate::views::cleanip::CleanipSort::default(),
+                backups_search: String::new(),
+                backup_sort: BackupSort::Newest,
+                configs_search: String::new(),
+                configs_fmt_filter: String::new(),
+                configs_sort: crate::views::configs::ConfigsSort::Newest,
+                token_history_filter: String::new(),
+                log_auto_scroll: true,
+                new_profile_name: String::new(),
+                scan_count: 2000,
+                scan_workers: 50,
+                scan_timeout: 8,
+                scan_ports: "443".into(),
+                scan_gentle: true,
+                stealth_enabled: false,
+                last_link: String::new(),
+                autopilot_on: false,
+                autopilot_status: String::new(),
+                autopilot_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_cause: None,
+                last_action_label: String::new(),
+                audit_output: String::new(),
+                backup_output: String::new(),
+                export_output: String::new(),
+                beacon_enabled: false,
+                beacon_channel: "Telegram".into(),
+                beacon_token: String::new(),
+                beacon_target: String::new(),
+                beacon_rate_limit: 900,
+                beacon_note: String::new(),
+                beacon_failover_enabled: false,
+                beacon_failover_channel: "Webhook".into(),
+                beacon_failover_token: String::new(),
+                beacon_failover_target: String::new(),
+                vps_host: String::new(),
+                vps_user: String::new(),
+                vps_key: String::new(),
+                vps_port: 22,
+                vps_domain: String::new(),
+                vps_note: String::new(),
+                worker_tunnel_note: String::new(),
+                hz_token: String::new(),
+                hz_location: String::new(),
+                hz_server_type: String::new(),
+                mw_count: 1,
+                mw_note: String::new(),
+                desync_enabled: false,
+                desync_min: 0,
+                desync_max: 0,
+                desync_delay_us: 0,
+                desync_note: String::new(),
+                drill_output: String::new(),
+                daemon_note: String::new(),
+                light_timeout_s: 0,
+                deep_timeout_s: 0,
+                max_backoff_s: 0,
+                network_down_sleep_s: 0,
+                light_check_interval_s: 0,
+                drill_interval_s: 0,
+                timeouts_note: String::new(),
+                auto_rotate_enabled: false,
+                auto_rotate_note: String::new(),
+                backup_auto_enabled: false,
+                backup_auto_interval: 0,
+                backup_auto_keep: 0,
+                backup_auto_note: String::new(),
+                mutation_enabled: false,
+                mutation_interval: 0,
+                mutation_rotate_path: false,
+                mutation_note: String::new(),
+                token_search: String::new(),
+                history_search: String::new(),
+                sec_backups: false,
+                cleanip_test_output: String::new(),
+                cleanip_add_draft: String::new(),
+                token_history_search: String::new(),
+            };
+            app.state.reload();
+
+            // Make "second" active through the same handler the button invokes.
+            let dlg = crate::views::tokens::run_action(
+                &mut app,
+                crate::views::tokens::TokensAction::MakeActive("second".into()),
+            );
+            assert!(dlg.is_none(), "make-active must not open a dialog");
+
+            // Store marker flipped.
+            assert_eq!(get_active_token(pid).unwrap().as_deref(), Some("second"));
+            // In-memory view state flipped.
+            assert_eq!(app.state.active_token_label.as_deref(), Some("second"));
+            assert!(app.state.tokens.iter().find(|t| t.label == "second").unwrap().is_active);
+            assert!(!app.state.tokens.iter().find(|t| t.label == "first").unwrap().is_active);
+            // A reload is scheduled so the store-driven view stays consistent.
+            assert!(app.state.reload_pending);
         });
     }
 }
