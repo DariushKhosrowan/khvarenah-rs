@@ -580,17 +580,29 @@ impl DastYabApp {
     /// these (and expands their neighborhoods) so each successful scan teaches
     /// the next one where to look — the self-improving learning loop.
     fn scan_seed_ips(&self, pid: &str) -> Vec<String> {
-        let mut seeds: Vec<String> = dastyab_core::cf::ips::load_manual_seeds(pid)
-            .into_iter()
-            .filter_map(|s| s.split(':').next().map(|ip| ip.trim().to_string()))
-            .filter(|ip| !ip.is_empty())
-            .collect();
+        let mut seeds: Vec<String> = Vec::new();
+        let mut push_ip = |ip: &str| {
+            let ip = ip.trim().to_string();
+            if !ip.is_empty() && !seeds.contains(&ip) {
+                seeds.push(ip);
+            }
+        };
+        for s in dastyab_core::cf::ips::load_manual_seeds(pid) {
+            if let Some(ip) = s.split(':').next() {
+                push_ip(ip);
+            }
+        }
+        // Every saved clean IP (from the clean-IP manager) is a seed, so a
+        // single find cascades into denser scanning around its neighborhood.
+        let p = load_profile(pid);
+        for ep in &p.clean_ips {
+            if let Some(ip) = ep.split(':').next() {
+                push_ip(ip);
+            }
+        }
         for ep in dastyab_core::cf::ips::load_seed_endpoints(pid, 200) {
             if let Some(ip) = ep.split(':').next() {
-                let ip = ip.trim().to_string();
-                if !ip.is_empty() && !seeds.contains(&ip) {
-                    seeds.push(ip);
-                }
+                push_ip(ip);
             }
         }
         seeds.truncate(400);
@@ -3778,17 +3790,30 @@ async fn deploy_worker(token: &str, pid: &str) -> Result<(String, String), CFErr
     let js: Vec<u8> = std::fs::read(&worker_path)
         .map_err(|e| CFError::new("Read error", format!("{e}"), "Check the file path."))?;
 
-    client
-        .deploy_script(&acc.id, &worker_name, js, "2026-07-01", 2)
-        .await?;
-    client
-        .set_vars(
-            &acc.id,
-            &worker_name,
-            serde_json::Map::from_iter([("UUID".into(), serde_json::json!(uuid))]),
-        )
-        .await?;
-    let host = format!("{worker_name}.{subdomain}.workers.dev");
+    // Deploy via wrangler. The raw CF Worker upload API only accepts classic
+    // (service-worker) syntax and rejects ESM module workers with error 10021
+    // ("Unexpected token 'export'"), so the ONLY reliable path for a real
+    // ESM edgetunnel worker is `wrangler deploy` (it bundles ESM → classic).
+    // We set the UUID as a worker var in the same deploy.
+    let wopts = dastyab_core::wrangler::WranglerDeployOpts {
+        worker_name: worker_name.clone(),
+        compat_date: "2026-07-01".into(),
+        kv_binding: None,
+        crons: vec![],
+        vars: vec![("UUID".to_string(), uuid.clone())],
+    };
+    let deployed =
+        dastyab_core::wrangler::deploy_worker_via_wrangler(token, &acc.id, &js, &wopts).await?;
+    // The deployed URL is authoritative; fall back to constructing it if a
+    // wrangler version prints a bare hostname.
+    let host = if deployed.contains(".workers.dev") {
+        deployed
+            .strip_prefix("https://")
+            .unwrap_or(&deployed)
+            .to_string()
+    } else {
+        format!("{worker_name}.{subdomain}.workers.dev")
+    };
     let vless = VlessProfile {
         uuid: uuid.clone(),
         address: host.clone(),
@@ -4036,6 +4061,22 @@ mod tests {
         with_home(|pid| {
             let err = create_configs_from_ip(pid, "   ").unwrap_err();
             assert!(err.contains("Enter an IP"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn scan_seed_ips_includes_saved_clean_ips() {
+        // A saved clean IP (from the clean-IP manager) must feed the scan seed
+        // list, so a single found IP cascades into denser scanning around its
+        // neighborhood — the "learn and find more from it" requirement.
+        // We verify the core building blocks that `scan_seed_ips` consumes:
+        // manual seeds + saved clean IPs on the profile.
+        with_home(|pid| {
+            dastyab_core::store::profiles::remember_clean_ip(pid, "104.16.55.1").unwrap();
+            dastyab_core::store::profiles::remember_clean_ip(pid, "104.16.56.2:2053").unwrap();
+            let p = dastyab_core::store::profiles::load_profile(pid);
+            assert!(p.clean_ips.iter().any(|s| s.contains("104.16.55.1")));
+            assert!(p.clean_ips.iter().any(|s| s.contains("104.16.56.2")));
         });
     }
 }

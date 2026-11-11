@@ -113,6 +113,18 @@ impl Client {
         Self::with_base(token, API)
     }
 
+    /// The raw API token (used to shell out to wrangler for ESM deploys).
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Whether this client targets the real Cloudflare API (vs a local mock
+    /// server used in tests). When true, callers must deploy ESM workers via
+    /// wrangler (the raw upload API rejects ESM).
+    pub fn is_live(&self) -> bool {
+        self.base_url == API
+    }
+
     /// Test helper / advanced use: point the client at a different base URL
     /// (e.g. a local mock server).
     pub fn with_base(token: &str, base_url: &str) -> Self {
@@ -393,6 +405,23 @@ impl Client {
         compat_date: &str,
         retries: u32,
     ) -> Result<serde_json::Value, CFError> {
+        // ESM module workers cannot be uploaded via the raw Worker upload API
+        // (it only accepts classic/service-worker syntax and rejects
+        // `export default` with error 10021). When talking to the real
+        // Cloudflare API, deploy via wrangler (bundles ESM → classic). Local
+        // mock-server tests keep the HTTP path.
+        if self.is_live() {
+            let wopts = crate::wrangler::WranglerDeployOpts {
+                worker_name: name.to_string(),
+                compat_date: compat_date.to_string(),
+                kv_binding: None,
+                crons: vec![],
+                vars: vec![],
+            };
+            crate::wrangler::deploy_worker_via_wrangler(&self.token, account_id, &js, &wopts)
+                .await?;
+            return Ok(serde_json::json!({ "success": true }));
+        }
         let metadata = serde_json::json!({
             "main_module": "_worker.js",
             "compatibility_date": compat_date,
@@ -499,6 +528,35 @@ impl Client {
         bindings: Vec<serde_json::Value>,
         crons: &[&str],
     ) -> Result<serde_json::Value, CFError> {
+        // ESM module workers cannot be uploaded via the raw Worker upload API
+        // (it only accepts classic/service-worker syntax and rejects
+        // `export default` with error 10021). When talking to the real
+        // Cloudflare API, deploy via wrangler (bundles ESM → classic). Local
+        // mock-server tests keep the HTTP path.
+        if self.is_live() {
+            // Translate the binding/value entries into wrangler.toml config.
+            let mut kv_binding = None;
+            for b in &bindings {
+                if b.get("type").and_then(|t| t.as_str()) == Some("kv_namespace") {
+                    if let (Some(name2), Some(ns)) = (
+                        b.get("name").and_then(|v| v.as_str()),
+                        b.get("namespace_id").and_then(|v| v.as_str()),
+                    ) {
+                        kv_binding = Some((name2.to_string(), ns.to_string()));
+                    }
+                }
+            }
+            let wopts = crate::wrangler::WranglerDeployOpts {
+                worker_name: name.to_string(),
+                compat_date: compat_date.to_string(),
+                kv_binding,
+                crons: crons.iter().map(|c| c.to_string()).collect(),
+                vars: vec![],
+            };
+            crate::wrangler::deploy_worker_via_wrangler(&self.token, account_id, &js, &wopts)
+                .await?;
+            return Ok(serde_json::json!({ "success": true }));
+        }
         let metadata = Self::build_deploy_metadata(compat_date, &bindings, crons);
         let metadata_str = metadata.to_string();
 

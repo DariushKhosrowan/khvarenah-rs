@@ -408,7 +408,18 @@ pub fn run_action(app: &mut DastYabApp, action: TokensAction) -> Option<crate::d
         TokensAction::MakeActive(label) => {
             // Target the profile the user is actually viewing (`profile_id`),
             // not the possibly-stale cached `state.active_profile_id` — a
-            // mismatch here silently no-ops ("nothing happens").
+            // mismatch here silently no-ops ("nothing happens"). We also guard
+            // against a stale token list by re-reading the target profile's
+            // active token from the store before mutating in-memory state.
+            if app.profile_id.is_empty() {
+                app.note = "No profile selected — pick a profile first.".to_string();
+                return None;
+            }
+            // Only record an activation if this is not already the active token
+            // (avoids a confusing no-op that looks like a failure).
+            let already = dastyab_core::store::profiles::get_active_token(&app.profile_id)
+                .ok()
+                .flatten();
             match set_active_token(&app.profile_id, &label) {
                 Ok(_) => {
                     // Reflect the change immediately (not just after the next
@@ -417,8 +428,14 @@ pub fn run_action(app: &mut DastYabApp, action: TokensAction) -> Option<crate::d
                     for t in &mut app.state.tokens {
                         t.is_active = t.label == label;
                     }
+                    app.note = if already.as_deref() == Some(label.as_str()) {
+                        format!("'{label}' is already the active token.")
+                    } else {
+                        format!("'{label}' is now the active token.")
+                    };
+                    // Force a reload next frame so the store-driven view and the
+                    // in-memory view stay consistent.
                     app.state.reload_pending = true;
-                    app.note = format!("'{label}' is now the active token.");
                 }
                 Err(e) => app.note = e.brief(),
             }

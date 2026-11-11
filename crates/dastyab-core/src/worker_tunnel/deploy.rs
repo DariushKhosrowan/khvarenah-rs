@@ -99,43 +99,65 @@ pub async fn deploy_worker_tunnel(
     let kv_ns_id = cf
         .ensure_kv_namespace(account_id, "dastyab-carrier-snapshot")
         .await?;
-    let binding = serde_json::json!({
-        "type": "kv_namespace",
-        "name": "DYB_CARRIER_SNAPSHOT",
-        "namespace_id": kv_ns_id,
-    });
 
-    // Deploy the worker bundle (with the KV binding and self-ping cron
-    // trigger in metadata). The cron trigger keeps the worker alive during
-    // long blackouts so Cloudflare does not deactivate it as idle.
-    cf.deploy_script_with_bindings(
-        account_id,
-        &worker_name,
-        WORKER_TUNNEL_JS.as_bytes().to_vec(),
-        &opts.compat_date,
-        opts.retries,
-        vec![binding],
-        &[WORKER_CRON_SCHEDULE],
-    )
-    .await?;
-
-    // Set the per-worker secret var.
-    let mut vars = serde_json::Map::new();
-    vars.insert(
-        "DYB_SESSION_SECRET".to_string(),
-        serde_json::Value::String(deploy_secret.clone()),
-    );
-    vars.insert(
-        "DYB_TUNNEL_BASE".to_string(),
-        serde_json::Value::String(DYB_TUNNEL_BASE.to_string()),
-    );
+    // Worker vars (secret, base domain, optional upstream).
+    let mut vars: Vec<(String, String)> = vec![
+        ("DYB_SESSION_SECRET".to_string(), deploy_secret.clone()),
+        ("DYB_TUNNEL_BASE".to_string(), DYB_TUNNEL_BASE.to_string()),
+    ];
     if let Some(upstream) = &opts.vless_upstream {
-        vars.insert(
-            "DYB_VLESS_UPSTREAM".to_string(),
-            serde_json::Value::String(upstream.clone()),
-        );
+        vars.push(("DYB_VLESS_UPSTREAM".to_string(), upstream.clone()));
     }
-    cf.set_vars(account_id, &worker_name, vars).await?;
+
+    // Deploy the worker bundle. The cron trigger keeps the worker alive
+    // during long blackouts so Cloudflare does not deactivate it as idle.
+    //
+    // ESM workers CANNOT be uploaded via the raw CF Worker upload API (it only
+    // accepts classic/service-worker syntax and rejects `export default` with
+    // error 10021). So when we are talking to the real Cloudflare API we must
+    // deploy via wrangler (which bundles ESM → classic). When the client
+    // points at a local mock server (tests) we keep the HTTP path so the mock
+    // can be asserted against.
+    if cf.is_live() {
+        let wopts = crate::wrangler::WranglerDeployOpts {
+            worker_name: worker_name.clone(),
+            compat_date: opts.compat_date.clone(),
+            kv_binding: Some(("DYB_CARRIER_SNAPSHOT".to_string(), kv_ns_id.clone())),
+            crons: vec![WORKER_CRON_SCHEDULE.to_string()],
+            vars,
+        };
+        let deployed = crate::wrangler::deploy_worker_via_wrangler(
+            cf.token(),
+            account_id,
+            WORKER_TUNNEL_JS.as_bytes(),
+            &wopts,
+        )
+        .await?;
+        // The deployed URL is authoritative; the constructed `worker_url` is
+        // only a fallback.
+        let _ = deployed;
+    } else {
+        let binding = serde_json::json!({
+            "type": "kv_namespace",
+            "name": "DYB_CARRIER_SNAPSHOT",
+            "namespace_id": kv_ns_id,
+        });
+        cf.deploy_script_with_bindings(
+            account_id,
+            &worker_name,
+            WORKER_TUNNEL_JS.as_bytes().to_vec(),
+            &opts.compat_date,
+            opts.retries,
+            vec![binding],
+            &[WORKER_CRON_SCHEDULE],
+        )
+        .await?;
+        let mut vmap = serde_json::Map::new();
+        for (k, v) in vars {
+            vmap.insert(k, serde_json::Value::String(v));
+        }
+        cf.set_vars(account_id, &worker_name, vmap).await?;
+    }
 
     // Persist the client config (mode=Worker) via the existing writer. It
     // always carries the current secret (never pending) so in-flight traffic

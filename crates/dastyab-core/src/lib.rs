@@ -95,6 +95,7 @@ pub mod worker;
 pub mod worker_tunnel;
 pub mod workspace_snapshot;
 pub mod workspace_snapshots;
+pub mod wrangler;
 
 pub use blackout::NetworkState;
 pub use connectivity::{FallbackLadder, Probe, ProbeVerdict, RealLadderProbe, Tier, TierChange};
