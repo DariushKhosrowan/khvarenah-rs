@@ -55,7 +55,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<Confi
     // more configs from clean IPs without redeploying.
     let ready = dastyab_core::worker_tunnel::resolve_deployed_base_link(&app.profile_id);
     let status_frame = egui::Frame::new()
-        .fill(if ready.is_some() { CARD } else { CARD })
+        .fill(if ready.is_some() {
+            egui::Color32::from_rgb(16, 36, 22)
+        } else {
+            egui::Color32::from_rgb(38, 30, 16)
+        })
         .inner_margin(egui::Margin::symmetric(10, 8))
         .corner_radius(6.0)
         .stroke(egui::Stroke::new(

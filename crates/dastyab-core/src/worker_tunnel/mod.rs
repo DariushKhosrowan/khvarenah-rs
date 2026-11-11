@@ -76,7 +76,6 @@ pub fn vless_link_for_worker(profile_id: &str, worker_url: &str) -> Option<Strin
         sni: Some(host.clone()),
         header_host: Some(host),
         name: format!("worker-{}", &uuid[..8]),
-        ..Default::default()
     };
     Some(prof.share_link())
 }

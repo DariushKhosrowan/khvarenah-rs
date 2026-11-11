@@ -1220,72 +1220,15 @@ impl DastYabApp {
     /// endpoint, reusing this profile's most recent deployed worker link — no
     /// redeploy. `endpoint` may be a bare IP or "ip:port".
     fn create_config_from_ip(&mut self, endpoint: &str) {
-        let ep = endpoint.trim();
-        if ep.is_empty() {
-            self.note = "Enter an IP (e.g. 104.16.1.1 or 104.16.1.1:443).".to_string();
-            return;
-        }
-        // Reuse the profile's deployed worker base link (non-clean history
-        // record, falling back to the persisted worker-tunnel config). This is
-        // fully decoupled from deploying: after the one-time deploy, the user
-        // can create configs from any clean IP without ever redeploying.
-        let base_link = dastyab_core::worker_tunnel::resolve_deployed_base_link(&self.profile_id);
-        let Some(base_link) = base_link else {
-            self.note = "No deployed worker link yet — deploy once, then you can point configs at any clean IP without redeploying.".to_string();
-            return;
-        };
-
-        // Parse the base worker config, then override the address with the
-        // user-supplied clean IP (keeps uuid/path/security/transport).
-        let mut prof = match dastyab_core::vless::VlessProfile::parse(&base_link) {
-            Ok(pr) => pr,
-            Err(e) => {
-                self.note = format!("Could not parse deployed link: {}", e.brief());
-                return;
+        match create_configs_from_ip(&self.profile_id, endpoint) {
+            Ok((n, base_link)) => {
+                self.state.reload_pending = true;
+                self.note = format!(
+                    "Created {n} config(s) from {endpoint} — no redeploy needed (url {base_link})"
+                );
             }
-        };
-        let (ip, port) = match ep.rsplit_once(':') {
-            Some((ip, port)) if port.chars().all(|c| c.is_ascii_digit()) => {
-                (ip.to_string(), port.parse::<u16>().unwrap_or(443))
-            }
-            _ => (ep.to_string(), 443),
-        };
-        prof.address = ip.clone();
-        prof.port = port;
-        prof.name = format!("clean-{ep}");
-
-        // Render all formats and write them into the generated-configs ledger.
-        let all = dastyab_core::export::render_all(&prof);
-        if all.is_empty() {
-            self.note = "Could not render any config for that endpoint.".to_string();
-            return;
+            Err(msg) => self.note = msg,
         }
-        let pid = self.profile_id.clone();
-        let mut ledger = dastyab_core::generated_configs::load_generated_configs(&pid);
-        let now = dastyab_core::store::now_ts() as u64;
-        use dastyab_core::generated_configs::ConfigSource;
-        for (fmt_label, content) in &all {
-            let fmt = dastyab_core::export::ExportFormat::parse(fmt_label);
-            let Some(fmt) = fmt else { continue };
-            let _ = ledger.push(
-                now,
-                fmt,
-                ConfigSource::WorkerVless,
-                Some(format!("clean {ep}")),
-                content.clone(),
-            );
-        }
-        let _ = dastyab_core::generated_configs::save_generated_configs(&pid, &ledger);
-
-        // Also remember it as a saved clean IP + learn it as a seed.
-        let _ = remember_clean_ip(&pid, ep);
-        let _ = dastyab_core::cf::ips::learn_clean_ip(&pid, &ip);
-
-        self.state.reload_pending = true;
-        self.note = format!(
-            "Created {n} config(s) from {ep} — no redeploy needed (url {base_link})",
-            n = all.len()
-        );
     }
 
     /// Drain the async bridge, applying every pending event to UI state.
@@ -1295,13 +1238,15 @@ impl DastYabApp {
             match ev {
                 UiEvent::Done { task, summary } => {
                     self.running.retain(|t| t != &task);
+                    // A task succeeding means whatever previously failed has
+                    // recovered (or never applied) — clear stale error banners
+                    // so errors disappear once things work again. This must
+                    // happen for ALL tasks, including dns-tunnel-worker (which
+                    // used to `continue` past the clear, leaving a red banner
+                    // up even after a successful redeploy).
+                    self.error_banner = None;
                     if task == "dns-tunnel-worker" {
                         self.worker_tunnel_note = summary.clone();
-                    } else {
-                        // A task succeeding means whatever previously failed has
-                        // recovered (or never applied) — clear stale error banners
-                        // so errors disappear once things work again.
-                        self.error_banner = None;
                     }
                     if task == "autopilot" {
                         self.autopilot_status = summary.clone();
@@ -3884,6 +3829,71 @@ async fn deploy_worker(token: &str, pid: &str) -> Result<(String, String), CFErr
     Ok((host, link))
 }
 
+/// Create fresh client configs (all formats) from a user-supplied clean IP
+/// endpoint, reusing the profile's most recently deployed worker link — no
+/// redeploy. `endpoint` may be a bare IP or "ip:port". Returns the number of
+/// configs created and the base link used.
+///
+/// This is the "deploy once, configure many" primitive: after a single deploy
+/// has recorded a worker base link (history or worker-tunnel config), the
+/// caller can point as many configs at as many clean IPs as it likes without
+/// ever touching Cloudflare again.
+fn create_configs_from_ip(profile_id: &str, endpoint: &str) -> Result<(usize, String), String> {
+    let ep = endpoint.trim();
+    if ep.is_empty() {
+        return Err("Enter an IP (e.g. 104.16.1.1 or 104.16.1.1:443).".to_string());
+    }
+    // Reuse the profile's deployed worker base link (non-clean history
+    // record, falling back to the persisted worker-tunnel config). This is
+    // fully decoupled from deploying: after the one-time deploy, the user
+    // can create configs from any clean IP without ever redeploying.
+    let base_link = dastyab_core::worker_tunnel::resolve_deployed_base_link(profile_id)
+        .ok_or_else(|| {
+            "No deployed worker link yet — deploy once, then you can point configs at any clean IP without redeploying.".to_string()
+        })?;
+
+    // Parse the base worker config, then override the address with the
+    // user-supplied clean IP (keeps uuid/path/security/transport).
+    let mut prof = dastyab_core::vless::VlessProfile::parse(&base_link).map_err(|e| e.brief())?;
+    let (ip, port) = match ep.rsplit_once(':') {
+        Some((ip, port)) if port.chars().all(|c| c.is_ascii_digit()) => {
+            (ip.to_string(), port.parse::<u16>().unwrap_or(443))
+        }
+        _ => (ep.to_string(), 443),
+    };
+    prof.address = ip.clone();
+    prof.port = port;
+    prof.name = format!("clean-{ep}");
+
+    // Render all formats and write them into the generated-configs ledger.
+    let all = dastyab_core::export::render_all(&prof);
+    if all.is_empty() {
+        return Err("Could not render any config for that endpoint.".to_string());
+    }
+    let mut ledger = dastyab_core::generated_configs::load_generated_configs(profile_id);
+    let now = dastyab_core::store::now_ts() as u64;
+    use dastyab_core::generated_configs::ConfigSource;
+    for (fmt_label, content) in &all {
+        let fmt = dastyab_core::export::ExportFormat::parse(fmt_label);
+        let Some(fmt) = fmt else { continue };
+        let _ = ledger.push(
+            now,
+            fmt,
+            ConfigSource::WorkerVless,
+            Some(format!("clean {ep}")),
+            content.clone(),
+        );
+    }
+    let _ = dastyab_core::generated_configs::save_generated_configs(profile_id, &ledger);
+
+    // Also remember it as a saved clean IP + learn it as a seed (so future
+    // scans bias toward this proven-good IP and its neighborhood).
+    let _ = remember_clean_ip(profile_id, ep);
+    let _ = dastyab_core::cf::ips::learn_clean_ip(profile_id, &ip);
+
+    Ok((all.len(), base_link))
+}
+
 /// Open a folder in the platform file manager.
 fn open_folder(dir: &std::path::Path) {
     let dir = dir.to_string_lossy().into_owned();
@@ -3893,4 +3903,139 @@ fn open_folder(dir: &std::path::Path) {
         _ => ("xdg-open", dir),
     };
     let _ = std::process::Command::new(prog).arg(arg).spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run a closure against an isolated mem-dir home so the store writes to a
+    /// throwaway directory and never touches the user's real ~/.dastyab.
+    fn with_home(f: impl FnOnce(&str) -> ()) {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join(".dastyab");
+        dastyab_core::store::set_mem_dir_override(base);
+        let pid = dastyab_core::store::profiles::create_profile("cfg-test", "test")
+            .expect("create profile");
+        f(&pid);
+    }
+
+    /// Simulate a completed deploy by writing a worker-tunnel client config (the
+    /// same thing deploy_worker_tunnel_gui persists). This is the "deploy once"
+    /// pre-condition that the Configs tab decouples from.
+    fn simulate_deploy(pid: &str) -> String {
+        let worker_url = "https://dyb-tun-cccc.sub.workers.dev".to_string();
+        let cfg = dastyab_core::vps_deploy::TunnelClientConfig {
+            host: worker_url.clone(),
+            base_domain: dastyab_core::worker_tunnel::DYB_TUNNEL_BASE.into(),
+            session: "s".into(),
+            resolver: "https".into(),
+            mode: dastyab_core::vps_deploy::TunnelMode::Worker,
+            worker_url: Some(worker_url.clone()),
+            worker_name: Some("dyb-tun-cccc".into()),
+            shared_secret: Some("x".into()),
+            worker_vless_upstream: None,
+        };
+        dastyab_core::vps_deploy::write_tunnel_client_config(pid, &cfg).unwrap();
+        worker_url
+    }
+
+    #[test]
+    fn config_from_ip_requires_prior_deploy() {
+        with_home(|pid| {
+            // No deploy yet → must error with a helpful message, not panic.
+            let err = create_configs_from_ip(pid, "104.16.1.1").unwrap_err();
+            assert!(
+                err.contains("deploy once"),
+                "expected deploy-first hint, got: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn deploy_once_then_configs_from_many_ips() {
+        with_home(|pid| {
+            simulate_deploy(pid);
+
+            // Create configs from multiple clean IPs — repeated, no redeploy.
+            for ip in ["104.16.1.1", "104.16.2.2:2053", "104.17.3.3"] {
+                let (n, base) = create_configs_from_ip(pid, ip).expect("create configs");
+                assert!(n >= 4, "expected at least 4 formats, got {n}");
+                assert!(base.starts_with("vless://"), "base link: {base}");
+            }
+
+            // The ledger now has all of them.
+            let ledger = dastyab_core::generated_configs::load_generated_configs(pid);
+            let records = ledger.records;
+            assert!(
+                records.len() >= 12,
+                "expected >=12 records, got {}",
+                records.len()
+            );
+
+            // Every record keeps the deployed worker's uuid/path (decoupled from
+            // deploy: the address changes, the worker identity doesn't).
+            let base = dastyab_core::worker_tunnel::resolve_deployed_base_link(pid).unwrap();
+            let prof = dastyab_core::vless::VlessProfile::parse(&base).unwrap();
+            let worker_uuid = prof.uuid.clone();
+            let worker_path = prof.path.clone();
+            for r in &records {
+                assert!(
+                    r.content.contains(&worker_uuid),
+                    "missing uuid in {}",
+                    r.fmt.label()
+                );
+                assert!(
+                    r.content.contains(&worker_path),
+                    "missing path in {}",
+                    r.fmt.label()
+                );
+            }
+
+            // The clean IPs were learned as seeds for future scans.
+            let seeds = dastyab_core::cf::ips::load_manual_seeds(pid);
+            assert!(seeds.iter().any(|s| s.contains("104.16.1.1")));
+            assert!(seeds.iter().any(|s| s.contains("104.17.3.3")));
+        });
+    }
+
+    #[test]
+    fn clean_ip_learning_feeds_future_scans() {
+        with_home(|pid| {
+            // Simulate the scanner finding + learning a clean IP.
+            let found = "104.16.1.1";
+            dastyab_core::cf::ips::learn_clean_ip(pid, found).unwrap();
+            dastyab_core::store::profiles::remember_clean_ip(pid, found).unwrap();
+
+            // scan_seed_ips must include it so the next scan targets its
+            // neighborhood instead of starting from zero.
+            // NOTE: scan_seed_ips is a method on DastYabApp; here we verify the
+            // core equivalents (manual seeds + seed endpoints) that feed it.
+            let manual = dastyab_core::cf::ips::load_manual_seeds(pid);
+            assert!(manual.iter().any(|s| s.contains(found)));
+
+            // Also confirm the learned IP appears among seed endpoints once a
+            // verified endpoint record exists (the autopilot ledger feed).
+            let endpoint = serde_json::json!([{
+                "ip": "104.16.1.1",
+                "port": 443,
+                "verified": true,
+                "ts": "2026-11-09T00:00:00Z",
+                "last_checked": "2026-11-09T00:00:00Z"
+            }]);
+            let dir = dastyab_core::store::profiles::profile_dir(pid);
+            std::fs::create_dir_all(dir.join("autopilot")).unwrap();
+            std::fs::write(dir.join("autopilot/endpoints.json"), endpoint.to_string()).unwrap();
+            let eps = dastyab_core::cf::ips::load_seed_endpoints(pid, 200);
+            assert!(eps.iter().any(|s| s.starts_with(found)), "seeds: {eps:?}");
+        });
+    }
+
+    #[test]
+    fn config_from_ip_rejects_empty_input() {
+        with_home(|pid| {
+            let err = create_configs_from_ip(pid, "   ").unwrap_err();
+            assert!(err.contains("Enter an IP"), "got: {err}");
+        });
+    }
 }
