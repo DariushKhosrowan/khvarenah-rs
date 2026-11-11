@@ -355,7 +355,11 @@ pub fn run_action(app: &mut DastYabApp, action: TokensAction) -> Option<crate::d
             ))
         }
         TokensAction::Remove(label) => {
-            let _ = remove_token(&app.state.active_profile_id, &label);
+            // Target the profile the user is actually viewing (`profile_id`),
+            // mirroring Add/MakeActive. Using the possibly-stale cached
+            // `state.active_profile_id` here could remove from the wrong
+            // profile if the cache lags the selection.
+            let _ = remove_token(&app.profile_id, &label);
             app.state.reload_pending = true;
             app.note = format!("Removed token '{label}'.");
             None

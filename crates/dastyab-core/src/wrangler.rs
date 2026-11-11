@@ -34,8 +34,21 @@ pub struct WranglerDeployOpts {
 }
 
 /// Locate the wrangler binary. Returns `Ok(None)` if not installed.
+///
+/// Resolution order:
+///   1. `DYB_WRANGLER_BIN` env var (absolute path to a wrangler binary —
+///      honored verbatim, used by tests to inject a mock, and lets users pin
+///      a specific install without relying on PATH).
+///   2. `command -v wrangler` on PATH.
 pub fn find_wrangler() -> Result<Option<String>, CFError> {
-    // `which wrangler` is the simplest cross-distro probe.
+    // 1. Explicit override (also the mock-injection seam for tests).
+    if let Ok(bin) = std::env::var("DYB_WRANGLER_BIN") {
+        let b = bin.trim().to_string();
+        if !b.is_empty() && std::path::Path::new(&b).is_file() {
+            return Ok(Some(b));
+        }
+    }
+    // 2. `which wrangler` is the simplest cross-distro probe.
     let out = Command::new("sh")
         .arg("-c")
         .arg("command -v wrangler 2>/dev/null")
@@ -182,6 +195,12 @@ fn parse_deployed_url(stdout: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the process-global `DYB_WRANGLER_BIN`
+    /// env var. Rust runs tests in parallel threads sharing one process env,
+    /// so without this lock two env-mutating tests would race and read each
+    /// other's value (observed flake).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn parse_deployed_url_extracts_workers_dev() {
         let out = "\nTotal Upload: 0.20 KiB\nDeployed dyb-tun-abc123 triggers (3.35 sec)\n  https://dyb-tun-abc123.sub.workers.dev\n";
@@ -236,5 +255,67 @@ mod tests {
         // binary is absent. We can't reliably force absence here, so this just
         // confirms the call type-checks and runs.
         let _ = result;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deploy_worker_via_wrangler_parses_mock_output() {
+        // Inject a fake wrangler via DYB_WRANGLER_BIN. It prints a workers.dev
+        // URL exactly like the real CLI, so we can verify the full subprocess
+        // path (toml write + env injection + URL parsing) without any network.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("wrangler");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf 'Deployed dyb-mock-1 triggers (3.35 sec)\\n  https://dyb-mock-1.acctsub.workers.dev\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake, perms).unwrap();
+        }
+
+        std::env::set_var("DYB_WRANGLER_BIN", &fake);
+        let result = deploy_worker_via_wrangler(
+            "tok",
+            "acc",
+            b"export default { fetch(){} };",
+            &WranglerDeployOpts {
+                worker_name: "dyb-mock-1".into(),
+                compat_date: "2026-07-01".into(),
+                kv_binding: None,
+                crons: vec![],
+                vars: vec![("UUID".to_string(), "abc-123".to_string())],
+            },
+        )
+        .await;
+        std::env::remove_var("DYB_WRANGLER_BIN");
+
+        match result {
+            Ok(url) => assert_eq!(url, "https://dyb-mock-1.acctsub.workers.dev"),
+            Err(e) => panic!("mock deploy should succeed, got: {}", e.explain()),
+        }
+    }
+
+    #[test]
+    fn find_wrangler_honors_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("wrangler-mock");
+        std::fs::write(&fake, "#!/bin/sh\necho hi\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake, perms).unwrap();
+        }
+        std::env::set_var("DYB_WRANGLER_BIN", &fake);
+        let got = find_wrangler().unwrap().unwrap();
+        std::env::remove_var("DYB_WRANGLER_BIN");
+        assert_eq!(got, fake.to_string_lossy().as_ref());
     }
 }

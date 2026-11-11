@@ -139,6 +139,15 @@ pub struct DastYabApp {
     pub note: String,
     /// The most recent background-task error (if any), shown as a red banner.
     error_banner: Option<String>,
+    /// Transient-notice auto-expiry. `note` and `error_banner` clear on their
+    /// own after a few seconds so warnings/errors disappear without the user
+    /// having to dismiss them. We key on content hash: when the text changes
+    /// we reset the timer, and when it has stayed identical past the TTL we
+    /// clear it. This covers every write site (direct assignment included).
+    note_hash: u64,
+    note_since: std::time::Instant,
+    banner_hash: u64,
+    banner_since: std::time::Instant,
     view: View,
     // async bridge
     pub tx: bridge::Tx,
@@ -360,6 +369,10 @@ impl DastYabApp {
             },
             note: String::new(),
             error_banner: None,
+            note_hash: 0,
+            note_since: std::time::Instant::now(),
+            banner_hash: 0,
+            banner_since: std::time::Instant::now(),
             tx,
             rx,
             running: Vec::new(),
@@ -1280,34 +1293,41 @@ impl DastYabApp {
                     self.running.retain(|t| t != &task);
                     // A task succeeding means whatever previously failed has
                     // recovered (or never applied) — clear stale error banners
-                    // so errors disappear once things work again. This must
-                    // happen for ALL tasks, including dns-tunnel-worker (which
-                    // used to `continue` past the clear, leaving a red banner
-                    // up even after a successful redeploy).
+                    // so errors disappear once things work again. This happens
+                    // for ALL tasks, so a successful redeploy clears the old
+                    // "Deploy failed" banner.
                     self.error_banner = None;
-                    if task == "dns-tunnel-worker" {
-                        self.worker_tunnel_note = summary.clone();
+                    match task.as_str() {
+                        "dns-tunnel-worker" => {
+                            // Deploy of the worker DNS tunnel: surface the
+                            // outcome on the deploy note line (visible from
+                            // every tab via the sidebar), refresh the store
+                            // cache, and log. This must NOT depend on which
+                            // tab is active — switching tabs mid-deploy must
+                            // not hide or drop the result.
+                            self.worker_tunnel_note = summary.clone();
+                            self.state.reload_pending = true;
+                            self.push_log(&format!("[done] {task}: {summary}"));
+                        }
+                        "autopilot" => {
+                            self.autopilot_status = summary.clone();
+                            self.autopilot_on = true;
+                            self.refresh_diagnostics();
+                            self.push_log(&format!("[done] {task}: {summary}"));
+                            self.state.reload_pending = true;
+                        }
+                        _ => {
+                            if task.starts_with("probe-") || task == "probe-all" {
+                                self.cleanip_test_output = summary.clone();
+                                self.note = summary.clone();
+                            } else {
+                                self.note = format!("✓ {task}: {summary}");
+                            }
+                            self.push_log(&format!("[done] {task}: {summary}"));
+                            // mutating tasks change the store; refresh the view cache
+                            self.state.reload_pending = true;
+                        }
                     }
-                    if task == "autopilot" {
-                        self.autopilot_status = summary.clone();
-                        self.autopilot_on = true;
-                        self.refresh_diagnostics();
-                    } else if task == "blackout-drill" {
-                        self.drill_output = summary.clone();
-                    } else if task.starts_with("probe-") || task == "probe-all" {
-                        self.cleanip_test_output = summary.clone();
-                        self.note = summary.clone();
-                        self.state.reload_pending = true;
-                    } else if task == "dns-tunnel-worker" {
-                        self.state.reload_pending = true;
-                        self.push_log(&format!("[done] {task}: {summary}"));
-                        continue;
-                    } else {
-                        self.note = format!("✓ {task}: {summary}");
-                    }
-                    self.push_log(&format!("[done] {task}: {summary}"));
-                    // mutating tasks change the store; refresh the view cache
-                    self.state.reload_pending = true;
                 }
                 UiEvent::TaskErr { task, error } => {
                     self.running.retain(|t| t != &task);
@@ -1336,6 +1356,56 @@ impl DastYabApp {
         // background events stream in visibly even when the user is idle.
         if !self.running.is_empty() {
             ctx.request_repaint();
+        }
+    }
+
+    /// FNV-1a hash used to detect when a transient notice's text changes.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    /// Auto-expire `note` and `error_banner` so warnings and errors disappear
+    /// without manual dismissal. A notice is cleared when it has stayed
+    /// byte-identical for longer than its TTL. This covers every write path —
+    /// direct `self.note = …` assignments included — because we key on the
+    /// current content hash, resetting the timer only when the text changes.
+    fn expire_notices(&mut self) {
+        let now = std::time::Instant::now();
+
+        // Informational note: short-lived (8s).
+        if self.note.is_empty() {
+            self.note_hash = 0;
+        } else {
+            let h = Self::fnv1a(self.note.as_bytes());
+            if h != self.note_hash {
+                self.note_hash = h;
+                self.note_since = now;
+            } else if now.duration_since(self.note_since) > std::time::Duration::from_secs(8) {
+                self.note.clear();
+                self.note_hash = 0;
+            }
+        }
+
+        // Error banner: longer-lived (25s) so a real failure stays readable.
+        match &self.error_banner {
+            None => self.banner_hash = 0,
+            Some(text) => {
+                let h = Self::fnv1a(text.as_bytes());
+                if h != self.banner_hash {
+                    self.banner_hash = h;
+                    self.banner_since = now;
+                } else if now.duration_since(self.banner_since)
+                    > std::time::Duration::from_secs(25)
+                {
+                    self.error_banner = None;
+                    self.banner_hash = 0;
+                }
+            }
         }
     }
 
@@ -1660,6 +1730,11 @@ impl eframe::App for DastYabApp {
 
         // Drain background async work before rendering any frame.
         self.poll_bridge(ui.ctx());
+
+        // Auto-expire transient notices so errors/warnings disappear without
+        // manual dismissal (NOTE: kept short for informational messages; the
+        // red error banner lives longer so a real failure stays readable).
+        self.expire_notices();
 
         // Keyboard shortcuts (Ctrl+1..9 / Ctrl+0).
         self.handle_shortcuts(ui);
@@ -4180,6 +4255,10 @@ mod tests {
             profiles: vec![pid.into()],
             note: String::new(),
             error_banner: None,
+            note_hash: 0,
+            note_since: std::time::Instant::now(),
+            banner_hash: 0,
+            banner_since: std::time::Instant::now(),
             view: View::DeployScan,
             tx: crate::bridge::channel().0,
             rx: crate::bridge::channel().1,
@@ -4382,6 +4461,10 @@ mod tests {
                 profiles: vec![pid.into()],
                 note: String::new(),
                 error_banner: None,
+                note_hash: 0,
+                note_since: std::time::Instant::now(),
+                banner_hash: 0,
+                banner_since: std::time::Instant::now(),
                 view: View::Tokens,
                 tx: crate::bridge::channel().0,
                 rx: crate::bridge::channel().1,
@@ -4487,6 +4570,307 @@ mod tests {
             assert!(!app.state.tokens.iter().find(|t| t.label == "first").unwrap().is_active);
             // A reload is scheduled so the store-driven view stays consistent.
             assert!(app.state.reload_pending);
+        });
+    }
+
+    #[test]
+    fn tab_switch_during_deploy_still_applies_result() {
+        // The "changing the tab must not change the deploying" complaint: a
+        // deploy result arriving over the bridge must be applied regardless of
+        // which tab is visible. We simulate the user starting a worker-tunnel
+        // deploy, switching away to Dashboard, then the deploy finishing — the
+        // note must update and the running task must clear even though the
+        // Deploy view isn't the one being rendered.
+        with_home(|pid| {
+            // Make the created profile the active one so a reload (triggered by
+            // the deploy completion) keeps `profile_id` pointing at it.
+            dastyab_core::store::profiles::set_active_profile(pid).unwrap();
+            let (tx, rx) = crate::bridge::channel();
+            let mut app = DastYabApp {
+                profile_id: pid.into(),
+                profiles: vec![pid.into()],
+                note: String::new(),
+                error_banner: None,
+                note_hash: 0,
+                note_since: std::time::Instant::now(),
+                banner_hash: 0,
+                banner_since: std::time::Instant::now(),
+                view: View::Dashboard, // user switched away mid-deploy
+                tx,
+                rx,
+                running: vec!["dns-tunnel-worker".into()],
+                log_lines: Vec::new(),
+                state: crate::state::GuiState::default(),
+                history_filter: HistoryFilter::All,
+                dialog: None,
+                pending_action: None,
+                selected_profile: None,
+                cleanip_search: String::new(),
+                cleanip_sort: crate::views::cleanip::CleanipSort::default(),
+                backups_search: String::new(),
+                backup_sort: BackupSort::Newest,
+                configs_search: String::new(),
+                configs_fmt_filter: String::new(),
+                configs_sort: crate::views::configs::ConfigsSort::Newest,
+                token_history_filter: String::new(),
+                log_auto_scroll: true,
+                new_profile_name: String::new(),
+                scan_count: 2000,
+                scan_workers: 50,
+                scan_timeout: 8,
+                scan_ports: "443".into(),
+                scan_gentle: true,
+                stealth_enabled: false,
+                last_link: String::new(),
+                autopilot_on: false,
+                autopilot_status: String::new(),
+                autopilot_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_cause: None,
+                last_action_label: String::new(),
+                audit_output: String::new(),
+                backup_output: String::new(),
+                export_output: String::new(),
+                beacon_enabled: false,
+                beacon_channel: "Telegram".into(),
+                beacon_token: String::new(),
+                beacon_target: String::new(),
+                beacon_rate_limit: 900,
+                beacon_note: String::new(),
+                beacon_failover_enabled: false,
+                beacon_failover_channel: "Webhook".into(),
+                beacon_failover_token: String::new(),
+                beacon_failover_target: String::new(),
+                vps_host: String::new(),
+                vps_user: String::new(),
+                vps_key: String::new(),
+                vps_port: 22,
+                vps_domain: String::new(),
+                vps_note: String::new(),
+                worker_tunnel_note: String::new(),
+                hz_token: String::new(),
+                hz_location: String::new(),
+                hz_server_type: String::new(),
+                mw_count: 1,
+                mw_note: String::new(),
+                desync_enabled: false,
+                desync_min: 0,
+                desync_max: 0,
+                desync_delay_us: 0,
+                desync_note: String::new(),
+                drill_output: String::new(),
+                daemon_note: String::new(),
+                light_timeout_s: 0,
+                deep_timeout_s: 0,
+                max_backoff_s: 0,
+                network_down_sleep_s: 0,
+                light_check_interval_s: 0,
+                drill_interval_s: 0,
+                timeouts_note: String::new(),
+                auto_rotate_enabled: false,
+                auto_rotate_note: String::new(),
+                backup_auto_enabled: false,
+                backup_auto_interval: 0,
+                backup_auto_keep: 0,
+                backup_auto_note: String::new(),
+                mutation_enabled: false,
+                mutation_interval: 0,
+                mutation_rotate_path: false,
+                mutation_note: String::new(),
+                token_search: String::new(),
+                history_search: String::new(),
+                sec_backups: false,
+                cleanip_test_output: String::new(),
+                cleanip_add_draft: String::new(),
+                token_history_search: String::new(),
+            };
+
+            // A background task completes while we're on the Dashboard tab.
+            let send = app.tx.clone();
+            send.send(crate::bridge::UiEvent::Done {
+                task: "dns-tunnel-worker".into(),
+                summary: "Worker tunnel deployed at https://dyb-tun-cccc.sub.workers.dev".into(),
+            })
+            .unwrap();
+
+            // Drain the bridge — exactly what update() does before rendering.
+            let ctx = egui::Context::default();
+            app.poll_bridge(&ctx);
+
+            // The deploy note surfaced (readable from any tab via the sidebar),
+            // and the task cleared. `poll_bridge` already consumed the pending
+            // reload (it reloads eagerly), so the view cache is fresh and the
+            // active profile is preserved.
+            assert!(app.worker_tunnel_note.contains("Worker tunnel deployed"));
+            assert!(!app.running.contains(&"dns-tunnel-worker".to_string()));
+            assert_eq!(app.state.active_profile_id, pid);
+            // No spurious error banner from a successful deploy.
+            assert!(app.error_banner.is_none());
+        });
+    }
+
+    #[test]
+    fn successful_redeploy_clears_stale_error_banner() {
+        // The "errors must disappear" complaint: a failed deploy sets the red
+        // banner; a subsequent successful deploy must clear it (not keep the
+        // stale failure up forever). We simulate the exact event sequence.
+        with_home(|pid| {
+            let (tx, rx) = crate::bridge::channel();
+            let mut app = DastYabApp {
+                profile_id: pid.into(),
+                profiles: vec![pid.into()],
+                note: String::new(),
+                error_banner: Some("Deploy failed: wrangler exited with 1".into()),
+                note_hash: 0,
+                note_since: std::time::Instant::now(),
+                banner_hash: 0,
+                banner_since: std::time::Instant::now(),
+                view: View::DeployScan,
+                tx,
+                rx,
+                running: vec!["dns-tunnel-worker".into()],
+                log_lines: Vec::new(),
+                state: crate::state::GuiState::default(),
+                history_filter: HistoryFilter::All,
+                dialog: None,
+                pending_action: None,
+                selected_profile: None,
+                cleanip_search: String::new(),
+                cleanip_sort: crate::views::cleanip::CleanipSort::default(),
+                backups_search: String::new(),
+                backup_sort: BackupSort::Newest,
+                configs_search: String::new(),
+                configs_fmt_filter: String::new(),
+                configs_sort: crate::views::configs::ConfigsSort::Newest,
+                token_history_filter: String::new(),
+                log_auto_scroll: true,
+                new_profile_name: String::new(),
+                scan_count: 2000,
+                scan_workers: 50,
+                scan_timeout: 8,
+                scan_ports: "443".into(),
+                scan_gentle: true,
+                stealth_enabled: false,
+                last_link: String::new(),
+                autopilot_on: false,
+                autopilot_status: String::new(),
+                autopilot_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_cause: None,
+                last_action_label: String::new(),
+                audit_output: String::new(),
+                backup_output: String::new(),
+                export_output: String::new(),
+                beacon_enabled: false,
+                beacon_channel: "Telegram".into(),
+                beacon_token: String::new(),
+                beacon_target: String::new(),
+                beacon_rate_limit: 900,
+                beacon_note: String::new(),
+                beacon_failover_enabled: false,
+                beacon_failover_channel: "Webhook".into(),
+                beacon_failover_token: String::new(),
+                beacon_failover_target: String::new(),
+                vps_host: String::new(),
+                vps_user: String::new(),
+                vps_key: String::new(),
+                vps_port: 22,
+                vps_domain: String::new(),
+                vps_note: String::new(),
+                worker_tunnel_note: String::new(),
+                hz_token: String::new(),
+                hz_location: String::new(),
+                hz_server_type: String::new(),
+                mw_count: 1,
+                mw_note: String::new(),
+                desync_enabled: false,
+                desync_min: 0,
+                desync_max: 0,
+                desync_delay_us: 0,
+                desync_note: String::new(),
+                drill_output: String::new(),
+                daemon_note: String::new(),
+                light_timeout_s: 0,
+                deep_timeout_s: 0,
+                max_backoff_s: 0,
+                network_down_sleep_s: 0,
+                light_check_interval_s: 0,
+                drill_interval_s: 0,
+                timeouts_note: String::new(),
+                auto_rotate_enabled: false,
+                auto_rotate_note: String::new(),
+                backup_auto_enabled: false,
+                backup_auto_interval: 0,
+                backup_auto_keep: 0,
+                backup_auto_note: String::new(),
+                mutation_enabled: false,
+                mutation_interval: 0,
+                mutation_rotate_path: false,
+                mutation_note: String::new(),
+                token_search: String::new(),
+                history_search: String::new(),
+                sec_backups: false,
+                cleanip_test_output: String::new(),
+                cleanip_add_draft: String::new(),
+                token_history_search: String::new(),
+            };
+
+            // The retry succeeds.
+            let send = app.tx.clone();
+            send.send(crate::bridge::UiEvent::Done {
+                task: "dns-tunnel-worker".into(),
+                summary: "Worker tunnel deployed at https://dyb-tun-cccc.sub.workers.dev".into(),
+            })
+            .unwrap();
+
+            let ctx = egui::Context::default();
+            app.poll_bridge(&ctx);
+
+            assert!(app.error_banner.is_none(), "stale error banner must clear");
+            assert!(app.worker_tunnel_note.contains("Worker tunnel deployed"));
+        });
+    }
+
+    #[test]
+    fn deploy_once_flow_sets_durable_base_link_and_ledger() {
+        // End-to-end "deploy once, then configure from clean IPs many times":
+        // simulate a deploy (as the GUI does), then assert config-from-IP
+        // keeps working repeatedly without ever redeploying.
+        with_home(|pid| {
+            simulate_deploy(pid);
+            // config-from-IP multiple times, no redeploy.
+            for ip in ["104.16.1.1", "104.16.2.2:2053"] {
+                let (n, _base) = create_configs_from_ip(pid, ip).expect("config from ip");
+                assert!(n >= 4);
+            }
+            // Ledger populated.
+            let ledger = dastyab_core::generated_configs::load_generated_configs(pid);
+            assert!(ledger.records.len() >= 8, "ledger too small");
+        });
+    }
+
+    #[test]
+    fn config_from_ip_learns_clean_ip_as_seed() {
+        // "when a clean IP is found the app must learn it and try to find more
+        // based on it": creating a config from a clean IP must both save it as
+        // a clean IP AND learn it as a persistent seed so future scans bias
+        // toward its neighborhood.
+        with_home(|pid| {
+            simulate_deploy(pid);
+            create_configs_from_ip(pid, "104.16.88.9:2053").expect("create configs");
+
+            // Saved as a clean IP.
+            let p = dastyab_core::store::profiles::load_profile(pid);
+            assert!(
+                p.clean_ips.iter().any(|s| s.contains("104.16.88.9")),
+                "expected clean IP saved, got {:?}",
+                p.clean_ips
+            );
+
+            // Learned as a persistent seed (the self-improving scanner hook).
+            let seeds = dastyab_core::cf::ips::load_manual_seeds(pid);
+            assert!(
+                seeds.iter().any(|s| s.contains("104.16.88.9")),
+                "expected learned seed, got {seeds:?}"
+            );
         });
     }
 }
