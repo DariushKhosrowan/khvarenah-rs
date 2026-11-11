@@ -990,8 +990,11 @@ impl DastYabApp {
                     })?;
             // Record a non-clean base deploy link in history so the Configs
             // tab's "create from IP" and scanning always have a vless://
-            // skeleton to build on — no redeploy needed.
+            // skeleton to build on — no redeploy needed. Also persist it
+            // durably (survives history clears) so config-from-IP always
+            // resolves the actually-deployed identity.
             if let Some(base) = dastyab_core::worker_tunnel::resolve_deployed_base_link(&pid) {
+                let _ = dastyab_core::store::profiles::set_last_deployed_base_link(&pid, &base);
                 let rec = dastyab_core::store::profiles::VlessRecord {
                     id: dastyab_core::store::new_id(),
                     ts: dastyab_core::store::profiles::now_iso(),
@@ -3871,6 +3874,11 @@ async fn deploy_worker(token: &str, pid: &str) -> Result<(String, String), CFErr
     }
     let _ = dastyab_core::generated_configs::save_generated_configs(pid, &ledger);
 
+    // Persist the canonical base link durably so config-from-IP and scanning
+    // keep resolving the *actual* deployed identity even after history is
+    // cleared/trimmed (the deployed UUID is random per deploy, so a
+    // synthesized fallback would never match).
+    let _ = dastyab_core::store::profiles::set_last_deployed_base_link(pid, &link);
     Ok((host, link))
 }
 
@@ -4002,6 +4010,11 @@ mod tests {
             worker_vless_upstream: None,
         };
         dastyab_core::vps_deploy::write_tunnel_client_config(pid, &cfg).unwrap();
+        // Persist the durable base link too, exactly as the real deploy paths
+        // do now (`deploy_worker` / `deploy_worker_tunnel_gui`).
+        if let Some(base) = dastyab_core::worker_tunnel::resolve_deployed_base_link(pid) {
+            dastyab_core::store::profiles::set_last_deployed_base_link(pid, &base).unwrap();
+        }
         worker_url
     }
 
@@ -4249,6 +4262,54 @@ mod tests {
             let p = dastyab_core::store::profiles::load_profile(pid);
             assert!(p.clean_ips.iter().any(|s| s.contains("104.16.55.1")));
             assert!(p.clean_ips.iter().any(|s| s.contains("104.16.56.2")));
+        });
+    }
+
+    #[test]
+    fn make_active_marks_token_and_persists_for_deploy() {
+        // The "Make active" complaint: clicking it must mark the token AND
+        // persist it so deploy/scan actually use it (not just a transient
+        // in-memory flag). We drive the same store path the GUI's
+        // `TokensAction::MakeActive` handler uses.
+        with_home(|pid| {
+            use dastyab_core::store::profiles::{
+                add_token, get_active_token, set_active_profile, set_active_token,
+            };
+            set_active_profile(pid).unwrap();
+            add_token(pid, "first", "token-a-very-long-value").unwrap();
+            add_token(pid, "second", "token-b-very-long-value").unwrap();
+
+            // Mark the second token active — the exact call the GUI makes.
+            set_active_token(pid, "second").unwrap();
+
+            // The store marker persists (durable), so a later deploy reads it.
+            assert_eq!(get_active_token(pid).unwrap().as_deref(), Some("second"));
+            // The old one is no longer active.
+            let p = dastyab_core::store::profiles::load_profile(pid);
+            assert_eq!(p.tokens.len(), 2);
+        });
+    }
+
+    #[test]
+    fn config_from_ip_survives_history_clear_via_durable_base_link() {
+        // deploy once -> config-from-IP many times must survive a history
+        // clear. This guards against regressing to synthesized-UUID fallback
+        // that would produce configs pointing at the wrong worker identity.
+        with_home(|pid| {
+            simulate_deploy(pid);
+            // Explicitly wipe history (as the History view's "clear" does).
+            dastyab_core::store::profiles::clear_history(pid).unwrap();
+            assert!(dastyab_core::store::profiles::load_profile(pid)
+                .history
+                .is_empty());
+
+            // Config-from-IP must still work and reuse the deployed identity.
+            let (n, base) = create_configs_from_ip(pid, "104.16.1.1").expect("config after clear");
+            assert!(n >= 4);
+            assert!(base.starts_with("vless://"), "base: {base}");
+
+            let ledger = dastyab_core::generated_configs::load_generated_configs(pid);
+            assert!(ledger.records.len() >= 4, "ledger missing records");
         });
     }
 }

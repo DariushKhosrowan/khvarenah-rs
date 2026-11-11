@@ -548,10 +548,7 @@ fn lock_profile_desync(profile_id: &str) -> std::io::Result<std::fs::File> {
     use std::io::Write;
     let dir = crate::store::profiles::profile_dir(profile_id);
     std::fs::create_dir_all(&dir).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("cannot create profile dir {}: {e}", dir.display()),
-        )
+        std::io::Error::other(format!("cannot create profile dir {}: {e}", dir.display()))
     })?;
     let path = dir.join(".desync-learn.lock");
     let file = std::fs::OpenOptions::new()

@@ -208,6 +208,14 @@ pub struct ProfileConfig {
     #[serde(default)]
     pub worker_secrets:
         std::collections::HashMap<String, crate::worker_tunnel::secret::WorkerSecret>,
+    /// The canonical `vless://` base link (worker uuid/path/transport) of the
+    /// most recent successful deploy, persisted durably so config-from-IP and
+    /// scanning can keep working even if profile history is cleared/trimmed —
+    /// and always with the *actual* deployed identity (never a synthesized one
+    /// that could mismatch a random-UUID edgetunnel deploy). `None` = never
+    /// deployed.
+    #[serde(default)]
+    pub last_deployed_base_link: Option<String>,
 }
 
 fn default_auto_rotate_on_blocked() -> bool {
@@ -313,6 +321,7 @@ impl Default for ProfileConfig {
             drill_interval_secs: 0,
             carrier_pool_path: None,
             worker_secrets: std::collections::HashMap::new(),
+            last_deployed_base_link: None,
         }
     }
 }
@@ -1165,6 +1174,20 @@ pub fn save_config(id: &str, cfg: &ProfileConfig) -> Result<(), CFError> {
     save_profile(&p)
 }
 
+/// Persist the canonical deployed worker base link (`vless://` skeleton) for
+/// this profile. This survives history clears/trims so config-from-IP and
+/// scanning always resolve the *actual* deployed worker identity.
+pub fn set_last_deployed_base_link(id: &str, link: &str) -> Result<(), CFError> {
+    let mut cfg = load_profile(id).config;
+    cfg.last_deployed_base_link = Some(link.trim().to_string());
+    save_config(id, &cfg)
+}
+
+/// Read the persisted canonical deployed worker base link, if any.
+pub fn last_deployed_base_link(id: &str) -> Option<String> {
+    load_profile(id).config.last_deployed_base_link.clone()
+}
+
 /// Whether the one-button Protection monitor is active for this profile.
 pub fn protection_enabled(id: &str) -> bool {
     load_profile(id).config.protection_enabled
@@ -1537,11 +1560,23 @@ mod tests {
     #[test]
     fn canonical_clean_ip_normalizes_and_rejects_malformed() {
         // Canonical forms are accepted and normalized.
-        assert_eq!(canonical_clean_ip("  104.16.1.1:443  ").as_deref(), Some("104.16.1.1:443"));
-        assert_eq!(canonical_clean_ip("104.16.1.1").as_deref(), Some("104.16.1.1"));
-        assert_eq!(canonical_clean_ip("8.8.8.8:2053").as_deref(), Some("8.8.8.8:2053"));
+        assert_eq!(
+            canonical_clean_ip("  104.16.1.1:443  ").as_deref(),
+            Some("104.16.1.1:443")
+        );
+        assert_eq!(
+            canonical_clean_ip("104.16.1.1").as_deref(),
+            Some("104.16.1.1")
+        );
+        assert_eq!(
+            canonical_clean_ip("8.8.8.8:2053").as_deref(),
+            Some("8.8.8.8:2053")
+        );
         // A plain valid IP with no leading-zero corruption is preserved as-is.
-        assert_eq!(canonical_clean_ip("4.18.227.124:443").as_deref(), Some("4.18.227.124:443"));
+        assert_eq!(
+            canonical_clean_ip("4.18.227.124:443").as_deref(),
+            Some("4.18.227.124:443")
+        );
         // Leading-zero octets (the historical corruption) are rejected.
         assert!(canonical_clean_ip("04.18.227.124:443").is_none());
         assert!(canonical_clean_ip("104.018.227.124:443").is_none());

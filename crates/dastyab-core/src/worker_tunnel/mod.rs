@@ -85,14 +85,22 @@ pub fn vless_link_for_worker(profile_id: &str, worker_url: &str) -> Option<Strin
 /// the address swapped for a clean IP.
 ///
 /// Preference:
-/// 1. The most recent non-clean deploy record in profile history (a full base
+/// 1. The durable persisted base link (`last_deployed_base_link`), written at
+///    deploy time — survives history clears/trims and always carries the
+///    actually-deployed identity (including a random-UUID edgetunnel deploy).
+/// 2. The most recent non-clean deploy record in profile history (a full base
 ///    link recorded at deploy time).
-/// 2. Fallback from the persisted worker-tunnel client config: if a worker has
+/// 3. Fallback from the persisted worker-tunnel client config: if a worker has
 ///    been deployed at any point, synthesize a canonical base link from its
 ///    workers.dev URL. This makes the Configs tab work right after a single
 ///    deploy even before a scan has written history.
 pub fn resolve_deployed_base_link(profile_id: &str) -> Option<String> {
     let p = crate::store::profiles::load_profile(profile_id);
+    if let Some(link) = &p.config.last_deployed_base_link {
+        if !link.is_empty() && link.starts_with("vless://") {
+            return Some(link.clone());
+        }
+    }
     if let Some(r) = p.history.iter().find(|r| !r.clean_ip) {
         if !r.link.is_empty() && r.link.starts_with("vless://") {
             return Some(r.link.clone());
@@ -247,5 +255,35 @@ mod tests {
         let seeds = crate::cf::ips::load_manual_seeds(&pid);
         assert!(seeds.iter().any(|s| s.contains("104.16.1.1")));
         assert!(seeds.iter().any(|s| s.contains("104.17.3.3")));
+    }
+
+    #[test]
+    fn durable_base_link_survives_history_clear() {
+        let _home = isolated_home();
+        let pid = crate::store::profiles::create_profile("durable", "test").unwrap();
+
+        // Simulate a deploy that persisted a *specific* base link (a random
+        // UUID edgetunnel deploy, say). This is what `deploy_worker` writes.
+        let deployed_link = "vless://11111111-2222-3333-4444-555555555555@host1.sub.workers.dev:443?security=tls&type=ws&path=%2F#worker-11111111";
+        crate::store::profiles::set_last_deployed_base_link(&pid, deployed_link).unwrap();
+
+        // Resolve before any history exists → the durable link wins.
+        let resolved = resolve_deployed_base_link(&pid).unwrap();
+        assert!(resolved.contains("11111111-2222-3333-4444-555555555555"), "resolved: {resolved}");
+
+        // Add some unrelated (clean) history then clear it — the durable link
+        // must still resolve. This is the core regression: previously, once
+        // history was cleared, resolution fell back to a *synthesized* UUID
+        // that never matched the actually-deployed (random) one, silently
+        // generating broken configs.
+        crate::store::profiles::remember_clean_ip(&pid, "104.16.1.1").unwrap();
+        crate::store::profiles::clear_history(&pid).unwrap();
+        assert!(crate::store::profiles::load_profile(&pid).history.is_empty());
+
+        let after = resolve_deployed_base_link(&pid).expect("base link after history clear");
+        assert_eq!(
+            after, deployed_link,
+            "durable base link must be unchanged by history clear"
+        );
     }
 }
