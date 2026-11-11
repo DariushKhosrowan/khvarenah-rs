@@ -354,15 +354,32 @@ pub fn classify_endpoint_outcome(
     }
 }
 
+/// Whether an HTTP status from a WS-upgrade response means the *origin/worker*
+/// is unavailable (as opposed to the edge/DPI rejecting the connection on our
+/// wire shape). Cloudflare 5xx statuses (502/503/504/520/521/522/524/530) are
+/// emitted by the edge when the worker script errors, times out, or the origin
+/// is down — they are NOT a signal about our anti-DPI write shape, so they must
+/// never demote a strategy.
+pub fn http_status_is_origin_unavailable(code: u16) -> bool {
+    (500..600).contains(&code)
+}
+
 /// Classify a single `WsProbe` failure reason (used by deeper per-probe paths)
 /// into a [`LearningSignal`]. `ConnectFailed`/`ConnectTimeout` are transport-
 /// level (never reached TLS) → `HostDown`. Everything after a successful TCP
-/// connect is strategy-attributable. `None` (a passing probe) → `Success`.
+/// connect is strategy-attributable EXCEPT origin-unavailable HTTP statuses
+/// (5xx — the worker is down behind a live TCP port/edge, which is not the
+/// desync strategy's fault). `None` (a passing probe) → `Success`.
 pub fn classify_probe_failure(reason: Option<crate::health::WsFailureReason>) -> LearningSignal {
     match reason {
         None => LearningSignal::Success,
         Some(crate::health::WsFailureReason::ConnectFailed)
         | Some(crate::health::WsFailureReason::ConnectTimeout) => LearningSignal::HostDown,
+        Some(crate::health::WsFailureReason::HttpStatus(code))
+            if http_status_is_origin_unavailable(code) =>
+        {
+            LearningSignal::Unclassifiable
+        }
         Some(
             crate::health::WsFailureReason::TlsAlert
             | crate::health::WsFailureReason::TlsTimeout
@@ -375,31 +392,60 @@ pub fn classify_probe_failure(reason: Option<crate::health::WsFailureReason>) ->
 }
 
 /// Classify a deep-discovery cycle's aggregate outcome into a [`LearningSignal`]
-/// from the pipeline's stage counters. This is the deep-path counterpart to
-/// [`classify_endpoint_outcome`] (light sweep): it splits host-unreachable from
-/// strategy-attributable failure so a down host never demotes a good strategy.
+/// from the pipeline's stage counters and phase-2 failure histogram. This is
+/// the deep-path counterpart to [`classify_endpoint_outcome`] (light sweep): it
+/// splits host-unreachable, worker-unavailable, and strategy-attributable
+/// failure so a down/offline worker never demotes a good strategy.
 ///
 /// | phase1_pass | phase2_pass | verified | signal | meaning |
 /// |---|---|---|---|---|
 /// | any | any | non-empty | `Success` | strategy worked; promote + clear host-down |
 /// | 0 | — | empty | `HostDown` | no TCP handshake succeeded → host unreachable, hold ladder |
-/// | >0 | 0 | empty | `StrategyFailure` | TCP connected, WS failed → demote strategy used |
+/// | >0 | 0 | empty, histogram origin-5xx-dominant | `Unclassifiable` | worker unavailable behind live TCP (502/503/…), hold ladder |
+/// | >0 | 0 | empty, else | `StrategyFailure` | TCP connected, WS failed → demote strategy used |
 /// | >0 | >0 | empty | `Unclassifiable` | WS worked (strategy fine); E2E/score gate filtered → no learning |
 pub fn classify_discovery_outcome(
     phase1_pass: u32,
     phase2_pass: u32,
     verified_nonempty: bool,
+    ws_failure_histogram: Option<&std::collections::HashMap<crate::health::WsFailureReason, u32>>,
 ) -> LearningSignal {
     if verified_nonempty {
         return LearningSignal::Success;
     }
     if phase1_pass == 0 {
-        LearningSignal::HostDown
-    } else if phase2_pass == 0 {
-        LearningSignal::StrategyFailure
-    } else {
-        LearningSignal::Unclassifiable
+        return LearningSignal::HostDown;
     }
+    if phase2_pass == 0 {
+        // TCP connected but every phase-2 probe failed. Distinguish DPI /
+        // strategy-attributable failure (TLS alert/reset dominant) from an
+        // unavailable worker behind a live TCP port (origin 5xx dominant).
+        // Per DeepSeek's gate: only the former demotes; the latter holds.
+        if let Some(h) = ws_failure_histogram {
+            let origin_unavail: u32 = h
+                .iter()
+                .filter(|(r, _)| matches!(r, crate::health::WsFailureReason::HttpStatus(c) if http_status_is_origin_unavailable(*c)))
+                .map(|(_, n)| *n)
+                .sum();
+            let dpi: u32 = h
+                .iter()
+                .filter(|(r, _)| {
+                    matches!(
+                        r,
+                        crate::health::WsFailureReason::TlsAlert
+                            | crate::health::WsFailureReason::TlsTimeout
+                            | crate::health::WsFailureReason::WriteFailed
+                    )
+                })
+                .map(|(_, n)| *n)
+                .sum();
+            if origin_unavail > 0 && origin_unavail >= dpi {
+                return LearningSignal::Unclassifiable;
+            }
+        }
+        return LearningSignal::StrategyFailure;
+    }
+    LearningSignal::Unclassifiable
 }
 
 /// Decide whether a [`LearningSignal`] should feed the strategy learner at all.
@@ -1048,6 +1094,28 @@ mod tests {
             StrategyFailure
         );
         assert_eq!(classify_probe_failure(Some(R::DeadRoute)), StrategyFailure);
+        // Origin-unavailable 5xx from an upstream proxy / edge (worker down
+        // behind live TCP) must NOT demote — it is not the desync strategy's
+        // fault (DeepSeek's live-case gate).
+        assert_eq!(
+            classify_probe_failure(Some(R::HttpStatus(502))),
+            Unclassifiable
+        );
+        assert_eq!(
+            classify_probe_failure(Some(R::HttpStatus(503))),
+            Unclassifiable
+        );
+        assert_eq!(
+            classify_probe_failure(Some(R::HttpStatus(504))),
+            Unclassifiable
+        );
+        assert!(http_status_is_origin_unavailable(502));
+        assert!(http_status_is_origin_unavailable(503));
+        assert!(http_status_is_origin_unavailable(520));
+        assert!(http_status_is_origin_unavailable(530));
+        assert!(!http_status_is_origin_unavailable(403));
+        assert!(!http_status_is_origin_unavailable(404));
+        assert!(!http_status_is_origin_unavailable(421));
         // Only Success/StrategyFailure feed the learner.
         assert!(should_learn(Success));
         assert!(should_learn(StrategyFailure));
@@ -1057,23 +1125,64 @@ mod tests {
 
     /// Deep-discovery classification table (DeepSeek ranked #1 discriminator):
     /// phase-1 TCP success proves the host is reachable, so the signal split is
-    /// host-unreachable (zero phase-1) vs strategy-attributable (phase-2 fail).
+    /// host-unreachable (zero phase-1) vs strategy-attributable (phase-2 fail),
+    /// further split by origin-5xx dominance (worker down behind live TCP).
     #[test]
     fn classify_discovery_outcome_table() {
+        use std::collections::HashMap;
         use LearningSignal::*;
+        fn hist(
+            pairs: &[(crate::health::WsFailureReason, u32)],
+        ) -> HashMap<crate::health::WsFailureReason, u32> {
+            pairs.iter().cloned().collect()
+        }
+        use crate::health::WsFailureReason as R;
         // Verified → success (promote + clear host-down).
-        assert_eq!(classify_discovery_outcome(0, 0, true), Success);
-        assert_eq!(classify_discovery_outcome(100, 50, true), Success);
+        assert_eq!(classify_discovery_outcome(0, 0, true, None), Success);
+        assert_eq!(classify_discovery_outcome(100, 50, true, None), Success);
         // Zero phase-1 → never connected → host-down (hold ladder, no demote).
-        assert_eq!(classify_discovery_outcome(0, 0, false), HostDown);
-        assert_eq!(classify_discovery_outcome(0, 0, false), HostDown);
-        // Phase-1 connected, phase-2 failed → strategy-attributable → demote.
-        assert_eq!(classify_discovery_outcome(10, 0, false), StrategyFailure);
-        assert_eq!(classify_discovery_outcome(1, 0, false), StrategyFailure);
+        assert_eq!(classify_discovery_outcome(0, 0, false, None), HostDown);
+        // Phase-1 connected, phase-2 failed with DPI/strategy-dominant reasons
+        // → strategy-attributable → demote.
+        assert_eq!(
+            classify_discovery_outcome(10, 0, false, Some(&hist(&[(R::TlsAlert, 8)]))),
+            StrategyFailure
+        );
+        // Phase-1 connected, phase-2 failed with origin-5xx-dominant reasons
+        // (worker unavailable behind live TCP/edge) → hold, do not demote.
+        assert_eq!(
+            classify_discovery_outcome(10, 0, false, Some(&hist(&[(R::HttpStatus(502), 8)]))),
+            Unclassifiable
+        );
+        assert_eq!(
+            classify_discovery_outcome(
+                10,
+                0,
+                false,
+                Some(&hist(&[(R::HttpStatus(503), 5), (R::HttpStatus(520), 3)]))
+            ),
+            Unclassifiable
+        );
+        // Mixed: DPI dominant over 5xx → strategy failure (demote).
+        assert_eq!(
+            classify_discovery_outcome(
+                10,
+                0,
+                false,
+                Some(&hist(&[(R::TlsAlert, 8), (R::HttpStatus(502), 2)]))
+            ),
+            StrategyFailure
+        );
         // Phase-2 passed but no verified → E2E/score gate filtered, not a
         // strategy failure → unclassifiable (no learning).
-        assert_eq!(classify_discovery_outcome(10, 5, false), Unclassifiable);
-        assert_eq!(classify_discovery_outcome(1, 1, false), Unclassifiable);
+        assert_eq!(
+            classify_discovery_outcome(10, 5, false, None),
+            Unclassifiable
+        );
+        assert_eq!(
+            classify_discovery_outcome(1, 1, false, None),
+            Unclassifiable
+        );
     }
 
     /// (a) deep-discovery host-unreachable (zero phase-1 TCP success) does not
@@ -1094,7 +1203,7 @@ mod tests {
             &mut c,
             "http://w",
             crate::desync::DesyncStrategy::SplitClientHello,
-            classify_discovery_outcome(0, 0, false),
+            classify_discovery_outcome(0, 0, false, None),
             1_700_000_000,
         );
         assert!(changed);
@@ -1125,7 +1234,7 @@ mod tests {
             &mut c,
             "http://w",
             crate::desync::DesyncStrategy::SplitClientHello,
-            classify_discovery_outcome(10, 0, false),
+            classify_discovery_outcome(10, 0, false, None),
             1_700_000_100,
         );
         assert!(changed);
@@ -1146,7 +1255,7 @@ mod tests {
             &mut c,
             "http://w",
             crate::desync::DesyncStrategy::SplitClientHello,
-            classify_discovery_outcome(10, 5, false),
+            classify_discovery_outcome(10, 5, false, None),
             1_700_000_300,
         );
         assert!(!changed);

@@ -676,6 +676,7 @@ async fn discover_native(
             d.phase1_pass,
             d.phase2_pass,
             !verified.is_empty(),
+            Some(&d.ws_failure_histogram),
         ),
         // No diagnostics (defensive) → preserve the legacy boolean mapping.
         None => {
