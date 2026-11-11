@@ -1319,15 +1319,27 @@ async fn export_cmd(
             "Deploy or scan first.",
         )
     })?;
-    // Reconstruct a profile from the saved record.
-    let mut vless = VlessProfile {
-        uuid: rec.uuid.clone(),
-        address: rec.address.clone(),
-        port: rec.port,
-        name: rec.name.clone(),
-        ..Default::default()
+    // Reconstruct a profile from the saved record. Parsing the stored link is
+    // authoritative: it carries the uuid, ws path, TLS/SNI and Host header
+    // that the sparse record fields (address/uuid) omit — especially for
+    // clean-IP records, where `uuid` is empty and `address` already embeds the
+    // port. Rebuilding from the fields alone yields broken exports (empty uuid,
+    // duplicated port, missing tls/ws). Fall back to the fields only if the
+    // link is unparseable.
+    let vless = match VlessProfile::parse(&rec.link) {
+        Ok(v) => v,
+        Err(_) => {
+            let mut v = VlessProfile {
+                uuid: rec.uuid.clone(),
+                address: rec.address.clone(),
+                port: rec.port,
+                name: rec.name.clone(),
+                ..Default::default()
+            };
+            v.normalize();
+            v
+        }
     };
-    vless.normalize();
 
     let text = render(&vless, fmt)?;
     match output {
