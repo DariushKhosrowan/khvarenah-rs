@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.1.4 — 2026-11-11
+
+### Fixed (worker deploy reliability + status-note auto-expiry)
+
+- `dastyab-core`: worker deploy no longer starves on a corrupt / oversized
+  on-disk `_worker.js` (e.g. a truncated 5 MB download with a garbage tail).
+  `validate_worker_js` now enforces Cloudflare's script-size ceiling and
+  rejects binary/corrupt tails; the new `find_valid_worker_js` /
+  `resolve_deploy_worker_bytes` pick the first *validated* bundle and fall back
+  to a new compact built-in `standard_vless_worker_js` (a real module ESM
+  WebSocket VLESS worker under 10 KB) so deploy ALWAYS succeeds with a usable
+  tunnel. The GUI `deploy_worker` and CLI `deploy` both route through it.
+  New tests: `validate_rejects_oversized_worker`,
+  `validate_rejects_corrupt_worker`, `find_valid_worker_skips_bad_candidates`,
+  `standard_vless_worker_validates_and_is_compact`,
+  `resolve_deploy_worker_falls_back_to_builtin_on_bad_disk`.
+- `dastyab-gui`: deploy-status notes (`worker_tunnel_note`, `vps_note`,
+  `mw_note`) now auto-expire after a TTL when no deploy is in flight — a stale
+  "Deploy failed: …" / warning disappears on its own instead of lingering
+  forever. New tests: `status_note_expires_after_ttl_when_idle`,
+  `status_note_retained_while_busy`, `status_note_not_expired_before_ttl`.
+
 ## Unreleased — 2026-11-11
 
 ### Fixed (GUI robustness — deploy/clean-IP/config flow)

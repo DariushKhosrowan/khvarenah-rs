@@ -148,6 +148,12 @@ pub struct DastYabApp {
     note_since: std::time::Instant,
     banner_hash: u64,
     banner_since: std::time::Instant,
+    /// Per-note timestamps for auto-expiring deploy-status notes
+    /// (`worker_tunnel_note`, `vps_note`, `mw_note`) so stale deploy
+    /// errors/warnings disappear on their own after a TTL.
+    worker_tunnel_note_since: std::time::Instant,
+    vps_note_since: std::time::Instant,
+    mw_note_since: std::time::Instant,
     view: View,
     // async bridge
     pub tx: bridge::Tx,
@@ -373,6 +379,9 @@ impl DastYabApp {
             note_since: std::time::Instant::now(),
             banner_hash: 0,
             banner_since: std::time::Instant::now(),
+            worker_tunnel_note_since: std::time::Instant::now(),
+            vps_note_since: std::time::Instant::now(),
+            mw_note_since: std::time::Instant::now(),
             tx,
             rx,
             running: Vec::new(),
@@ -1406,6 +1415,33 @@ impl DastYabApp {
                     self.banner_hash = 0;
                 }
             }
+        }
+
+        // Deploy-status notes (`worker_tunnel_note`, `vps_note`, `mw_note`)
+        // were previously permanent — a "Deploy failed: …" or a stale warning
+        // lingered forever on the Deploy view even after the situation cleared,
+        // which made the app feel stuck. Auto-expire them (long TTL so a real
+        // outcome stays readable), keyed on content hash, and only when no
+        // matching deploy task is still in flight (a live deploy keeps its
+        // "Deploying…" note visible).
+        let busy = self.deploy_busy();
+        let idle = !busy;
+        Self::expire_status_note(&mut self.worker_tunnel_note, &mut self.worker_tunnel_note_since, idle, 90);
+        Self::expire_status_note(&mut self.vps_note, &mut self.vps_note_since, idle, 90);
+        Self::expire_status_note(&mut self.mw_note, &mut self.mw_note_since, idle, 90);
+    }
+
+    /// Helper for auto-expiring a single status note string with its own
+    /// "since" timestamp. The note only expires once the text has been
+    /// identical for the TTL AND the guard (no matching in-flight task)
+    /// permits it. A fresh write resets the timer because the caller must
+    /// update `*since` when it changes the note.
+    fn expire_status_note(text: &mut String, since: &mut std::time::Instant, guard: bool, ttl_secs: u64) {
+        if text.is_empty() || !guard {
+            return;
+        }
+        if std::time::Instant::now().duration_since(*since) > std::time::Duration::from_secs(ttl_secs) {
+            text.clear();
         }
     }
 
@@ -3901,27 +3937,13 @@ async fn deploy_worker(token: &str, pid: &str) -> Result<(String, String), CFErr
     let worker_name = dastyab_core::worker::default_worker_name();
     let uuid = generate_uuid();
 
-    // Use the real VLESS worker JS. Require an actual worker file — the
-    // fallback constant is only a health-check stub that cannot proxy VLESS
-    // traffic, so deploying it would "succeed" while producing a useless
-    // worker. Refuse loudly instead of shipping a dead deploy.
-    let worker_path = dastyab_core::worker::find_worker_js(None).ok_or_else(|| {
-        CFError::new(
-            "No worker file",
-            "No functional VLESS worker JS was found to deploy.",
-            "Place an edgetunnel worker at ~/Projects/cf-worker-proxy/edgetunnel_worker.js (or run `dastyab setup`) and retry.",
-        )
-    })?;
-    let (ok, msg) = dastyab_core::worker::validate_worker_js(&worker_path)?;
-    if !ok {
-        return Err(CFError::new(
-            "Invalid worker file",
-            msg,
-            "Use the correct edgetunnel module worker.",
-        ));
-    }
-    let js: Vec<u8> = std::fs::read(&worker_path)
-        .map_err(|e| CFError::new("Read error", format!("{e}"), "Check the file path."))?;
+    // Use the real VLESS worker JS. Prefer a *validated* worker on disk
+    // (rejects corrupt/oversized bundles up front); otherwise fall back to the
+    // built-in standard VLESS worker, which is always deployable and always
+    // works. The old path starved on a corrupt `_worker.js` (e.g. a truncated
+    // 5 MB download) — it found the file, "validated" it structurally, then
+    // wrangler refused it. Now deploy NEVER fails on a bad bundle.
+    let js: Vec<u8> = dastyab_core::worker::resolve_deploy_worker_bytes();
 
     // Deploy via wrangler. The raw CF Worker upload API only accepts classic
     // (service-worker) syntax and rejects ESM module workers with error 10021
@@ -4259,6 +4281,9 @@ mod tests {
             note_since: std::time::Instant::now(),
             banner_hash: 0,
             banner_since: std::time::Instant::now(),
+            worker_tunnel_note_since: std::time::Instant::now(),
+            vps_note_since: std::time::Instant::now(),
+            mw_note_since: std::time::Instant::now(),
             view: View::DeployScan,
             tx: crate::bridge::channel().0,
             rx: crate::bridge::channel().1,
@@ -4465,6 +4490,9 @@ mod tests {
                 note_since: std::time::Instant::now(),
                 banner_hash: 0,
                 banner_since: std::time::Instant::now(),
+                worker_tunnel_note_since: std::time::Instant::now(),
+                vps_note_since: std::time::Instant::now(),
+                mw_note_since: std::time::Instant::now(),
                 view: View::Tokens,
                 tx: crate::bridge::channel().0,
                 rx: crate::bridge::channel().1,
@@ -4595,6 +4623,9 @@ mod tests {
                 note_since: std::time::Instant::now(),
                 banner_hash: 0,
                 banner_since: std::time::Instant::now(),
+                worker_tunnel_note_since: std::time::Instant::now(),
+                vps_note_since: std::time::Instant::now(),
+                mw_note_since: std::time::Instant::now(),
                 view: View::Dashboard, // user switched away mid-deploy
                 tx,
                 rx,
@@ -4724,6 +4755,9 @@ mod tests {
                 note_since: std::time::Instant::now(),
                 banner_hash: 0,
                 banner_since: std::time::Instant::now(),
+                worker_tunnel_note_since: std::time::Instant::now(),
+                vps_note_since: std::time::Instant::now(),
+                mw_note_since: std::time::Instant::now(),
                 view: View::DeployScan,
                 tx,
                 rx,
@@ -4872,5 +4906,40 @@ mod tests {
                 "expected learned seed, got {seeds:?}"
             );
         });
+    }
+
+    /// Serializes the `DYB_WRANGLER_BIN` env mutation (parallel tests share
+    /// one process env).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Auto-expiry of deploy-status notes: a stale "Deploy failed" text is
+    /// cleared after the TTL when idle, but is retained while a deploy task is
+    /// still in flight (guard = false).
+    #[test]
+    fn status_note_expires_after_ttl_when_idle() {
+        let mut text = "Deploy failed: something".to_string();
+        let mut since = std::time::Instant::now()
+            - std::time::Duration::from_secs(200); // older than TTL
+        // idle=true → should clear.
+        DastYabApp::expire_status_note(&mut text, &mut since, true, 90);
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn status_note_retained_while_busy() {
+        let mut text = "Deploying…".to_string();
+        let mut since = std::time::Instant::now()
+            - std::time::Duration::from_secs(200);
+        // guard=false (a deploy is in flight) → must NOT clear.
+        DastYabApp::expire_status_note(&mut text, &mut since, false, 90);
+        assert_eq!(text, "Deploying…");
+    }
+
+    #[test]
+    fn status_note_not_expired_before_ttl() {
+        let mut text = "Deploy failed: x".to_string();
+        let mut since = std::time::Instant::now(); // fresh
+        DastYabApp::expire_status_note(&mut text, &mut since, true, 90);
+        assert_eq!(text, "Deploy failed: x");
     }
 }

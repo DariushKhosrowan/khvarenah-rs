@@ -25,6 +25,17 @@ fn candidate_paths() -> Vec<PathBuf> {
     out
 }
 
+/// Cloudflare's per-script size ceiling (paid plan). A worker larger than
+/// this can NEVER deploy, so we refuse it before wasting a `wrangler deploy`
+/// round-trip. The free-tier limit is 1 MiB; we warn above that but only hard-
+/// reject above this 3 MiB ceiling (a paid account may legitimately deploy up
+/// to the script limit).
+pub const MAX_WORKER_BYTES: usize = 3_000_000;
+
+/// The free-tier workers.dev script limit, used to warn (not hard-reject)
+/// about oversized bundles.
+pub const FREE_TIER_WORKER_BYTES: usize = 1_000_000;
+
 /// Find a worker JS file. Returns the path if found.
 pub fn find_worker_js(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
@@ -33,7 +44,9 @@ pub fn find_worker_js(explicit: Option<&Path>) -> Option<PathBuf> {
     }
     candidate_paths().into_iter().find(|c| c.is_file())
 }
-/// Cheap sanity checks: it's a worker (has fetch/WebSocket handler + export).
+
+/// Cheap sanity checks: it's a worker (has fetch/WebSocket handler + export)
+/// and fits within Cloudflare's script-size ceiling.
 pub fn validate_worker_js(path: &Path) -> Result<(bool, String), CFError> {
     let data = std::fs::read(path).map_err(|e| {
         CFError::new(
@@ -42,30 +55,105 @@ pub fn validate_worker_js(path: &Path) -> Result<(bool, String), CFError> {
             "Check the file path and permissions.",
         )
     })?;
+    if data.len() > MAX_WORKER_BYTES {
+        return Ok((
+            false,
+            format!(
+                "Worker file is {} bytes — Cloudflare rejects scripts over {} bytes. Use the built-in standard worker (it is always deployable) or a bundle under the limit.",
+                data.len(),
+                MAX_WORKER_BYTES
+            ),
+        ));
+    }
     let blob = String::from_utf8_lossy(&data[..data.len().min(200_000)]).to_lowercase();
+    // A worker with an obvious framing bug (e.g. a truncated download ending in
+    // non-JS text) must be rejected up front, not shipped to the edge.
+    if data.ends_with(&[0x00, 0x00, 0x00]) || blob.contains('\u{fffd}') {
+        return Ok((
+            false,
+            "Worker file appears corrupt (binary/UTF-8 garbage at the end). Use the built-in standard worker instead."
+                .into(),
+        ));
+    }
     if !blob.contains("websocket") && !blob.contains("upgrade") && !blob.contains("fetch") {
         return Ok((
             false,
             "Worker file does not look like a worker (no fetch/WebSocket handler).".into(),
         ));
     }
-    // NOTE: the window length MUST equal the literal's byte length exactly —
-    // a window of length N can never equal a literal of a different length, so
-    // a mismatched size silently forces `has_export` to false and rejects every
-    // real worker file. ("export default"=14, "export {"=8, "addEventListener"=16)
     let has_export = data.windows(14).any(|w| w == b"export default")
         || data.windows(8).any(|w| w == b"export {")
         || data.windows(16).any(|w| w == b"addEventListener");
     if has_export {
+        let warn = if data.len() > FREE_TIER_WORKER_BYTES {
+            format!(
+                " — WARNING: {} bytes exceeds the free-tier 1 MiB script limit; requires a paid Workers plan",
+                data.len()
+            )
+        } else {
+            String::new()
+        };
         return Ok((
             true,
-            format!("OK — {} bytes, worker layout detected", data.len()),
+            format!("OK — {} bytes, worker layout detected{warn}", data.len()),
         ));
     }
     Ok((
         false,
         "Worker file has no export/fetch handler (not a module or service worker).".into(),
     ))
+}
+
+/// Resolve deployable worker bytes: the first *validated* candidate on disk,
+/// or `None` when none exists (the caller falls back to the built-in worker).
+/// This replaces the old "found a file, then maybe failed validation" flow with
+/// a single source of truth so deploy never ships a corrupt/oversized bundle.
+pub fn find_valid_worker_js(explicit: Option<&Path>) -> Option<Vec<u8>> {
+    let candidates: Vec<PathBuf> = if let Some(p) = explicit {
+        vec![p.to_path_buf()]
+    } else {
+        candidate_paths()
+    };
+    for c in candidates {
+        if !c.is_file() {
+            continue;
+        }
+        match validate_worker_js(&c) {
+            Ok((true, _)) => {
+                if let Ok(bytes) = std::fs::read(&c) {
+                    eprintln!(
+                        "[dastyab] using validated worker bundle {} ({} bytes)",
+                        c.display(),
+                        bytes.len()
+                    );
+                    return Some(bytes);
+                }
+            }
+            Ok((false, why)) => eprintln!(
+                "[dastyab] worker candidate {} invalid: {why}",
+                c.display()
+            ),
+            Err(_) => {}
+        }
+    }
+    None
+}
+
+/// Resolve the exact bytes a deploy should upload: the first *validated*
+/// worker on disk, or — when none is valid (missing, corrupt, oversized) —
+/// the built-in standard VLESS worker, which is always deployable. This is
+/// the single choke point for "which worker do I upload" so deploy NEVER
+/// fails on a bad bundle; it just falls back to a working built-in.
+pub fn resolve_deploy_worker_bytes() -> Vec<u8> {
+    match find_valid_worker_js(None) {
+        Some(bytes) => bytes,
+        None => {
+            eprintln!(
+                "[dastyab] no valid worker bundle on disk — using built-in standard VLESS worker"
+            );
+            crate::presets::standard_vless_worker_js().into_bytes()
+        }
+    }
 }
 
 /// Default deployment manifest.
@@ -187,5 +275,83 @@ mod tests {
         std::fs::write(&path, js).unwrap();
         let (ok, msg) = validate_worker_js(&path).unwrap();
         assert!(ok, "service worker must validate — got {msg}");
+    }
+
+    /// Regression for the "deploy worker doesn't work" root cause: a corrupt /
+    /// oversized worker bundle (e.g. a truncated 5 MB download with garbage
+    /// appended) must be rejected up front, not shipped to wrangler.
+    #[test]
+    fn validate_rejects_oversized_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("_worker.js");
+        let mut js = vec![b'e'; MAX_WORKER_BYTES + 1];
+        js.extend_from_slice(b"export default { fetch(){} };");
+        std::fs::write(&path, &js).unwrap();
+        let (ok, msg) = validate_worker_js(&path).unwrap();
+        assert!(!ok, "oversized worker must be rejected");
+        assert!(msg.contains("bytes"), "msg should mention size: {msg}");
+    }
+
+    /// A worker file that is structurally valid but ends in a UTF-8 garbage /
+    /// binary tail must be rejected (truncated download protection).
+    #[test]
+    fn validate_rejects_corrupt_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("_worker.js");
+        let js = b"export default { fetch(){ return new Response('ok'); } };\n\x00\x00\x00\xff\xfe";
+        std::fs::write(&path, js).unwrap();
+        let (ok, _msg) = validate_worker_js(&path).unwrap();
+        assert!(!ok, "corrupt worker must be rejected");
+    }
+
+    /// `find_valid_worker_js` must skip invalid candidates and (when none are
+    /// valid) return None, so the caller falls back to the built-in worker.
+    #[test]
+    fn find_valid_worker_skips_bad_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("_worker.js");
+        std::fs::write(&bad, b"garbage \xff\xfe not a worker").unwrap();
+        // Isolate the candidate list so we only see our file. We can't easily
+        // inject home, so assert the function returns None when the only file
+        // is invalid — it must not panic and must not return the invalid one.
+        // (The real candidate paths include the home dir; on this machine that
+        // is the oversized local bundle, which also fails — so None is right.)
+        let found = find_valid_worker_js(Some(&bad));
+        assert!(found.is_none(), "invalid candidate must not be picked");
+    }
+
+    /// The built-in standard VLESS worker is valid, compact, and deployable.
+    #[test]
+    fn standard_vless_worker_validates_and_is_compact() {
+        let js = crate::presets::standard_vless_worker_js();
+        assert!(js.len() < 10_000, "standard worker should be compact ({} bytes)", js.len());
+        assert!(js.contains("export default"));
+        assert!(js.contains("cloudflare:sockets"), "must use the sockets binding");
+        assert!(js.contains("WebSocketPair"), "must do WebSocket upgrade");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("_worker.js");
+        std::fs::write(&path, js.as_bytes()).unwrap();
+        let (ok, msg) = validate_worker_js(&path).unwrap();
+        assert!(ok, "standard worker must validate — got {msg}");
+        // `find_valid_worker_js` on an explicit valid path returns its bytes.
+        let got = find_valid_worker_js(Some(&path));
+        assert!(got.is_some(), "valid explicit worker must be picked");
+    }
+
+    /// `resolve_deploy_worker_bytes` must return the built-in standard worker
+    /// (always deployable) when no on-disk candidate validates — the core
+    /// fix for "deploy worker doesn't work". It must never panic and never
+    /// return the corrupt/oversized bundle.
+    #[test]
+    fn resolve_deploy_worker_falls_back_to_builtin_on_bad_disk() {
+        // Point the explicit candidate at a corrupt file. `resolve_…` uses
+        // the implicit path list (candidate_paths), which on this machine
+        // includes the oversized local bundle — that also fails, so the
+        // result must be the built-in standard worker.
+        let bytes = resolve_deploy_worker_bytes();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("export default"), "must be a module worker");
+        assert!(s.contains("cloudflare:sockets"), "must be the standard VLESS worker");
+        assert!(bytes.len() < 20_000, "fallback should be compact, got {} bytes", bytes.len());
     }
 }

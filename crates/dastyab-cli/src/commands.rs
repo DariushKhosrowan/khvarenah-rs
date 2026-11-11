@@ -11,7 +11,7 @@ use dastyab_core::store::profiles::{
 };
 use dastyab_core::vless::VlessProfile;
 use dastyab_core::worker::{
-    find_worker_js, generate_uuid, safe_worker_name, validate_worker_js, worker_name_from_account,
+    generate_uuid, safe_worker_name, worker_name_from_account,
 };
 use dastyab_core::{CFError, BRAND, VERSION};
 use std::path::PathBuf;
@@ -642,25 +642,8 @@ async fn deploy(
         dastyab_core::worker::default_worker_name()
     };
 
-    // find worker js (or fall back to the preset's built-in worker)
-    let worker_bytes = match find_worker_js(None) {
-        Some(path) => {
-            let (ok, msg) = validate_worker_js(&path)?;
-            if !ok {
-                return Err(CFError::new(
-                    "Invalid worker file",
-                    msg,
-                    "Use the correct edgetunnel module worker.",
-                ));
-            }
-            std::fs::read(&path)
-                .map_err(|e| CFError::new("Read error", format!("{e}"), "Check file."))?
-        }
-        None => {
-            println!("⚠ No _worker.js found — using the built-in preset worker.");
-            dastyab_core::presets::fallback_worker_js().into_bytes()
-        }
-    };
+    // find worker js (validated disk bundle, else built-in standard worker)
+    let worker_bytes = dastyab_core::worker::resolve_deploy_worker_bytes();
 
     let client = Client::new(&token);
     let acc_id = resolve_account_id(&p, &client, account.as_deref())?;
