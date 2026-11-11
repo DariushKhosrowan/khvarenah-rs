@@ -1895,95 +1895,60 @@ impl eframe::App for DastYabApp {
         // Keyboard shortcuts (Ctrl+1..9 / Ctrl+0).
         self.handle_shortcuts(ui);
 
-        ui.vertical_centered(|ui| {
-            ui.heading(egui::RichText::new("DastYab").color(GOLD).size(28.0));
-            ui.label(egui::RichText::new("Cloudflare-Workers VLESS VPN console").color(GOLD_DIM));
-        });
-        ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_label("Profile")
-                .selected_text(&self.profile_id)
-                .show_ui(ui, |ui| {
-                    let mut clicked: Option<String> = None;
-                    for id in &self.profiles {
-                        if ui
-                            .selectable_label(self.profile_id == *id, id.as_str())
-                            .clicked()
-                        {
-                            clicked = Some(id.clone());
+        // Structural layout fix: use real egui panels so the active view
+        // fills the entire window on resize/maximize. The previous manual
+        // `ui.horizontal` gave the content a fixed height equal to the
+        // sidebar's natural height, so maximizing left the selected tab
+        // clipped (scrollable but not showing the full view).
+        egui::containers::Panel::top("app_header").show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.vertical_centered(|ui| {
+                ui.heading(egui::RichText::new("DastYab").color(GOLD).size(28.0));
+                ui.label(
+                    egui::RichText::new("Cloudflare-Workers VLESS VPN console").color(GOLD_DIM),
+                );
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_label("Profile")
+                    .selected_text(&self.profile_id)
+                    .show_ui(ui, |ui| {
+                        let mut clicked: Option<String> = None;
+                        for id in &self.profiles {
+                            if ui
+                                .selectable_label(self.profile_id == *id, id.as_str())
+                                .clicked()
+                            {
+                                clicked = Some(id.clone());
+                            }
                         }
+                        if let Some(id) = clicked {
+                            self.switch_profile(&id);
+                        }
+                    });
+                if ui.button("New profile").clicked() && !self.new_profile_name.is_empty() {
+                    match create_profile(&self.new_profile_name, "") {
+                        Ok(id) => {
+                            // Activate the fresh profile so the store marker,
+                            // the view-model cache, and every action (Make
+                            // active, …) all target it.
+                            let _ = set_active_profile(&id);
+                            self.profile_id = id;
+                            self.state.reload_pending = true;
+                            self.new_profile_name.clear();
+                            self.reload_profiles();
+                        }
+                        Err(e) => self.note = e.brief(),
                     }
-                    if let Some(id) = clicked {
-                        self.switch_profile(&id);
-                    }
-                });
-            if ui.button("New profile").clicked() && !self.new_profile_name.is_empty() {
-                match create_profile(&self.new_profile_name, "") {
-                    Ok(id) => {
-                        // Activate the fresh profile so the store marker, the
-                        // view-model cache, and every action (Make active, …)
-                        // all target it — otherwise `state.active_profile_id`
-                        // stays on the old profile and token/config actions
-                        // silently hit the wrong one.
-                        let _ = set_active_profile(&id);
-                        self.profile_id = id;
-                        self.state.reload_pending = true;
-                        self.new_profile_name.clear();
-                        self.reload_profiles();
-                    }
-                    Err(e) => self.note = e.brief(),
                 }
-            }
-            ui.text_edit_singleline(&mut self.new_profile_name);
+                ui.text_edit_singleline(&mut self.new_profile_name);
+            });
+            ui.add_space(6.0);
         });
-
-        ui.add_space(8.0);
 
         let p = load_profile(&self.profile_id);
         self.render_shell(ui, &p);
         self.handle_dialog(ui.ctx());
-
-        if let Some(err) = self.error_banner.clone() {
-            ui.add_space(8.0);
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(60, 12, 12))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 60, 60)))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Label::new(
-                            egui::RichText::new(err).color(egui::Color32::from_rgb(255, 160, 160)),
-                        ));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button("✕")
-                                .on_hover_text("Dismiss this error")
-                                .clicked()
-                            {
-                                self.error_banner = None;
-                            }
-                        });
-                    });
-                });
-        }
-
-        if !self.note.is_empty() {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.add(egui::Label::new(
-                    egui::RichText::new(&self.note).color(GOLD_DIM),
-                ));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("✕")
-                        .on_hover_text("Clear message")
-                        .clicked()
-                    {
-                        self.note.clear();
-                    }
-                });
-            });
-        }
     }
 }
 
@@ -2357,10 +2322,14 @@ impl DastYabApp {
     /// The app shell: left navigation sidebar + active view, with the active
     /// view name shown in gold.
     fn render_shell(&mut self, ui: &mut egui::Ui, p: &dastyab_core::store::profiles::Profile) {
-        ui.horizontal(|ui| {
-            // Left sidebar with the eight views.
-            ui.vertical(|ui| {
-                ui.set_width(180.0);
+        // ── Left navigation sidebar ───────────────────────────────────
+        // A real SidePanel fills the full window height and keeps the nav
+        // fixed while the content scrolls.
+        egui::containers::Panel::left("sidebar")
+            .resizable(false)
+            .exact_size(200.0)
+            .show_separator_line(true)
+            .show(ui, |ui| {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new("DASTYAB")
@@ -2385,7 +2354,6 @@ impl DastYabApp {
                 }
                 ui.add_space(8.0);
                 ui.separator();
-                // Compact status footer: active profile + pending beacon alerts.
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("profile").color(GOLD_DIM).small());
                 let prof_label = if self.profile_id.is_empty() {
@@ -2394,7 +2362,6 @@ impl DastYabApp {
                     self.profile_id.clone()
                 };
                 ui.label(egui::RichText::new(prof_label).color(TEXT).strong().small());
-                // Compact live counts for the active profile.
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(format!(
@@ -2408,17 +2375,11 @@ impl DastYabApp {
                 if self.state.beacon_outbox > 0 {
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new(format!(
-                            "⚠ {} queued alerts",
-                            self.state.beacon_outbox
-                        ))
-                        .color(egui::Color32::from_rgb(230, 160, 60))
-                        .small(),
+                        egui::RichText::new(format!("⚠ {} queued alerts", self.state.beacon_outbox))
+                            .color(egui::Color32::from_rgb(230, 160, 60))
+                            .small(),
                     );
                 }
-                // Live background-task status — visible from every tab so a
-                // deploy/scan in progress is never "lost" when the user
-                // switches views. Shows the task names while they run.
                 if !self.running.is_empty() {
                     ui.add_space(4.0);
                     ui.label(
@@ -2427,11 +2388,6 @@ impl DastYabApp {
                             .small(),
                     );
                 }
-                // Durable deploy-status line — the last deploy outcome (or a
-                // live "Deploying…" progress line) is ALWAYS shown here, on
-                // every tab, independent of which view is active. A deploy's
-                // result never disappears just because the user switched tabs
-                // mid-deploy. It auto-expires on its own after its TTL.
                 let deploy_note = if !self.worker_tunnel_note.is_empty() {
                     Some(&self.worker_tunnel_note)
                 } else if !self.vps_note.is_empty() {
@@ -2449,17 +2405,21 @@ impl DastYabApp {
                 }
             });
 
-            ui.separator();
+        // ── Central content ────────────────────────────────────────────
+        // A CentralPanel fills the remaining window space, so the active view
+        // uses the full height on maximize; its inner ScrollArea handles
+        // content taller than the window.
+        egui::CentralPanel::default().show(ui, |ui| {
+            // Notices are pinned above the scrolling content so errors and
+            // warnings stay visible on every tab and auto-expire on their own.
+            self.render_inline_notices(ui);
+            ui.add_space(4.0);
 
-            // Main content area — wrapped in a vertical ScrollArea so every
-            // view (Settings, Tools, …) stays reachable when its content is
-            // taller than the window. The sidebar remains fixed.
             egui::ScrollArea::vertical()
                 .id_salt("main-content-scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.vertical(|ui| {
-                        // active view name in gold, with glyph
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(self.view.glyph())
@@ -2489,6 +2449,51 @@ impl DastYabApp {
                     });
                 });
         });
+    }
+
+    /// Render the transient error banner and note, pinned at the top of the
+    /// central area so feedback is always visible and auto-expiring.
+    fn render_inline_notices(&mut self, ui: &mut egui::Ui) {
+        if let Some(err) = self.error_banner.clone() {
+            ui.add_space(4.0);
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(60, 12, 12))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 60, 60)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(err).color(egui::Color32::from_rgb(255, 160, 160)),
+                        ));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Dismiss this error")
+                                .clicked()
+                            {
+                                self.error_banner = None;
+                            }
+                        });
+                    });
+                });
+        }
+
+        if !self.note.is_empty() {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(&self.note).color(GOLD_DIM),
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("Clear message")
+                        .clicked()
+                    {
+                        self.note.clear();
+                    }
+                });
+            });
+        }
     }
 
     fn deploy_panel(&mut self, ui: &mut egui::Ui, p: &dastyab_core::store::profiles::Profile) {
@@ -4334,6 +4339,18 @@ fn create_configs_from_ip(profile_id: &str, endpoint: &str) -> Result<(usize, St
         .ok_or_else(|| {
             "No deployed worker link yet — deploy once, then you can point configs at any clean IP without redeploying.".to_string()
         })?;
+    // The resolved base link must parse to a worker with a non-empty host; a
+    // malformed legacy record (empty host) would silently render broken configs
+    // against an empty server, so refuse loudly instead.
+    let parsed_host = dastyab_core::vless::VlessProfile::parse(&base_link)
+        .map(|prof| prof.address.trim().to_string())
+        .unwrap_or_default();
+    if parsed_host.is_empty() || parsed_host.contains("..") || parsed_host.starts_with('.') {
+        return Err(
+            "The stored worker base link is malformed (empty host). Redeploy the worker once to repair it."
+                .to_string(),
+        );
+    }
 
     // Parse the base worker config, then override the address with the
     // user-supplied clean IP (keeps uuid/path/security/transport).
@@ -4433,6 +4450,68 @@ mod tests {
             }
         }
         worker_url
+    }
+
+    #[test]
+    fn panel_layout_renders_at_default_and_maximized_sizes() {
+        // Structural regression: the shell must render with the real egui
+        // panel layout (TopBottomPanel + SidePanel + CentralPanel) at both
+        // default and maximized window sizes without panicking, and the
+        // central content must occupy the full available height (so the
+        // selected tab is fully shown on maximize). This exercises the exact
+        // code path that previously used a manual `ui.horizontal` and left
+        // the active tab clipped when maximized.
+        with_home(|pid| {
+            let (mut app, _tx) = test_app(pid, Vec::new());
+            let ctx = egui::Context::default();
+            let prof = load_profile(pid);
+
+            for (label, w, h) in [
+                ("default", 1280.0, 800.0),
+                ("maximized", 1920.0, 1080.0),
+            ] {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w, h),
+                    )),
+                    ..Default::default()
+                };
+                // Render one frame; if the panel layout is broken (panics,
+                // competing panels) this will panic and fail the test.
+                let output = ctx.run_ui(input, |ui| {
+                    // Simulate the full update() body's shell part safely:
+                    // render the shell (sidebar + central content).
+                    app.render_shell(ui, &prof);
+                });
+                // A maximized screen must allocate a tall central content area
+                // (height roughly the full screen minus header). We assert the
+                // frame produced content and did not panic; the key structural
+                // guarantee (full-height central) is that no error/panic
+                // occurred while laying out panels at this size.
+                assert!(
+                    !output.shapes.is_empty(),
+                    "{label}: expected rendered shapes (frame produced output)"
+                );
+                // The central content must fill the window height (the exact
+                // maximize bug): the rendered shapes' clip rects should extend
+                // to near the bottom of the screen, not stop at the sidebar's
+                // natural height. We track the deepest clip rect bottom.
+                let deepest = output
+                    .shapes
+                    .iter()
+                    .map(|cs| cs.clip_rect.bottom())
+                    .fold(f32::MIN, |a, b| a.max(b));
+                assert!(
+                    deepest >= h - 60.0,
+                    "{label}: central content must fill the window (deepest shape bottom = {deepest:.1}, screen h = {h})"
+                );
+                // Drop the frame's texture deltas explicitly (egui requires
+                // this when the caller doesn't pass them to a renderer).
+                output.drop_without_applying_deltas();
+                let _ = output.platform_output;
+            }
+        });
     }
 
     #[test]

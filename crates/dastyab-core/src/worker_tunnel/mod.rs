@@ -96,15 +96,30 @@ pub fn vless_link_for_worker(profile_id: &str, worker_url: &str) -> Option<Strin
 ///    deploy even before a scan has written history.
 pub fn resolve_deployed_base_link(profile_id: &str) -> Option<String> {
     let p = crate::store::profiles::load_profile(profile_id);
+    // A base link is only usable if it parses to a worker with a non-empty,
+    // well-formed host. A malformed legacy record (empty host, e.g.
+    // "vless://uuid@:443?" — seen in the wild from a pre-Rust deploy) must
+    // never be returned, otherwise every later config-from-IP renders against
+    // an empty server and silently produces broken configs.
+    let usable = |link: &str| -> bool {
+        if !link.starts_with("vless://") {
+            return false;
+        }
+        match crate::vless::VlessProfile::parse(link) {
+            Ok(prof) => {
+                let h = prof.address.trim();
+                !h.is_empty() && !h.contains("..") && !h.starts_with('.')
+            }
+            Err(_) => false,
+        }
+    };
     if let Some(link) = &p.config.last_deployed_base_link {
-        if !link.is_empty() && link.starts_with("vless://") {
+        if usable(link) {
             return Some(link.clone());
         }
     }
-    if let Some(r) = p.history.iter().find(|r| !r.clean_ip) {
-        if !r.link.is_empty() && r.link.starts_with("vless://") {
-            return Some(r.link.clone());
-        }
+    if let Some(r) = p.history.iter().find(|r| !r.clean_ip && usable(&r.link)) {
+        return Some(r.link.clone());
     }
     let cfg = crate::vps_deploy::load_tunnel_client_config(profile_id)?;
     let url = match cfg.mode {
@@ -291,4 +306,69 @@ mod tests {
             "durable base link must be unchanged by history clear"
         );
     }
+    #[test]
+    fn resolve_deployed_base_link_skips_empty_host_records() {
+        // A legacy malformed record (empty host, e.g. the one observed in the
+        // wild: "vless://uuid@:443?…") must NEVER be returned as the base link.
+        // If it were, config-from-IP would render broken configs against an
+        // empty server and the Configs tab would falsely report "deployed".
+        let _home = isolated_home();
+        let pid = crate::store::profiles::create_profile("resolve-emptyhost", "test").unwrap();
+
+        // Valid deploy first (should be preferred if it comes first).
+        let good = crate::store::profiles::VlessRecord {
+            id: crate::store::new_id(),
+            ts: crate::store::profiles::now_iso(),
+            epoch: crate::store::now_ts(),
+            uuid: String::new(),
+            address: "104.16.9.9".into(),
+            port: 443,
+            name: "worker-good".into(),
+            clean_ip: false,
+            link: "vless://good111@104.16.9.9:443?security=tls&type=ws#worker-good".into(),
+            note: "deployed".into(),
+        };
+        // Malformed empty-host record placed BEFORE the good one — the resolver
+        // must skip it, not return it.
+        let bad = crate::store::profiles::VlessRecord {
+            id: crate::store::new_id(),
+            ts: crate::store::profiles::now_iso(),
+            epoch: crate::store::now_ts(),
+            uuid: String::new(),
+            address: String::new(),
+            port: 443,
+            name: String::new(),
+            clean_ip: false,
+            link: "vless://81c2913f-5d08-4f80-a8ee-bda46fc0b65b@:443?encryption=none&security=tls&type=ws&sni=&host=&path=%2F&fp=chrome#".into(),
+            note: String::new(),
+        };
+        crate::store::profiles::remember_vless(&pid, bad).unwrap();
+        crate::store::profiles::remember_vless(&pid, good).unwrap();
+
+        let link = resolve_deployed_base_link(&pid).expect("should resolve to the valid record");
+        assert!(link.contains("104.16.9.9"), "got: {link}");
+        assert!(link.contains("good111"), "got: {link}");
+        assert!(!link.contains("@:"), "must not be the empty-host record: {link}");
+    }
+
+    #[test]
+    fn resolve_deployed_base_link_none_when_only_empty_host_records() {
+        let _home = isolated_home();
+        let pid = crate::store::profiles::create_profile("resolve-allempty", "test").unwrap();
+        let bad = crate::store::profiles::VlessRecord {
+            id: crate::store::new_id(),
+            ts: crate::store::profiles::now_iso(),
+            epoch: crate::store::now_ts(),
+            uuid: String::new(),
+            address: String::new(),
+            port: 443,
+            name: String::new(),
+            clean_ip: false,
+            link: "vless://81c2913f-5d08-4f80-a8ee-bda46fc0b65b@:443?encryption=none&security=tls&type=ws&sni=&host=&path=%2F&fp=chrome#".into(),
+            note: String::new(),
+        };
+        crate::store::profiles::remember_vless(&pid, bad).unwrap();
+        assert!(resolve_deployed_base_link(&pid).is_none(), "all records empty-host ⇒ None");
+    }
+
 }
