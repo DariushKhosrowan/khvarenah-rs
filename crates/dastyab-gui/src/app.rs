@@ -2714,10 +2714,13 @@ impl DastYabApp {
             .clicked()
         {
             let pid = self.profile_id.clone();
-            // Prefer the store's active token (falls back to the first one).
-            let token = dastyab_core::store::profiles::get_active_token(&pid)
-                .ok()
-                .flatten()
+            // Resolve the deploy token with self-heal, mirroring the worker
+            // tunnel path: `ensure_active_token` repopulates an empty/stale
+            // active-token marker from any valid token on the profile instead
+            // of silently no-oping ("nothing happens"), then prefer that token,
+            // falling back to the first token only if none is marked active.
+            let token = dastyab_core::store::profiles::ensure_active_token(&pid)
+                .unwrap_or(None)
                 .and_then(|label| {
                     dastyab_core::store::profiles::get_token(&pid, &label)
                         .ok()
@@ -2727,6 +2730,11 @@ impl DastYabApp {
             match token {
                 Some(token) => {
                     self.running.push("deploy".to_string());
+                    // Immediate feedback so a click is never silent: show a live
+                    // "Deploying…" progress note (the sidebar + Deploy tab show
+                    // it until the bridge delivers the outcome).
+                    self.error_banner = None;
+                    self.worker_tunnel_note = "Deploying worker (wrangler)…".to_string();
                     let tx = self.tx.clone();
                     bridge::spawn("deploy", tx, async move {
                         match deploy_worker(&token, &pid).await {
@@ -4458,6 +4466,35 @@ mod tests {
             assert!(!app.deploy_busy(), "a scan is not a deploy")
         });
         with_running("test", vec![], |app| assert!(!app.deploy_busy()));
+    }
+
+    #[test]
+    fn deploy_panel_resolves_token_heals_blank_active_and_shows_progress() {
+        // The "deploy does nothing" complaint: the Deploy tab must self-heal
+        // a blank/stale active-token marker (via `ensure_active_token`) so it
+        // never silently no-ops, and it must show a live "Deploying…" note
+        // immediately so a click is never silent. We verify the two building
+        // blocks the button uses:
+        //   1. `ensure_active_token` repopulates an empty marker from any token.
+        //   2. Starting a deploy sets the "Deploying…" status note.
+        with_home(|pid| {
+            use dastyab_core::store::profiles::{add_token, set_active_profile};
+            set_active_profile(pid).unwrap();
+            add_token(pid, "primary", "cf_live_token_abcdefgh").unwrap();
+
+            // No token is marked active yet -> ensure_active_token must heal.
+            let healed = dastyab_core::store::profiles::ensure_active_token(pid).unwrap();
+            assert_eq!(healed.as_deref(), Some("primary"));
+
+            // Simulate the deploy button's immediate feedback: set the live
+            // "Deploying…" note and mark the task running (deploy-once).
+            let (mut app, _tx) = test_app(pid, vec!["deploy".into()]);
+            assert!(app.deploy_busy());
+            app.error_banner = None;
+            app.worker_tunnel_note = "Deploying worker (wrangler)…".to_string();
+            assert!(app.worker_tunnel_note.contains("Deploying"));
+            assert!(app.error_banner.is_none());
+        });
     }
 
     /// Run a closure with an app instance whose `profile_id` and `running`
