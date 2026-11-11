@@ -77,7 +77,7 @@ pub fn sing_box_json(profile: &VlessProfile) -> Result<String, CFError> {
         },
         "transport": {
             "type": "ws",
-            "path": p.path,
+            "path": p.canonical_path(),
             "headers": { "Host": host }
         }
     });
@@ -115,7 +115,7 @@ pub fn clash_entry(profile: &VlessProfile) -> String {
         p.port,
         p.uuid,
         tls_enabled,
-        p.path
+        p.canonical_path()
     )
 }
 

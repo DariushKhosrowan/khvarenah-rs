@@ -66,6 +66,20 @@ fn decode_query(v: &str) -> String {
 }
 
 impl VlessProfile {
+    /// The WS path as it must appear in rendered config JSON/YAML/share links:
+    /// percent-decoded (so a legacy `%2F` collapses back to `/`) and never
+    /// empty (defaults to `/`). Every renderer calls this so no client-facing
+    /// config can ever carry an encoded path — v2rayN and other clients refuse
+    /// to import `path: %2F`.
+    pub fn canonical_path(&self) -> String {
+        let p = decode_query(&self.path);
+        if p.is_empty() {
+            "/".to_string()
+        } else {
+            p
+        }
+    }
+
     /// Fill in default sni/header_host from address, like Python's __post_init__.
     pub fn normalize(&mut self) {
         if self.sni.as_deref().unwrap_or("").is_empty() {
@@ -95,6 +109,7 @@ impl VlessProfile {
     pub fn share_link(&self) -> String {
         let mut p = self.clone();
         p.normalize();
+        let canonical_path = p.canonical_path();
         let sni = p.sni.unwrap_or_else(|| p.address.clone());
         let host = p.header_host.unwrap_or_else(|| p.address.clone());
 
@@ -104,7 +119,7 @@ impl VlessProfile {
         base.push_str(&format!("&type={}", p.transport));
         base.push_str(&format!("&sni={sni}"));
         base.push_str(&format!("&host={host}"));
-        base.push_str(&format!("&path={}", p.path));
+        base.push_str(&format!("&path={canonical_path}"));
         base.push_str("&fp=chrome");
         base.push_str(&format!(
             "#{}",
@@ -146,7 +161,7 @@ impl VlessProfile {
                         serde_json::Value::Null
                     }),
                     "wsSettings": {
-                        "path": p.path,
+                        "path": p.canonical_path(),
                         "headers": {"Host": host}
                     }
                 }

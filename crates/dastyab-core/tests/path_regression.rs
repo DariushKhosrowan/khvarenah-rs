@@ -59,3 +59,54 @@ fn export_reconstruct_from_clean_ip_record_uses_link() {
     assert!(xray.contains("\"path\": \"/\""), "xray path not clean: {}", xray);
     assert!(xray.contains("\"address\": \"104.18.227.124\""), "xray address unclean: {}", xray);
 }
+
+/// A profile constructed directly (not via parse) may still carry a legacy
+/// percent-encoded path, e.g. from a pre-decode stored record. Every renderer
+/// must canonicalize it to `/` so v2rayN / sing-box / Clash can import the
+/// result. This guards against any future code path building a profile with an
+/// encoded path bypassing `parse()`'s decode.
+#[test]
+fn render_canonicalizes_encoded_path_even_without_parse() {
+    let p = VlessProfile {
+        uuid: "11111111-2222-3333-4444-555555555555".into(),
+        address: "104.18.227.124".into(),
+        port: 443,
+        security: "tls".into(),
+        path: "%2F".into(), // legacy encoded path
+        transport: "ws".into(),
+        sni: Some("dastyab-humantest.dariuskhosrowan.workers.dev".into()),
+        header_host: Some("dastyab-humantest.dariuskhosrowan.workers.dev".into()),
+        name: "encoded-clean".into(),
+    };
+
+    // share link
+    let link = p.share_link();
+    assert!(!link.contains("path=%2F"), "share_link leaked %2F: {}", link);
+    assert!(link.contains("&path=/"), "share_link missing plain /: {}", link);
+
+    // xray (v2rayN)
+    let xray = p.xray_client_json().expect("xray");
+    assert!(!xray.contains("%2F"), "xray leaked %2F: {}", xray);
+    assert!(xray.contains("\"path\": \"/\""), "xray path unclean: {}", xray);
+
+    // sing-box
+    let sb = dastyab_core::export::sing_box_json(&p).expect("sing-box");
+    assert!(!sb.contains("%2F"), "sing-box leaked %2F: {}", sb);
+    assert!(sb.contains("\"path\": \"/\""), "sing-box path unclean: {}", sb);
+
+    // Clash
+    let clash = dastyab_core::export::clash_entry(&p);
+    assert!(!clash.contains("%2F"), "clash leaked %2F: {}", clash);
+    assert!(clash.contains("path: /"), "clash path unclean: {}", clash);
+}
+
+/// The exact link that produced the user's un-importable v2rayN config
+/// ("path": "%2F"). The renderer must emit an importable "path": "/".
+#[test]
+fn exact_user_link_renders_clean_v2rayn() {
+    let link = "vless://11111111-2222-3333-4444-555555555555@dastyab-humantest.dariuskhosrowan.workers.dev:443?encryption=none&security=tls&type=ws&sni=dastyab-humantest.dariuskhosrowan.workers.dev&host=dastyab-humantest.dariuskhosrowan.workers.dev&path=%2F&fp=chrome#test";
+    let p = VlessProfile::parse(link).expect("parse");
+    let xray = p.xray_client_json().expect("xray");
+    assert!(!xray.contains("%2F"), "STILL HAS %2F: {}", xray);
+    assert!(xray.contains("\"path\": \"/\""), "path not / : {}", xray);
+}
