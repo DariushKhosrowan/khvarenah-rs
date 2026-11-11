@@ -215,6 +215,40 @@ pub fn required_fields_ok(kind: &ArtifactKind, bytes: &[u8]) -> bool {
     }
 }
 
+/// If `dest` currently holds a `config.json` with a non-empty
+/// `last_deployed_base_link` but the backup content does not (or holds an older
+/// one), return the backup content with the live base link re-injected. This
+/// stops auto-heal from rewinding a newer deploy alongside genuinely-corrupt
+/// files. Returns the content unchanged when there is nothing to preserve or
+/// either side fails to parse.
+fn preserve_live_base_link(dest: &std::path::Path, backup_content: &str) -> String {
+    let Ok(live_bytes) = std::fs::read(dest) else {
+        return backup_content.to_string();
+    };
+    let live: serde_json::Value = match serde_json::from_slice(&live_bytes) {
+        Ok(v) => v,
+        Err(_) => return backup_content.to_string(),
+    };
+    let Some(live_link) = live
+        .get("last_deployed_base_link")
+        .and_then(|l| l.as_str())
+        .map(|s| s.to_string())
+    else {
+        return backup_content.to_string();
+    };
+    if live_link.is_empty() {
+        return backup_content.to_string();
+    }
+    let mut backup: serde_json::Value = match serde_json::from_str(backup_content) {
+        Ok(v) => v,
+        Err(_) => return backup_content.to_string(),
+    };
+    // Prefer the *live* link whenever it is set - it reflects the most recent
+    // successful deploy. Only fall back to the backup's when the live is empty.
+    backup["last_deployed_base_link"] = serde_json::Value::String(live_link);
+    serde_json::to_string_pretty(&backup).unwrap_or_else(|_| backup_content.to_string())
+}
+
 /// Execute a heal plan.
 pub fn execute_heal(
     action: &HealAction,
@@ -250,6 +284,17 @@ pub fn execute_heal(
                     continue;
                 }
                 let dest = profile_dir.join(rel);
+                // Forward-preserve the durable deployed base link: the live
+                // config.json may carry a `last_deployed_base_link` that a
+                // NEWER deploy wrote after this backup was taken. Restoring
+                // the backup verbatim would wipe it and break config-from-IP
+                // (deploy-once → configure-many). Keep the live value when the
+                // backup predates it (or lacks it entirely).
+                let content = if rel == "config.json" {
+                    preserve_live_base_link(&dest, &content)
+                } else {
+                    content
+                };
                 crate::store::atomic_write(&dest, content.as_bytes())
                     .map_err(|e| HealError::Io(e.brief()))?;
                 // Post-restore required-field check: never report "healed"
@@ -405,6 +450,65 @@ mod tests {
             let report = execute_heal(&action, &dir, 1000).unwrap();
             assert!(report.healed.contains(&"token.json".to_string()));
         });
+    }
+
+    #[test]
+    fn preserve_live_base_link_keeps_live_link_when_backup_lacks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("config.json");
+        let live_link = "vless://11111111-2222-3333-4444-555555555555@workers.example.workers.dev:443#dep";
+        // Live config has a newer durable base link; the backup predates it
+        // (no key at all).
+        std::fs::write(
+            &dest,
+            format!(
+                r#"{{"protection_enabled":true,"last_deployed_base_link":"{live_link}"}}"#
+            ),
+        )
+        .unwrap();
+        let backup = r#"{"protection_enabled":true}"#;
+        let out = preserve_live_base_link(&dest, backup);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["last_deployed_base_link"].as_str(),
+            Some(live_link),
+            "live base link must survive the heal"
+        );
+    }
+
+    #[test]
+    fn preserve_live_base_link_prefers_live_over_older_backup_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("config.json");
+        let live_link = "vless://live-uuid@host-a.workers.dev:443#live";
+        let old_link = "vless://old-uuid@host-b.workers.dev:443#old";
+        std::fs::write(
+            &dest,
+            format!(
+                r#"{{"protection_enabled":true,"last_deployed_base_link":"{live_link}"}}"#
+            ),
+        )
+        .unwrap();
+        let backup = format!(r#"{{"protection_enabled":false,"last_deployed_base_link":"{old_link}"}}"#);
+        let out = preserve_live_base_link(&dest, &backup);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["last_deployed_base_link"].as_str(),
+            Some(live_link),
+            "the newest live deploy must win over an older backup link"
+        );
+        // Other fields from the backup are retained.
+        assert_eq!(v["protection_enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn preserve_live_base_link_unchanged_when_no_live_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("config.json");
+        std::fs::write(&dest, br#"{"protection_enabled":true}"#).unwrap();
+        let backup = r#"{"protection_enabled":true}"#;
+        let out = preserve_live_base_link(&dest, backup);
+        assert_eq!(out, backup);
     }
 
     #[test]

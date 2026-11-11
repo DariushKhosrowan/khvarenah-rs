@@ -526,6 +526,34 @@ mod tests {
     }
 
     #[test]
+    fn save_profile_keeps_manifest_fresh() {
+        with_home(|| {
+            let id = fresh_profile_id();
+            seed_artifacts(&id);
+            write_manifest(&build_manifest(&id).unwrap()).unwrap();
+
+            // A legitimate profile save (the store's normal write path, e.g.
+            // set_last_deployed_base_link) must refresh the manifest so the
+            // daemon's auto-heal does not misread a normal save as corruption
+            // and rewind-restore an old backup.
+            let mut prof = crate::store::profiles::load_profile(&id);
+            prof.config.last_deployed_base_link =
+                Some("vless://abc@worker.example.workers.dev:443#x".into());
+            crate::store::profiles::save_profile(&prof).unwrap();
+
+            // Manifest must now match the on-disk state -> no "changed".
+            let r = verify_profile(&id);
+            assert!(
+                r.is_clean(),
+                "expected clean after save_profile; missing={:?} changed={:?} extra={:?}",
+                r.missing,
+                r.changed,
+                r.extra
+            );
+        });
+    }
+
+    #[test]
     fn manifest_excludes_mtime_from_integrity() {
         with_home(|| {
             let id = fresh_profile_id();

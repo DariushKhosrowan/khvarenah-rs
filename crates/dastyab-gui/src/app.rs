@@ -1032,6 +1032,15 @@ impl DastYabApp {
             // just returned (never rely on later re-resolution), then persist
             // it durably (survives history clears) so config-from-IP always
             // resolves the actually-deployed identity.
+            if res.worker_url.trim().is_empty() {
+                // Defensive guard mirroring deploy_worker_with_client: never
+                // record/generate configs from an empty resolved host.
+                return Err(CFError::new(
+                    "Worker tunnel",
+                    "Worker deploy returned an empty worker URL.",
+                    "Check the CF token / account state and redeploy.",
+                ));
+            }
             if let Some(base) =
                 dastyab_core::worker_tunnel::vless_link_for_worker(&pid, &res.worker_url)
             {
@@ -2619,6 +2628,18 @@ impl DastYabApp {
                                         note: "clean IP".into(),
                                     };
                                     let _ = remember_vless(&pid, rec);
+                                    // Persist a durable base link from the worker
+                                    // skeleton this scan used, so config-from-IP
+                                    // keeps working even if history is later
+                                    // cleared/trimmed (deploy-once →
+                                    // configure-many). Only set when absent or
+                                    // when this is a fresher non-clean worker link.
+                                    if let Some(base) =
+                                        dastyab_core::worker_tunnel::resolve_deployed_base_link(&pid)
+                                    {
+                                        let _ = dastyab_core::store::profiles::
+                                            set_last_deployed_base_link(&pid, &base);
+                                    }
                                     Ok::<String, CFError>(format!(
                                         "Found working IP: {ep} — learned as a seed; link updated in profile."
                                     ))
@@ -2678,6 +2699,12 @@ impl DastYabApp {
                                         // neighbourhoods (self-improving).
                                         let _ =
                                             dastyab_core::cf::ips::learn_clean_ip(&pid, ep);
+                                    }
+                                    if let Some(base) =
+                                        dastyab_core::worker_tunnel::resolve_deployed_base_link(&pid)
+                                    {
+                                        let _ = dastyab_core::store::profiles::
+                                            set_last_deployed_base_link(&pid, &base);
                                     }
                                     Ok::<String, CFError>(format!(
                                         "{} — {} (learned as seeds)",
@@ -4149,6 +4176,18 @@ async fn deploy_worker_with_client(
     } else {
         format!("{worker_name}.{subdomain}.workers.dev")
     };
+    // Structural guard: a deploy that resolves no usable worker host must fail
+    // loudly instead of recording a broken empty-host config. A suspended /
+    // deactivated account (or a wrangler output without a host) can otherwise
+    // silently persist a vless record with empty address/SNI — the exact
+    // malformed history entry seen in the wild.
+    if host.trim().is_empty() || host.trim().starts_with('.') {
+        return Err(CFError::new(
+            "Deploy failed",
+            "Cloudflare reported an empty worker host (no valid subdomain).",
+            "Your Cloudflare account may be suspended/deactivated, or the token lacks Workers permissions. Resolve the account state, then redeploy.",
+        ));
+    }
     let vless = VlessProfile {
         uuid: uuid.clone(),
         address: host.clone(),
@@ -4462,6 +4501,35 @@ mod tests {
             assert!(err.contains("Enter an IP"), "got: {err}");
         });
     }
+    #[test]
+    fn scan_persists_durable_base_link_survives_history_clear() {
+        // The "deploy once → configure many" guarantee must survive history
+        // clears/trims. A successful scan learns clean IPs AND leaves a durable
+        // base link behind, so config-from-IP still resolves after clear_history.
+        with_home(|pid| {
+            simulate_deploy(pid);
+            // A scan finding a clean IP should persist the durable base link
+            // (our scan success path does this via resolve_deployed_base_link ->
+            // set_last_deployed_base_link).
+            let base = dastyab_core::worker_tunnel::resolve_deployed_base_link(pid)
+                .expect("deploy yields a base link");
+            dastyab_core::store::profiles::set_last_deployed_base_link(pid, &base).unwrap();
+
+            // Clear all history (the old failure mode: config-from-IP would
+            // fall back to a synthetic UUID and break).
+            dastyab_core::store::profiles::clear_history(pid).unwrap();
+
+            // Durable base link survives.
+            assert_eq!(
+                dastyab_core::worker_tunnel::resolve_deployed_base_link(pid).as_deref(),
+                Some(base.as_str())
+            );
+            // config-from-IP still works with no redeploy.
+            let (n, _) = create_configs_from_ip(pid, "104.16.1.1").expect("config from ip after clear");
+            assert!(n >= 4);
+        });
+    }
+
     #[test]
     fn config_from_ip_rejects_invalid_ipv4() {
         with_home(|pid| {

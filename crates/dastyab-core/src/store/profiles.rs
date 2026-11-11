@@ -527,6 +527,21 @@ pub fn save_profile(p: &Profile) -> Result<(), CFError> {
     write_json(&dir.join("config.json"), &p.config)?;
     write_json(&dir.join("token_history.json"), &p.token_history)?;
     write_json(&dir.join("cleanip_meta.json"), &p.clean_ip_meta)?;
+
+    // Keep the integrity manifest in sync with these legitimate writes. The
+    // daemon's auto-heal only restores from backup when a critical artifact is
+    // flagged `Changed`/`Missing` by the manifest. Without refreshing here,
+    // every ordinary config/profile write (settings edits, token changes, the
+    // durable `last_deployed_base_link` set on deploy) makes the manifest go
+    // stale, so the next daemon tick misreads a normal save as corruption and
+    // rewind-restores `config.json`/`profile.json` from an OLD backup — wiping
+    // newer options and the deployed base link. Refreshing on every save makes
+    // auto-heal fire only on real corruption (missing/unparseable files).
+    // Best-effort: a manifest refresh failure must never fail the save.
+    let _ = crate::manifest::refresh_manifest_after_write(
+        &dir,
+        crate::store::now_ts() as u64,
+    );
     Ok(())
 }
 
