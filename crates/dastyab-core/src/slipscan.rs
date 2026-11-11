@@ -341,6 +341,19 @@ pub struct PipelineDiagnostics {
     pub e2e_enabled: bool,
 }
 
+/// The monitor's LIGHT-sweep aggregate, persisted so the CLI/GUI can surface
+/// the healthy-but-muted signal live (not just deep's phase-2 histogram).
+/// Written by the light phase of `monitor_cycle` each time it probes the
+/// ledger. `total` is the number of ledger endpoints probed; `alive` is how
+/// many were healthy; `histogram` folds every non-alive endpoint's failure
+/// histogram together, exactly as fed to `classify_light_sweep`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct LightSweepDiag {
+    pub alive: u32,
+    pub total: u32,
+    pub histogram: HashMap<crate::health::WsFailureReason, u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PipelineResult {
     pub verified: Vec<CleanEndpoint>,

@@ -1926,6 +1926,16 @@ impl AutopilotEngine {
                     Some(&light_hist),
                 )
             };
+            // Persist the light-sweep aggregate (healthy-but-muted signal) so
+            // the CLI/GUI can surface it without re-probing.
+            let _ = crate::store::profiles::save_last_light_sweep(
+                &self.profile_id,
+                &crate::slipscan::LightSweepDiag {
+                    alive: alive as u32,
+                    total: ledger_len as u32,
+                    histogram: light_hist.clone(),
+                },
+            );
             crate::worker_tunnel::secret::learn_from_discovery_persisted_signal(
                 &self.profile_id,
                 &worker_host,
@@ -3968,6 +3978,46 @@ mod tests {
             LightOutcome::Alive(_) => panic!("dead endpoints must yield NeedDeep"),
             LightOutcome::NeedDeep => {}
         }
+    }
+
+    /// The light phase must persist the sweep aggregate (alive/total + folded
+    /// failure histogram) so `health --verbose` / the GUI can surface the
+    /// healthy-but-muted signal without re-probing. Regression guard for the
+    /// option-#2 surface surface (commits 30+ after d394d1e).
+    #[tokio::test]
+    async fn test_monitor_light_phase_persists_sweep_aggregate() {
+        let _home = rescue_home();
+        let id = make_profile();
+        seeded_vless_profile(&id);
+        let ledger = dead_loopback_ledger();
+        let total = ledger.len();
+        write_ledger(&id, &ledger).unwrap();
+
+        let engine = AutopilotEngine::with_provider(
+            id.clone(),
+            DiscoveryParams::default(),
+            std::time::Duration::from_secs(300),
+            Box::new(ScriptedProvider { result: Ok(vec![]) }),
+        );
+        match engine
+            .monitor_light_phase()
+            .await
+            .expect("light phase runs")
+        {
+            LightOutcome::Alive(_) => panic!("dead endpoints must yield NeedDeep"),
+            LightOutcome::NeedDeep => {}
+        }
+
+        let diag = crate::store::profiles::load_last_light_sweep(&id)
+            .expect("light-sweep aggregate persisted");
+        assert_eq!(diag.total as usize, total, "ledger size recorded");
+        assert_eq!(diag.alive, 0, "all endpoints dead in this ledger");
+        // The aggregate must carry the failure composition (the fold across all
+        // non-alive endpoints), not just counts — that is what the CLI renders.
+        assert!(
+            !diag.histogram.is_empty(),
+            "dead endpoints must contribute a failure histogram"
+        );
     }
 
     /// All endpoints dead at the TRANSPORT level (TCP connect refused/timeout

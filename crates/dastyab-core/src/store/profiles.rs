@@ -1365,6 +1365,23 @@ pub fn load_last_diagnostics(id: &str) -> Option<crate::slipscan::PipelineDiagno
     read_opt::<crate::slipscan::PipelineDiagnostics>(&p)
 }
 
+/// The last monitor LIGHT-sweep aggregate (healthy-but-muted signal), so the
+/// CLI/GUI can surface it without re-probing. Written by the light phase of
+/// `monitor_cycle` each ledger probe.
+pub fn save_last_light_sweep(
+    id: &str,
+    diag: &crate::slipscan::LightSweepDiag,
+) -> Result<(), CFError> {
+    let p = profile_dir(id).join("last-light-sweep.json");
+    write_json(&p, diag)
+}
+
+/// Read the last saved light-sweep aggregate, if any.
+pub fn load_last_light_sweep(id: &str) -> Option<crate::slipscan::LightSweepDiag> {
+    let p = profile_dir(id).join("last-light-sweep.json");
+    read_opt::<crate::slipscan::LightSweepDiag>(&p)
+}
+
 /// --- Legacy migration ---
 const LEGACY_FILES: &[&str] = &[
     "history.json",
@@ -2317,6 +2334,28 @@ mod tests {
             let meta = load_profile(&id).clean_ip_meta["104.16.1.1"].clone();
             assert_eq!(meta.source, "manual");
             assert_eq!(meta.port, 443);
+        });
+    }
+
+    #[test]
+    fn light_sweep_diag_roundtrip() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            let mut d = crate::slipscan::LightSweepDiag::default();
+            d.alive = 6;
+            d.total = 7;
+            d.histogram
+                .insert(crate::health::WsFailureReason::TlsAlert, 1);
+            save_last_light_sweep(&id, &d).unwrap();
+            let got = load_last_light_sweep(&id).expect("sweep diag loads back");
+            assert_eq!(got.alive, 6);
+            assert_eq!(got.total, 7);
+            assert_eq!(
+                got.histogram.get(&crate::health::WsFailureReason::TlsAlert),
+                Some(&1)
+            );
+            // Missing file → None (no panic, no empty default misread).
+            assert!(load_last_light_sweep("no-such-profile").is_none());
         });
     }
 }

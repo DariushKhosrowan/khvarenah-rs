@@ -1959,6 +1959,54 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                     println!("  (no last-diagnostics file for profile {profile})");
                 }
             }
+            // `--verbose`: surface the last monitor LIGHT-sweep aggregate so an
+            // operator sees the healthy-but-muted signal live. Read it with the
+            // same alive/total classification the light phase ran so the demo
+            // matches what actually drove the learning verdict.
+            if verbose {
+                println!("\n--- light-sweep aggregate (last monitor pass) ---");
+                if let Some(light) =
+                    dastyab_core::store::profiles::load_last_light_sweep(profile)
+                {
+                    if light.total == 0 {
+                        println!("  (no light sweep recorded yet — run a monitor cycle first)");
+                    } else {
+                        println!(
+                            "  alive {}/{} (dead fraction {:.0}%)",
+                            light.alive,
+                            light.total,
+                            if light.total > 0 {
+                                (light.total.saturating_sub(light.alive)) as f64 * 100.0
+                                    / light.total as f64
+                            } else {
+                                0.0
+                            }
+                        );
+                        if light.histogram.is_empty() {
+                            println!("  failure histogram: (empty)");
+                        } else {
+                            let mut rows: Vec<_> = light.histogram.iter().collect();
+                            rows.sort_by(|a, b| b.1.cmp(a.1));
+                            for (reason, count) in rows {
+                                println!("  {reason:?}: {count}");
+                            }
+                        }
+                        let (dpi, origin) = dastyab_core::worker_tunnel::secret::histogram_attribution(
+                            &light.histogram,
+                        );
+                        let sig = dastyab_core::worker_tunnel::secret::classify_light_sweep(
+                            light.alive as usize,
+                            light.total as usize,
+                            Some(&light.histogram),
+                        );
+                        println!(
+                            "  attribution: DPI/401/403={dpi}  origin-5xx={origin}  verdict={sig:?}"
+                        );
+                    }
+                } else {
+                    println!("  (no light-sweep file for profile {profile})");
+                }
+            }
             // Self-learning phase-2 SNI strategy status (the autonomy knob, v2
             // rolling-window).
             if verbose {
