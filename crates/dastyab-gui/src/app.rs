@@ -4082,6 +4082,16 @@ fn load_daemon_state_opt(profile: &str) -> Option<dastyab_core::daemon::DaemonSt
 /// config formats into the generated-configs ledger. Returns (host, link).
 async fn deploy_worker(token: &str, pid: &str) -> Result<(String, String), CFError> {
     let client = dastyab_core::cf::Client::new(token);
+    deploy_worker_with_client(&client, pid).await
+}
+
+/// The deploy worker's real work, with the CF client injected so it can be
+/// exercised end-to-end against a local mock CF API + a mock wrangler binary
+/// (no live Cloudflare account needed in tests).
+async fn deploy_worker_with_client(
+    client: &dastyab_core::cf::Client,
+    pid: &str,
+) -> Result<(String, String), CFError> {
     let accs = client.list_accounts().await?;
     let acc = accs.first().ok_or_else(|| {
         CFError::new(
@@ -4115,7 +4125,7 @@ async fn deploy_worker(token: &str, pid: &str) -> Result<(String, String), CFErr
         vars: vec![("UUID".to_string(), uuid.clone())],
     };
     let deployed =
-        dastyab_core::wrangler::deploy_worker_via_wrangler(token, &acc.id, &js, &wopts).await?;
+        dastyab_core::wrangler::deploy_worker_via_wrangler(client.token(), &acc.id, &js, &wopts).await?;
     // The deployed URL is authoritative; fall back to constructing it if a
     // wrangler version prints a bare hostname.
     let host = if deployed.contains(".workers.dev") {
@@ -4262,6 +4272,12 @@ fn open_folder(dir: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that mutate the process-global `DYB_WRANGLER_BIN`
+    /// env var (the mock-wrangler injection seam). Rust runs tests in parallel
+    /// threads sharing one process env, so without this lock two env-mutating
+    /// tests would race and read each other's value (observed flake).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Run a closure against an isolated mem-dir home so the store writes to a
     /// throwaway directory and never touches the user's real ~/.dastyab.
@@ -5206,6 +5222,153 @@ mod tests {
                 "expected learned seed, got {seeds:?}"
             );
         });
+    }
+
+    /// A minimal mock Cloudflare API server that scripts the calls the deploy
+    /// flow makes — `GET /accounts` (list_accounts) and
+    /// `GET /accounts/{id}/workers/subdomain` — returning a synthetic account
+    /// and subdomain. Returns the base URL (pointed at via `Client::with_base`).
+    fn mock_cf_api_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let head = String::from_utf8_lossy(&buf);
+                let first = head.lines().next().unwrap_or("").to_string();
+                let body = if first.contains("workers/subdomain") {
+                    r#"{"success":true,"result":{"subdomain":"sub"}}"#
+                } else if first.contains("/accounts") {
+                    r#"{"success":true,"result":[{"id":"acc-1","name":"Test Account"}]}"#
+                } else {
+                    r#"{"success":true,"result":{}}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A mock wrangler executable that prints a workers.dev URL exactly like the
+    /// real CLI. Returns the path (injected via `DYB_WRANGLER_BIN`).
+    fn mock_wrangler_bin() -> std::path::PathBuf {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep the TempDir alive for the duration of the caller's use — leak it
+        // into a global so the path stays valid (test-only).
+        std::mem::forget(dir);
+        let fake = std::env::temp_dir().join(format!("mock-wrangler-{}", std::process::id()));
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf 'Deployed dyb-e2e-1 triggers (3.35 sec)\n  https://dyb-e2e-1.sub.workers.dev\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake, perms).unwrap();
+        }
+        fake
+    }
+
+    /// End-to-end deploy test: drive the real `deploy_worker_with_client` path
+    /// (list_accounts → get_subdomain → wrangler mock → record configs → durable
+    /// base link) against a mock CF API and a mock wrangler, proving a deploy
+    /// actually produces a full, usable config set in the ledger and a durable
+    /// base link — the core "deploy worker works and creates configs well"
+    /// guarantee, without needing a live Cloudflare account.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deploy_worker_e2e_creates_configs_and_durable_link() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        dastyab_core::store::set_mem_dir_override(tmp.path().join(".dastyab"));
+        let pid = dastyab_core::store::profiles::create_profile("cfg-e2e", "test")
+            .expect("create profile");
+
+        let base = mock_cf_api_server();
+        let wrangler = mock_wrangler_bin();
+        std::env::set_var("DYB_WRANGLER_BIN", &wrangler);
+
+        let client = dastyab_core::cf::Client::with_base("tok", &base);
+        let (host, link) = deploy_worker_with_client(&client, &pid)
+            .await
+            .expect("deploy should succeed against mock CF + mock wrangler");
+        std::env::remove_var("DYB_WRANGLER_BIN");
+
+        // The deployed harness is authoritative from the wrangler output.
+        assert_eq!(host, "dyb-e2e-1.sub.workers.dev");
+        assert!(link.starts_with("vless://"), "link: {link}");
+
+        // A durable base link was persisted (config-from-IP works after).
+        let base_link = dastyab_core::worker_tunnel::resolve_deployed_base_link(&pid)
+            .expect("durable base link");
+        assert!(base_link.starts_with("vless://"));
+        assert_eq!(base_link, link);
+
+        // The full config set landed in the ledger (share-link/v2rayN/
+        // sing-box/Clash), all sharing the deployed worker identity.
+        let ledger = dastyab_core::generated_configs::load_generated_configs(&pid);
+        let fmts: std::collections::BTreeSet<&str> = ledger
+            .records
+            .iter()
+            .map(|r| r.fmt.label())
+            .collect();
+        for want in ["share-link", "v2rayN", "sing-box", "Clash"] {
+            assert!(fmts.contains(want), "missing {want} in ledger: {fmts:?}");
+        }
+        let prof = dastyab_core::vless::VlessProfile::parse(&base_link).unwrap();
+        for r in &ledger.records {
+            assert!(
+                r.content.contains(&prof.uuid),
+                "record missing worker uuid in {}",
+                r.fmt.label()
+            );
+        }
+
+        // After the deploy, config-from-IP works repeatedly with no redeploy.
+        let (n, _) = create_configs_from_ip(&pid, "104.16.1.1").expect("config from ip");
+        assert!(n >= 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deploy_worker_no_account_returns_helpful_error() {
+        // A deploy with no accessible account must fail with a clear error, not
+        // panic or silently no-op.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"success":true,"result":[]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        });
+        let base = format!("http://{addr}");
+        let client = dastyab_core::cf::Client::with_base("tok", &base);
+        let err = deploy_worker_with_client(&client, "pid")
+            .await
+            .expect_err("no account must error");
+        assert!(err.brief().contains("No account"), "brief: {}", err.brief());
     }
 
     /// Helper: a status note whose `hash` already matches its text (so no

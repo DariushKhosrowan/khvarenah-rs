@@ -1584,6 +1584,37 @@ fn base_vless_for(profile: &str) -> dastyab_core::VlessProfile {
     dastyab_core::autopilot::base_vless(profile).unwrap_or_default()
 }
 
+/// Render one line of the per-worker desync learning state for `health --verbose`.
+/// Pure (testable): effective strategy (or "ladder" when none learned), the
+/// host-down / hold signal, and the failed-strategy list.
+fn desync_worker_line(
+    url: &str,
+    ws: &dastyab_core::worker_tunnel::secret::WorkerSecret,
+    now_epoch: i64,
+) -> String {
+    let eff = ws
+        .desync_strategy
+        .map(|s| s.label().to_string())
+        .unwrap_or_else(|| "ladder".to_string());
+    let failed: Vec<&str> = ws
+        .failed_strategies
+        .iter()
+        .map(|s| s.label())
+        .collect();
+    let down = if ws.host_down {
+        let since = ws.host_down_since_unix as i64;
+        let dur = if since > 0 {
+            now_epoch.saturating_sub(since)
+        } else {
+            0
+        };
+        format!("HOST-DOWN {dur}s (ladder held — no demote/advance)")
+    } else {
+        "up".to_string()
+    };
+    format!("{url}: eff={eff} {down} failed=[{}]", failed.join(", "))
+}
+
 async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<(), CFError> {
     match action {
         crate::AutopilotAction::Status => {
@@ -1789,6 +1820,23 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                     println!("  Strategy: {name} (rotated {rotated_ts}s epoch, window empty)");
                 } else {
                     println!("  Strategy: {name} (not yet learned; auto)");
+                }
+                // Per-worker desync learning state (the host-down / hold signal
+                // from the learning table): effective strategy, failed
+                // strategies, and whether the worker host is currently marked
+                // down (ladder held — no demote/advance until a success clears
+                // it). This is the "reads host-down / hold state from the
+                // table" half of `health --verbose`.
+                let store_live = dastyab_core::store::profiles::load_profile(profile);
+                let lnow = dastyab_core::store::now_ts() as i64;
+                if !store_live.config.worker_secrets.is_empty() {
+                    println!("  Desync learning (per worker):");
+                    let mut workers: Vec<_> =
+                        store_live.config.worker_secrets.iter().collect();
+                    workers.sort_by(|a, b| a.0.cmp(b.0));
+                    for (url, ws) in workers {
+                        println!("    {}", desync_worker_line(url, ws, lnow));
+                    }
                 }
                 // Bundle sync state (the user's actual handoff).
                 if let Some(ledger_ep) = dastyab_core::cleanip::active_ledger_endpoint(profile) {
@@ -3697,5 +3745,39 @@ mod tests {
         assert!(cmd_verify("", "1.2.3.4").is_err());
         assert!(cmd_verify("1.2.3.4", "").is_err());
         assert!(cmd_verify("", "").is_err());
+    }
+
+    #[test]
+    fn test_desync_worker_line_renders_host_down_hold() {
+        use dastyab_core::worker_tunnel::secret::WorkerSecret;
+        let ws = WorkerSecret {
+            worker_url: "https://w.workers.dev".into(),
+            secret: "s".into(),
+            rotated_unix: 1,
+            version: 2,
+            pending_secret: None,
+            pending_since_unix: 0,
+            desync_strategy: Some(dastyab_core::desync::DesyncStrategy::SplitTwo),
+            failed_strategies: vec![
+                dastyab_core::desync::DesyncStrategy::SplitClientHello,
+            ],
+            host_down: true,
+            host_down_since_unix: 1_700_000_000,
+        };
+        let line = desync_worker_line("https://w.workers.dev", &ws, 1_700_000_100);
+        // effective strategy + host-down hold + failed list all present
+        assert!(line.contains("split-two"), "line: {line}");
+        assert!(line.contains("HOST-DOWN 100s"), "line: {line}");
+        assert!(line.contains("split-clienthello"), "line: {line}");
+    }
+
+    #[test]
+    fn test_desync_worker_line_renders_ladder_up() {
+        use dastyab_core::worker_tunnel::secret::WorkerSecret;
+        let ws = WorkerSecret::default(); // no strategy learned, host up
+        let line = desync_worker_line("https://w.workers.dev", &ws, 1_700_000_000);
+        assert!(line.contains("eff=ladder"), "line: {line}");
+        assert!(line.contains(" up ") || line.ends_with(" up"), "line: {line}");
+        assert!(line.contains("failed=[]"), "line: {line}");
     }
 }
