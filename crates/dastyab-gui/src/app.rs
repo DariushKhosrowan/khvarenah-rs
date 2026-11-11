@@ -5182,10 +5182,6 @@ mod tests {
         });
     }
 
-    /// Serializes the `DYB_WRANGLER_BIN` env mutation (parallel tests share
-    /// one process env).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Helper: a status note whose `hash` already matches its text (so no
     /// reset fires) and whose `since` is older than the TTL.
     fn stale_status_note(text: &str) -> (String, u64, std::time::Instant) {
