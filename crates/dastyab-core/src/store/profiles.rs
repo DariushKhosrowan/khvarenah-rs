@@ -791,6 +791,12 @@ fn active_token_path(id: &str) -> PathBuf {
 /// Returns `Ok(None)` when there is no active-token file, or when the label
 /// no longer exists in `tokens.json` (the token was probably deleted). It
 /// never errors for a missing/stale marker — that is an expected state.
+///
+/// PURE: this getter never writes. A stale label is reported as `Ok(None)`
+/// and left untouched; healing (repopulating an empty/stale marker) is the
+/// job of `ensure_active_token`. This is the root-cause guard for the
+/// empty-marker bug — a read path can never turn a transient miss into a
+/// persistent empty marker (see the writer table in `docs/ops/runbook.md`).
 pub fn get_active_token(profile_id: &str) -> Result<Option<String>, CFError> {
     let label = match read_opt::<String>(&active_token_path(profile_id)) {
         Some(l) if !l.trim().is_empty() => l.trim().to_string(),
@@ -800,11 +806,12 @@ pub fn get_active_token(profile_id: &str) -> Result<Option<String>, CFError> {
     if p.tokens.contains_key(&label) {
         Ok(Some(label))
     } else {
-        // stale marker — the token was removed. Log a warning and clear it.
+        // stale marker — the token was removed. The getter is pure: report
+        // None WITHOUT clearing, leaving the marker for `ensure_active_token`
+        // to heal (it repopulates from a real token when any exist).
         eprintln!(
             "[dastyab] warn: active token '{label}' no longer exists in profile '{profile_id}'"
         );
-        let _ = write_json(&active_token_path(profile_id), &String::new());
         Ok(None)
     }
 }
@@ -871,6 +878,11 @@ pub fn ensure_active_token(profile_id: &str) -> Result<Option<String>, CFError> 
 }
 
 /// Clear the active token marker for a profile.
+///
+/// Only used by tests today. If a production path ever needs an explicit
+/// clear, it must go through `ensure_active_token` healing instead so a live
+/// marker is never blanked while valid tokens exist.
+#[cfg(test)]
 pub fn clear_active_token(profile_id: &str) -> Result<(), CFError> {
     write_json(&active_token_path(profile_id), &String::new())
 }
@@ -2233,6 +2245,27 @@ mod tests {
             // valid label still works
             set_active_token(&id, "default").unwrap();
             assert_eq!(get_active_token(&id).unwrap().as_deref(), Some("default"));
+        });
+    }
+
+    /// Purity guard: `get_active_token` never writes. A stale marker (label
+    /// that no longer exists) is reported as `Ok(None)` but the marker file is
+    /// left untouched — a read can never turn a transient miss into a
+    /// persistent empty marker.
+    #[test]
+    fn get_active_token_is_pure_and_leaves_stale_marker_untouched() {
+        with_home(|| {
+            let id = create_profile("work", "").unwrap();
+            add_token(&id, "default", "cf_secret_default").unwrap();
+            // Simulate a stale marker: points at a token that no longer exists.
+            write_json(&active_token_path(&id), &"ghost".to_string()).unwrap();
+            assert_eq!(get_active_token(&id).unwrap(), None);
+            // The marker file is NOT cleared by the read — it still holds "ghost".
+            let marker = read_opt::<String>(&active_token_path(&id)).unwrap_or_default();
+            assert_eq!(marker, "ghost");
+            // And extant_active_token heals it to a real token.
+            let healed = ensure_active_token(&id).unwrap();
+            assert_eq!(healed.as_deref(), Some("default"));
         });
     }
 
