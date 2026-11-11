@@ -4502,6 +4502,35 @@ mod tests {
         });
     }
     #[test]
+    fn config_from_ip_renders_decoded_path_for_v2rayn() {
+        // Regression for the v2rayN-import bug: a base link whose ws path is
+        // URL-encoded ("%2F", as older share links stored it) must render a
+        // v2rayN config with an importable "path": "/" — NOT the literal
+        // "%2F" that v2rayN rejects.
+        with_home(|pid| {
+            // Simulate the historical record: non-clean worker link with an
+            // encoded path, plus a durable base link.
+            let encoded_link =
+                "vless://11111111-2222-3333-4444-555555555555@worker.example.workers.dev:443                 ?encryption=none&security=tls&type=ws&sni=w.workers.dev&host=w.workers.dev                 &path=%2F&fp=chrome#w";
+            dastyab_core::store::profiles::set_last_deployed_base_link(pid, encoded_link).unwrap();
+
+            let (n, _) = create_configs_from_ip(pid, "104.18.227.124").expect("config from ip");
+            assert!(n >= 4);
+
+            let ledger = dastyab_core::generated_configs::load_generated_configs(pid);
+            let v2 = ledger
+                .records
+                .iter()
+                .find(|r| r.fmt.label() == "v2rayN")
+                .expect("v2rayN config in ledger");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&v2.content).expect("v2rayN content is valid JSON");
+            let ws_path = &parsed["outbounds"][0]["streamSettings"]["wsSettings"]["path"];
+            assert_eq!(ws_path, "/", "v2rayN path must be '/', got {ws_path:?}");
+        });
+    }
+
+    #[test]
     fn scan_persists_durable_base_link_survives_history_clear() {
         // The "deploy once → configure many" guarantee must survive history
         // clears/trims. A successful scan learns clean IPs AND leaves a durable

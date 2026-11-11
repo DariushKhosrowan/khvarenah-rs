@@ -57,6 +57,14 @@ impl Default for VlessProfile {
     }
 }
 
+/// Percent-decode a query-string value (e.g. `%2F` -> `/`). Falls back to the
+/// raw string when decoding fails or is a no-op.
+fn decode_query(v: &str) -> String {
+    percent_encoding::percent_decode_str(v)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
 impl VlessProfile {
     /// Fill in default sni/header_host from address, like Python's __post_init__.
     pub fn normalize(&mut self) {
@@ -197,9 +205,15 @@ impl VlessProfile {
                 match k {
                     "security" => profile.security = v.to_string(),
                     "type" => profile.transport = v.to_string(),
-                    "sni" => profile.sni = Some(v.to_string()),
-                    "host" => profile.header_host = Some(v.to_string()),
-                    "path" => profile.path = v.to_string(),
+                    // URL-decode the free-form fields. The share link encodes
+                    // the ws path (and host/SNI) into the query string, so a
+                    // path like "/" arrives as "%2F". Storing it verbatim makes
+                    // rendered v2rayN/sing-box/Clash configs emit "path":
+                    // "%2F", which v2rayN refuses to import. Decode once here
+                    // so every downstream renderer gets the real path.
+                    "sni" => profile.sni = Some(decode_query(v)),
+                    "host" => profile.header_host = Some(decode_query(v)),
+                    "path" => profile.path = decode_query(v),
                     _ => {}
                 }
             }
@@ -217,6 +231,39 @@ impl VlessProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_percent_decodes_path_into_slashes() {
+        // The share link encodes "/" as "%2F"; parse() must decode it back to
+        // "/" so rendered v2rayN/sing-box/Clash configs are importable.
+        let p = VlessProfile::parse(
+            "vless://uuid@1.2.3.4:443?security=tls&type=ws&path=%2F&sni=h.workers.dev#x",
+        )
+        .unwrap();
+        assert_eq!(p.path, "/", "path must be decoded, got {:?}", p.path);
+        assert_eq!(p.sni.as_deref(), Some("h.workers.dev"));
+    }
+
+    #[test]
+    fn parse_decodes_encoded_path_and_host() {
+        let p = VlessProfile::parse(
+            "vless://uuid@1.2.3.4:443?type=ws&path=%2Fws%2Fapi&host=h.example.com#x",
+        )
+        .unwrap();
+        assert_eq!(p.path, "/ws/api");
+        assert_eq!(p.header_host.as_deref(), Some("h.example.com"));
+    }
+
+    #[test]
+    fn parse_keeps_plain_path_unchanged() {
+        // Un-encoded query values must still work (no double-decoding).
+        let p = VlessProfile::parse(
+            "vless://uuid@1.2.3.4:443?type=ws&path=/ws&host=h.example.com#x",
+        )
+        .unwrap();
+        assert_eq!(p.path, "/ws");
+        assert_eq!(p.header_host.as_deref(), Some("h.example.com"));
+    }
 
     #[test]
     fn share_link_roundtrip() {
