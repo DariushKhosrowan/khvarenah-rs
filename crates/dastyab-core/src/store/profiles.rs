@@ -445,6 +445,25 @@ pub fn profile_dir(id: &str) -> PathBuf {
     }
 }
 
+/// Read and sanitize the clean-IP list from disk.
+///
+/// Malformed entries (non-canonical IPv4, leading-zero octets, bad ports)
+/// are filtered out on every load so they never reach the UI, scanning seeds,
+/// or config generation — even if an older version wrote them.
+fn clean_ips_from_disk(path: &std::path::Path) -> Vec<String> {
+    let raw = read_or_default::<Vec<String>>(path);
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for ep in raw {
+        if let Some(c) = canonical_clean_ip(&ep) {
+            if seen.insert(c.clone()) {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
 /// Load a profile by id (falls back to empty defaults).
 pub fn load_profile(id: &str) -> Profile {
     let dir = profile_dir(id);
@@ -457,11 +476,17 @@ pub fn load_profile(id: &str) -> Profile {
     let tokens = read_or_default::<BTreeMap<String, TokenEntry>>(&dir.join("token.json"));
     let accounts = read_or_default::<BTreeMap<String, Account>>(&dir.join("accounts.json"));
     let history = read_or_default::<Vec<VlessRecord>>(&dir.join("history.json"));
-    let clean_ips = read_or_default::<Vec<String>>(&dir.join("cleanips.json"));
+    let clean_ips = clean_ips_from_disk(&dir.join("cleanips.json"));
     let config = read_or_default::<ProfileConfig>(&dir.join("config.json"));
     let token_history = read_or_default::<Vec<TokenEvent>>(&dir.join("token_history.json"));
-    let clean_ip_meta =
+    let clean_ip_meta_raw =
         read_or_default::<BTreeMap<String, CleanIpMeta>>(&dir.join("cleanip_meta.json"));
+    // Keep the meta map consistent with the sanitized clean-IP list: drop
+    // metadata whose endpoint was filtered out (malformed) on load.
+    let clean_ip_meta: BTreeMap<String, CleanIpMeta> = clean_ip_meta_raw
+        .into_iter()
+        .filter(|(ep, _)| clean_ips.contains(ep))
+        .collect();
     Profile {
         meta,
         tokens,
@@ -886,10 +911,12 @@ pub fn remember_clean_ip(id: &str, ip: &str) -> Result<(), CFError> {
 pub fn remember_clean_ip_with_source(id: &str, ip: &str, source: &str) -> Result<(), CFError> {
     let dir = profile_dir(id);
     let mut p = load_profile(id);
-    let ep = ip.trim().to_string();
-    if ep.is_empty() {
-        return Ok(());
-    }
+    // Gate on canonical validation so malformed endpoints can never enter the
+    // ledger (defense-in-depth on top of the scanner tokenizer fix).
+    let ep = match canonical_clean_ip(ip) {
+        Some(ep) => ep,
+        None => return Ok(()),
+    };
     let now = crate::store::now_iso();
     let port = parse_ip_port(&ep);
     if !p.clean_ips.contains(&ep) {
@@ -922,6 +949,62 @@ fn parse_ip_port(ep: &str) -> u16 {
     ep.rsplit_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok())
         .unwrap_or(443)
+}
+
+/// Normalize and validate a clean-IP endpoint string.
+///
+/// Accepts `ip` or `ip:port`. Returns the canonical `ip:port` (or bare `ip`
+/// when no port was supplied). Returns `None` for anything invalid: a
+/// non-IPv4 host, an empty/zero port, or a non-canonical octet with a leading
+/// zero (`04.18.…`). This is the single gate every clean IP must pass before
+/// it is persisted, so malformed entries can never re-enter the ledger.
+pub fn canonical_clean_ip(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (ip, port) = match s.rsplit_once(':') {
+        Some((ip, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (ip.trim(), Some(p))
+        }
+        _ => (s, None),
+    };
+    let octets: Vec<&str> = ip.split('.').collect();
+    if octets.len() != 4 {
+        return None;
+    }
+    // Canonical octets: non-empty, ≤3 digits, no leading zero, ≤255.
+    let mut norm = Vec::with_capacity(4);
+    for o in octets {
+        if o.is_empty()
+            || o.len() > 3
+            || !o.chars().all(|c| c.is_ascii_digit())
+            || (o.len() > 1 && o.starts_with('0'))
+        {
+            return None;
+        }
+        let v: u16 = o.parse().ok()?;
+        if v > 255 {
+            return None;
+        }
+        norm.push(v.to_string());
+    }
+    let ip = format!("{}.{}.{}.{}", norm[0], norm[1], norm[2], norm[3]);
+    match port {
+        Some(p) => {
+            // Reject zero and non-canonical (leading-zero) ports for symmetry
+            // with octets: "0443" is not a canonical port string.
+            if p.len() > 1 && p.starts_with('0') {
+                return None;
+            }
+            let p: u16 = p.parse().ok()?;
+            if p == 0 {
+                return None;
+            }
+            Some(format!("{ip}:{p}"))
+        }
+        None => Some(ip),
+    }
 }
 
 /// Remove a single saved clean IP. Returns `Ok(false)` when it was not
@@ -1415,6 +1498,71 @@ mod tests {
             add_token(&id, "cf-main", "secret-token").unwrap();
             let p2 = load_profile(&id);
             assert_eq!(p2.tokens.get("cf-main").unwrap().token, "secret-token");
+        });
+    }
+
+    #[test]
+    fn canonical_clean_ip_normalizes_and_rejects_malformed() {
+        // Canonical forms are accepted and normalized.
+        assert_eq!(canonical_clean_ip("  104.16.1.1:443  ").as_deref(), Some("104.16.1.1:443"));
+        assert_eq!(canonical_clean_ip("104.16.1.1").as_deref(), Some("104.16.1.1"));
+        assert_eq!(canonical_clean_ip("8.8.8.8:2053").as_deref(), Some("8.8.8.8:2053"));
+        // A plain valid IP with no leading-zero corruption is preserved as-is.
+        assert_eq!(canonical_clean_ip("4.18.227.124:443").as_deref(), Some("4.18.227.124:443"));
+        // Leading-zero octets (the historical corruption) are rejected.
+        assert!(canonical_clean_ip("04.18.227.124:443").is_none());
+        assert!(canonical_clean_ip("104.018.227.124:443").is_none());
+        assert!(canonical_clean_ip("104.18.227.124:0443").is_none());
+        // Bad ports / non-IPv4.
+        assert!(canonical_clean_ip("104.16.1.1:0").is_none());
+        assert!(canonical_clean_ip("104.16.1.1:99999").is_none());
+        assert!(canonical_clean_ip("host.name:443").is_none());
+        assert!(canonical_clean_ip("999.999.999.999:443").is_none());
+        assert!(canonical_clean_ip("").is_none());
+    }
+
+    #[test]
+    fn load_profile_sanitizes_malformed_clean_ips() {
+        with_home(|| {
+            let id = create_profile("sani", "").unwrap();
+            // Write a cleanips.json containing one truly malformed entry (the
+            // historical leading-zero corruption) plus valid ones, then
+            // confirm load only drops the malformed one.
+            let dir = crate::store::profiles::profile_dir(&id);
+            let path = dir.join("cleanips.json");
+            let bad: Vec<String> = vec![
+                "104.18.227.124:443".to_string(),
+                "04.18.227.124:443".to_string(),
+                "4.18.227.124:443".to_string(),
+                "104.16.1.1:443".to_string(),
+            ];
+            crate::store::profiles::write_json(&path, &bad).unwrap();
+            let p = load_profile(&id);
+            assert_eq!(
+                p.clean_ips,
+                vec![
+                    "104.18.227.124:443".to_string(),
+                    "4.18.227.124:443".to_string(),
+                    "104.16.1.1:443".to_string()
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn remember_clean_ip_rejects_malformed_endpoints() {
+        with_home(|| {
+            let id = create_profile("rej", "").unwrap();
+            remember_clean_ip(&id, "04.18.227.124:443").unwrap();
+            // 4.18.227.124:443 is a *valid* IP (no leading zero); only the
+            // truly-malformed leading-zero form above is rejected.
+            remember_clean_ip(&id, "4.18.227.124:443").unwrap();
+            remember_clean_ip(&id, "104.16.1.1:443").unwrap();
+            let p = load_profile(&id);
+            assert_eq!(
+                p.clean_ips,
+                vec!["4.18.227.124:443".to_string(), "104.16.1.1:443".to_string()]
+            );
         });
     }
 

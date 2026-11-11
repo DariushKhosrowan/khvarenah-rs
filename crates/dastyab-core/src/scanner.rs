@@ -145,6 +145,23 @@ pub struct ScanResult {
 }
 
 /// Regex-ish validator for an endpoint.
+/// Immutable, canonical IPv4 octet: non-empty, ≤3 digits, no leading zero
+/// (Rust's `Ipv4Addr::parse` rejects `04`), and ≤255.
+fn octet_ok(o: &str) -> bool {
+    !o.is_empty()
+        && o.len() <= 3
+        && o.chars().all(|c| c.is_ascii_digit())
+        && !(o.len() > 1 && o.starts_with('0'))
+        && o.parse::<u16>().map(|v| v <= 255).unwrap_or(false)
+}
+
+/// Regex-ish validator for an endpoint.
+///
+/// Accepts only canonical `ipv4:port` tokens (`1.2.3.4:443`). Leading-zero
+/// octets (`04.18.227.124`) are rejected because they are not a canonical IPv4
+/// address (and silently normalizing them would produce a bogus *different*
+/// IP). A bare IP without a port is rejected — every scanner endpoint we
+/// consume carries a port.
 fn looks_like_endpoint(e: &str) -> bool {
     let e = e.trim();
     if e.is_empty() {
@@ -153,39 +170,51 @@ fn looks_like_endpoint(e: &str) -> bool {
     // ipv4:port
     if let Some((ip, port)) = e.rsplit_once(':') {
         if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            let port_ok = port.parse::<u16>().map(|v| v > 0).unwrap_or(false);
             let octets: Vec<&str> = ip.split('.').collect();
             if octets.len() == 4 {
-                return octets.iter().all(|o| {
-                    !o.is_empty()
-                        && o.len() <= 3
-                        && o.chars().all(|c| c.is_ascii_digit())
-                        && o.parse::<u16>().map(|v| v <= 255).unwrap_or(false)
-                });
+                return port_ok && octets.iter().all(|o| octet_ok(o));
             }
         }
     }
     false
 }
 
+/// Extract candidate `ip:port` endpoints from arbitrary scanner output.
+///
+/// The tokenizer scans **maximal runs** of `[0-9.:]` as single tokens, rather
+/// than sliding one byte at a time. The old sliding-window approach started a
+/// new candidate at every digit, so from `104.18.227.124:443` it also emitted
+/// the suffix substrings `04.18.227.124:443` and `4.18.227.124:443` (the
+/// latter a *valid-but-different* IP) — which then got persisted as "clean
+/// IPs". Consuming the whole run and validating it as one token eliminates
+/// those spurious suffixes and is linear in the input length.
 fn extract_endpoints(text: &str) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
-    for line in text.lines() {
-        // find "ip:port" tokens anywhere in the line
-        let mut rest = line;
-        while let Some(pos) = rest.find(|c: char| c.is_ascii_digit()) {
-            let candidate = &rest[pos..];
-            let end = candidate
-                .find(|c: char| !c.is_ascii_digit() && c != '.' && c != ':')
-                .unwrap_or(candidate.len());
-            let tok = &candidate[..end];
-            if looks_like_endpoint(tok) {
-                let low = tok.to_lowercase();
-                if !seen.contains(&low) {
-                    seen.push(low);
-                }
-            }
-            rest = &candidate[1..];
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip ahead to the start of a plausible token (a digit).
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
         }
+        let start = i;
+        // Consume the maximal contiguous run of digits, dots, colons.
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || matches!(bytes[i], b'.' | b':')) {
+            i += 1;
+        }
+        let tok = &text[start..i];
+        if looks_like_endpoint(tok) {
+            let low = tok.to_lowercase();
+            if !seen.contains(&low) {
+                seen.push(low);
+            }
+        }
+        // Otherwise the maximal run was not a valid endpoint (e.g. a bare
+        // number, or a glue like "1.2.3.4:443abc"). We have already consumed
+        // the entire run, so the next iteration skips past it — this is what
+        // makes the scan linear and immune to spurious suffix substrings.
     }
     seen
 }
@@ -477,6 +506,32 @@ mod tests {
         assert!(eps.contains(&"1.2.3.4:443".to_string()));
         assert!(eps.contains(&"5.6.7.8:443".to_string()));
         assert_eq!(eps.iter().filter(|e| *e == "1.2.3.4:443").count(), 1);
+    }
+
+    #[test]
+    fn extract_does_not_emit_suffix_substrings() {
+        // The old sliding-window tokenizer emitted the truncated suffix
+        // substrings of a valid endpoint ("04.18.227.124:443",
+        // "4.18.227.124:443") — the latter is a *valid-but-different* IP.
+        // The maximal-run tokenizer must emit only the exact full endpoint.
+        let text = "104.18.227.124:443 8.8.8.8:2053";
+        let eps = extract_endpoints(text);
+        assert_eq!(
+            eps,
+            vec!["104.18.227.124:443".to_string(), "8.8.8.8:2053".to_string()]
+        );
+        assert!(!eps.iter().any(|e| e.starts_with("04.")));
+        assert!(!eps.iter().any(|e| e.starts_with("4.18.")));
+    }
+
+    #[test]
+    fn looks_like_endpoint_rejects_leading_zero_octets() {
+        // Rust's Ipv4Addr rejects leading-zero octets; we must too.
+        assert!(!looks_like_endpoint("04.18.227.124:443"));
+        assert!(!looks_like_endpoint("104.018.227.124:443"));
+        assert!(looks_like_endpoint("104.18.227.124:443"));
+        assert!(!looks_like_endpoint("104.18.227.124:0"));
+        assert!(!looks_like_endpoint("104.18.227.124")); // no port
     }
 
     #[test]
