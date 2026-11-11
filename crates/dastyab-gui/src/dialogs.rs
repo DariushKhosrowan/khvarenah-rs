@@ -226,3 +226,17 @@ pub fn prompt_text_area(title: impl Into<String>, placeholder: impl Into<String>
         draft: String::new(),
     }
 }
+
+/// A convenience constructor for a multi-line text-area prompt pre-filled with
+/// an initial draft (e.g. editing an existing config's content).
+pub fn prompt_text_area_filled(
+    title: impl Into<String>,
+    placeholder: impl Into<String>,
+    initial: impl Into<String>,
+) -> Dialog {
+    Dialog::TextArea {
+        title: title.into(),
+        placeholder: placeholder.into(),
+        draft: initial.into(),
+    }
+}

@@ -34,6 +34,14 @@ pub enum ConfigsAction {
     ExportAll,
     /// Open the "create config from a clean IP" dialog (no redeploy).
     CreateFromIp,
+    /// Edit a single config's content in place (opens a text-area dialog).
+    Edit { id: u64, current: String },
+    /// Rename a single config's label (opens a text dialog).
+    Rename { id: u64, current: Option<String> },
+    /// Export a single config to disk under the export folder.
+    ExportOne { id: u64, fmt: String, content: String },
+    /// Delete a single config (destructive confirm).
+    Delete { id: u64 },
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<ConfigsAction> {
@@ -271,6 +279,44 @@ pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<Confi
                                         .small(),
                                     );
                                     if ui
+                                        .button("🗑")
+                                        .on_hover_text("Delete this config")
+                                        .clicked()
+                                    {
+                                        action = Some(ConfigsAction::Delete { id: row.id });
+                                    }
+                                    if ui
+                                        .button("✏️")
+                                        .on_hover_text("Edit config content")
+                                        .clicked()
+                                    {
+                                        action = Some(ConfigsAction::Edit {
+                                            id: row.id,
+                                            current: row.content.clone(),
+                                        });
+                                    }
+                                    if ui
+                                        .button("🏷")
+                                        .on_hover_text("Rename config label")
+                                        .clicked()
+                                    {
+                                        action = Some(ConfigsAction::Rename {
+                                            id: row.id,
+                                            current: Some(row.label.clone()),
+                                        });
+                                    }
+                                    if ui
+                                        .button("💾")
+                                        .on_hover_text("Export this config to disk")
+                                        .clicked()
+                                    {
+                                        action = Some(ConfigsAction::ExportOne {
+                                            id: row.id,
+                                            fmt: row.fmt.clone(),
+                                            content: row.content.clone(),
+                                        });
+                                    }
+                                    if ui
                                         .button("📋")
                                         .on_hover_text("Copy this config to clipboard")
                                         .clicked()
@@ -347,7 +393,65 @@ pub fn run_action(
                 "IP or ip:port (e.g. 104.16.1.1 or 104.16.1.1:443)",
             ))
         }
+        ConfigsAction::Edit { id, current } => {
+            app.pending_action = Some(PendingDialogAction::EditConfig(id));
+            Some(crate::dialogs::prompt_text_area_filled(
+                "Edit config content",
+                "config content…",
+                current,
+            ))
+        }
+        ConfigsAction::Rename { id, current } => {
+            app.pending_action = Some(PendingDialogAction::RenameConfig(id));
+            Some(crate::dialogs::prompt_text(
+                "Rename config",
+                current.unwrap_or_default(),
+            ))
+        }
+        ConfigsAction::ExportOne { id, fmt, content } => {
+            let pid = app.profile_id.clone();
+            match export_one(&pid, id, &fmt, &content) {
+                Ok(path) => {
+                    app.note = format!("Exported config (#{id}) → {}", path.display());
+                }
+                Err(e) => app.note = format!("Export failed: {e}"),
+            }
+            None
+        }
+        ConfigsAction::Delete { id } => {
+            app.pending_action = Some(PendingDialogAction::DeleteConfig(id));
+            Some(crate::dialogs::confirm(
+                "Delete config",
+                "Delete this generated config from the ledger? This cannot be undone.",
+                true,
+            ))
+        }
     }
+}
+
+/// Write one generated config to disk under
+/// `~/.dastyab/exported_configs/<profile>/`.
+fn export_one(
+    profile: &str,
+    id: u64,
+    fmt: &str,
+    content: &str,
+) -> Result<std::path::PathBuf, String> {
+    let base = dastyab_core::store::mem_dir()
+        .join("exported_configs")
+        .join(profile);
+    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    let now = crate::state::format_ts(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    )
+    .replace([' ', ':'], "-");
+    let fname = format!("{now}_{fmt}_{id}.conf");
+    let path = base.join(fname);
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 /// Write every generated config in the ledger to disk under

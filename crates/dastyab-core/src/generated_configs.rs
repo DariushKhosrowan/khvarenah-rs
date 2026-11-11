@@ -196,6 +196,61 @@ pub fn record_profile_configs(
     n
 }
 
+/// Update a stored record's rendered content. Recomputes the content hash and
+/// preserves id/created_unix/format/source/label. Used by the Configs tab's
+/// in-place editing (a user can tweak a config and save it back).
+pub fn update_config_content(id: &str, rec_id: u64, new_content: String) -> Result<(), CFError> {
+    let mut ledger = load_generated_configs(id);
+    let rec = ledger
+        .records
+        .iter_mut()
+        .find(|r| r.id == rec_id)
+        .ok_or_else(|| CFError::new("Config not found", "No generated config with that id.", "Refresh the Configs tab."))?;
+    rec.content = new_content;
+    rec.content_sha256 = sha256_bytes(rec.content.as_bytes());
+    save_generated_configs(id, &ledger)
+}
+
+/// Rename a stored config's label (its human-readable name). `None` clears
+/// the label. Used by the Configs tab's rename action.
+pub fn update_config_label(id: &str, rec_id: u64, new_label: Option<String>) -> Result<(), CFError> {
+    let mut ledger = load_generated_configs(id);
+    let rec = ledger
+        .records
+        .iter_mut()
+        .find(|r| r.id == rec_id)
+        .ok_or_else(|| CFError::new("Config not found", "No generated config with that id.", "Refresh the Configs tab."))?;
+    let label = new_label.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    rec.label = label;
+    save_generated_configs(id, &ledger)
+}
+
+/// Delete a stored config record from the ledger. Returns `true` if a record
+/// was removed, `false` if no such id existed.
+///
+/// Deletion is an intentional shrink: like history/token-ledger removal, we
+/// write the file directly and rebase the append-only high-water mark down so
+/// the doctor does not flag a deliberate delete as corruption.
+pub fn delete_config(id: &str, rec_id: u64) -> Result<bool, CFError> {
+    let mut ledger = load_generated_configs(id);
+    let before = ledger.records.len();
+    ledger.records.retain(|r| r.id != rec_id);
+    if ledger.records.len() == before {
+        return Ok(false);
+    }
+    let dir = crate::store::profiles::profile_dir(id);
+    let records = &ledger.records;
+    crate::store::write_json(&dir.join(GeneratedConfigsLedger::FILE), records)
+        .map_err(|e| CFError::new("Storage error", e.to_string(), "Internal error."))?;
+    let _ = crate::ledger_guard::rebase_high_water(
+        &dir,
+        crate::ledger_guard::LedgerKind::GeneratedConfigs,
+        records.len() as u64,
+        crate::store::now_ts() as u64,
+    );
+    Ok(true)
+}
+
 /// Persist the generated-configs ledger for a profile.
 ///
 /// The write goes through the ledger append-only guard (high-water) so the
@@ -402,5 +457,65 @@ mod tests {
         record_profile_configs(&id, &prof, ConfigSource::WorkerVless, Some("again".into()));
         let total = load_generated_configs(&id);
         assert_eq!(total.records.len(), loaded.records.len() * 2);
+    }
+
+    #[test]
+    fn update_content_recomputes_hash_and_preserves_identity() {
+        crate::store::set_mem_dir_override(test_mem_dir());
+        let id = crate::store::profiles::create_profile("g4", "gen").unwrap();
+        let mut ledger = GeneratedConfigsLedger::default();
+        let (f, s, c) = rec(ExportFormat::ShareLink, ConfigSource::ShareLink, "vless://a");
+        let rid = ledger.push(1000, f, s, Some("home".into()), c).unwrap();
+        save_generated_configs(&id, &ledger).unwrap();
+
+        let new_content = "vless://edited".to_string();
+        update_config_content(&id, rid, new_content.clone()).unwrap();
+        let loaded = load_generated_configs(&id);
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(loaded.records[0].content, new_content);
+        assert_eq!(
+            loaded.records[0].content_sha256,
+            sha256_bytes(new_content.as_bytes())
+        );
+        assert_eq!(loaded.records[0].id, rid);
+        assert_eq!(loaded.records[0].source, ConfigSource::ShareLink);
+        assert_eq!(loaded.records[0].label.as_deref(), Some("home"));
+    }
+
+    #[test]
+    fn update_label_trim_and_clear() {
+        crate::store::set_mem_dir_override(test_mem_dir());
+        let id = crate::store::profiles::create_profile("g5", "gen").unwrap();
+        let mut ledger = GeneratedConfigsLedger::default();
+        let (f, s, c) = rec(ExportFormat::SingBox, ConfigSource::WorkerVless, "{}");
+        let rid = ledger.push(2000, f, s, None, c).unwrap();
+        save_generated_configs(&id, &ledger).unwrap();
+
+        update_config_label(&id, rid, Some("  my config  ".into())).unwrap();
+        let loaded = load_generated_configs(&id);
+        assert_eq!(loaded.records[0].label.as_deref(), Some("my config"));
+
+        update_config_label(&id, rid, Some("   ".into())).unwrap();
+        let loaded = load_generated_configs(&id);
+        assert_eq!(loaded.records[0].label, None);
+    }
+
+    #[test]
+    fn delete_config_removes_only_matching_record() {
+        crate::store::set_mem_dir_override(test_mem_dir());
+        let id = crate::store::profiles::create_profile("g6", "gen").unwrap();
+        let mut ledger = GeneratedConfigsLedger::default();
+        let (f1, s1, c1) = rec(ExportFormat::ShareLink, ConfigSource::ShareLink, "a");
+        let (f2, s2, c2) = rec(ExportFormat::Clash, ConfigSource::WorkerVless, "b");
+        let r1 = ledger.push(1000, f1, s1, None, c1).unwrap();
+        let r2 = ledger.push(2000, f2, s2, None, c2).unwrap();
+        save_generated_configs(&id, &ledger).unwrap();
+
+        assert!(delete_config(&id, r1).unwrap());
+        let loaded = load_generated_configs(&id);
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(loaded.records[0].id, r2);
+        // Missing id → false, not an error.
+        assert!(!delete_config(&id, 9999).unwrap());
     }
 }

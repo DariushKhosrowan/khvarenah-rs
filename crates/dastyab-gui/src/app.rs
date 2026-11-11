@@ -324,6 +324,12 @@ pub enum PendingDialogAction {
     /// Create fresh client configs (all formats) from a user-supplied clean
     /// IP endpoint, reusing the last deployed worker link — no redeploy.
     CreateConfigFromIp,
+    /// Edit a generated config's content in place.
+    EditConfig(u64),
+    /// Rename a generated config's label.
+    RenameConfig(u64),
+    /// Delete a generated config record.
+    DeleteConfig(u64),
 }
 
 impl DastYabApp {
@@ -1809,6 +1815,58 @@ impl DastYabApp {
                     Some(PendingDialogAction::CreateConfigFromIp) => {
                         if let DialogPayload::Text(ep) = payload {
                             self.create_config_from_ip(&ep);
+                        }
+                    }
+                    Some(PendingDialogAction::EditConfig(rec_id)) => {
+                        if let DialogPayload::Text(content) = payload {
+                            match dastyab_core::generated_configs::update_config_content(
+                                &self.profile_id,
+                                rec_id,
+                                content,
+                            ) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note = format!("Config #{rec_id} updated.");
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::RenameConfig(rec_id)) => {
+                        if let DialogPayload::Text(label) = payload {
+                            let label = if label.trim().is_empty() {
+                                None
+                            } else {
+                                Some(label)
+                            };
+                            match dastyab_core::generated_configs::update_config_label(
+                                &self.profile_id,
+                                rec_id,
+                                label,
+                            ) {
+                                Ok(_) => {
+                                    self.state.reload_pending = true;
+                                    self.note = format!("Config #{rec_id} renamed.");
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
+                        }
+                    }
+                    Some(PendingDialogAction::DeleteConfig(rec_id)) => {
+                        if let DialogPayload::Confirm = payload {
+                            match dastyab_core::generated_configs::delete_config(
+                                &self.profile_id,
+                                rec_id,
+                            ) {
+                                Ok(true) => {
+                                    self.state.reload_pending = true;
+                                    self.note = format!("Config #{rec_id} deleted.");
+                                }
+                                Ok(false) => {
+                                    self.note = format!("Config #{rec_id} not found.");
+                                }
+                                Err(e) => self.note = e.brief(),
+                            }
                         }
                     }
                     None => {}
@@ -5324,6 +5382,56 @@ mod tests {
             // Ledger populated.
             let ledger = dastyab_core::generated_configs::load_generated_configs(pid);
             assert!(ledger.records.len() >= 8, "ledger too small");
+        });
+    }
+
+    #[test]
+    fn configs_manager_edit_rename_delete_roundtrip() {
+        // The "manage and edit configs" requirement: after a deploy, the
+        // Configs ledger supports editing content, renaming a label, and
+        // deleting a record — all durably via the guarded core functions.
+        with_home(|pid| {
+            simulate_deploy(pid);
+            let (n, _base) = create_configs_from_ip(pid, "104.16.1.1").expect("config from ip");
+            assert!(n >= 4);
+
+            let mut ledger = dastyab_core::generated_configs::load_generated_configs(pid);
+            assert!(ledger.records.len() >= 4);
+            let rec = ledger.records.first().unwrap().clone();
+            let rid = rec.id;
+
+            // 1. Edit content — hash recomputes, identity preserved.
+            let new_content = format!("{}-edited\n{}", rec.content, rec.content);
+            dastyab_core::generated_configs::update_config_content(pid, rid, new_content.clone())
+                .unwrap();
+            let after = dastyab_core::generated_configs::load_generated_configs(pid);
+            let edited = after.records.iter().find(|r| r.id == rid).unwrap();
+            assert_eq!(edited.content, new_content);
+            assert_eq!(edited.id, rid);
+            assert_eq!(edited.fmt, rec.fmt);
+            assert_ne!(edited.content_sha256, rec.content_sha256);
+
+            // 2. Rename label — trimmed, cleared when blank.
+            dastyab_core::generated_configs::update_config_label(pid, rid, Some("  home-vpn  ".into()))
+                .unwrap();
+            let after = dastyab_core::generated_configs::load_generated_configs(pid);
+            assert_eq!(
+                after.records.iter().find(|r| r.id == rid).unwrap().label.as_deref(),
+                Some("home-vpn")
+            );
+            dastyab_core::generated_configs::update_config_label(pid, rid, Some("  ".into()))
+                .unwrap();
+            let after = dastyab_core::generated_configs::load_generated_configs(pid);
+            assert_eq!(after.records.iter().find(|r| r.id == rid).unwrap().label, None);
+
+            // 3. Delete — only that record removed, the rest survive.
+            let total = after.records.len();
+            assert!(dastyab_core::generated_configs::delete_config(pid, rid).unwrap());
+            let after = dastyab_core::generated_configs::load_generated_configs(pid);
+            assert_eq!(after.records.len(), total - 1);
+            assert!(!after.records.iter().any(|r| r.id == rid));
+            // Missing id → false, doctor stays green (no shrink flag).
+            assert!(!dastyab_core::generated_configs::delete_config(pid, rid).unwrap());
         });
     }
 
