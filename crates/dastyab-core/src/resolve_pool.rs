@@ -191,27 +191,21 @@ impl ResolverPool {
                     {
                         Ok(rt) => rt,
                         Err(e) => {
-                            return Err(CFError::new(
-                                "resolve-pool",
-                                format!("runtime: {e}"),
-                                "",
-                            ));
+                            return Err(CFError::new("resolve-pool", format!("runtime: {e}"), ""));
                         }
                     };
                     rt.block_on(udp_query_txt(&srv, name, timeout))
                 });
-                handle
-                    .join()
-                    .unwrap_or_else(|_| Err(CFError::new("resolve-pool", "query thread panicked", "")))
+                handle.join().unwrap_or_else(|_| {
+                    Err(CFError::new("resolve-pool", "query thread panicked", ""))
+                })
             });
             match result {
                 Ok(reply) => return Ok(reply),
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            CFError::new("resolve-pool", "all resolvers failed", "")
-        }))
+        Err(last_err.unwrap_or_else(|| CFError::new("resolve-pool", "all resolvers failed", "")))
     }
 }
 
@@ -280,7 +274,10 @@ mod tests {
         use std::net::UdpSocket;
         let sock = UdpSocket::bind("127.0.0.1:0").expect("bind responder");
         let addr = sock.local_addr().expect("local addr");
-        let server = Arc::new(DnsTunnelServer::new(base.to_string(), TunnelHandler::default()));
+        let server = Arc::new(DnsTunnelServer::new(
+            base.to_string(),
+            TunnelHandler::default(),
+        ));
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             loop {
@@ -292,7 +289,8 @@ mod tests {
                         } else {
                             // Not a tunnel frame → emulate an ordinary recursive
                             // resolver that answers the query anyway.
-                            if let Ok((id, qname, _, _)) = crate::dnstt_server::parse_question(pkt) {
+                            if let Ok((id, qname, _, _)) = crate::dnstt_server::parse_question(pkt)
+                            {
                                 let resp = crate::dnstt_server::build_dns_response_txt(
                                     id,
                                     &qname,
@@ -340,11 +338,7 @@ mod tests {
         // one is third — the pool must skip the dead ones and find it.
         let dead = "127.0.0.1:1".to_string();
         let pool = ResolverPool::new(
-            vec![
-                dead.clone(),
-                dead.clone(),
-                addr_str(live),
-            ],
+            vec![dead.clone(), dead.clone(), addr_str(live)],
             Duration::from_millis(800),
         );
         let frame = TunnelFrame {
@@ -354,7 +348,9 @@ mod tests {
             payload: Vec::new(),
         };
         let qname = frame.encode_name_clamped(base, 1, MAX_QNAME_LEN_C);
-        let reply = pool.query_txt(&qname).expect("pool should reach live resolver");
+        let reply = pool
+            .query_txt(&qname)
+            .expect("pool should reach live resolver");
         let decoded = TunnelFrame::decode_name(reply.trim_end_matches('.'), base).unwrap();
         assert_eq!(decoded.flags, 1);
         assert_eq!(decoded.payload, b"pong");
@@ -369,9 +365,11 @@ mod tests {
             addr_str(live),
             "127.0.0.1:2".to_string(),
         ];
-        let found = discover_open_resolvers(&candidates, 4, Duration::from_millis(800), "")
-            .await;
-        assert!(found.contains(&addr_str(live)), "live resolver must be discovered: {found:?}");
+        let found = discover_open_resolvers(&candidates, 4, Duration::from_millis(800), "").await;
+        assert!(
+            found.contains(&addr_str(live)),
+            "live resolver must be discovered: {found:?}"
+        );
         assert_eq!(found.len(), 1);
     }
 

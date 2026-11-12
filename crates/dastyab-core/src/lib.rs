@@ -36,6 +36,7 @@ pub mod mock_worker;
 
 pub mod account_state;
 pub mod analytics;
+pub mod arq;
 pub mod artifact_versions;
 pub mod auto_heal;
 pub mod autonomy;

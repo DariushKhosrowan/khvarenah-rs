@@ -137,7 +137,12 @@ impl TunnelFrame {
     /// resolvers is ~101 (see `MAX_QNAME_LEN`). Longer payloads are truncated
     /// (monotonic, part of the text-rate framing contract) so every query fits
     /// well under the per-query cap and is not dropped by filter hardware.
-    pub fn encode_name_clamped(&self, base_domain: &str, nonce: u32, max_qname_len: usize) -> String {
+    pub fn encode_name_clamped(
+        &self,
+        base_domain: &str,
+        nonce: u32,
+        max_qname_len: usize,
+    ) -> String {
         let mut pl = self.payload.clone();
         loop {
             let name = self.assemble_name(base_domain, nonce, &pl);
@@ -370,5 +375,77 @@ mod tests {
         assert!(name.len() <= MAX_QNAME_LEN);
         let decoded = TunnelFrame::decode_name(&name, "tun.example.com").unwrap();
         assert_eq!(decoded.payload, b"pong");
+    }
+
+    /// End-to-end ARQ ↔ wire-format integration: the sender's frames travel
+    /// through the real `TunnelFrame` encode/decode path (base32 labels under
+    /// a base domain), and the receiver's cumulative+selective ACK must round
+    /// trip back into the sender, retiring exactly the acknowledged frames.
+    #[test]
+    fn arq_session_roundtrips_through_wire_format() {
+        use crate::arq::{ArqReceiver, ArqSender, RecvVerdict};
+        use std::time::Duration;
+        const BASE: &str = "tun.example.com";
+        const NONCE: u32 = 0x1357;
+
+        let mut tx = ArqSender::new(8, Duration::from_millis(50));
+        let mut rx = ArqReceiver::new(8);
+
+        // Send 3 frames; each is encoded/decoded through the real framing.
+        let payloads = [b"aaa".to_vec(), b"bbb".to_vec(), b"ccc".to_vec()];
+        let mut seqs = Vec::new();
+        for pl in &payloads {
+            let s = tx.send(pl.clone()).expect("window not full");
+            seqs.push(s);
+        }
+
+        // Frame 0 is lost on the wire; frames 1 and 2 arrive.
+        for i in 1..3 {
+            let frame = TunnelFrame {
+                session: "s".into(),
+                seq: seqs[i].0,
+                flags: 0,
+                payload: payloads[i].clone(),
+            };
+            let name = frame.encode_name_clamped(BASE, NONCE, MAX_QNAME_LEN);
+            let decoded = TunnelFrame::decode_name(&name, BASE).unwrap();
+            assert_eq!(tx.0, seqs[i].0);
+            assert_eq!(decoded.payload, payloads[i]);
+            // Receiver buffers the out-of-order frame.
+            assert_eq!(rx.recv(seqs[i], &decoded.payload), RecvVerdict::Accepted);
+        }
+
+        // Sender learns the SACK → frames 1 and 2 retire, frame 0 stays.
+        let (cum, sack) = rx.ack();
+        tx.on_ack(cum, sack);
+        assert_eq!(tx.inflight(), 1);
+        assert!(tx.in_flight.contains_key(&seqs[0]));
+
+        // The lost frame retransmits through the wire format and is delivered.
+        let retx = tx.retransmit(seqs[0]).expect("retx payload");
+        let frame = TunnelFrame {
+            session: "s".into(),
+            seq: seqs[0].0,
+            flags: 0,
+            payload: retx,
+        };
+        let name = frame.encode_name_clamped(BASE, NONCE, MAX_QNAME_LEN);
+        let decoded = TunnelFrame::decode_name(&name, BASE).unwrap();
+        assert_eq!(rx.recv(seqs[0], &decoded.payload), RecvVerdict::Accepted);
+
+        let delivered = rx.take_delivered();
+        assert_eq!(delivered.len(), 3);
+        // In-order delivery despite the reorder.
+        assert_eq!(delivered[0].0, seqs[0]);
+        assert_eq!(delivered[1].0, seqs[1]);
+        assert_eq!(delivered[2].0, seqs[2]);
+        assert_eq!(delivered[0].1, b"aaa");
+        assert_eq!(delivered[1].1, b"bbb");
+        assert_eq!(delivered[2].1, b"ccc");
+
+        // Full ACK retires everything.
+        let (cum, sack) = rx.ack();
+        tx.on_ack(cum, sack);
+        assert!(tx.is_idle());
     }
 }
