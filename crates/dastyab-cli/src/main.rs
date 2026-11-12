@@ -509,6 +509,14 @@ enum Command {
         /// How many archive pages to walk back per channel (default 3).
         #[arg(long, default_value_t = 3)]
         depth: usize,
+        /// Systematic discovery: probe `DISCOVER_CANDIDATE_CHANNELS` (plus any
+        /// `--channels`) and print their live plaintext-link yield, ranked.
+        #[arg(long)]
+        discover: bool,
+        /// With `--discover`: persist the channels that yielded ≥1 link to the
+        /// profile so future refill passes automatically include them.
+        #[arg(long)]
+        save: bool,
     },
     /// Ingest free configs from GitHub sources (topic + curated repos) into
     /// a profile's node store.

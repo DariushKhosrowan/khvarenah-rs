@@ -226,7 +226,9 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             profile,
             proxy,
             depth,
-        } => cmd_harvest(&profile, &channels, proxy, depth).await,
+            discover,
+            save,
+        } => cmd_harvest(&profile, &channels, proxy, depth, discover, save).await,
         Command::Sources {
             action,
             profile,
@@ -273,8 +275,51 @@ async fn cmd_harvest(
     channels: &str,
     proxy: bool,
     depth: usize,
+    discover: bool,
+    save: bool,
 ) -> Result<(), CFError> {
     use dastyab_core::harvest;
+
+    // Systematic discovery mode: probe candidates, print live yield, and
+    // optionally persist the yielding channels for future refill passes.
+    if discover {
+        let mut candidates: Vec<String> = harvest::DISCOVER_CANDIDATE_CHANNELS
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        for c in channels.split(',') {
+            let c = c.trim().trim_start_matches('@').to_string();
+            if !c.is_empty() && !candidates.contains(&c) {
+                candidates.push(c);
+            }
+        }
+        println!("discovering {} candidate channel(s)…", candidates.len());
+        let yields = harvest::discover_channel_yields(proxy, &candidates, 8).await;
+        let mut winners = Vec::new();
+        for (ch, n) in &yields {
+            if *n > 0 {
+                println!("  {ch}: {n} links");
+                winners.push(ch.clone());
+            }
+        }
+        if winners.is_empty() {
+            println!("no candidate channels yielded links");
+        } else if save {
+            harvest::save_discovered_channels(
+                profile,
+                &harvest::DiscoveredChannels {
+                    channels: winners.clone(),
+                    probed_at: dastyab_core::store::profiles::now_ts(),
+                },
+            )?;
+            println!(
+                "saved {} discovered channel(s) to profile '{profile}'",
+                winners.len()
+            );
+        }
+        return Ok(());
+    }
+
     let list: Vec<String> = channels
         .split(',')
         .map(|c| c.trim().to_string())
@@ -3783,7 +3828,7 @@ async fn cmd_configs(
                     },
                     chan_list.len()
                 );
-                cmd_harvest(profile, channels, proxy, depth).await?;
+                cmd_harvest(profile, channels, proxy, depth, false, false).await?;
             }
 
             let rep = selfheal(profile, proxy);

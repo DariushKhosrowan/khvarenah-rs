@@ -119,10 +119,19 @@ pub async fn run_refill_depth(profile: &str, use_proxy: bool, depth: usize) -> R
     }
 
     // --- Source 1: deep Telegram channel harvest ---
-    let chan_list: Vec<String> = DEFAULT_REFILL_CHANNELS
+    // Merge the hardcoded default net with channels discovered by previous
+    // `harvest --discover` passes, so autonomous recovery keeps widening its
+    // sources (never hardcoded/circular).
+    let mut chan_list: Vec<String> = DEFAULT_REFILL_CHANNELS
         .iter()
         .map(|s| s.to_string())
         .collect();
+    let discovered = crate::harvest::load_discovered_channels(profile);
+    for ch in discovered.channels {
+        if !chan_list.contains(&ch) {
+            chan_list.push(ch);
+        }
+    }
     let concurrency = chan_list.len().min(8);
     let tg_results =
         crate::harvest::harvest_many(profile, &chan_list, use_proxy, concurrency, depth.max(1))

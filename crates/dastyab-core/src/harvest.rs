@@ -185,6 +185,108 @@ pub fn extract_vless_links(body: &str) -> Vec<String> {
 /// Max archive pages walked backwards per channel (each page is ~20 messages).
 pub const MAX_ARCHIVE_DEPTH: usize = 10;
 
+/// Broad candidate-channel list for **systematic Telegram discovery**: probing
+/// these on demand reveals which channels currently broadcast plaintext
+/// share-links (so the refill net is not hardcoded to a fixed set). Ordered
+/// roughly by historical reliability; `discover_channel_yields` rank them by
+/// *live* yield.
+pub const DISCOVER_CANDIDATE_CHANNELS: &[&str] = &[
+    "v2ray_configs_pools",
+    "MARAMBASHI",
+    "v2raycollector",
+    "v2rayann",
+    "FreeV2rayConfigs",
+    "v2ray_team",
+    "proxy_v2ray",
+    "v2rayfree",
+    "v2ray_config",
+    "V2ray_Config",
+    "configs_v2ray",
+    "vlessconfigs",
+    "sub_config",
+    "v2rayofficial",
+    "v2ray_server",
+    "v2ray_new",
+    "v2ray_pro",
+    "vlessfree",
+    "VlessConfigs",
+    "v2ray_links",
+    "v2ray_config_en",
+    "v2rayng",
+    "v2ray_world",
+    "v2ray_sub",
+    "clean_v2ray",
+    "hiddify",
+    "singboxconfigs",
+    "v2ray_team2",
+    "freev2ray",
+    "v2ray_cfg",
+    "v2ray_config_pool",
+];
+
+/// Persisted result of a discovery pass: which channels yielded configs and
+/// when. Stored per-profile at `<profile>/harvest_channels.json` and merged
+/// into the refill channel net so autonomous recovery keeps discovering new
+/// sources (doctrine §5: bootstrapping never goes circular/hardcoded).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveredChannels {
+    /// Channel names that yielded ≥1 plaintext link on the last discovery.
+    pub channels: Vec<String>,
+    /// Epoch-seconds the discovery ran.
+    pub probed_at: f64,
+}
+
+/// Path to the per-profile discovered-channel record.
+pub fn discovered_channels_path(profile: &str) -> std::path::PathBuf {
+    crate::store::profiles::profile_dir(profile).join("harvest_channels.json")
+}
+
+/// Load the persisted discovered-channel set (empty when none yet).
+pub fn load_discovered_channels(profile: &str) -> DiscoveredChannels {
+    crate::store::read_or_default(&discovered_channels_path(profile))
+}
+
+/// Persist the discovered-channel set.
+pub fn save_discovered_channels(
+    profile: &str,
+    d: &DiscoveredChannels,
+) -> Result<(), crate::error::CFError> {
+    crate::store::write_json(&discovered_channels_path(profile), d)
+}
+
+/// Probe a set of candidate channels and rank them by **live** plaintext-link
+/// yield (single preview page each, no import). Returns `(channel, links)`
+/// sorted descending by yield. Does not touch the node store — pure discovery.
+pub async fn discover_channel_yields(
+    use_proxy: bool,
+    candidates: &[String],
+    concurrency: usize,
+) -> Vec<(String, usize)> {
+    use futures_util::stream::StreamExt;
+
+    let client = match build_client(use_proxy) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let conc = concurrency.clamp(1, 8);
+
+    let mut yields: Vec<(String, usize)> = futures_util::stream::iter(candidates.iter().cloned())
+        .map(|ch| {
+            let client = client.clone();
+            async move {
+                let links = fetch_channel_links_async(&client, &ch)
+                    .await
+                    .unwrap_or_default();
+                (ch, links.len())
+            }
+        })
+        .buffer_unordered(conc)
+        .collect()
+        .await;
+    yields.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    yields
+}
+
 /// Harvest a channel into a profile's config store using a shared client.
 /// `depth` = how many preview pages to walk back into the channel's archive
 /// (1 = latest page only). Returns how many links were found and imported.
@@ -464,5 +566,25 @@ mod tests {
         // And the direct import path (the one the harvester uses):
         let sum = crate::config_store::import_single_link(&profile, &links[0]).unwrap();
         assert_eq!(sum.added, 1);
+    }
+
+    #[test]
+    fn discovered_channels_persist_and_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(dir.path().join("mem"));
+        let profile = "default".to_string();
+
+        let disc = DiscoveredChannels {
+            channels: vec!["chan_a".into(), "chan_b".into()],
+            probed_at: 1234.0,
+        };
+        save_discovered_channels(&profile, &disc).unwrap();
+        let loaded = load_discovered_channels(&profile);
+        assert_eq!(loaded.channels, disc.channels);
+        assert_eq!(loaded.probed_at, 1234.0);
+
+        // Missing file → empty default.
+        let empty = load_discovered_channels(&profile);
+        assert_eq!(empty.channels.len(), 2);
     }
 }
