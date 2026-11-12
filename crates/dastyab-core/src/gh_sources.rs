@@ -23,7 +23,6 @@ use std::time::Duration;
 
 use base64::Engine;
 
-use crate::config_store::import_single_link;
 use crate::error::CFError;
 use crate::multilayer::PROXY_SOCKS_PORT;
 
@@ -336,7 +335,11 @@ pub async fn ingest_github(
                 report.repos_ok.push(repo.clone());
                 for link in &links {
                     report.found += 1;
-                    match import_single_link(profile, link) {
+                    match crate::config_store::import_single_link_source(
+                        profile,
+                        link,
+                        crate::config_store::SOURCE_GITHUB,
+                    ) {
                         Ok(s) => {
                             report.added += s.added;
                             report.duplicates += s.duplicates;

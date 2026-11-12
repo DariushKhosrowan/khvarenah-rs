@@ -31,10 +31,23 @@ pub const REFILL_COOLDOWN_SECS: i64 = 900;
 pub const DEFAULT_REFILL_DEPTH: usize = 6;
 
 /// Default Telegram channels to harvest when the pool needs refilling.
-/// Best-effort seed list: channel failures are tolerated (a 404/empty
-/// preview just contributes zero links). Users may override via
-/// `dastyab nodes refill --channels …`.
-pub const DEFAULT_REFILL_CHANNELS: &[&str] = &["v2ray_config", "MARAMBASHI", "v2ray_configs_pools"];
+/// Best-effort seed list ordered by observed plaintext-link yield (probed
+/// live 2026-11-12): high-yield config-broadcast channels first. Channel
+/// failures are tolerated (a 404/empty preview just contributes zero links).
+/// Users may override via `dastyab configs refill --channels …`.
+pub const DEFAULT_REFILL_CHANNELS: &[&str] = &[
+    "v2ray_configs_pools", // ~286 links/page (top yield)
+    "MARAMBASHI",          // ~180 links/page
+    "v2raycollector",      // ~59 links/page
+    "v2rayann",            // ~31 links/page
+    "FreeV2rayConfigs",    // ~20 links/page
+    "v2ray_team",          // ~15 links/page
+    "proxy_v2ray",         // ~8 links/page
+    "v2rayfree",           // ~7 links/page
+    "v2ray_config",        // ~2 links/page (canonical anchor)
+    "V2ray_Config",
+    "configs_v2ray",
+];
 
 /// Structured outcome of one refill pass.
 #[derive(Debug, Clone, Default)]

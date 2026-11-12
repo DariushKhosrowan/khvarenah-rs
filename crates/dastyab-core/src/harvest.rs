@@ -222,7 +222,11 @@ pub async fn harvest_channel_async_depth(
     // Import everything collected; the store dedups across schemes and pages.
     let links = std::mem::take(&mut harvest.links);
     for link in &links {
-        match crate::config_store::import_single_link(profile, link) {
+        match crate::config_store::import_single_link_source(
+            profile,
+            link,
+            crate::config_store::SOURCE_TELEGRAM,
+        ) {
             Ok(s) => {
                 harvest.summary.found += s.found;
                 harvest.summary.added += s.added;

@@ -316,9 +316,30 @@ pub fn import_v2rayn_store(profile: &str, path: &Path) -> Result<ImportSummary, 
     Ok(summary)
 }
 
+/// Source label recorded on nodes imported from an autonomous/out-of-band
+/// source (Telegram archive or GitHub config repo) — distinct from a
+/// hand-pasted link so the store can track provenance and prune/audit
+/// auto-discovered configs separately from manual ones.
+pub const SOURCE_TELEGRAM: &str = "telegram";
+pub const SOURCE_GITHUB: &str = "github";
+pub const SOURCE_PASTED: &str = "pasted";
+
 /// Paste a single share-link into the profile's node store. Any supported
 /// scheme is accepted (vless, vmess, trojan, ss, ssr, hysteria2, tuic).
+/// Node provenance is recorded as [`SOURCE_PASTED`].
 pub fn import_single_link(profile: &str, link: &str) -> Result<ImportSummary, CFError> {
+    import_single_link_source(profile, link, SOURCE_PASTED)
+}
+
+/// [`import_single_link`] with an explicit provenance `source` label (see
+/// [`SOURCE_TELEGRAM`], [`SOURCE_GITHUB`]). Used by the Telegram harvester and
+/// GitHub ingester so auto-recovered configs are distinguishable from manual
+/// pastes in the node store.
+pub fn import_single_link_source(
+    profile: &str,
+    link: &str,
+    source: &str,
+) -> Result<ImportSummary, CFError> {
     let link = link.trim();
     let uri = crate::proxy_uri::ProxyUri::parse(link).ok_or_else(|| {
         CFError::new(
@@ -339,7 +360,7 @@ pub fn import_single_link(profile: &str, link: &str) -> Result<ImportSummary, CF
         alias,
         url: link.to_string(),
         source_index: None,
-        source: "pasted".to_string(),
+        source: source.to_string(),
         added_epoch: now_ts(),
         last_checked_epoch: None,
         healthy: None,
@@ -564,5 +585,35 @@ mod tests {
         assert_eq!(m.get("spx").map(String::as_str), Some("%2FY7vPvjIeUOpXQSq"));
         assert_eq!(m.get("flow").map(String::as_str), Some("xtls-rprx-vision"));
         assert_eq!(m.get("sid").map(String::as_str), Some("a114"));
+    }
+
+    #[test]
+    fn import_source_tags_provenance() {
+        let (profile, _d) = tmp_profile();
+        // Default (pasted) provenance.
+        import_single_link(
+            &profile,
+            "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443?type=tcp#p",
+        )
+        .unwrap();
+        // Explicit source labels.
+        import_single_link_source(
+            &profile,
+            "vless://22222222-2222-2222-2222-222222222222@5.6.7.8:443?type=tcp#t",
+            SOURCE_TELEGRAM,
+        )
+        .unwrap();
+        import_single_link_source(
+            &profile,
+            "vless://33333333-3333-3333-3333-333333333333@9.10.11.12:443?type=tcp#g",
+            SOURCE_GITHUB,
+        )
+        .unwrap();
+
+        let store = load_node_store(&profile);
+        let by_id = |id: &str| store.nodes.iter().find(|n| n.url.contains(id)).unwrap();
+        assert_eq!(by_id("11111111").source, SOURCE_PASTED);
+        assert_eq!(by_id("22222222").source, SOURCE_TELEGRAM);
+        assert_eq!(by_id("33333333").source, SOURCE_GITHUB);
     }
 }
