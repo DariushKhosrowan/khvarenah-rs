@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use crate::config_store::{load_node_store, save_node_store, NodeStore, V2RayNode};
+use crate::config_store::{load_node_store, save_node_store, V2RayNode};
 use crate::multilayer::PROXY_SOCKS_PORT;
 use crate::store::profiles::now_ts;
 
@@ -173,7 +173,7 @@ fn probe_one(node: &V2RayNode, use_proxy: bool) -> (bool, u128, Option<String>) 
         TcpStream::connect_timeout(&target, PROBE_TIMEOUT)
     };
     match result {
-        Ok(mut s) => {
+        Ok(s) => {
             let _ = s.set_read_timeout(Some(PROBE_TIMEOUT));
             let ms = start.elapsed().as_millis();
             (true, ms, None)
@@ -310,7 +310,7 @@ mod tests {
         store.nodes.push(dead);
         store.nodes.push(alive);
         store.active_id = Some("dead".into());
-        assert_eq!(store.set_active("dead"), true);
+        assert!(store.set_active("dead"));
         // failover_if_dead operates on the persisted store; test the inner
         // decision directly by simulating what it does:
         let active_healthy = store

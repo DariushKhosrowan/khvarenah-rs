@@ -229,28 +229,19 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
 
 async fn cmd_harvest(profile: &str, channels: &str, proxy: bool) -> Result<(), CFError> {
     use dastyab_core::harvest;
-    let list: Vec<&str> = channels
+    let list: Vec<String> = channels
         .split(',')
-        .map(|c| c.trim())
+        .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
         .collect();
     if list.is_empty() {
         eprintln!("no channels given");
         return Ok(());
     }
-    let profile = profile.to_string();
-    let channels_owned: Vec<String> = list.into_iter().map(|c| c.to_string()).collect();
-    let results = tokio::task::spawn_blocking(move || {
-        channels_owned
-            .into_iter()
-            .map(|channel| {
-                let h = harvest::harvest_channel(&profile, &channel, proxy);
-                (channel, h)
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .map_err(|e| CFError::new("harvest", format!("join: {e}"), ""))?;
+    // Concurrent, connection-pooled harvest: one shared async client across
+    // all channels (TLS keep-alive reuse), bounded in-flight fetches.
+    let concurrency = list.len().min(8);
+    let results = harvest::harvest_many(profile, &list, proxy, concurrency).await;
 
     for (channel, h) in results {
         if let Some(err) = &h.fetch_error {
