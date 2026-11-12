@@ -803,6 +803,13 @@ pub enum DnsTunnelAction {
         /// Cloudflare worker compatibility date.
         #[arg(long, default_value = "2026-07-01")]
         compat_date: String,
+        /// Optional VLESS upstream host:port for the worker's `/ws` data-plane
+        /// dumb pipe (e.g. `203.0.113.7:443`). When set, the deployed worker
+        /// relays raw TCP to this upstream over the WebSocket byte-pipe, so
+        /// v2rayN/sing-box can treat the worker as a VLESS-over-WS address.
+        /// When omitted, the worker runs control-plane only (flags 1/2/3).
+        #[arg(long)]
+        vless_upstream: Option<String>,
     },
     /// Provision a fresh Hetzner Cloud VPS, then deploy the DNS tunnel to it.
     Provision {

@@ -4567,6 +4567,7 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
         crate::DnsTunnelAction::Worker {
             worker_name,
             compat_date,
+            vless_upstream,
         } => {
             let token = first_token(&load_profile(profile))?;
             let client = dastyab_core::cf::Client::new(&token);
@@ -4591,7 +4592,7 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
                 session_seed: seed,
                 compat_date,
                 retries: 2,
-                vless_upstream: None,
+                vless_upstream,
             };
             let res = dastyab_core::worker_tunnel::deploy_worker_tunnel(
                 &client, &acc.id, profile, &opts,
