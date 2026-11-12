@@ -116,6 +116,11 @@ pub struct FallbackLadder<P> {
     current: Tier,
     fails_in_row: u32,
     max_fails: u32,
+    /// Optional liveness sentinel (doctrine C). When set, the caller feeds it
+    /// per-route traffic via `record_outbound`/`record_inbound`; if it flags a
+    /// half-open stall, `watchdog_tick` force-verifies the route instead of
+    /// waiting for `max_fails` probe failures.
+    sentinel: Option<crate::liveness_sentinel::LivenessSentinel>,
 }
 
 impl<P: Probe> FallbackLadder<P> {
@@ -126,7 +131,38 @@ impl<P: Probe> FallbackLadder<P> {
             current: start,
             fails_in_row: 0,
             max_fails: policy::MAX_FAILS_BEFORE_DESCEND,
+            sentinel: None,
         }
+    }
+
+    /// Attach a liveness sentinel to this ladder (doctrine C). Returns `self`
+    /// for chaining.
+    pub fn with_sentinel(mut self, s: crate::liveness_sentinel::LivenessSentinel) -> Self {
+        self.sentinel = Some(s);
+        self
+    }
+
+    /// Record outbound traffic on the current route (feeds the sentinel).
+    pub fn record_outbound(&mut self, bytes: u64) {
+        if let Some(s) = self.sentinel.as_mut() {
+            s.record_outbound(bytes);
+        }
+    }
+
+    /// Record inbound traffic on the current route (feeds the sentinel).
+    pub fn record_inbound(&mut self, bytes: u64) {
+        if let Some(s) = self.sentinel.as_mut() {
+            s.record_inbound(bytes);
+        }
+    }
+
+    /// True if the sentinel reports a confirmed half-open stall for the current
+    /// route (should trigger a soft-break / force re-verify).
+    pub fn sentinel_wants_break(&self) -> bool {
+        self.sentinel
+            .as_ref()
+            .map(|s| s.should_break())
+            .unwrap_or(false)
     }
 
     /// Override how many consecutive failures trigger a descend.
@@ -212,6 +248,21 @@ impl<P: Probe> FallbackLadder<P> {
     /// Full watchdog tick: poll the current tier; if it failed and we
     /// descended, opportunistically try to climb back to a recovered tier.
     pub async fn watchdog_tick(&mut self) -> TierChange {
+        // Doctrine C: if the liveness sentinel flags a confirmed half-open
+        // stall, bypass the max_fails patience and force-verify the route now.
+        if self.sentinel_wants_break() {
+            if !self.probe_tier(self.current).await.ok {
+                self.fails_in_row = 0;
+                self.descend();
+                return TierChange::Descended(self.current);
+            }
+            // Route actually recovered — reset sentinel counters.
+            if let Some(s) = self.sentinel.as_mut() {
+                s.reset();
+            }
+            return TierChange::Stable(self.current);
+        }
+
         if self.poll().await {
             return TierChange::Stable(self.current);
         }
@@ -699,5 +750,63 @@ mod tests {
             Tier::Direct,
         );
         assert_eq!(ladder.liveness_status().await, (true, Some(Tier::DoH)));
+    }
+
+    /// Doctrine C: a confirmed sentinel stall forces a soft-break descend even
+    /// when the active probe would report the route as healthy (the probe
+    /// cannot see silent blackholing of the data path).
+    #[tokio::test]
+    async fn sentinel_stall_forces_soft_break_descend() {
+        use crate::liveness_sentinel::{LivenessSentinel, DEFAULT_STALL_TIMEOUT};
+        use std::time::{Duration, Instant};
+
+        // Probe: Direct is down, DoH is up. We set a huge max_fails so the
+        // ordinary poll would need many failures to descend — but the sentinel
+        // confirms a stall, so a single verified failure must break immediately.
+        let p = scripted(&[(Tier::Direct, false), (Tier::DoH, true)]);
+        let mut sentinel = LivenessSentinel::new("direct", DEFAULT_STALL_TIMEOUT);
+        let now = Instant::now();
+        sentinel.record_inbound_at(100, now); // route was alive
+        // Feed two consecutive stalls (transmitting, inbound silent).
+        sentinel.record_outbound_at(200, now + Duration::from_secs(1));
+        sentinel.check_stall(now + Duration::from_secs(5));
+        sentinel.record_outbound_at(50, now + Duration::from_secs(5));
+        sentinel.check_stall(now + Duration::from_secs(6));
+        assert!(sentinel.should_break());
+
+        let mut ladder = FallbackLadder::new(p, Tier::Direct)
+            .with_max_fails(999)
+            .with_sentinel(sentinel);
+        // The sentinel break must descend immediately, despite the huge
+        // max_fails that would otherwise keep us on Direct for ages.
+        let change = ladder.watchdog_tick().await;
+        assert_eq!(change, TierChange::Descended(Tier::DoH));
+        assert_eq!(ladder.current(), Tier::DoH);
+    }
+
+    /// Doctrine C: if the sentinel flags a stall but the route actually still
+    /// works (e.g. a false positive), the tick verifies and stays put.
+    #[tokio::test]
+    async fn sentinel_stall_but_route_alive_stays() {
+        use crate::liveness_sentinel::{LivenessSentinel, DEFAULT_STALL_TIMEOUT};
+        use std::time::{Duration, Instant};
+
+        // Probe: Direct up, and DoH up too (so a verify would pass).
+        let p = scripted(&[(Tier::Direct, true), (Tier::DoH, true)]);
+        let mut sentinel = LivenessSentinel::new("direct", DEFAULT_STALL_TIMEOUT);
+        let now = Instant::now();
+        sentinel.record_inbound_at(100, now);
+        sentinel.record_outbound_at(200, now + Duration::from_secs(1));
+        sentinel.check_stall(now + Duration::from_secs(5));
+        sentinel.record_outbound_at(50, now + Duration::from_secs(5));
+        sentinel.check_stall(now + Duration::from_secs(6));
+        assert!(sentinel.should_break());
+
+        let mut ladder = FallbackLadder::new(p, Tier::Direct).with_sentinel(sentinel);
+        let change = ladder.watchdog_tick().await;
+        // Verify passed → stay on Direct, sentinel reset.
+        assert_eq!(change, TierChange::Stable(Tier::Direct));
+        assert_eq!(ladder.current(), Tier::Direct);
+        assert!(!ladder.sentinel_wants_break());
     }
 }

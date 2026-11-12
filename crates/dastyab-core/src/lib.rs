@@ -74,6 +74,7 @@ pub mod health_beacon;
 pub mod inventory;
 pub mod journal;
 pub mod ledger_guard;
+pub mod liveness_sentinel;
 pub mod manifest;
 pub mod multi_worker;
 pub mod multilayer;
