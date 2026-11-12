@@ -469,7 +469,8 @@ enum Command {
     },
     /// Manage native config-storage nodes (imported from v2rayN or pasted).
     Nodes {
-        /// Sub-command: import | paste | activate | list | clear.
+        /// Sub-command: import | paste | activate | list | clear | probe |
+        /// failover | selfheal.
         #[arg()]
         action: String,
         /// Profile to operate on (default "default").
@@ -484,6 +485,10 @@ enum Command {
         /// Route the probe through the local xray SOCKS5 (for NIN/blackout).
         #[arg(long, default_value_t = false)]
         proxy: bool,
+        /// Comma-separated Telegram channels to harvest from (only used by
+        /// `selfheal`, to refill an empty/all-dead pool).
+        #[arg(long, default_value = "")]
+        channels: String,
     },
     /// Harvest free vless configs from Telegram channels (public previews,
     /// no browser needed) into a profile's node store.

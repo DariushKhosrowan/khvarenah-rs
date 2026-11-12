@@ -233,6 +233,51 @@ pub fn failover_if_dead(profile: &str) -> Option<String> {
     Some(id)
 }
 
+/// Outcome of a single self-heal pass over the node pool.
+#[derive(Debug, Clone, Default)]
+pub struct SelfHealReport {
+    /// Total nodes probed.
+    pub probed: usize,
+    /// Nodes that passed the connection check.
+    pub healthy: usize,
+    /// Nodes that failed (including unparseable).
+    pub unhealthy: usize,
+    /// If the active node was dead and we promoted a healthy one, its id.
+    pub promoted: Option<String>,
+    /// Whether the previously-active node was already healthy (no change).
+    pub active_was_healthy: bool,
+}
+
+/// Self-heal the node pool: probe every node, then fail over to a verified
+/// healthy node if the active one is dead/unset. Returns a summary report.
+/// This is the zero-human "keep a working config at the front" engine — call
+/// it from the CLI, a cron job, or the daemon's autonomy loop.
+///
+/// `use_proxy` routes the probes through the local xray SOCKS5 so the health
+/// check works even when direct foreign TCP is severed (NIN).
+pub fn selfheal(profile: &str, use_proxy: bool) -> SelfHealReport {
+    use crate::config_store::load_node_store;
+
+    let before = load_node_store(profile);
+    let active_was_healthy = before
+        .active()
+        .map(|a| a.healthy == Some(true))
+        .unwrap_or(false);
+
+    let reports = probe_all(profile, use_proxy);
+    let healthy = reports.iter().filter(|r| r.ok).count();
+    let unhealthy = reports.len() - healthy;
+    let promoted = failover_if_dead(profile);
+
+    SelfHealReport {
+        probed: reports.len(),
+        healthy,
+        unhealthy,
+        promoted,
+        active_was_healthy,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +380,59 @@ mod tests {
         let target: SocketAddr = "127.0.0.1:443".parse().unwrap();
         let r = socks5_connect(&target);
         assert!(r.is_err() || r.is_ok(), "should not panic");
+    }
+
+    #[test]
+    fn selfheal_report_surfaces_healthy_and_underdead_pool() {
+        // Use the in-memory profile override so the store writes to a tempdir.
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(dir.path().join("mem"));
+        let profile = "default".to_string();
+
+        // Empty pool → 0 probed, no promotion.
+        let rep = selfheal(&profile, false);
+        assert_eq!(rep.probed, 0);
+        assert!(rep.promoted.is_none());
+
+        // Seed a store with a dead active + a live local listener node.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut store = crate::config_store::NodeStore::default();
+
+        let dead = crate::config_store::V2RayNode {
+            id: "dead".into(),
+            alias: "dead".into(),
+            url: format!("vless://u@127.0.0.1:1?type=tcp"),
+            source_index: None,
+            source: "pasted".into(),
+            added_epoch: crate::store::profiles::now_ts(),
+            last_checked_epoch: None,
+            healthy: Some(false),
+        };
+        let alive = crate::config_store::V2RayNode {
+            id: "alive".into(),
+            alias: "alive".into(),
+            url: format!("vless://u@127.0.0.1:{}?type=tcp", addr.port()),
+            source_index: None,
+            source: "pasted".into(),
+            added_epoch: crate::store::profiles::now_ts(),
+            last_checked_epoch: None,
+            healthy: None,
+        };
+        store.nodes.push(dead);
+        store.nodes.push(alive);
+        store.active_id = Some("dead".into());
+        crate::config_store::save_node_store(&profile, &store).unwrap();
+
+        // selfheal probes both (dead fails, alive hits the listener) and
+        // promotes the healthy "alive" node.
+        let rep = selfheal(&profile, false);
+        assert_eq!(rep.probed, 2);
+        assert_eq!(rep.healthy, 1);
+        assert_eq!(rep.unhealthy, 1);
+        assert_eq!(rep.promoted.as_deref(), Some("alive"));
+
+        let after = crate::config_store::load_node_store(&profile);
+        assert_eq!(after.active().map(|a| a.id.as_str()), Some("alive"));
     }
 }

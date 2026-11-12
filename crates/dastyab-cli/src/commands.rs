@@ -218,7 +218,8 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             path,
             link,
             proxy,
-        } => cmd_configs(&profile, &action, &path, &link, proxy),
+            channels,
+        } => cmd_configs(&profile, &action, &path, &link, proxy, &channels).await,
         Command::Harvest {
             channels,
             profile,
@@ -3550,13 +3551,15 @@ fn cmd_platform(action: &str, dry_run: bool, mtu: u32) -> Result<(), CFError> {
 }
 
 /// Manage native config-storage nodes: import from a v2rayN ServersStore.json,
-/// paste a single vless link, list nodes, or activate one.
-fn cmd_configs(
+/// paste a single vless link, list nodes, activate one, probe health, fail
+/// over, or run a full self-heal pass (refilling an empty pool from Telegram).
+async fn cmd_configs(
     profile: &str,
     action: &str,
     path: &str,
     link: &str,
     proxy: bool,
+    channels: &str,
 ) -> Result<(), CFError> {
     use dastyab_core::config_store::{
         import_single_link, import_v2rayn_store, load_node_store, render_nodes, save_node_store,
@@ -3712,10 +3715,59 @@ fn cmd_configs(
             }
             Ok(())
         }
+        "selfheal" => {
+            use dastyab_core::node_probe::selfheal;
+            // If the pool is empty (or has no healthy node) and the caller
+            // supplied channels, refill from Telegram first, then probe.
+            let store = load_node_store(profile);
+            let pool_empty = store.nodes.is_empty();
+            let no_healthy = store.nodes.iter().all(|n| n.healthy != Some(true));
+            let chan_list: Vec<String> = channels
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            if (pool_empty || no_healthy) && !chan_list.is_empty() {
+                println!(
+                    "[configs] pool {} — harvesting {} channel(s) to refill",
+                    if pool_empty {
+                        "empty"
+                    } else {
+                        "has no healthy node"
+                    },
+                    chan_list.len()
+                );
+                cmd_harvest(profile, channels, proxy).await?;
+            }
+
+            let rep = selfheal(profile, proxy);
+            if rep.probed == 0 {
+                println!(
+                    "[configs] selfheal: no nodes in profile '{profile}' (harvest or import first)"
+                );
+                return Ok(());
+            }
+            println!(
+                "[configs] selfheal: {probed} probed, {healthy} healthy, {unhealthy} unhealthy",
+                probed = rep.probed,
+                healthy = rep.healthy,
+                unhealthy = rep.unhealthy,
+            );
+            match &rep.promoted {
+                Some(id) => println!("[configs]   → failed over to healthy node '{id}'"),
+                None if rep.active_was_healthy => {
+                    println!("[configs]   active node healthy — no failover needed");
+                }
+                None => {
+                    println!("[configs]   active node unchanged (no healthy candidate)");
+                }
+            }
+            Ok(())
+        }
         _ => Err(CFError::new(
             "configs",
             format!("unknown action {action:?}"),
-            "Use: import | paste | activate | list | clear | probe | failover",
+            "Use: import | paste | activate | list | clear | probe | failover | selfheal",
         )),
     }
 }
