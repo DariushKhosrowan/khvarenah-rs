@@ -110,6 +110,27 @@ browser / OCR). Start with channels known to post raw `vless://` text (e.g.
 The harvester is a *transient* process: it fetches, imports, and exits. It
 holds no browser, no socket, no timer — nothing to keep warm.
 
+## Systematic Telegram channel discovery — never hardcode the net
+
+The refill channel list is a *starting point*, not a fixed truth. Channels
+come and go; a quiet one today may broadcast a flood of configs tomorrow. `dastyab harvest --discover [--save]` probes a broad candidate set
+(`DISCOVER_CANDIDATE_CHANNELS`, plus any `--channels`) and ranks them by
+**live** plaintext-link yield — no import, just a quick one-page probe per
+channel. With `--save`, the channels that actually yielded links are persisted
+to `<profile>/harvest_channels.json`, and every future refill pass merges them
+into its net. This is how autonomous recovery keeps finding new sources instead
+of going stale (doctrine §5: bootstrapping never goes circular/hardcoded).
+
+```
+$ dastyab harvest --discover --save
+discovering 31 candidate channel(s)…
+  v2ray_configs_pools: 160 links
+  MARAMBASHI: 93 links
+  v2raycollector: 33 links
+  …
+saved 11 discovered channel(s) to profile 'default'
+```
+
 ## Periodic config-health decay — keep the pool verified-live
 
 A node being *present* says nothing about whether it *still works*. The
