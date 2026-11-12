@@ -232,3 +232,28 @@ answers are rejected:
 `discover_open_resolvers` finds working domestic recursive resolvers to build
 the pool that the DNS tunnel stripes across (splitting load and surviving
 resolver rate-limits).
+
+## 22. `liveness_sentinel.rs` — liveness sentinel (doctrine C)
+Per-route traffic observer that detects the half-open state (outbound flowing,
+zero inbound for the stall timeout) via debounced `Stalled` verdicts. Integrated
+into `FallbackLadder` as an optional component: on a confirmed stall,
+`watchdog_tick` force-verifies (and descends) immediately, bypassing
+`max_fails` patience. 6 unit tests + 2 ladder integration tests.
+
+## 23. `interface_monitor.rs` — interface-flap monitoring (doctrine E)
+`InterfaceMonitor` trait + `SysfsInterfaceMonitor` (reads carrier/operstate from
+sysfs) + a debounced `FlapDetector` that surfaces a sustained DOWN as a single
+confirmed flap with flap-count and recency. 5 unit tests.
+
+## 24. `tun_route.rs` — TUN anti-loop routing (doctrine A)
+Pure generator for the fwmark anti-loop rule plan. Parses existing
+`ip rule show` fwmark rules and produces an idempotent install/uninstall plan
+(`ip rule add prio 9000 fwmark 0x2024 lookup main`) that keeps tunnel-originated
+(SO_MARK) packets on the main table instead of re-entering the TUN default
+route. Validated against the live host (mark 0x2024 present → no-op). 6 unit
+tests.
+
+## 25. `tun_mtu.rs` — MTU/MSS clamping (doctrine D)
+Pure generator for TCP MSS-clamp rules (`rables -t mangle -A FORWARD ... -j
+TCPMSS`). Supports adaptive `--clamp-mss-to-pmtu` and fixed `--set-mss <mtu-40>`
+plans, both idempotent against parsed existing mangle rules. 7 unit tests.

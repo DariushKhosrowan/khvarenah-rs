@@ -193,14 +193,21 @@ Implemented and committed (see `ROADMAP.md`):
 - AI Studio / Gemini reachability bridge (`dastyab aistudio`) and DeepSeek
   bridge loop for autonomous dev. The Gemini API (via the AI Studio tunnel) is
   used for design review and hard decisions.
+- **Authenticated DNS-tunnel responses** (doctrine B) — ChaCha20-Poly1305
+  `seal`/`open` with a session-tagged key; server seals replies, client verifies
+  and penalizes poisoned/forged responses (`dnstunnel_auth.rs`).
+- **Liveness sentinel** (doctrine C) — half-open stall detection (transmitting
+  but zero inbound), debounced `Stalled` verdicts, integrated into the racing
+  engine so a confirmed stall force-verifies/descends (`liveness_sentinel.rs`).
+- **Interface-flap handling** (doctrine E) — sysfs carrier/operstate monitor +
+  debounced flap detector, ready for netlink driver swap (`interface_monitor.rs`).
+- **TUN anti-loop routing** (doctrine A) — fwmark anti-loop rule plan generator,
+  idempotent against live rules (`tun_route.rs`).
+- **MTU/MSS clamping** (doctrine D) — adaptive and fixed TCP MSS-clamp rule
+  plan generator (`tun_mtu.rs`).
 
-Gaps tracked as open work (see `ROADMAP.md` → **Doctrine gaps**):
+Remaining gaps tracked as open work (see `ROADMAP.md` → **Doctrine gaps**):
 
-- [ ] **Authenticated DNS-tunnel responses** — ChaCha20-Poly1305 / Noise
-      validation, poisoned-response rejection (doctrine B).
-- [ ] **TUN anti-loop routing** — `SO_MARK`/fwmark policy routing on Linux,
-      WinTUN bypass, `VpnService.protect` (doctrine A).
-- [ ] **Liveness sentinel** integrated with the racing engine (doctrine C).
-- [ ] **MTU/MSS clamping** on the TUN (doctrine D).
-- [ ] **Interface-flap handling** via netlink (doctrine E).
+- [ ] **Platform execution** of the doctrine A/D rule plans (Linux `ip`/`ip6tables`
+      invocation, TUN device bring-up, WinTUN / `VpnService.protect`).
 - [ ] **P2P LAN mesh** — mDNS neighbor discovery + relay (Level 4).
