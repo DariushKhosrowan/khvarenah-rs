@@ -31,6 +31,7 @@ tokio-rustls = { version = "0.26", features = ["aws_lc_rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 webpki-roots = "1.0"
 rcgen = { version = "0.13", optional = true }
+chacha20poly1305 = "0.11.0"
 
 [dev-dependencies]
 anyhow.workspace = true

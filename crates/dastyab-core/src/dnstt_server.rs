@@ -60,6 +60,9 @@ pub struct TunnelHandler {
     pub allowed_sessions: Option<HashSet<String>>,
     /// Optional bootstrap blob served on flags=3.
     pub bootstrap: Option<BootstrapInfo>,
+    /// When set, every reply payload is authenticated (doctrine B): sealed
+    /// with ChaCha20-Poly1305 before it is embedded in the TXT answer.
+    pub auth_key: Option<crate::dnstunnel_auth::DnsTunnelKey>,
     /// For uptime reporting (flags=2).
     started_at: Instant,
 }
@@ -78,8 +81,15 @@ impl TunnelHandler {
         Self {
             allowed_sessions,
             bootstrap,
+            auth_key: None,
             started_at: Instant::now(),
         }
+    }
+
+    /// Builder: enable authenticated (sealed) replies (doctrine B).
+    pub fn with_auth(mut self, key: crate::dnstunnel_auth::DnsTunnelKey) -> Self {
+        self.auth_key = Some(key);
+        self
     }
 
     /// Is this frame's session authorized?
@@ -244,11 +254,17 @@ pub fn handle_datagram(pkt: &[u8], server: &DnsTunnelServer) -> Option<Vec<u8>> 
         return None;
     }
     let reply = server.handler.handle(&frame);
+    // Doctrine B: when auth is enabled, seal the reply payload so a poisoned
+    // or spoofed answer cannot impersonate the authoritative server.
+    let payload = match &server.handler.auth_key {
+        Some(key) => crate::dnstunnel_auth::seal(key, &reply.payload),
+        None => reply.payload,
+    };
     let reply_frame = TunnelFrame {
         session: frame.session.clone(),
         seq: frame.seq,
         flags: reply.flags,
-        payload: reply.payload,
+        payload,
     };
     let nonce: u32 = rand::random::<u32>() & 0xFFFF;
     let reply_name = reply_frame.encode_name(&server.base_domain, nonce);
@@ -421,5 +437,49 @@ mod tests {
         let decoded = TunnelFrame::decode_name(&txts[0], base).unwrap();
         assert_eq!(decoded.seq, 42);
         assert_eq!(decoded.session, "sess");
+    }
+
+    #[test]
+    fn authenticated_reply_is_sealed_and_opens_with_key() {
+        // Doctrine B: server seals the reply; a client with the key can open
+        // it, and a tampered/forged reply is rejected.
+        let key_hex = crate::dnstunnel_auth::KEY_HEX_LEN;
+        let key = crate::dnstunnel_auth::DnsTunnelKey::from_hex(
+            &"a1".repeat(key_hex / 2),
+        )
+        .unwrap();
+        let base = "tun.example.com";
+        let server = DnsTunnelServer::new(
+            base,
+            TunnelHandler::new(None, None).with_auth(key.clone()),
+        );
+
+        let req = TunnelFrame {
+            session: "sess".into(),
+            seq: 7,
+            flags: 1,
+            payload: b"alive".to_vec(),
+        };
+        let qname = req.encode_name(base, 0xABCD);
+        let query = build_dns_query_txt(&qname, 0x4321);
+        let resp = handle_datagram(&query, &server).unwrap();
+        let txts = parse_dns_response_txt(&resp).unwrap();
+        assert_eq!(txts.len(), 1);
+        let reply = TunnelFrame::decode_name(&txts[0], base).unwrap();
+        assert_eq!(reply.flags, 1);
+        assert_eq!(reply.seq, 7);
+
+        // The payload must NOT be the plaintext "pong" — it is sealed.
+        assert_ne!(reply.payload, b"pong");
+
+        // Opening with the key recovers the plaintext.
+        let plain = crate::dnstunnel_auth::open(&key, &reply.payload).unwrap();
+        assert_eq!(plain, b"pong");
+
+        // Tampering with the ciphertext must fail authentication.
+        let mut bad = reply.payload.clone();
+        let n = bad.len();
+        bad[n - 2] ^= 0x01;
+        assert!(crate::dnstunnel_auth::open(&key, &bad).is_err());
     }
 }

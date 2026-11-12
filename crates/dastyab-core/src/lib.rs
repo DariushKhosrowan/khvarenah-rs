@@ -60,6 +60,7 @@ pub mod diagnose;
 pub mod diagnostics;
 pub mod dnstt_server;
 pub mod dnstunnel;
+pub mod dnstunnel_auth;
 pub mod doctor;
 pub mod doh;
 pub mod dot;

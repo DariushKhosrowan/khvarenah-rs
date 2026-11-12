@@ -165,3 +165,70 @@ real GeoLite2 file if present.
 ## 16. `qr.rs` — QR rendering
 
 Renders a share link as a square pixel matrix (used by UIs).
+
+---
+
+## 17. `arq.rs` — selective-repeat windowed ARQ (Level 3)
+
+A self-contained, dependency-light automatic repeat-request engine for reliable
+delivery over the lossy DNS transport.
+
+- `Seqno` — 16-bit sequence number with wraparound helpers.
+- `ArqSender` — send window; `send()` assigns seqnos, `retransmit()` /
+  `pending_timeouts()` drive timeout-based selective retransmission,
+  `on_ack(cum, sack)` advances the base and applies the SACK bitmap.
+- `ArqReceiver` — reorder buffer; `recv()` returns a `RecvVerdict`
+  (delivered / duplicate / buffered / reject); `take_delivered()` drains
+  in-order frames; `ack()` returns cumulative ACK + SACK.
+- Tested against simulated loss/reorder/duplication and 16-bit wraparound.
+
+**Read `docs/DNS-TUNNEL-PROTOCOL.md` §3 — the protocol contract.**
+
+---
+
+## 18. `dnstunnel.rs` — DNS-tunnel client framing
+
+Client-side framing and the resolver pool:
+
+- `TunnelFrame` — the wire frame (session, seq, flags, payload).
+- `encode_name` / `encode_name_clamped` — QNAME assembly with a hard
+  `MAX_QNAME_LEN=101` DPI cap (base32 labels, ≤63-char chunks).
+- `decode_name` — parse a reply back into a frame.
+- `ResolverPool` — discovered domestic recursive resolvers, round-robin.
+
+**Read `docs/DNS-TUNNEL-PROTOCOL.md` §2.**
+
+---
+
+## 19. `dnstt_server.rs` — native authoritative DNS-tunnel server
+
+The server half:
+
+- `TunnelHandler` — per-session authorization + command dispatch (ping,
+  status, bootstrap, data echo).
+- `DnsTunnelServer` — authoritative server wrapper (base domain + handler).
+- `parse_question` / `build_dns_response_txt` — DNS datagram codec.
+- `handle_datagram` — end-to-end request→reply pipeline.
+
+**Read `docs/DNS-TUNNEL-PROTOCOL.md` §2.3–2.4.**
+
+---
+
+## 20. `dnstunnel_auth.rs` — authenticated responses (doctrine B)
+
+Seals every server→client reply with ChaCha20-Poly1305 so poisoned/spoofed
+answers are rejected:
+
+- `DnsTunnelKey` — 32-byte shared secret + 8-hex session tag.
+- `seal(key, plaintext)` — AEAD encrypt, returns nonce‖ciphertext+tag.
+- `open(key, authed)` — verify + decrypt; fails on any tampering/tag mismatch.
+
+**Read `docs/DNS-TUNNEL-PROTOCOL.md` §4.**
+
+---
+
+## 21. `resolve_pool.rs` — domestic resolver discovery
+
+`discover_open_resolvers` finds working domestic recursive resolvers to build
+the pool that the DNS tunnel stripes across (splitting load and surviving
+resolver rate-limits).

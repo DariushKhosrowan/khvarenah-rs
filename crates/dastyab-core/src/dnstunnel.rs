@@ -208,6 +208,27 @@ pub async fn send_receive<R: Resolver>(
     TunnelFrame::decode_name(reply.trim_end_matches('.'), base_domain)
 }
 
+/// Authenticated variant of [`send_receive`] (doctrine B): sends a frame and
+/// verifies the reply came from the trusted server by opening its sealed
+/// payload. A failed authentication is returned as a `CFError` so the caller
+/// can penalize that resolver as poisoned — never trust an unauthenticated
+/// answer on a DNS-tunnel path.
+pub async fn send_receive_authed<R: Resolver>(
+    resolver: &R,
+    base_domain: &str,
+    frame: &TunnelFrame,
+    key: &crate::dnstunnel_auth::DnsTunnelKey,
+) -> Result<TunnelFrame, CFError> {
+    let reply_frame = send_receive(resolver, base_domain, frame).await?;
+    let plain = crate::dnstunnel_auth::open(key, &reply_frame.payload)?;
+    Ok(TunnelFrame {
+        session: reply_frame.session,
+        seq: reply_frame.seq,
+        flags: reply_frame.flags,
+        payload: plain,
+    })
+}
+
 /// Live DNS-tunnel liveness probe: send a raw UDP TXT query straight to the
 /// VPS tunnel server (UDP 53, the dnstt-server port) and require a DNS
 /// datagram back within `timeout`. This is a real round-trip against the
