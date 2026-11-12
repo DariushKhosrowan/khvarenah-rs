@@ -287,6 +287,140 @@ pub async fn discover_channel_yields(
     yields
 }
 
+/// Reserved `t.me/` path segments that are not channel handles (share links,
+/// sticker bots, proxies, etc.).
+fn is_reserved_handle(h: &str) -> bool {
+    matches!(
+        h,
+        "s" | "share"
+            | "addstickers"
+            | "addtheme"
+            | "proxy"
+            | "joinchat"
+            | "telegram"
+            | "mr"
+            | "iv"
+            | "bg"
+            | "settings"
+            | "login"
+            | "auth"
+            | "confirm"
+            | "dl"
+    ) || h.is_empty()
+        || h.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Extract **external** Telegram channel handles referenced on a channel's
+/// preview page, excluding the channel itself and reserved/non-channel paths.
+///
+/// Two signals are fused:
+/// 1. `t.me/<handle>` hrefs inside message content (channels cross-reference
+///    each other, e.g. "join @foo" → `t.me/foo/<msgid>`).
+/// 2. `@<handle>` text mentions (e.g. `@angelvpn`).
+///
+/// Pure-numeric `@NNN` tokens are Telegram message-reference shorthand, not
+/// channels, and are dropped. `self_channel` is always excluded. This is the
+/// seed for systematic graph discovery — discovering the new channels a
+/// working channel links to, rather than relying on a hardcoded list.
+pub fn extract_external_channel_handles(body: &str, self_channel: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let self_ch = self_channel.trim_start_matches('@');
+
+    // Signal 1: t.me/<handle> href links.
+    let mut rest = body;
+    while let Some(pos) = rest.find("t.me/") {
+        rest = &rest[pos + "t.me/".len()..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .unwrap_or(rest.len());
+        let handle = &rest[..end];
+        rest = &rest[end..];
+        if handle.is_empty() || handle == self_ch || is_reserved_handle(handle) {
+            continue;
+        }
+        if !found.contains(&handle.to_string()) {
+            found.push(handle.to_string());
+        }
+    }
+
+    // Signal 2: @handle text mentions.
+    for (i, token) in body.split('@').enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let end = token
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(token.len());
+        let handle = &token[..end];
+        if handle.len() < 4 || handle.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if handle == self_ch || is_reserved_handle(handle) {
+            continue;
+        }
+        if !found.contains(&handle.to_string()) {
+            found.push(handle.to_string());
+        }
+    }
+
+    found
+}
+
+/// Systematically expand a channel net by crawling the cross-referenced
+/// channels found on a set of seed channels' previews (one raw page each).
+/// Returns the new candidate handles not already in `known`, deduped. This is
+/// bounded (one hop, one page per seed) so discovery stays cheap — the daemon
+/// refill merges these into its harvest net so it never hardcodes a closed set
+/// (doctrine §5: bootstrapping must not go circular).
+pub async fn discover_related_channels(
+    use_proxy: bool,
+    seeds: &[String],
+    known: &[String],
+    max_per_seed: usize,
+    concurrency: usize,
+) -> Vec<String> {
+    use futures_util::stream::StreamExt;
+
+    let client = match build_client(use_proxy) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let conc = concurrency.clamp(1, 8);
+    let max = max_per_seed.max(1);
+
+    let seeds = seeds.to_vec();
+    let bodies: Vec<(String, String)> = futures_util::stream::iter(seeds)
+        .map(|seed| {
+            let client = client.clone();
+            async move {
+                let url = format!("https://t.me/s/{seed}");
+                let body = match client.get(&url).send().await {
+                    Ok(resp) if resp.status().as_u16() == 200 => {
+                        resp.text().await.unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
+                (seed, body)
+            }
+        })
+        .buffer_unordered(conc)
+        .collect()
+        .await;
+
+    let mut related: Vec<String> = Vec::new();
+    for (seed, body) in bodies {
+        for h in extract_external_channel_handles(&body, &seed)
+            .into_iter()
+            .take(max)
+        {
+            if !related.contains(&h) && !known.contains(&h) {
+                related.push(h);
+            }
+        }
+    }
+    related
+}
+
 /// Harvest a channel into a profile's config store using a shared client.
 /// `depth` = how many preview pages to walk back into the channel's archive
 /// (1 = latest page only). Returns how many links were found and imported.
@@ -489,6 +623,39 @@ mod tests {
         "#;
         let ids = extract_message_ids(body);
         assert_eq!(ids, vec![12345, 12340]);
+    }
+
+    #[test]
+    fn related_handles_are_extracted_and_filtered() {
+        // A preview page that cross-references other channels (signal 1:
+        // t.me/<handle> links; signal 2: @handle mentions) and includes
+        // noise (numeric message refs, self-link, reserved paths).
+        let body = r#"
+          <a href="https://t.me/oneclickvpnkeys/25273">link</a>
+          <span>join @angelvpn and @v2ray_team today</span>
+          <a href="https://t.me/v2ray_configs_pools/3694">self</a>
+          <a href="https://t.me/addstickers/SomeStickerPack">sticker</a>
+          <span>reply to @104 @202</span>
+          <a href="https://t.me/joinchat/AAAAabcd">joinchat</a>
+        "#;
+        let handles = extract_external_channel_handles(body, "v2ray_configs_pools");
+        assert!(handles.contains(&"oneclickvpnkeys".to_string()));
+        assert!(handles.contains(&"angelvpn".to_string()));
+        assert!(handles.contains(&"v2ray_team".to_string()));
+        // Self, numeric message refs, reserved paths must be excluded.
+        assert!(!handles.contains(&"v2ray_configs_pools".to_string()));
+        assert!(!handles.contains(&"104".to_string()));
+        assert!(!handles.contains(&"addstickers".to_string()));
+        assert!(!handles.contains(&"joinchat".to_string()));
+        assert!(!handles
+            .iter()
+            .any(|h| h.chars().all(|c| c.is_ascii_digit())));
+    }
+
+    #[test]
+    fn related_handles_exclude_self_and_empty() {
+        let handles = extract_external_channel_handles("https://t.me/foo/1 @foo @t.me/bar", "foo");
+        assert_eq!(handles, vec!["bar".to_string()]);
     }
 
     #[test]

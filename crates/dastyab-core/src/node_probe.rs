@@ -115,10 +115,113 @@ fn socks5_connect(target: &SocketAddr) -> std::io::Result<TcpStream> {
     Ok(s)
 }
 
+/// Does a share-link declare a TLS-secured transport? Only servers that are
+/// actually expected to speak TLS get the TLS handshake verification, so a
+/// plain Shadowsocks node (TCP-only) is not wrongly rejected by a TLS probe.
+fn link_uses_tls(url: &str) -> bool {
+    let Some(u) = crate::proxy_uri::ProxyUri::parse(url) else {
+        return false;
+    };
+    match u.scheme.as_str() {
+        // These transports are TLS/QUIC by construction.
+        "trojan" | "hysteria2" | "tuic" => true,
+        // VLESS: only when the share-link declares TLS, REALITY or XTLS.
+        "vless" => {
+            let query = u.raw.split(['?', '#']).nth(1).unwrap_or("");
+            query.split('&').any(|kv| {
+                kv.split_once('=')
+                    .map(|(k, v)| k == "security" && matches!(v, "tls" | "reality" | "xtls"))
+                    .unwrap_or(false)
+            })
+        }
+        // vmess / ss / ssr are left to the cheap TCP check (their TLS
+        // marker lives inside a base64 JSON payload; not worth a false
+        // rejection on an unparseable edge).
+        _ => false,
+    }
+}
+
+/// Build a minimal TLS 1.2 ClientHello record (with SNI) — just enough to
+/// make any real TLS server answer with a Handshake record. Used as a
+/// lightweight "does this endpoint actually speak TLS?" oracle, so probes
+/// reject silent-TCP blackholes and non-TLS servers instead of reporting
+/// false confidence.
+fn build_client_hello(sni: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]); // ClientVersion: TLS 1.2
+                                           // Random (32 bytes): timestamp-prefixed, deterministic filler.
+    let ts = crate::store::profiles::now_ts().to_le_bytes();
+    body.extend_from_slice(&ts);
+    body.extend_from_slice(&[0u8; 24]);
+    // Session ID (empty).
+    body.push(0x00);
+    // Cipher suites: a few common TLS1.2/1.3 ones.
+    let ciphers: [u16; 6] = [0x1301, 0x1302, 0x1303, 0xc02f, 0xc030, 0x009c];
+    body.push((ciphers.len() * 2) as u8);
+    for c in ciphers {
+        body.extend_from_slice(&c.to_be_bytes());
+    }
+    // Compression methods: null.
+    body.push(0x01);
+    body.push(0x00);
+    // Extensions: SNI only.
+    let mut ext = Vec::new();
+    let sni = sni.as_bytes();
+    if !sni.is_empty() && sni.len() <= 255 {
+        let mut sni_body = Vec::new();
+        sni_body.push(0x00); // name_type = host_name
+        sni_body.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+        sni_body.extend_from_slice(sni);
+        ext.extend_from_slice(&[0x00, 0x00]); // extension type: server_name
+        ext.extend_from_slice(&(sni_body.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&sni_body);
+    }
+    body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+    body.extend_from_slice(&ext);
+
+    let mut hs = Vec::new();
+    hs.push(0x01); // ClientHello
+    hs.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]); // 24-bit len
+    hs.extend_from_slice(&body);
+
+    let mut record = Vec::new();
+    record.push(0x16); // Handshake record type
+    record.extend_from_slice(&[0x03, 0x01]);
+    record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+    record.extend_from_slice(&hs);
+    record
+}
+
+/// Write a ClientHello and inspect the first response bytes. Returns true if
+/// the peer answered with a TLS protocol record (Handshake 0x16 or Alert
+/// 0x15) — proof it actually speaks TLS rather than silently swallowing TCP.
+fn tls_handshake_ok(s: &mut TcpStream, sni: &str) -> bool {
+    let hello = build_client_hello(sni);
+    if s.write_all(&hello).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 1024];
+    let n = match s.read(&mut buf) {
+        Ok(0) => return false,
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    if n == 0 {
+        return false;
+    }
+    matches!(buf[0], 0x16 | 0x15)
+}
+
 /// Probe a single node. Returns (ok, ms, error).
 ///
 /// `use_proxy` routes the connection through the local xray SOCKS5 so the
 /// probe works even when direct foreign TCP is severed (NIN).
+///
+/// The probe is **two-phase**: a cheap TCP reachability check (doctrine §6.5
+/// — cheapest useful thing first), then — for transports that declare TLS —
+/// a real TLS handshake verification (doctrine §6.4 — no fabricated success).
+/// A server that accepts TCP but does not produce a TLS response is marked
+/// unhealthy, so the pool is never populated with silent-TCP blackholes.
 fn probe_one(node: &V2RayNode, use_proxy: bool) -> (bool, u128, Option<String>) {
     let (host, port) = match parse_host_port(&node.url) {
         Some(x) => x,
@@ -133,6 +236,7 @@ fn probe_one(node: &V2RayNode, use_proxy: bool) -> (bool, u128, Option<String>) 
             );
         }
     };
+    let tls = link_uses_tls(&node.url);
     // Resolve the host. Prefer a numeric IP; fall back to a DNS lookup.
     let ip = match host.parse::<std::net::IpAddr>() {
         Ok(ip) => ip,
@@ -157,9 +261,18 @@ fn probe_one(node: &V2RayNode, use_proxy: bool) -> (bool, u128, Option<String>) 
         TcpStream::connect_timeout(&target, PROBE_TIMEOUT)
     };
     match result {
-        Ok(s) => {
+        Ok(mut s) => {
             let _ = s.set_read_timeout(Some(PROBE_TIMEOUT));
             let ms = start.elapsed().as_millis();
+            // Phase 2: if this transport declares TLS, demand a real TLS
+            // handshake (SNI = the node host) before calling it healthy.
+            if tls && !tls_handshake_ok(&mut s, &host) {
+                return (
+                    false,
+                    ms,
+                    Some("connected but no TLS handshake (silent blackhole?)".into()),
+                );
+            }
             (true, ms, None)
         }
         Err(e) => {
@@ -397,6 +510,78 @@ mod tests {
         let node = fake_node(&url);
         let (ok, _, _) = probe_one(&node, false);
         assert!(!ok, "probe to a closed port should fail");
+    }
+
+    #[test]
+    fn tls_probe_rejects_plain_tcp_server() {
+        // A plain TCP listener that does NOT speak TLS must be reported
+        // unhealthy for a TLS-declaring transport (no fabricated success).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Accept the probe, then hold the connection open without ever
+            // sending a TLS response — like a silent blackhole.
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+            }
+        });
+        // TLS-declaring VLESS node pointing at the plain TCP listener.
+        let url = format!(
+            "vless://uuid@127.0.0.1:{}?security=tls&type=ws",
+            addr.port()
+        );
+        let node = fake_node(&url);
+        let (ok, _, err) = probe_one(&node, false);
+        assert!(!ok, "plain-TCP server must not pass a TLS probe");
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn tls_probe_accepts_tls_echo_server() {
+        // A minimal TLS-ish server that answers a ClientHello with a Handshake
+        // record type must pass the TLS probe.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                // Respond with a Handshake record header (0x16) + a bit of
+                // body — enough for tls_handshake_ok to see type 0x16.
+                let resp = [0x16u8, 0x03, 0x03, 0x00, 0x05, 0x02, 0x00, 0x00, 0x03];
+                let _ = s.write_all(&resp);
+                let _ = s.flush();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+        let url = format!(
+            "vless://uuid@127.0.0.1:{}?security=tls&type=ws",
+            addr.port()
+        );
+        let node = fake_node(&url);
+        let (ok, _, _) = probe_one(&node, false);
+        assert!(ok, "TLS-speaking server should pass the TLS probe");
+    }
+
+    #[test]
+    fn link_uses_tls_detects_security_param() {
+        assert!(link_uses_tls("vless://u@1.2.3.4:443?security=tls&type=ws"));
+        assert!(link_uses_tls(
+            "vless://u@1.2.3.4:443?security=reality&type=tcp"
+        ));
+        assert!(!link_uses_tls(
+            "vless://u@1.2.3.4:443?encryption=none&type=ws"
+        ));
+        assert!(link_uses_tls("trojan://pw@1.2.3.4:443"));
+        assert!(link_uses_tls("hysteria2://tok@1.2.3.4:8443"));
+        assert!(link_uses_tls("tuic://uuid:tok@1.2.3.4:7780"));
+        assert!(!link_uses_tls("ss://method:pw@1.2.3.4:8388"));
     }
 
     #[test]
