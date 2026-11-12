@@ -933,6 +933,13 @@ pub enum MultiWorkerAction {
         #[arg()]
         name: String,
     },
+    /// Delete a worker: removes the remote CF script and drops it from the
+    /// set. If it was the active worker, fails over to a healthy standby.
+    Delete {
+        /// Worker name to delete.
+        #[arg()]
+        name: String,
+    },
 }
 
 /// Multi-layer tunnel actions.

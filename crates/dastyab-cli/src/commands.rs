@@ -5046,6 +5046,29 @@ async fn cmd_multi_worker(profile: &str, action: crate::MultiWorkerAction) -> Re
             println!("Active worker set to '{name}'.");
             Ok(())
         }
+        crate::MultiWorkerAction::Delete { name } => {
+            use dastyab_core::multi_worker::RealWorkerPeer;
+            let p = dastyab_core::store::profiles::load_profile(profile);
+            let acc_id = if p.config.active_account.is_empty() {
+                return Err(CFError::new(
+                    "multi-worker",
+                    "No active account.",
+                    "Run `dastyab up` or set an active account first.",
+                ));
+            } else {
+                p.config.active_account.clone()
+            };
+            let peer = RealWorkerPeer;
+            let next = dastyab_core::multi_worker::delete_worker_from_set(
+                &peer, profile, &acc_id, &name,
+            )
+            .await?;
+            match next {
+                Some(n) => println!("Deleted worker '{name}'. Active worker is now '{n}'."),
+                None => println!("Deleted worker '{name}'. No workers remain in the set."),
+            }
+            Ok(())
+        }
     }
 }
 

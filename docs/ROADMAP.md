@@ -155,7 +155,12 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   protocol (echo probes + data forwarding); `dastyab mesh {serve|forward}` host
   the relay over a real egress and fetch URLs through a verified hop (echo RTT
   gating). Verified live end-to-end in the CLI, commit below.
-- **Multi-worker management** — list/delete/update workers from one place.
+- ✅ **Multi-worker management** — list/delete/update workers from one place.
+  `dastyab multi-worker {status|deploy|failover|set-active|delete}`. The
+  `delete` action removes the remote CF script via the API, drops it from the
+  persisted set, and fails over to a healthy standby if it was the active
+  worker (`delete_worker_from_set` in `multi_worker.rs`, unit-tested for
+  active/non-active/unknown cases).
 - ✅ **Multipath ARQ packet bonding** — `multipath_bond.rs`. Stripe or mirror
   frames across multiple lossy lanes (cellular, Wi-Fi, DNS tunnel), each lane
   running its own ARQ sender/receiver, with global bond-sequence reassembly and

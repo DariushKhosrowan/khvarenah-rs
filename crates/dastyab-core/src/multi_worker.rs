@@ -171,6 +171,15 @@ pub trait WorkerPeer: Send + Sync {
     /// Probe a worker's step-0 health. Returns `true` if alive.
     async fn worker_alive(&self, host: &str) -> bool;
 
+    /// Delete a deployed worker (removes the CF script). The supplied `name`
+    /// is the CF-side slug. Returns Ok if deleted or already absent.
+    async fn delete_worker(
+        &self,
+        profile_id: &str,
+        account_id: &str,
+        name: &str,
+    ) -> Result<(), CFError>;
+
     /// Persist the worker set for a profile.
     fn save_set(&self, profile_id: &str, set: &WorkerSet) -> Result<(), CFError>;
 }
@@ -287,6 +296,57 @@ pub async fn failover_worker_set<P: WorkerPeer>(
     Ok(false)
 }
 
+/// Delete a worker from the set: removes the remote CF script, drops it from
+/// the persisted set, and — if the deleted worker was the active one — fails
+/// over to the healthiest remaining worker that is still alive.
+///
+/// Returns the new active worker name (if any) after deletion.
+pub async fn delete_worker_from_set<P: WorkerPeer>(
+    peer: &P,
+    profile_id: &str,
+    account_id: &str,
+    name: &str,
+) -> Result<Option<String>, CFError> {
+    let mut set = profiles::load_profile(profile_id).config.worker_set;
+    // Snapshot the old active worker before removal.
+    let was_active = set.active_worker().map(|w| w.name.clone());
+    let before = set.len();
+
+    if set.get(name).is_none() {
+        return Err(CFError::new(
+            "DeleteWorker",
+            format!("worker '{name}' is not in the set"),
+            "Run `dastyab multi-worker status` to list workers.",
+        ));
+    }
+
+    // Remove the remote CF script.
+    peer.delete_worker(profile_id, account_id, name).await?;
+
+    set.workers.retain(|w| w.name != name);
+    if set.is_empty() {
+        peer.save_set(profile_id, &set)?;
+        return Ok(None);
+    }
+
+    // If we deleted the active worker, fail over to the healthiest alive one.
+    if was_active.as_deref() == Some(name) {
+        let healthy = probe_worker_set(peer, &set).await;
+        if let Some(next) = select_active_worker(&set, &healthy) {
+            set.set_active(&next);
+        } else if let Some(first) = set.workers.first().map(|w| w.name.clone()) {
+            // None healthy/reported: keep the set usable by marking the first,
+            // which gives the user a deterministic active to inspect.
+            set.set_active(&first);
+        }
+    }
+
+    let after = set.len();
+    debug_assert!(after + 1 == before, "delete must remove exactly one worker");
+    peer.save_set(profile_id, &set)?;
+    Ok(set.active_worker().map(|w| w.name.clone()))
+}
+
 /// Real `WorkerPeer`: talks to the live Cloudflare API and network.
 pub struct RealWorkerPeer;
 
@@ -340,6 +400,34 @@ impl WorkerPeer for RealWorkerPeer {
             crate::autopilot::probe_worker_health(host, None, Some(&doh), 8).await,
             crate::autopilot::WorkerHealth::Alive
         )
+    }
+
+    async fn delete_worker(
+        &self,
+        profile_id: &str,
+        account_id: &str,
+        name: &str,
+    ) -> Result<(), CFError> {
+        let label = profiles::get_active_token(profile_id)?;
+        let token = match label {
+            Some(l) => profiles::get_token(profile_id, &l)?.ok_or_else(|| {
+                CFError::new(
+                    "DeleteWorker",
+                    "Active token not found.",
+                    "Re-add the token.",
+                )
+            })?,
+            None => {
+                return Err(CFError::new(
+                    "DeleteWorker",
+                    "No active token for this profile.",
+                    "Set an active token before deleting workers.",
+                ))
+            }
+        };
+        let client = crate::cf::Client::new(&token);
+        client.delete_script(account_id, name).await?;
+        Ok(())
     }
 
     fn save_set(&self, profile_id: &str, set: &WorkerSet) -> Result<(), CFError> {
@@ -444,6 +532,15 @@ mod tests {
             self.alive_hosts.iter().any(|h| h == host)
         }
 
+        async fn delete_worker(
+            &self,
+            _profile_id: &str,
+            _account_id: &str,
+            _name: &str,
+        ) -> Result<(), CFError> {
+            Ok(())
+        }
+
         fn save_set(&self, _profile_id: &str, set: &WorkerSet) -> Result<(), CFError> {
             *self.saved.lock().unwrap() = Some(set.clone());
             Ok(())
@@ -516,5 +613,70 @@ mod tests {
         // First deployed worker becomes active. Base name derives from the
         // account ("acc" -> safe name "acc"), so the variants are acc-0, acc-1.
         assert_eq!(set.active_worker().map(|w| w.name.as_str()), Some("acc-0"));
+    }
+
+    fn make_saved_peer(alive: Vec<&str>) -> FakeWorkerPeer {
+        FakeWorkerPeer {
+            alive_hosts: alive.into_iter().map(|s| s.to_string()).collect(),
+            deploy_ok: true,
+            saved: std::sync::Mutex::new(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_active_worker_fails_over_to_healthy_standby() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(tmp.path().to_path_buf());
+        let id = crate::store::profiles::create_profile("t", "").unwrap();
+        let set = make_set(&["a", "b"], Some("a"));
+        let mut p = crate::store::profiles::load_profile(&id);
+        p.config.worker_set = set;
+        crate::store::profiles::save_profile(&p).unwrap();
+        // Only "b" is alive; deleting active "a" must switch to "b".
+        let peer = make_saved_peer(vec!["b.sub.workers.dev"]);
+        let next = delete_worker_from_set(&peer, &id, "acc", "a")
+            .await
+            .unwrap();
+        assert_eq!(next.as_deref(), Some("b"));
+        let saved = peer.saved.lock().unwrap();
+        let saved = saved.as_ref().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved.active_worker().map(|w| w.name.as_str()), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn delete_non_active_worker_keeps_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(tmp.path().to_path_buf());
+        let id = crate::store::profiles::create_profile("t", "").unwrap();
+        let set = make_set(&["a", "b"], Some("a"));
+        let mut p = crate::store::profiles::load_profile(&id);
+        p.config.worker_set = set;
+        crate::store::profiles::save_profile(&p).unwrap();
+        let peer = make_saved_peer(vec!["a.sub.workers.dev", "b.sub.workers.dev"]);
+        let next = delete_worker_from_set(&peer, &id, "acc", "b")
+            .await
+            .unwrap();
+        assert_eq!(next.as_deref(), Some("a"));
+        let saved = peer.saved.lock().unwrap();
+        let saved = saved.as_ref().unwrap();
+        assert_eq!(saved.active_worker().map(|w| w.name.as_str()), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_worker_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(tmp.path().to_path_buf());
+        let id = crate::store::profiles::create_profile("t", "").unwrap();
+        let set = make_set(&["a"], Some("a"));
+        let mut p = crate::store::profiles::load_profile(&id);
+        p.config.worker_set = set;
+        crate::store::profiles::save_profile(&p).unwrap();
+        let peer = make_saved_peer(vec!["a.sub.workers.dev"]);
+        let err = delete_worker_from_set(&peer, &id, "acc", "nope")
+            .await
+            .unwrap_err();
+        // err.detail carries the human message; title identifies the action.
+        assert!(err.detail.contains("not in the set"));
     }
 }
