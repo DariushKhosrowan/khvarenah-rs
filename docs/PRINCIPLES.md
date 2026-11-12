@@ -253,7 +253,9 @@ Implemented and committed (see `ROADMAP.md`):
 
 Remaining gaps tracked as open work (see `ROADMAP.md` → **Doctrine gaps**):
 
-- [ ] **P2P LAN mesh** — mDNS neighbor discovery + relay (Level 4).
+- [x] **P2P LAN mesh — discovery + relay selection** — `lan_mesh.rs`
+  broadcast-beacon discovery (Level 4). The relay **transport** that forwards
+  traffic through a discovered neighbor remains as follow-up work.
 
 ---
 

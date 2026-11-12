@@ -281,3 +281,14 @@ every recovered node, and promotes a verified-healthy one. Wired into the
 daemon's self-maintenance (rate-limited), exposed as `dastyab nodes refill`.
 6 unit tests.
 
+## 29. `lan_mesh.rs` — Level-4 intranet P2P LAN mesh
+The final resilience-ladder rung (PRINCIPLES §3 Level 4). A raw-UDP broadcast
+beacon (`UDP_PORT` 5837, magic `DYBMESH1`) advertises each instance's peer id,
+relay port, and live-upstream status. `NeighborTable` ingests heartbeats,
+prunes stale peers after `NEIGHBOR_TIMEOUT_SECS`, and `best_relay` picks the
+best hop candidate (fresh + uplink, lowest EWMA RTT, then recency). Self-echo
+is filtered via `forget`. Exposed as `dastyab mesh {discover|listen|relay}`.
+This is the discovery+selection layer; a relay *transport* that forwards
+traffic through the candidate remains the follow-up (tracked in ROADMAP).
+6 unit tests.
+

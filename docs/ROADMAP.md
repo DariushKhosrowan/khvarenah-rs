@@ -69,7 +69,14 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 ## 🔜 Next — Doctrine gaps (remaining)
 
 - **WinTUN / `VpnService.protect`** platform execution (Windows/Android).
-- **P2P LAN mesh** — mDNS neighbor discovery + relay (Level 4).
+
+## ✅ Done — Doctrine gaps
+
+- **P2P LAN mesh — discovery + relay selection (Level 4)** — `lan_mesh.rs`
+  broadcast-beacon discovery + neighbor table + `best_relay` candidate
+  selection, exposed as `dastyab mesh {discover|listen|relay}`. This closes
+  the final ladder rung's discovery half; a relay **transport** that forwards
+  traffic through the candidate is tracked as follow-up below.
 
 ## ✅ Done — Efficiency doctrine (§6.5)
 
@@ -96,6 +103,9 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   worker URL and checks it responds.
 - **UDP-native DNS tunnel** — move the client off TCP-style framing toward the
   low-overhead ARQ over raw UDP (5–7 byte overhead target).
+- **Mesh relay transport (Level 4)** — forward traffic through the `best_relay`
+  LAN neighbor discovered by `lan_mesh` (local hop forwarding) to complete the
+  Level-4 ladder rung end-to-end.
 - **Multi-worker management** — list/delete/update workers from one place.
 - **DNS smoke test** — verify a DNS record resolves through Cloudflare.
 - **GUI async/threading** — run scans in a real background task so the UI

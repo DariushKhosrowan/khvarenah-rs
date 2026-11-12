@@ -212,6 +212,12 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             dry_run,
             mtu,
         } => cmd_platform(&action, dry_run, mtu),
+        Command::Mesh {
+            action,
+            window,
+            upstream,
+            name,
+        } => cmd_mesh(&action, window, upstream, &name),
         Command::Nodes {
             action,
             profile,
@@ -3636,6 +3642,113 @@ fn cmd_platform(action: &str, dry_run: bool, mtu: u32) -> Result<(), CFError> {
             "platform",
             format!("unknown action {action:?}"),
             "Use: apply | teardown | plan",
+        )),
+    }
+}
+
+/// Level-4 intranet P2P LAN mesh (PRINCIPLES §3 Level 4). Discovers other
+/// DastYab instances on the local network and reports the best relay
+/// candidate (a peer with a live upstream uplink).
+fn cmd_mesh(action: &str, window: u64, upstream: bool, name: &str) -> Result<(), CFError> {
+    use dastyab_core::lan_mesh;
+    let action = action.trim().to_lowercase();
+    let now = dastyab_core::store::profiles::now_ts() as u64;
+
+    // Stable per-host peer id (hostname). Good enough for a beacon identity on
+    // a private LAN; the daemon can substitute its own UUID.
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_else(|_| "dastyab".to_string());
+    let label = if name.is_empty() {
+        host.clone()
+    } else {
+        name.to_string()
+    };
+
+    match action.as_str() {
+        "discover" => {
+            println!(
+                "[mesh] sweeping LAN for {}s (window={window}s)…",
+                lan_mesh::UDP_PORT
+            );
+            let (table, heard) = lan_mesh::discover_once(&host, &label, upstream, window, now);
+            let live = table.live(now);
+            println!(
+                "[mesh] heard {heard} datagram(s), {} live peer(s)",
+                live.len()
+            );
+            for n in &live {
+                println!(
+                    "  {} @ {}  uplink={} rtt={}ms last_seen={}s ago",
+                    n.name,
+                    n.addr,
+                    if n.has_uplink { "yes" } else { "no" },
+                    n.rtt_ms,
+                    now.saturating_sub(n.last_seen_unix)
+                );
+            }
+            match table.best_relay(now) {
+                Some(b) => println!(
+                    "[mesh] best relay candidate: {} @ {} (uplink, rtt={}ms)",
+                    b.name, b.addr, b.rtt_ms
+                ),
+                None => println!("[mesh] no relay candidate with a live upstream uplink found"),
+            }
+            Ok(())
+        }
+        "listen" => {
+            let table = lan_mesh::NeighborTable::new();
+            let _ = lan_mesh::broadcast_beacon(
+                std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0),
+                std::net::Ipv4Addr::new(255, 255, 255, 255),
+                &lan_mesh::Beacon::new(&host, &label, upstream),
+            );
+            println!("[mesh] listening for beacons for {window}s (ctr-c to stop)…");
+            let heard = lan_mesh::listen_once(
+                std::net::SocketAddr::new(
+                    std::net::Ipv4Addr::UNSPECIFIED.into(),
+                    lan_mesh::UDP_PORT,
+                ),
+                &table,
+                window,
+                now,
+            )
+            .unwrap_or(0);
+            table.forget(&host);
+            println!("[mesh] heard {heard} beacon(s)");
+            for n in table.live(now) {
+                println!(
+                    "  {} @ {}  uplink={} rtt={}ms",
+                    n.name,
+                    n.addr,
+                    if n.has_uplink { "yes" } else { "no" },
+                    n.rtt_ms
+                );
+            }
+            Ok(())
+        }
+        "relay" => {
+            let (table, heard) = lan_mesh::discover_once(&host, &label, upstream, window, now);
+            match table.best_relay(now) {
+                Some(b) => {
+                    println!(
+                        "[mesh] relay candidate: {} @ {}",
+                        b.name, b.addr
+                    );
+                    println!("[mesh] heard {heard} datagram(s)");
+                    Ok(())
+                }
+                None => Err(CFError::new(
+                    "mesh",
+                    format!("no relay candidate found (heard {heard} datagram(s))"),
+                    "Ensure another DastYab instance with a live uplink runs on this LAN, then retry.",
+                )),
+            }
+        }
+        other => Err(CFError::new(
+            "mesh",
+            format!("unknown action {other:?}"),
+            "Use: discover | listen | relay",
         )),
     }
 }

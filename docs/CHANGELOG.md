@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — 2026-11-13
+
+### Added (Level-4 P2P LAN mesh — the final resilience-ladder rung)
+
+- **`dastyab-core::lan_mesh`** (new module): intranet P2P discovery via a
+  tiny raw-UDP broadcast beacon (`UDP_PORT` 5837, magic `DYBMESH1`). Each
+  instance advertises its peer id, relay port, and whether it currently holds a
+  live upstream uplink (`has_uplink`). A `NeighborTable` keeps heartbeats
+  fresh (stale pruned after `NEIGHBOR_TIMEOUT_SECS`), and `best_relay` picks
+  the best hop candidate — preferring a fresh peer with an active uplink,
+  lowest EWMA RTT, then recency. Self-echo is filtered so a host never treats
+  its own broadcast as a peer. 6 unit tests.
+- **CLI**: `dastyab mesh {discover|listen|relay} [--window SECS] [--upstream]
+  [--name LABEL]`. `discover` sweeps the LAN and reports live peers + the best
+  relay candidate; `listen` announces this host and watches for peers; `relay`
+  resolves the best hop candidate and errors clearly if none exists. This is
+  the discovery/selection half of doctrine Level 4 — the transport layer can
+  open a local hop through the returned candidate.
+- **Doctrine coverage**: Level 4 of the resilience ladder (PRINCIPLES §3) is
+  now implemented at the discovery+selection layer, closing the last open
+  ladder rung; the remaining sub-task is a relay *transport* that uses the
+  candidate (tracked in ROADMAP).
+
 ## Unreleased — 2026-11-12
 
 ### Added (node provenance + periodic config-health decay)

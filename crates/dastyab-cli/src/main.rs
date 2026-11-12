@@ -467,6 +467,25 @@ enum Command {
         #[arg(long, default_value_t = 1290)]
         mtu: u32,
     },
+    /// Level-4 intranet P2P LAN mesh: discover other DastYab instances on
+    /// the local network and pick one with a live upstream uplink to use as a
+    /// local hop relay during a total blackout. The final rung of the
+    /// resilience ladder (PRINCIPLES §3 Level 4).
+    Mesh {
+        /// Action: discover | listen | list | relay.
+        #[arg()]
+        action: String,
+        /// Seconds to listen for beacons during discovery (default 6).
+        #[arg(long, default_value_t = 6)]
+        window: u64,
+        /// Advertise this instance as having a live upstream uplink (default
+        /// false — only the daemon knows the true state).
+        #[arg(long)]
+        upstream: bool,
+        /// Host label advertised in beacons (default: hostname).
+        #[arg(long, default_value = "")]
+        name: String,
+    },
     /// Manage native config-storage nodes (imported from v2rayN or pasted).
     Nodes {
         /// Sub-command: import | paste | activate | list | clear | probe |
