@@ -205,6 +205,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::Journal { action } => cmd_journal(&profile, action),
         Command::Autonomy { action } => cmd_autonomy(&profile, action).await,
         Command::Onboard { action } => cmd_onboard(&profile, action),
+        Command::Aistudio { action } => cmd_aistudio(&action),
     }
 }
 
@@ -3357,6 +3358,46 @@ async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CF
     }
 }
 
+
+fn cmd_aistudio(action: &str) -> Result<(), CFError> {
+    // Delegate to the verified, self-healing Python bridge (project-local).
+    // The Python tool owns the xray tunnel + watchdog; this is a thin wrapper.
+    let script = "/home/amir/Projects/dastyab/dastyab-aistudio.py";
+    let action = action.trim().to_lowercase();
+
+    // Normalize a few natural spellings.
+    let action = match action.as_str() {
+        "start" | "on" | "up" | "open" => "start".to_string(),
+        "stop" | "off" | "down" => "stop".to_string(),
+        "watch" | "watchdog" | "guard" => "watch".to_string(),
+        "verify" | "status" => "verify".to_string(),
+        other => other.to_string(),
+    };
+
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(script).arg(&action);
+    let out = cmd.output().map_err(|e| {
+        CFError::new(
+            "Aistudio launch failed",
+            format!("Could not run {script}: {e}"),
+            "Make sure python3 and the dastyab-aistudio.py script exist.",
+        )
+    })?;
+
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    if !out.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    if !out.status.success() {
+        return Err(CFError::new(
+            "Aistudio returned an error",
+            format!("exit code {:?}", out.status.code()),
+            "Check the tunnel / server pool status.",
+        ));
+    }
+    Ok(())
+}
 fn save_beacon(profile: &str, cfg: &BeaconConfig) -> Result<(), CFError> {
     let mut p = load_profile(profile);
     p.config.beacon = Some(cfg.clone());

@@ -434,6 +434,21 @@ enum Command {
         #[command(subcommand)]
         action: OnboardAction,
     },
+
+    /// Launch/stop the self-healing clean-IP tunnel to Google AI Studio.
+    /// Routes your browser through a working foreign server pool and keeps it
+    /// alive with a watchdog (auto-rotates when a server dies).
+    ///
+    /// Simple usage:
+    ///   dastyab aistudio start     # tunnel + open AI Studio in Chrome
+    ///   dastyab aistudio watch     # self-healing watchdog (background)
+    ///   dastyab aistudio stop      # stop the tunnel
+    ///   dastyab aistudio verify    # show pool + live egress IP
+    Aistudio {
+        #[arg()]
+        action: String,
+    },
+
 }
 
 #[derive(Subcommand)]
