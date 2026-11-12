@@ -96,6 +96,7 @@ pub mod tls;
 pub mod token_provision;
 pub mod token_rotate;
 pub mod tor;
+pub mod tun_route;
 pub mod vless;
 pub mod vps_deploy;
 pub mod vps_provision;
