@@ -555,6 +555,23 @@ enum Command {
         #[arg(long, default_value = "")]
         repos: String,
     },
+    /// Discover verified-live egress anchors from public certificate-transparency
+    /// logs (crt.sh) — an independent, out-of-band bootstrap source that keeps
+    /// recovery from going circular (doctrine §8.1).
+    Anchors {
+        /// Sub-command: discover | list | clear.
+        #[arg()]
+        action: String,
+        /// Profile to operate on (default "default").
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Route queries/probes through the local xray SOCKS5 (NIN/blackout).
+        #[arg(long)]
+        proxy: bool,
+        /// Comma-separated crt.sh query terms (default = DEFAULT_QUERIES).
+        #[arg(long, default_value = "")]
+        queries: String,
+    },
 }
 
 #[derive(Subcommand)]

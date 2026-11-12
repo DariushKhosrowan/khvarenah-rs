@@ -164,6 +164,49 @@ check, the sweep fails over to a verified-healthy one. This is the difference
 between "imported a working config" (can go stale) and "keeping a working
 config at the front" (the doctrine).
 
+## Certificate-Transparency egress-anchor discovery (doctrine §8.1)
+
+Bootstrapping must never be circular: every recovery source should be an
+*independent* out-of-band path. Telegram channels and GitHub repos are two;
+the third is **certificate transparency** — the public log of every domain
+that has ever issued a TLS certificate. Proxy/VPN operator hostnames
+(`v2ray-*`, `vless-*`, `vpn-*`, `.workers.dev`, ...) appear there, often
+before they are shared in any channel, so this source stays alive even when a
+channel net goes quiet.
+
+```
+$ dastyab anchors discover [--proxy] [--queries v2ray,vless,vpn]
+[anchors] CT discovery pass:
+  queries   : 3
+  hosts seen : 420
+  candidates : 97
+  verified   : 29
+  anchors total: 29
+    v2ray-god--tel.workers.dev   978ms via=v2ray
+    ...
+```
+
+How it works (all in `dastyab-core/src/ct_anchors.rs`):
+
+1. **Query** crt.sh (`?q=<term>&output=json`) with backoff retries (it is
+   rate-limited and returns HTML 502 under load). Default terms are strong
+   proxy/VPN signals (`DEFAULT_QUERIES`).
+2. **Filter** CN/SAN hostnames: dedupe, drop junk suffixes, wildcards, and IP
+   literals, and keep only names containing a *strong* keyword (vless,
+   v2ray, vmess, trojan, shadowsocks, ss2022, proxy, vpn, tunnel, relay,
+   gateway) — deliberately excluding generic words (cdn, node, server, ...)
+   that would drown real anchors in noise.
+3. **Probe** each candidate with a real TLS handshake through the pooled
+   `reqwest` client (`https://<host>/`). Only hosts that complete TLS are
+   recorded — silent-TCP blackholes and non-TLS servers are rejected
+   (doctrine §6.4, no fabricated success). Bounded (≤64 probes).
+4. **Persist** verified-live anchors to `<profile>/ct_anchors.json` with
+   probe timestamp, RTT, and provenance query; `anchors list` / `anchors
+   clear` manage the set.
+
+The daemon can consult this anchor set to reseed the node pool when channels
+and repos are both unavailable — a third independent bootstrap leg.
+
 ## Tests
 
 - `config_store` — import (server, dedup, raw-link preservation), paste,

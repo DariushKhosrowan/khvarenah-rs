@@ -281,7 +281,16 @@ every recovered node, and promotes a verified-healthy one. Wired into the
 daemon's self-maintenance (rate-limited), exposed as `dastyab nodes refill`.
 6 unit tests.
 
-## 29. `lan_mesh.rs` — Level-4 intranet P2P LAN mesh
+## 29. `ct_anchors.rs` — CT-log egress-anchor discovery
+Independent, out-of-band bootstrap source (doctrine §8.1). Queries crt.sh
+certificate-transparency logs for proxy/VPN keyword hostnames (with backoff
+retries against 502s), filters CN/SAN entries (dedupe, junk/wildcard/IP
+drop, strong-keyword-only), TLS-verifies candidates through the pooled
+`reqwest` client (`https://<host>/`), and persists verified-live anchors to
+`<profile>/ct_anchors.json` with probe time, RTT, and provenance. Exposed as
+`dastyab anchors {discover|list|clear}`. 4 unit tests.
+
+## 30. `lan_mesh.rs` — Level-4 intranet P2P LAN mesh
 The final resilience-ladder rung (PRINCIPLES §3 Level 4). A raw-UDP broadcast
 beacon (`UDP_PORT` 5837, magic `DYBMESH1`) advertises each instance's peer id,
 relay port, and live-upstream status. `NeighborTable` ingests heartbeats,

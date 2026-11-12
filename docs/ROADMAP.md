@@ -107,6 +107,11 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   export-v2rayn` merges the verified-healthy pool into v2rayN's ServersStore.json
   (dedup by host+port+uuid, atomic write, idempotent). Closes the loop:
   harvest → probe → export healthy → v2rayN GUI.
+- ✅ **CT-log egress-anchor discovery** — `dastyab anchors discover` pulls
+  candidate proxy/VPN anchor hostnames from public certificate-transparency
+  logs (crt.sh), TLS-verifies them via the pooled client, and persists the
+  verified-live set to `<profile>/ct_anchors.json`. An independent,
+  out-of-band bootstrap source (doctrine §8.1) so recovery never goes circular.
 - **Wrangler-free deploy confirmation** — post-deploy smoke test that hits the
   worker URL and checks it responds.
 - **UDP-native DNS tunnel** — move the client off TCP-style framing toward the

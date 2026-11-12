@@ -241,6 +241,12 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             proxy,
             repos,
         } => cmd_sources(&profile, &action, proxy, &repos).await,
+        Command::Anchors {
+            action,
+            profile,
+            proxy,
+            queries,
+        } => cmd_anchors(&profile, &action, proxy, &queries),
     }
 }
 
@@ -272,6 +278,70 @@ async fn cmd_sources(profile: &str, action: &str, proxy: bool, repos: &str) -> R
             "sources",
             format!("unknown action '{other}'"),
             "Use: ingest | refresh",
+        )),
+    }
+}
+
+/// `dastyab anchors {discover|list|clear}` — certificate-transparency
+/// egress-anchor discovery (doctrine §8.1). Independent, out-of-band bootstrap
+/// source beyond Telegram/GitHub, so recovery never goes circular.
+fn cmd_anchors(profile: &str, action: &str, proxy: bool, queries_csv: &str) -> Result<(), CFError> {
+    use dastyab_core::ct_anchors::{
+        discover_ct_anchors, load_anchors, CtAnchorStore, DEFAULT_QUERIES,
+    };
+    match action {
+        "discover" => {
+            let queries: Vec<&str> = if queries_csv.trim().is_empty() {
+                DEFAULT_QUERIES.to_vec()
+            } else {
+                queries_csv
+                    .split(',')
+                    .map(|q| q.trim())
+                    .filter(|q| !q.is_empty())
+                    .collect()
+            };
+            let report = discover_ct_anchors(profile, proxy, &queries);
+            println!("[anchors] CT discovery pass:");
+            println!("  queries   : {}", report.queries);
+            println!("  hosts seen : {}", report.hosts_seen);
+            println!("  candidates : {}", report.candidates);
+            println!("  verified   : {}", report.verified);
+            println!("  added      : {}", report.added);
+            println!("  anchors total: {}", report.anchors_total);
+            let store = load_anchors(profile);
+            for a in &store.anchors {
+                println!("    {:<40} {}ms via={}", a.host, a.ms, a.via);
+            }
+            Ok(())
+        }
+        "list" => {
+            let store = load_anchors(profile);
+            println!("[anchors] verified-live CT egress anchors (profile '{profile}'):");
+            if store.anchors.is_empty() {
+                println!("  (none — run `dastyab anchors discover` first)");
+            }
+            for a in &store.anchors {
+                println!("    {:<40} {}ms via={}", a.host, a.ms, a.via);
+            }
+            Ok(())
+        }
+        "clear" => {
+            let store = CtAnchorStore {
+                anchors: Vec::new(),
+            };
+            dastyab_core::store::atomic_write(
+                &dastyab_core::ct_anchors::anchors_path_pub(profile),
+                &serde_json::to_vec_pretty(&store).map_err(|e| {
+                    CFError::new("anchors", format!("serialize: {e}"), "Internal error.")
+                })?,
+            )?;
+            println!("[anchors] cleared CT anchor set");
+            Ok(())
+        }
+        other => Err(CFError::new(
+            "anchors",
+            format!("unknown action '{other}'"),
+            "Use: discover | list | clear",
         )),
     }
 }
