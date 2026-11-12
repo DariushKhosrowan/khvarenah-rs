@@ -86,7 +86,7 @@ def is_running():
 def start(server_index=0):
     if is_running():
         print(f"[aistudio] Tunnel already running on 127.0.0.1:{SOCK}")
-        return
+        return False, None
     pool = json.load(open(POOL))
     if not pool:
         raise SystemExit("No working servers saved. Run 'verify' first.")
@@ -97,6 +97,7 @@ def start(server_index=0):
     proc = subprocess.Popen([XRAY,"run","-c",cfgpath],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     open(PIDFILE,"w").write(str(proc.pid))
+    open("/tmp/dastyab_aistudio_idx","w").write(str(server_index % len(pool)))
     # wait for port
     for _ in range(20):
         s=socket.socket()
@@ -112,6 +113,59 @@ def start(server_index=0):
     print()
     print(f"[aistudio] Opening AI Studio through the tunnel...")
     launch_browser()
+    return True, server_index % len(pool)
+
+def probe_egress(timeout=12):
+    """Return current egress IP via tunnel, or None if tunnel dead."""
+    try:
+        r = subprocess.run(["curl","-s","--max-time",str(timeout),
+            "--socks5-hostname",f"127.0.0.1:{SOCK}","https://api.ipify.org"],
+            capture_output=True, text=True, timeout=timeout+3)
+        out = r.stdout.strip()
+        return out if out and not out.startswith("curl") else None
+    except Exception:
+        return None
+
+def watch(interval=20, max_fail=2):
+    """Self-healing daemon: probe the tunnel; if it dies, swap to the next
+    live server from the pool. Runs in the background."""
+    import random
+    pool = json.load(open(POOL))
+    if not pool:
+        raise SystemExit("Empty pool")
+    fail = 0
+    idx = 0
+    if os.path.exists("/tmp/dastyab_aistudio_idx"):
+        try: idx = int(open("/tmp/dastyab_aistudio_idx").read())
+        except: pass
+    print(f"[aistudio] Watchdog started: probing every {interval}s (pool={len(pool)})")
+    while True:
+        time.sleep(interval)
+        ip = probe_egress()
+        if ip:
+            fail = 0
+            continue
+        fail += 1
+        if fail >= max_fail:
+            print(f"[aistudio] Tunnel down (probe {fail}). Rotating server...")
+            # stop current
+            stop()
+            time.sleep(1)
+            # try next servers until one works
+            for off in range(1, len(pool)+1):
+                nxt = (idx + off) % len(pool)
+                try:
+                    started, _ = start(nxt)
+                except Exception:
+                    started = False
+                time.sleep(4)
+                if started and probe_egress():
+                    idx = nxt
+                    fail = 0
+                    print(f"[aistudio] Switched to {pool[idx]['addr']}:{pool[idx]['port']}")
+                    break
+            else:
+                print("[aistudio] No server in pool responded. Will retry.")
 
 def stop():
     if os.path.exists(PIDFILE):
@@ -179,6 +233,9 @@ if __name__=="__main__":
         stop()
     elif cmd=="verify":
         verify()
+    elif cmd=="watch":
+        interval = int(sys.argv[2]) if len(sys.argv)>2 else 20
+        watch(interval=interval)
     elif cmd=="build-pool":
         pop_pool(sys.argv[2])
     else:
