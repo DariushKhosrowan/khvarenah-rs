@@ -257,6 +257,7 @@ The `docs/` folder is the single source of truth for the project:
 | Document | What it covers |
 |---|---|
 | [README.md](README.md) | This file — overview, quick start, links |
+| [docs/PRINCIPLES.md](docs/PRINCIPLES.md) | Mission, threat model, resilience ladder, engineering standards |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System maps, data flow, component diagrams |
 | [docs/MODULES.md](docs/MODULES.md) | Module-by-module guide |
 | [docs/API.md](docs/API.md) | Cloudflare API coverage & client reference |

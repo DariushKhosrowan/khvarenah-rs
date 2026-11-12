@@ -21,6 +21,24 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   systemd, Dante SOCKS5 egress).
 - **Domain-selection strategy + user guide** — `docs/BLACKOUT-DNS-TUNNEL-PLAN.md`
   §6 and `docs/USER-GUIDE-DNS-TUNNEL.md`.
+- **Selective-repeat windowed ARQ** (`core/src/arq.rs`) — sender window,
+  receiver reorder buffer, cumulative+SACK, timing retransmission, 16-bit
+  wrap-around; `cargo test -p dastyab-core arq` green.
+- **Project doctrine** — `docs/PRINCIPLES.md` codifies the mission, threat
+  model, resilience ladder, and engineering standards.
+
+## 🔜 Next — Doctrine gaps
+
+- **Authenticated DNS-tunnel responses** — ChaCha20-Poly1305 / Noise
+  validation + poisoned-resolver penalty (doctrine B).
+- **TUN anti-loop routing** — `SO_MARK`/fwmark policy routing (Linux),
+  WinTUN bypass, `VpnService.protect` (doctrine A).
+- **Liveness sentinel** integrated with the racing engine (doctrine C).
+- **MTU/MSS clamping** on the TUN (doctrine D).
+- **Interface-flap handling** via netlink (doctrine E).
+- **P2P LAN mesh** — mDNS neighbor discovery + relay (Level 4).
+- **DNS-tunnel entropy shaping** — pacing/padding + decoy queries
+  (doctrine §5).
 
 ## 🔜 Next
 

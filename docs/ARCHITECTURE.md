@@ -53,6 +53,7 @@ dastyab-core/src/
 ├── health.rs     # TCP / TLS latency + throughput probe
 ├── export.rs     # v2rayN / sing-box / Clash exporters
 ├── analytics.rs  # usage aggregation across scripts
+├── arq.rs       # selective-repeat windowed ARQ for the DNS tunnel
 ├── diagnostics.rs# endpoint diagnostics
 ├── security.rs   # local security audit
 ├── backup.rs     # profile backup / restore
@@ -155,6 +156,8 @@ just works".
 
 ## 8. Where to go next
 
+- [PRINCIPLES.md](PRINCIPLES.md) — the project's mission, threat model, and
+  resilience doctrine (read this first).
 - [MODULES.md](MODULES.md) — read the modules in dependency order.
 - [API.md](API.md) — Cloudflare endpoint coverage.
 - [DESIGN.md](DESIGN.md) — principles and conventions behind the code.

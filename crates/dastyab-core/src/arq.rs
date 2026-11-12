@@ -130,6 +130,11 @@ impl ArqSender {
         self.in_flight.len()
     }
 
+    /// Whether the given sequence number is still unacknowledged in flight.
+    pub fn is_inflight(&self, seq: Seqno) -> bool {
+        self.in_flight.contains_key(&seq)
+    }
+
     /// Lowest unacknowledged sequence number (the window base).
     pub fn base(&self) -> Seqno {
         self.base

@@ -409,7 +409,7 @@ mod tests {
             };
             let name = frame.encode_name_clamped(BASE, NONCE, MAX_QNAME_LEN);
             let decoded = TunnelFrame::decode_name(&name, BASE).unwrap();
-            assert_eq!(tx.0, seqs[i].0);
+            assert_eq!(frame.seq, seqs[i].0);
             assert_eq!(decoded.payload, payloads[i]);
             // Receiver buffers the out-of-order frame.
             assert_eq!(rx.recv(seqs[i], &decoded.payload), RecvVerdict::Accepted);
@@ -419,7 +419,9 @@ mod tests {
         let (cum, sack) = rx.ack();
         tx.on_ack(cum, sack);
         assert_eq!(tx.inflight(), 1);
-        assert!(tx.in_flight.contains_key(&seqs[0]));
+        assert!(tx.is_inflight(seqs[0]));
+        assert!(!tx.is_inflight(seqs[1]));
+        assert!(!tx.is_inflight(seqs[2]));
 
         // The lost frame retransmits through the wire format and is delivered.
         let retx = tx.retransmit(seqs[0]).expect("retx payload");
