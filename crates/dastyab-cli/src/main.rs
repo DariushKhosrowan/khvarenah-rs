@@ -179,6 +179,11 @@ enum Command {
     },
     /// Show history.
     History,
+    /// Manage the saved clean-IP ledger (list / remove / clear).
+    Cleanip {
+        #[command(subcommand)]
+        action: CleanipAction,
+    },
     /// List / show / export generated configs (the completeness ledger).
     Configs {
         #[command(subcommand)]
@@ -423,6 +428,36 @@ enum Command {
         #[command(subcommand)]
         action: OnboardAction,
     },
+}
+
+#[derive(Subcommand)]
+pub enum CleanipAction {
+    /// List saved clean IPs with provenance (source, port, country, verified times).
+    /// Mirrors the GUI Clean-IPs manager. Default: human table sorted by endpoint.
+    List {
+        /// Sort field: ip | port | source | country | added | last.
+        #[arg(long, default_value = "ip")]
+        sort: String,
+        /// Only show endpoints whose country begins with this (e.g. --country IR).
+        #[arg(long)]
+        country: Option<String>,
+        /// Only show endpoints matching this text substring (endpoint / source).
+        #[arg(long)]
+        search: Option<String>,
+        /// Only show endpoints from a given source (scan | import | manual).
+        #[arg(long)]
+        source: Option<String>,
+        /// Emit JSON instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove one saved clean IP by its endpoint string.
+    Remove {
+        #[arg()]
+        ip: String,
+    },
+    /// Remove all saved clean IPs.
+    Clear,
 }
 
 #[derive(Subcommand)]

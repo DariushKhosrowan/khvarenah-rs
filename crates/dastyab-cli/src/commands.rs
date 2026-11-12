@@ -15,7 +15,7 @@ use dastyab_core::{CFError, BRAND, VERSION};
 use std::path::PathBuf;
 
 use crate::{
-    BackupAction, Command, DaemonAction, DnsAction, ProtectionAction, RoutesAction,
+    BackupAction, Command, CleanipAction, DaemonAction, DnsAction, ProtectionAction, RoutesAction,
     SnapshotsAction, WorkspaceAction,
 };
 use dastyab_core::remote_beacon::BeaconConfig;
@@ -130,6 +130,13 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             .await
         }
         Command::History => history(&profile),
+        Command::Cleanip { action } => {
+            let out = cleanip_cmd(&profile, action)?;
+            if !out.is_empty() {
+                println!("{out}");
+            }
+            Ok(())
+        }
         Command::Configs { action } => configs_cmd(&profile, action),
         Command::Status => status(&profile),
         Command::Migrate => {
@@ -928,6 +935,116 @@ fn history(profile: &str) -> Result<(), CFError> {
         );
     }
     Ok(())
+}
+
+/// Manage the saved clean-IP ledger (mirror of the GUI Clean-IPs manager).
+/// Returns the rendered output as a String (empty when nothing to report) so
+/// the CLI prints it and tests can assert on it directly.
+fn cleanip_cmd(profile: &str, action: CleanipAction) -> Result<String, CFError> {
+    use dastyab_core::store::profiles::{
+        clean_ip_meta, clear_clean_ips, remove_clean_ip, CleanIpMeta,
+    };
+    match action {
+        CleanipAction::List {
+            sort,
+            country,
+            search,
+            source,
+            json,
+        } => {
+            let p = load_profile(profile);
+            if p.clean_ips.is_empty() {
+                return Ok(format!("No saved clean IPs in profile '{profile}'."));
+            }
+            // Build rows: endpoint + meta (default when missing).
+            let meta_map = clean_ip_meta(profile);
+            let mut rows: Vec<(String, CleanIpMeta)> = p
+                .clean_ips
+                .into_iter()
+                .map(|ep| {
+                    let m = meta_map.get(&ep).cloned().unwrap_or_default();
+                    (ep, m)
+                })
+                .collect();
+            // Filters.
+            if let Some(src) = source {
+                rows.retain(|(_, m)| m.source == src);
+            }
+            if let Some(cc) = &country {
+                let cc_up = cc.to_uppercase();
+                rows.retain(|(_, m)| {
+                    m.country.as_ref().map(|c| c.to_uppercase()).as_deref()
+                        == Some(cc_up.as_str())
+                });
+            }
+            if let Some(q) = search {
+                let ql = q.to_lowercase();
+                rows.retain(|(ep, m)| {
+                    ep.to_lowercase().contains(&ql) || m.source.to_lowercase().contains(&ql)
+                });
+            }
+            // Sort.
+            rows.sort_by(|(epa, ma), (epb, mb)| match sort.as_str() {
+                "port" => ma.port.cmp(&mb.port).then_with(|| epa.cmp(epb)),
+                "source" => ma.source.cmp(&mb.source).then_with(|| epa.cmp(epb)),
+                "country" => {
+                    ma.country.cmp(&mb.country).then_with(|| epa.cmp(epb))
+                }
+                "added" => ma.first_verified_at.cmp(&mb.first_verified_at).then_with(|| epa.cmp(epb)),
+                "last" => ma.last_verified_at.cmp(&mb.last_verified_at).then_with(|| epa.cmp(epb)),
+                _ => epa.cmp(epb),
+            });
+            if json {
+                let arr: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|(ep, m)| {
+                        serde_json::json!({
+                            "endpoint": ep,
+                            "source": m.source,
+                            "port": m.port,
+                            "country": m.country,
+                            "first_verified_at": m.first_verified_at,
+                            "last_verified_at": m.last_verified_at,
+                        })
+                    })
+                    .collect();
+                return Ok(serde_json::to_string_pretty(&arr).unwrap());
+            }
+            let mut out = format!("Clean IPs ({}):\n", rows.len());
+            for (ep, m) in &rows {
+                // Prefer the stored meta country; fall back to a live geoip
+                // lookup (entries recorded before the geo-tag round have
+                // `country: None` in their meta).
+                let cc = m
+                    .country
+                    .clone()
+                    .or_else(|| {
+                        let ip_part = ep.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(ep);
+                        ip_part
+                            .parse::<std::net::IpAddr>()
+                            .ok()
+                            .and_then(|ip| dastyab_core::geoip::GeoDB::load(None).country_code(&ip))
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                out.push_str(&format!(
+                    "  {ep:<24} src={:<7} port={:<5} cc={}\n",
+                    m.source, m.port, cc
+                ));
+            }
+            Ok(out)
+        }
+        CleanipAction::Remove { ip } => {
+            if remove_clean_ip(profile, &ip)? {
+                Ok(format!("Removed clean IP '{ip}'"))
+            } else {
+                Ok(format!("No clean IP '{ip}' found in profile '{profile}'."))
+            }
+        }
+        CleanipAction::Clear => {
+            clear_clean_ips(profile)?;
+            Ok(format!("Cleared all clean IPs for profile '{profile}'."))
+        }
+    }
 }
 
 fn configs_cmd(profile: &str, action: crate::ConfigsAction) -> Result<(), CFError> {
@@ -4154,6 +4271,85 @@ mod tests {
             let p = dastyab_core::store::profiles::load_profile(&id);
             assert_eq!(p.config.light_timeout_secs, 200);
             assert_eq!(p.config.deep_timeout_secs, 0, "unflagged keeps default");
+        });
+    }
+
+    #[test]
+    fn cleanip_list_sorts_and_filters_by_country() {
+        config_test_home(|id| {
+            use dastyab_core::store::profiles::remember_clean_ip_with_source;
+            // 81.0.0.1 → IR, 1.1.1.1 → unknown (builtin table).
+            remember_clean_ip_with_source(&id, "81.0.0.1:443", "scan").unwrap();
+            remember_clean_ip_with_source(&id, "1.1.1.1:443", "manual").unwrap();
+            // Default list (sorted by endpoint) renders both with source/cc.
+            let out = cleanip_cmd(
+                &id,
+                CleanipAction::List {
+                    sort: "ip".into(),
+                    country: None,
+                    search: None,
+                    source: None,
+                    json: false,
+                },
+            )
+            .unwrap();
+            assert!(out.contains("81.0.0.1"), "out: {out}");
+            assert!(out.contains("cc=IR"), "out: {out}");
+            assert!(out.contains("manual"), "out: {out}");
+            // Filter to IR only.
+            let out2 = cleanip_cmd(
+                &id,
+                CleanipAction::List {
+                    sort: "ip".into(),
+                    country: Some("IR".into()),
+                    search: None,
+                    source: None,
+                    json: false,
+                },
+            )
+            .unwrap();
+            assert!(out2.contains("81.0.0.1"), "out2: {out2}");
+            assert!(!out2.contains("1.1.1.1"), "out2: {out2}");
+        });
+    }
+
+    #[test]
+    fn cleanip_list_json_emits_meta_fields() {
+        config_test_home(|id| {
+            use dastyab_core::store::profiles::remember_clean_ip_with_source;
+            remember_clean_ip_with_source(&id, "81.0.0.1:443", "scan").unwrap();
+            let out = cleanip_cmd(
+                &id,
+                CleanipAction::List {
+                    sort: "ip".into(),
+                    country: None,
+                    search: None,
+                    source: None,
+                    json: true,
+                },
+            )
+            .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+            let arr = v.as_array().unwrap();
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0]["endpoint"], "81.0.0.1:443");
+            assert_eq!(arr[0]["country"], "IR");
+            assert_eq!(arr[0]["source"], "scan");
+        });
+    }
+
+    #[test]
+    fn cleanip_remove_and_clear_mutate_ledger() {
+        config_test_home(|id| {
+            use dastyab_core::store::profiles::{remember_clean_ip_with_source, clean_ip_meta};
+            remember_clean_ip_with_source(&id, "81.0.0.1:443", "scan").unwrap();
+            remember_clean_ip_with_source(&id, "8.8.8.8:443", "scan").unwrap();
+            cleanip_cmd(&id, CleanipAction::Remove { ip: "81.0.0.1:443".into() }).unwrap();
+            let remaining = clean_ip_meta(&id);
+            assert!(!remaining.contains_key("81.0.0.1:443"));
+            assert!(remaining.contains_key("8.8.8.8:443"));
+            cleanip_cmd(&id, CleanipAction::Clear).unwrap();
+            assert!(clean_ip_meta(&id).is_empty());
         });
     }
 }
