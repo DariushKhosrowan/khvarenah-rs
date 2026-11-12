@@ -97,6 +97,11 @@ async fn fetch_preview_page(
     if let Some(b) = before {
         url.push_str(&format!("?before={b}"));
     }
+    // Anti-bot stealth: human-shaped pause *before* each t.me request. This
+    // keeps a multi-page/aggreg-channel archive walk from tripping t.me's
+    // rate-limit (which surfaced as intermittent body-decode fetch errors).
+    // The global toggle (DASTYAB_STEALTH=0 / --no-stealth) disables it.
+    crate::stealth::pre_request_pause("read").await;
     let resp = client.get(&url).send().await.map_err(|e| {
         CFError::new(
             "harvest",
