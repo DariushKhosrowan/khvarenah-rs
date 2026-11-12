@@ -205,9 +205,11 @@ Implemented and committed (see `ROADMAP.md`):
   idempotent against live rules (`tun_route.rs`).
 - **MTU/MSS clamping** (doctrine D) — adaptive and fixed TCP MSS-clamp rule
   plan generator (`tun_mtu.rs`).
+- **Platform execution** (doctrine A/D) — `platform_linux.rs` applies the plans
+  via `ip`/`iptables` with a **dry-run** mode for CI, RAII TUN teardown, and
+  a `dastyab platform {plan|apply|teardown}` CLI command. Builds run on
+  GitHub Actions runners (not the local laptop) — see `.github/workflows/`.
 
 Remaining gaps tracked as open work (see `ROADMAP.md` → **Doctrine gaps**):
 
-- [ ] **Platform execution** of the doctrine A/D rule plans (Linux `ip`/`ip6tables`
-      invocation, TUN device bring-up, WinTUN / `VpnService.protect`).
 - [ ] **P2P LAN mesh** — mDNS neighbor discovery + relay (Level 4).

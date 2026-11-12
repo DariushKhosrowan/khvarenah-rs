@@ -56,9 +56,7 @@ impl SysfsInterfaceMonitor {
     /// Build from an explicit sysfs directory (mainly for tests, or for
     /// non-standard paths).
     pub fn from_dir(dir: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            path: dir.into(),
-        }
+        Self { path: dir.into() }
     }
 
     fn read_carrier(&self) -> InterfaceState {
@@ -202,11 +200,8 @@ mod tests {
 
     #[test]
     fn single_down_sample_is_debounced_away() {
-        let m = ScriptedMonitor::new(&[
-            InterfaceState::Down,
-            InterfaceState::Up,
-            InterfaceState::Up,
-        ]);
+        let m =
+            ScriptedMonitor::new(&[InterfaceState::Down, InterfaceState::Up, InterfaceState::Up]);
         let mut d = FlapDetector::new(m, 2, InterfaceState::Up);
         assert!(!d.sample_once()); // 1st Down: below debounce
         assert!(!d.sample_once()); // recovery

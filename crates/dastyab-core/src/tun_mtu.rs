@@ -175,7 +175,8 @@ num pkts bytes target prot opt in out source destination
 
     #[test]
     fn parse_detects_fixed_mss() {
-        let out = "1 0 0 TCPMSS tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcpflags:0x06/0x06 TCPMSS set mss 1250\n";
+        let out =
+            "1 0 0 TCPMSS tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcpflags:0x06/0x06 TCPMSS set mss 1250\n";
         let clamps = parse_existing_mss_clamps(out);
         assert!(clamps.contains("--set-mss 1250"));
     }

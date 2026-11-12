@@ -68,7 +68,10 @@ impl DnsTunnelKey {
         let mut key = [0u8; 32];
         let n = raw.len().min(32);
         key[..n].copy_from_slice(&raw[..n]);
-        let session_tag = format!("{:08x}", u32::from_be_bytes([key[28], key[29], key[30], key[31]]));
+        let session_tag = format!(
+            "{:08x}",
+            u32::from_be_bytes([key[28], key[29], key[30], key[31]])
+        );
         Self { key, session_tag }
     }
 
@@ -104,7 +107,13 @@ pub fn seal(key: &DnsTunnelKey, plaintext: &[u8]) -> Vec<u8> {
     let nonce_bytes: [u8; NONCE_LEN] = rand::random();
     let nonce = Nonce::from(nonce_bytes);
     let ct = cipher
-        .encrypt(&nonce, Payload { msg: plaintext, aad: key.session_tag.as_bytes() })
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad: key.session_tag.as_bytes(),
+            },
+        )
         .expect("chacha20poly1305 encrypt cannot fail for in-memory input");
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce_bytes);
@@ -129,7 +138,13 @@ pub fn open(key: &DnsTunnelKey, authed: &[u8]) -> Result<Vec<u8>, CFError> {
     let nonce = Nonce::from(nonce_bytes);
     let ct = &authed[NONCE_LEN..];
     cipher
-        .decrypt(&nonce, Payload { msg: ct, aad: key.session_tag.as_bytes() })
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ct,
+                aad: key.session_tag.as_bytes(),
+            },
+        )
         .map_err(|_| {
             CFError::new(
                 "dns-tunnel-auth",
@@ -145,8 +160,8 @@ mod tests {
 
     fn test_key() -> DnsTunnelKey {
         let raw: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
         ];
         DnsTunnelKey::from_bytes(&raw)
     }

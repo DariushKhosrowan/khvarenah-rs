@@ -207,6 +207,11 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::Autonomy { action } => cmd_autonomy(&profile, action).await,
         Command::Onboard { action } => cmd_onboard(&profile, action),
         Command::Aistudio { action } => cmd_aistudio(&action),
+        Command::Platform {
+            action,
+            dry_run,
+            mtu,
+        } => cmd_platform(&action, dry_run, mtu),
     }
 }
 
@@ -3423,6 +3428,82 @@ fn cmd_aistudio(action: &str) -> Result<(), CFError> {
     }
     Ok(())
 }
+
+/// Execute the doctrine A+D platform network rules (anti-loop fwmark
+/// routing + TCP MSS clamp). Supports:
+///   dastyab platform apply      -- install rules (needs root)
+///   dastyab platform teardown   -- remove rules we installed
+///   dastyab platform plan       -- just print what would run (dry-run)
+/// Pass `--dry-run` to preview any action without touching the system.
+fn cmd_platform(action: &str, dry_run: bool, mtu: u32) -> Result<(), CFError> {
+    let action = action.trim().to_lowercase();
+    let mut ex = dastyab_core::platform_linux::PlatformExecutor::new(dry_run);
+
+    match action.as_str() {
+        "apply" | "on" | "up" => {
+            let routing = ex.apply_routing_policy(dastyab_core::tun_route::TUN_FWMARK)?;
+            let clamp = ex.apply_mss_clamp(mtu)?;
+            println!(
+                "[platform] applied {} routing rule(s) + {} mss clamp rule(s) (mtu={mtu})",
+                routing.plan.install.len(),
+                clamp.plan.install.len()
+            );
+            if dry_run {
+                println!("[platform] --dry-run enabled; no system changes were made.");
+                for c in &ex.log {
+                    println!("  would run: {c}");
+                }
+            }
+            Ok(())
+        }
+        "teardown" | "off" | "down" => {
+            // Re-plan so install commands are empty, then run uninstall:
+            // discover current state, plan with it, run the *uninstall* side.
+            let existing_marks = ex.discover_existing_fwmarks()?;
+            let routing_plan = dastyab_core::tun_route::plan_anti_loop(
+                dastyab_core::tun_route::TUN_FWMARK,
+                &existing_marks,
+            );
+            ex.teardown_routing(&routing_plan)?;
+
+            let existing_clamps = ex.discover_existing_clamps()?;
+            let clamp_plan = dastyab_core::tun_mtu::plan_mss_clamp_fixed(mtu, &existing_clamps);
+            ex.teardown_clamp(&clamp_plan)?;
+
+            println!("[platform] teardown complete (mtu={mtu}).");
+            if dry_run {
+                for c in &ex.log {
+                    println!("  would run: {c}");
+                }
+            }
+            Ok(())
+        }
+        "plan" | "preview" => {
+            // Force dry-run semantics for a pure preview.
+            ex = dastyab_core::platform_linux::PlatformExecutor::new(true);
+            let routing = ex.apply_routing_policy(dastyab_core::tun_route::TUN_FWMARK)?;
+            let clamp = ex.apply_mss_clamp(mtu)?;
+            #[allow(clippy::needless_range_loop)]
+            for c in &routing.commands {
+                println!("{c}");
+            }
+            #[allow(clippy::needless_range_loop)]
+            for c in &clamp.commands {
+                println!("{c}");
+            }
+            if routing.plan.install.is_empty() && clamp.plan.install.is_empty() {
+                println!("[platform] nothing to do (rules already present).");
+            }
+            Ok(())
+        }
+        _ => Err(CFError::new(
+            "platform",
+            format!("unknown action {action:?}"),
+            "Use: apply | teardown | plan",
+        )),
+    }
+}
+
 fn save_beacon(profile: &str, cfg: &BeaconConfig) -> Result<(), CFError> {
     let mut p = load_profile(profile);
     p.config.beacon = Some(cfg.clone());
@@ -3612,8 +3693,7 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
                 println!("  {r}");
             }
             // Persist as the profile's blackout resolver pool.
-            let mut cfg = vps::load_tunnel_client_config(profile)
-                .unwrap_or_else(vps::TunnelClientConfig::default);
+            let mut cfg = vps::load_tunnel_client_config(profile).unwrap_or_default();
             cfg.resolver_pool = Some(found);
             vps::write_tunnel_client_config(profile, &cfg)?;
             println!("\nPersisted resolver pool for profile '{profile}'.");

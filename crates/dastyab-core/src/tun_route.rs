@@ -38,7 +38,10 @@ pub fn parse_existing_fwmark_rules(ip_rule_show: &str) -> HashSet<u32> {
     let mut marks = HashSet::new();
     for line in ip_rule_show.lines() {
         // format: "<prio>:\tfrom all fwmark 0x2024 lookup 2022"
-        let prio = line.split(':').next().and_then(|p| p.trim().parse::<u32>().ok());
+        let prio = line
+            .split(':')
+            .next()
+            .and_then(|p| p.trim().parse::<u32>().ok());
         let Some(prio) = prio else { continue };
         // Only consider rules at or above our target priority (the anti-loop
         // slice of the table). Lower-numbered = higher precedence.
@@ -50,7 +53,7 @@ pub fn parse_existing_fwmark_rules(ip_rule_show: &str) -> HashSet<u32> {
         for i in 0..toks.len().saturating_sub(1) {
             if toks[i] == "fwmark" {
                 if let Some(hex) = toks.get(i + 1) {
-                    if let Some(v) = u32::from_str_radix(hex.trim_start_matches("0x"), 16).ok() {
+                    if let Ok(v) = u32::from_str_radix(hex.trim_start_matches("0x"), 16) {
                         marks.insert(v);
                     }
                 }

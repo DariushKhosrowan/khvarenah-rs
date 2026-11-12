@@ -42,11 +42,14 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **DNS-tunnel entropy shaping** (doctrine §5) — `dns_shaper.rs`
   (jittered pacing + length padding + decoy queries) + `send_receive_shaped`
   integration in the tunnel client.
+- **Platform execution** (doctrine A/D) — `platform_linux.rs` runs the
+  A/D rule plans via `ip`/`iptables` (dry-run mode for CI, RAII TUN
+  teardown) + `dastyab platform {plan|apply|teardown}` CLI. Builds run on
+  GitHub Actions runners (not the laptop).
 
 ## 🔜 Next — Doctrine gaps (remaining)
 
-- **Platform execution** of doctrine A/D rule plans — Linux `ip`/`iptables`
-  + TUN device bring-up, WinTUN bypass, `VpnService.protect`.
+- **WinTUN / `VpnService.protect`** platform execution (Windows/Android).
 - **P2P LAN mesh** — mDNS neighbor discovery + relay (Level 4).
 
 ## 🔜 Next

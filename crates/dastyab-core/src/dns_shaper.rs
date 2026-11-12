@@ -246,7 +246,10 @@ mod tests {
         let s = DnsShaper::new(cfg, 3);
         // 60 chars -> smallest bucket >= 60 is 64. Stays under the cap.
         let name = "a".repeat(60) + ".example.com";
-        assert!(name.len() < MAX_QNAME_LEN, "precondition: valid under-cap name");
+        assert!(
+            name.len() < MAX_QNAME_LEN,
+            "precondition: valid under-cap name"
+        );
         let padded = s.pad_name(&name, "example.com");
         assert!(
             padded.len() >= name.len() && padded.len() <= MAX_QNAME_LEN,
@@ -255,7 +258,10 @@ mod tests {
             name.len()
         );
         // And padding to the 64 bucket must have added some filler.
-        assert!(padded.len() > name.len(), "bucket padding should add filler");
+        assert!(
+            padded.len() > name.len(),
+            "bucket padding should add filler"
+        );
     }
 
     #[test]
@@ -288,13 +294,18 @@ mod tests {
         let mut s = DnsShaper::new(cfg, 6);
         let mut saw_decoy = false;
         for _ in 0..2000 {
-            if let ShaperDecision::EmitDecoy { domain } = s.step_frame("f.example.com", "example.com") {
+            if let ShaperDecision::EmitDecoy { domain } =
+                s.step_frame("f.example.com", "example.com")
+            {
                 saw_decoy = true;
                 // Must look like sub.<ref-domain>.
                 assert!(domain.contains("."), "decoy should be a FQDN: {domain}");
             }
         }
-        assert!(saw_decoy, "with prob 0.25 over 2000 slots we should see a decoy");
+        assert!(
+            saw_decoy,
+            "with prob 0.25 over 2000 slots we should see a decoy"
+        );
     }
 
     #[test]

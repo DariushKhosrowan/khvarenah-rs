@@ -15,14 +15,19 @@
 //!
 //! Wire this into a loop:
 //! ```
-//! let mut sentinel = LivenessSentinel::new(ROUTE_ID, STALL_TIMEOUT);
+//! use std::time::{Duration, Instant};
+//! use dastyab_core::liveness_sentinel::{LivenessSentinel, SentinelVerdict};
+//!
+//! let mut sentinel = LivenessSentinel::new("tun0", Duration::from_secs(4));
+//! let now = Instant::now();
 //! // on each outbound write:
-//! sentinel.record_outbound(bytes);
+//! sentinel.record_outbound(1400);
 //! // on each inbound read:
-//! sentinel.record_inbound(bytes);
+//! sentinel.record_inbound(1400);
 //! // periodically:
-//! if sentinel.check_stall(now) {
-//!     soft_break(route); // switch path
+//! if sentinel.check_stall(now + Duration::from_secs(1)) == SentinelVerdict::Stalled {
+//!     // switch path (soft-break)
+//!     assert!(sentinel.should_break());
 //! }
 //! ```
 
@@ -212,7 +217,10 @@ mod tests {
         s.record_inbound_at(100, now);
         s.record_outbound_at(100, now);
         // Inbound is fresh (1s ago) -> healthy.
-        assert_eq!(s.check_stall(now + Duration::from_secs(1)), SentinelVerdict::Healthy);
+        assert_eq!(
+            s.check_stall(now + Duration::from_secs(1)),
+            SentinelVerdict::Healthy
+        );
         assert!(!s.should_break());
     }
 
@@ -222,7 +230,10 @@ mod tests {
         let now = t0();
         s.record_outbound_at(50, now);
         // Never saw inbound -> Idle (route still establishing), not stalled.
-        assert_eq!(s.check_stall(now + Duration::from_secs(10)), SentinelVerdict::Idle);
+        assert_eq!(
+            s.check_stall(now + Duration::from_secs(10)),
+            SentinelVerdict::Idle
+        );
         assert!(!s.should_break());
     }
 
@@ -232,11 +243,17 @@ mod tests {
         let now = t0();
         s.record_inbound_at(10, now); // route was alive
         s.record_outbound_at(200, now + Duration::from_secs(1)); // now transmitting
-        // 5s later: still within outbound recency, inbound silent 5s -> stall.
-        assert_eq!(s.check_stall(now + Duration::from_secs(5)), SentinelVerdict::Stalled);
+                                                                 // 5s later: still within outbound recency, inbound silent 5s -> stall.
+        assert_eq!(
+            s.check_stall(now + Duration::from_secs(5)),
+            SentinelVerdict::Stalled
+        );
         // Refresh transmission so it stays recent; inbound still silent -> stall again.
         s.record_outbound_at(50, now + Duration::from_secs(5));
-        assert_eq!(s.check_stall(now + Duration::from_secs(6)), SentinelVerdict::Stalled);
+        assert_eq!(
+            s.check_stall(now + Duration::from_secs(6)),
+            SentinelVerdict::Stalled
+        );
         // Two consecutive stalls -> break.
         assert!(s.should_break());
     }
@@ -247,12 +264,18 @@ mod tests {
         let now = t0();
         s.record_inbound_at(10, now);
         s.record_outbound_at(200, now + Duration::from_secs(1));
-        assert_eq!(s.check_stall(now + Duration::from_secs(5)), SentinelVerdict::Stalled);
+        assert_eq!(
+            s.check_stall(now + Duration::from_secs(5)),
+            SentinelVerdict::Stalled
+        );
         // Traffic recovers: inbound arrives -> stall cleared. Keep outbound
         // fresh (as a live transmit loop would).
         s.record_inbound_at(50, now + Duration::from_secs(5));
         s.record_outbound_at(30, now + Duration::from_secs(5));
-        assert_eq!(s.check_stall(now + Duration::from_secs(6)), SentinelVerdict::Healthy);
+        assert_eq!(
+            s.check_stall(now + Duration::from_secs(6)),
+            SentinelVerdict::Healthy
+        );
         assert!(!s.should_break());
     }
 
@@ -263,7 +286,10 @@ mod tests {
         s.record_inbound_at(10, now);
         s.record_outbound_at(100, now);
         // No outbound for a long while -> Idle (nothing in flight).
-        assert_eq!(s.check_stall(now + Duration::from_secs(30)), SentinelVerdict::Idle);
+        assert_eq!(
+            s.check_stall(now + Duration::from_secs(30)),
+            SentinelVerdict::Idle
+        );
         assert!(!s.should_break());
     }
 
@@ -277,7 +303,10 @@ mod tests {
         s.reset();
         assert_eq!(s.tx_bytes(), 0);
         assert_eq!(s.rx_bytes(), 0);
-        assert_eq!(s.check_stall(now + Duration::from_secs(6)), SentinelVerdict::Idle);
+        assert_eq!(
+            s.check_stall(now + Duration::from_secs(6)),
+            SentinelVerdict::Idle
+        );
         assert!(!s.should_break());
     }
 }

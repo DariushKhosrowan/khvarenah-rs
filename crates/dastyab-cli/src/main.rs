@@ -454,6 +454,19 @@ enum Command {
         #[arg()]
         action: String,
     },
+    /// Apply / teardown the doctrine A+D platform network rules (anti-loop
+    /// fwmark routing + TCP MSS clamp). Use `--dry-run` to preview commands.
+    Platform {
+        /// Action: apply | teardown | plan.
+        #[arg()]
+        action: String,
+        /// Only print the commands that would run; require root.
+        #[arg(long)]
+        dry_run: bool,
+        /// Tunnel MTU for the MSS clamp (default 1290).
+        #[arg(long, default_value_t = 1290)]
+        mtu: u32,
+    },
 }
 
 #[derive(Subcommand)]

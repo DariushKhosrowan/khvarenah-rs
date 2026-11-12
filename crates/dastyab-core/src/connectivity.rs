@@ -767,7 +767,7 @@ mod tests {
         let mut sentinel = LivenessSentinel::new("direct", DEFAULT_STALL_TIMEOUT);
         let now = Instant::now();
         sentinel.record_inbound_at(100, now); // route was alive
-        // Feed two consecutive stalls (transmitting, inbound silent).
+                                              // Feed two consecutive stalls (transmitting, inbound silent).
         sentinel.record_outbound_at(200, now + Duration::from_secs(1));
         sentinel.check_stall(now + Duration::from_secs(5));
         sentinel.record_outbound_at(50, now + Duration::from_secs(5));

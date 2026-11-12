@@ -158,10 +158,7 @@ fn read_pid(profile: &str) -> Option<u32> {
 fn port_listening(port: u16) -> bool {
     use std::net::SocketAddr;
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    match TcpConnect::connect_timeout(&addr, PORT_PROBE_TIMEOUT) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    TcpConnect::connect_timeout(&addr, PORT_PROBE_TIMEOUT).is_ok()
 }
 
 /// A tiny wrapper so we can use `TcpStream::connect_timeout` consistently.

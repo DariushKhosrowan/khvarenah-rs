@@ -444,15 +444,10 @@ mod tests {
         // Doctrine B: server seals the reply; a client with the key can open
         // it, and a tampered/forged reply is rejected.
         let key_hex = crate::dnstunnel_auth::KEY_HEX_LEN;
-        let key = crate::dnstunnel_auth::DnsTunnelKey::from_hex(
-            &"a1".repeat(key_hex / 2),
-        )
-        .unwrap();
+        let key = crate::dnstunnel_auth::DnsTunnelKey::from_hex(&"a1".repeat(key_hex / 2)).unwrap();
         let base = "tun.example.com";
-        let server = DnsTunnelServer::new(
-            base,
-            TunnelHandler::new(None, None).with_auth(key.clone()),
-        );
+        let server =
+            DnsTunnelServer::new(base, TunnelHandler::new(None, None).with_auth(key.clone()));
 
         let req = TunnelFrame {
             session: "sess".into(),
