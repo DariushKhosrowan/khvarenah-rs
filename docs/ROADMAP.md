@@ -2,6 +2,18 @@
 
 Planned work, roughly in priority order. Items marked ✅ are done.
 
+## ✅ Done (v0.1.3) — multi-scheme config acquisition
+
+- **Multi-scheme node ingestion** — the node store now accepts every supported
+  share-link scheme (vless, vmess, trojan, ss/ssr, hysteria2, tuic), with
+  cross-scheme dedup by host+port+id (`proxy_uri`,`,config_store`).
+- **Telegram harvest upgrades** — `extract_proxy_links` recognizes all schemes;
+  **archive-depth pagination** walks older posts via the `?before=<id>` cursor
+  so configs long gone from the latest page are recovered (`--depth`).
+- **GitHub config-source ingestion** (`dastyab sources ingest`) — discovers the
+  `v2ray-configs` topic + curated repos, fetches plain & base64 subscription
+  files, validates links, and imports into the store.
+
 ## ✅ Done (v0.1.x)
 
 - Core Cloudflare client (accounts, scripts, subdomain, analytics).

@@ -498,7 +498,7 @@ enum Command {
     /// is imported (vless, vmess, trojan, ss, ssr, hysteria2, tuic).
     Harvest {
         /// Comma-separated channel handles (with or without leading '@').
-        #[arg(long, default_value = "v2ray_config")]
+        #[arg(long, default_value = "v2ray_config,MARAMBASHI,v2ray_configs_pools")]
         channels: String,
         /// Profile to import into (default "default").
         #[arg(long, default_value = "default")]
@@ -509,6 +509,22 @@ enum Command {
         /// How many archive pages to walk back per channel (default 3).
         #[arg(long, default_value_t = 3)]
         depth: usize,
+    },
+    /// Ingest free configs from GitHub sources (topic + curated repos) into
+    /// a profile's node store.
+    Sources {
+        /// Sub-command: ingest | refresh.
+        #[arg()]
+        action: String,
+        /// Profile to import into (default "default").
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Route through the local xray SOCKS5 proxy (use when direct is blocked).
+        #[arg(long)]
+        proxy: bool,
+        /// Extra comma-separated `owner/repo` repos to include.
+        #[arg(long, default_value = "")]
+        repos: String,
     },
 }
 

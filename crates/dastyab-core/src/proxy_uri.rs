@@ -150,17 +150,28 @@ fn parse_userinfo_host(out: &mut ProxyUri, rest: &str, split_at: usize) -> bool 
     true
 }
 
-/// Shadowsocks: plain `method:password@host:port` or base64-encoded.
+/// Shadowsocks: plain `method:password@host:port`, SIP002
+/// `BASE64(method:password)@host:port`, or whole-link base64.
 fn parse_ss(out: &mut ProxyUri, rest: &str) -> bool {
-    // Plain form first: `method:password@host:port`.
     if let Some((userinfo, host_part)) = rest.split_once('@') {
+        // SIP002: `ss://BASE64(method:password)@host:port`. The userinfo is
+        // base64 of `method:password` (the ':' is not in the base64 alphabet,
+        // so if it decodes, it is unambiguous).
+        if let Some(decoded) = b64_decode(userinfo) {
+            if decoded.contains(':') && set_host_port(out, host_part) {
+                out.id = decoded;
+                return true;
+            }
+        }
+        // Plain form: `ss://method:password@host:port`.
         if userinfo.contains(':') && set_host_port(out, host_part) {
             out.id = crate::vless::decode_query(userinfo);
             return !out.id.is_empty() && out.id.contains(':');
         }
+        return false;
     }
-    // Base64 form: `ss://BASE64(method:password@host:port)`. Some clients
-    // also append `#frag` — strip the fragment before decoding.
+    // Whole-link base64 form: `ss://BASE64(method:password@host:port)`.
+    // Some clients also append `#frag` — strip the fragment before decoding.
     let b64_candidate = rest.split(['?']).next().unwrap_or(rest).split('#').next().unwrap_or(rest);
     let decoded = match b64_decode(b64_candidate) {
         Some(d) => d,
@@ -321,13 +332,27 @@ mod tests {
         assert_eq!(plain.port, 8388);
 
         // Base64 of `chacha20-ietf-poly1305:key@1.2.3.4:8388`.
-        let b64 = base64::engine::general_purpose::STANDARD.encode("chacha20-ietf-poly1305:key@1.2.3.4:8388");
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode("chacha20-ietf-poly1305:key@1.2.3.4:8388");
         let enc = ProxyUri::parse(&format!("ss://{b64}#ss2")).unwrap();
         assert_eq!(enc.id, "chacha20-ietf-poly1305:key");
         assert_eq!(enc.host, "1.2.3.4");
         assert_eq!(enc.port, 8388);
     }
 
+    #[test]
+    fn ss_sip002_base64_userinfo() {
+        // Subscriptions use SIP002: only the `method:password` part is base64,
+        // followed by @host:port#frag.
+        let userinfo = base64::engine::general_purpose::STANDARD
+            .encode("aes-256-gcm:supersecret");
+        let link = format!("ss://{userinfo}@198.244.201.129:19999#London");
+        let u = ProxyUri::parse(&link).unwrap();
+        assert_eq!(u.id, "aes-256-gcm:supersecret");
+        assert_eq!(u.host, "198.244.201.129");
+        assert_eq!(u.port, 19999);
+        assert_eq!(u.alias, "London");
+    }
     #[test]
     fn vmess_base64_json() {
         let json = r#"{"v":"2","ps":"vmess-telegram","add":"192.168.1.100","port":"443","id":"7748b328-f0e8-40ab-b2e3-9a1c2c22d111","aid":"0"}"#;

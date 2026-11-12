@@ -71,6 +71,7 @@ pub mod error;
 pub mod export;
 pub mod generated_configs;
 pub mod geoip;
+pub mod gh_sources;
 pub mod harvest;
 pub mod health;
 pub mod health_beacon;

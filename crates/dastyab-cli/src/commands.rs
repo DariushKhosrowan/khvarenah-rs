@@ -227,6 +227,49 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             proxy,
             depth,
         } => cmd_harvest(&profile, &channels, proxy, depth).await,
+        Command::Sources {
+            action,
+            profile,
+            proxy,
+            repos,
+        } => cmd_sources(&profile, &action, proxy, &repos).await,
+    }
+}
+
+async fn cmd_sources(
+    profile: &str,
+    action: &str,
+    proxy: bool,
+    repos: &str,
+) -> Result<(), CFError> {
+    use dastyab_core::gh_sources;
+    match action {
+        "ingest" | "refresh" => {
+            let extra: Vec<String> = repos
+                .split(',')
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty())
+                .collect();
+            let report = gh_sources::ingest_github(profile, proxy, &extra).await;
+            println!("[sources] GitHub ingestion pass:");
+            println!("  repos ok: {}", report.repos_ok.len());
+            for r in &report.repos_ok {
+                println!("    ok   {r}");
+            }
+            for (repo, err) in &report.repos_failed {
+                println!("    fail {repo}: {err}");
+            }
+            println!(
+                "  links: found={} added={} duplicates={} invalid={}",
+                report.found, report.added, report.duplicates, report.invalid
+            );
+            Ok(())
+        }
+        other => Err(CFError::new(
+            "sources",
+            format!("unknown action '{other}'"),
+            "Use: ingest | refresh",
+        )),
     }
 }
 
