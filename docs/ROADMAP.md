@@ -27,15 +27,23 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **Project doctrine** — `docs/PRINCIPLES.md` codifies the mission, threat
   model, resilience ladder, and engineering standards.
 
-## 🔜 Next — Doctrine gaps
+## ✅ Done — Doctrine gaps
 
-- **Authenticated DNS-tunnel responses** — ChaCha20-Poly1305 / Noise
-  validation + poisoned-resolver penalty (doctrine B).
-- **TUN anti-loop routing** — `SO_MARK`/fwmark policy routing (Linux),
-  WinTUN bypass, `VpnService.protect` (doctrine A).
-- **Liveness sentinel** integrated with the racing engine (doctrine C).
-- **MTU/MSS clamping** on the TUN (doctrine D).
-- **Interface-flap handling** via netlink (doctrine E).
+- **Authenticated DNS-tunnel responses** — ChaCha20-Poly1305 `seal`/`open`,
+  server-sealed replies + client verification / poisoned-resolver penalty
+  (doctrine B) — `dnstunnel_auth.rs`.
+- **Liveness sentinel** integrated with the racing engine (doctrine C) —
+  `liveness_sentinel.rs`.
+- **Interface-flap handling** (doctrine E) — `interface_monitor.rs` (sysfs
+  carrier/operstate; netlink driver swap noted).
+- **TUN anti-loop routing plan** (doctrine A) — `tun_route.rs` (fwmark rule
+  plan generator, validated idempotent on live host).
+- **MTU/MSS clamping plan** (doctrine D) — `tun_mtu.rs`.
+
+## 🔜 Next — Doctrine gaps (remaining)
+
+- **Platform execution** of doctrine A/D rule plans — Linux `ip`/`iptables`
+  + TUN device bring-up, WinTUN bypass, `VpnService.protect`.
 - **P2P LAN mesh** — mDNS neighbor discovery + relay (Level 4).
 - **DNS-tunnel entropy shaping** — pacing/padding + decoy queries
   (doctrine §5).
