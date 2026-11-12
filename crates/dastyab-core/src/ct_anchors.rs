@@ -86,6 +86,15 @@ const MAX_PROBE: usize = 64;
 /// Cap on the number of verified anchors kept.
 const MAX_ANCHORS: usize = 200;
 
+/// Daemon self-maintenance cadence for refreshing the CT-anchor set.
+/// Rate-limited so a permanently-dead network doesn't hammer crt.sh on every
+/// tick (doctrine §6.5: rate-limit the expensive).
+pub const ANCHOR_REFRESH_INTERVAL_SECS: i64 = 6 * 3600;
+
+/// Anchors older than this are considered stale and are re-probed on the next
+/// refresh; those that no longer complete TLS are pruned (dropped).
+pub const MAX_ANCHOR_AGE_SECS: f64 = 7.0 * 24.0 * 3600.0;
+
 /// Recommended query terms (each yields a crt.sh call).
 pub const DEFAULT_QUERIES: &[&str] = &[
     "v2ray",
@@ -322,6 +331,59 @@ pub fn discover_ct_anchors(profile: &str, use_proxy: bool, queries: &[&str]) -> 
     report
 }
 
+/// Re-probe anchors older than [`MAX_ANCHOR_AGE_SECS`] and drop those that no
+/// longer complete a real TLS handshake. Keeps the out-of-band anchor set
+/// pruned toward *verified-live* hosts (doctrine §6.4 — no fabricated success)
+/// and bounds unbounded growth of stale entries. Returns the number dropped.
+pub fn prune_stale_anchors(profile: &str, use_proxy: bool) -> usize {
+    let mut store = load_anchors(profile);
+    if store.anchors.is_empty() {
+        return 0;
+    }
+    let client = match build_client(use_proxy) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let now = now_ts();
+    let mut kept: Vec<CtAnchor> = Vec::with_capacity(store.anchors.len());
+    let mut dropped = 0usize;
+    for mut a in store.anchors.drain(..) {
+        if now - a.verified_epoch < MAX_ANCHOR_AGE_SECS {
+            kept.push(a); // still fresh — keep without re-probing
+            continue;
+        }
+        match tls_probe_ok(&client, &a.host) {
+            Some(ms) => {
+                a.verified_epoch = now;
+                a.ms = ms;
+                kept.push(a);
+            }
+            None => dropped += 1,
+        }
+    }
+    store.anchors = kept;
+    let _ = save_anchors(profile, &store);
+    dropped
+}
+
+/// The current set of verified-live anchor hostnames (for runtime consumers
+/// such as SNI-candidate seeding / anti-DPI allowlist building).
+pub fn anchor_hosts(profile: &str) -> Vec<String> {
+    load_anchors(profile)
+        .anchors
+        .into_iter()
+        .map(|a| a.host)
+        .collect()
+}
+
+/// A single defer refresh pass: discover new anchors, then prune stale ones.
+/// Returns `(added, pruned)` so the daemon can journal both.
+pub fn refresh_and_prune(profile: &str, use_proxy: bool, queries: &[&str]) -> (usize, usize) {
+    let report = discover_ct_anchors(profile, use_proxy, queries);
+    let pruned = prune_stale_anchors(profile, use_proxy);
+    (report.added, pruned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +470,65 @@ mod tests {
         assert!(hosts.contains(&"web-static.shop".to_string()));
         // drop unused client warning-free
         let _ = client;
+    }
+
+    #[test]
+    fn anchor_hosts_lists_verified_hostnames() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(dir.path().join("mem"));
+        let profile = "anchor-hosts-test".to_string();
+        let now = now_ts();
+        let store = CtAnchorStore {
+            anchors: vec![
+                CtAnchor {
+                    host: "v2ray-a.khadijet.net".to_string(),
+                    verified_epoch: now,
+                    ms: 12,
+                    via: "v2ray".to_string(),
+                },
+                CtAnchor {
+                    host: "tunnel.example.org".to_string(),
+                    verified_epoch: now,
+                    ms: 30,
+                    via: "tunnel".to_string(),
+                },
+            ],
+        };
+        save_anchors(&profile, &store).unwrap();
+        let hosts = anchor_hosts(&profile);
+        assert_eq!(hosts.len(), 2);
+        assert!(hosts.contains(&"v2ray-a.khadijet.net".to_string()));
+        assert!(hosts.contains(&"tunnel.example.org".to_string()));
+    }
+
+    #[test]
+    fn prune_empty_store_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(dir.path().join("mem"));
+        let profile = "prune-empty-test".to_string();
+        // No file → empty store → no network probe, zero dropped.
+        assert_eq!(prune_stale_anchors(&profile, false), 0);
+    }
+
+    #[test]
+    fn prune_keeps_fresh_anchors_unprobed() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(dir.path().join("mem"));
+        let profile = "prune-fresh-test".to_string();
+        let now = now_ts();
+        let store = CtAnchorStore {
+            anchors: vec![CtAnchor {
+                host: "fresh-vless.edge.xyz".to_string(),
+                verified_epoch: now, // fresh — must not re-probe
+                ms: 20,
+                via: "vless".to_string(),
+            }],
+        };
+        save_anchors(&profile, &store).unwrap();
+        // Fresh anchors are kept without any network I/O; nothing dropped.
+        assert_eq!(prune_stale_anchors(&profile, false), 0);
+        let after = load_anchors(&profile);
+        assert_eq!(after.anchors.len(), 1);
+        assert_eq!(after.anchors[0].host, "fresh-vless.edge.xyz");
     }
 }

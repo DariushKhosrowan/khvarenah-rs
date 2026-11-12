@@ -571,7 +571,7 @@ enum Command {
     /// logs (crt.sh) — an independent, out-of-band bootstrap source that keeps
     /// recovery from going circular (doctrine §8.1).
     Anchors {
-        /// Sub-command: discover | list | clear.
+        /// Sub-command: discover | list | prune | refresh | clear.
         #[arg()]
         action: String,
         /// Profile to operate on (default "default").

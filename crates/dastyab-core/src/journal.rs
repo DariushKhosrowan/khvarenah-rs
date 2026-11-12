@@ -59,6 +59,9 @@ pub enum JournalKind {
     /// An autonomous node-refill pass ran because the pool had no known-healthy
     /// config (detail = reason + added/probed/healthy/promoted counts).
     NodeRefill,
+    /// The out-of-band CT-anchor set was refreshed + pruned (detail = added /
+    /// pruned / total verified anchors).
+    AnchorsRefreshed,
 }
 
 /// One durable journal entry.

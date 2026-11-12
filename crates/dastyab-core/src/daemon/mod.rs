@@ -166,6 +166,11 @@ pub struct DaemonState {
     /// Rate-limits re-probing of stale nodes to `NODE_DECAY_INTERVAL_SECS`.
     #[serde(default)]
     pub last_node_decay_ts: i64,
+    /// Last epoch-seconds the out-of-band CT-anchor set was refreshed + pruned.
+    /// Rate-limits crt.sh discovery + re-probe to
+    /// `ANCHOR_REFRESH_INTERVAL_SECS` (doctrine §6.5: rate-limit expensive).
+    #[serde(default)]
+    pub last_anchors_refresh_ts: i64,
 }
 
 fn default_interval() -> u64 {
@@ -199,6 +204,7 @@ impl Default for DaemonState {
             last_snapshot_ts: 0,
             last_refill_ts: 0,
             last_node_decay_ts: 0,
+            last_anchors_refresh_ts: 0,
         }
     }
 }
@@ -1416,6 +1422,48 @@ async fn run_self_maintenance(
                 ),
             );
         }
+    }
+
+    // 8. Out-of-band CT-anchor rotation. The certificate-transparency anchor
+    // set is an independent bootstrap feed (doctrine §5 — never circular).
+    // Refresh it on a slow cadence so the verified-live set the runtime
+    // consults (SNI/anti-DPI seeding) never goes stale/silent, and prune
+    // anchors that no longer complete TLS. Rate-limited; requires the network.
+    // The CT-anchor path uses reqwest's *blocking* client, which cannot be
+    // built/dropped inside an async runtime — so run it on a blocking thread.
+    if net_up && now - state.last_anchors_refresh_ts >= crate::ct_anchors::ANCHOR_REFRESH_INTERVAL_SECS {
+        state.last_anchors_refresh_ts = now;
+        let profile_owned = profile.to_string();
+        let (added, pruned) = match tokio::task::spawn_blocking(move || {
+            crate::ct_anchors::refresh_and_prune(
+                &profile_owned,
+                false,
+                crate::ct_anchors::DEFAULT_QUERIES,
+            )
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log(&log_line(
+                    "WARN",
+                    &format!("ct anchors refresh aborted (blocking task: {e})"),
+                ));
+                (0usize, 0usize)
+            }
+        };
+        let total = crate::ct_anchors::anchor_hosts(profile).len();
+        log(&log_line(
+            "INFO",
+            &format!(
+                "ct anchors: refreshed (+{added} new, pruned {pruned} dead, {total} verified-live)"
+            ),
+        ));
+        let _ = crate::journal::append(
+            profile,
+            crate::journal::JournalKind::AnchorsRefreshed,
+            &format!("added={added} pruned={pruned} total={total}"),
+        );
     }
 }
 /// Auto-heal step (daemon self-maintenance). Runs on every tick, detects

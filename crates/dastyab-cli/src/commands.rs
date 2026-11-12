@@ -247,7 +247,18 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             profile,
             proxy,
             queries,
-        } => cmd_anchors(&profile, &action, proxy, &queries),
+        } => {
+            // The CT-anchor path uses reqwest's *blocking* client. Building
+            // that client creates (and drops) a private tokio runtime, which
+            // panics if done inside this async runtime (`#[tokio::main]`).
+            // Run the whole blocking command on a dedicated blocking thread.
+            let action = action.clone();
+            let profile = profile.clone();
+            let queries = queries.clone();
+            tokio::task::spawn_blocking(move || cmd_anchors(&profile, &action, proxy, &queries))
+                .await
+                .map_err(|e| CFError::new("anchors", "spawn_blocking", &e.to_string()))?
+        }
     }
 }
 
@@ -339,10 +350,36 @@ fn cmd_anchors(profile: &str, action: &str, proxy: bool, queries_csv: &str) -> R
             println!("[anchors] cleared CT anchor set");
             Ok(())
         }
+        "prune" => {
+            let dropped = dastyab_core::ct_anchors::prune_stale_anchors(profile, proxy);
+            let total = dastyab_core::ct_anchors::anchor_hosts(profile).len();
+            println!(
+                "[anchors] pruned {dropped} stale anchors; {total} verified-live remain"
+            );
+            Ok(())
+        }
+        "refresh" => {
+            let queries: Vec<&str> = if queries_csv.trim().is_empty() {
+                DEFAULT_QUERIES.to_vec()
+            } else {
+                queries_csv
+                    .split(',')
+                    .map(|q| q.trim())
+                    .filter(|q| !q.is_empty())
+                    .collect()
+            };
+            let (added, pruned) =
+                dastyab_core::ct_anchors::refresh_and_prune(profile, proxy, &queries);
+            let total = dastyab_core::ct_anchors::anchor_hosts(profile).len();
+            println!(
+                "[anchors] refresh: +{added} new, pruned {pruned} dead, {total} verified-live"
+            );
+            Ok(())
+        }
         other => Err(CFError::new(
             "anchors",
             format!("unknown action '{other}'"),
-            "Use: discover | list | clear",
+            "Use: discover | list | prune | refresh | clear",
         )),
     }
 }
@@ -4941,6 +4978,7 @@ fn kind_label(k: dastyab_core::journal::JournalKind) -> &'static str {
         JournalKind::SnapshotWritten => "workspace-snapshot",
         JournalKind::VersionVerified => "versions-verified",
         JournalKind::NodeRefill => "node-refill",
+        JournalKind::AnchorsRefreshed => "ct-anchors-refreshed",
     }
 }
 

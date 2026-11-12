@@ -112,6 +112,12 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   logs (crt.sh), TLS-verifies them via the pooled client, and persists the
   verified-live set to `<profile>/ct_anchors.json`. An independent,
   out-of-band bootstrap source (doctrine §8.1) so recovery never goes circular.
+- ✅ **Autonomous CT-anchor rotation (daemon wire-in)** — the daemon's
+  self-maintenance now refreshes the CT-anchor set on a slow cadence
+  (`anchors refresh` = refresh + prune; rate-limited, network-gated, run on a
+  blocking thread to avoid the reqwest-blocking-under-tokio panic), prunes
+  anchors that no longer complete TLS, and journals each pass. New CLI actions:
+  `refresh` and `prune`. Closes the "daemon wire-in" half of §8.1.
 - **Wrangler-free deploy confirmation** — post-deploy smoke test that hits the
   worker URL and checks it responds.
 - **UDP-native DNS tunnel** — move the client off TCP-style framing toward the
