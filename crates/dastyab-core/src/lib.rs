@@ -122,6 +122,10 @@ pub mod workspace_snapshot;
 pub mod workspace_snapshots;
 pub mod wrangler;
 
+/// Deterministic adversarial fuzz gates for the wire codecs (doctrine §8.4).
+/// A permanent CI gate, not a one-off test: seeded PRNG, no external deps.
+pub mod codec_fuzz;
+
 pub use blackout::NetworkState;
 pub use connectivity::{FallbackLadder, Probe, ProbeVerdict, RealLadderProbe, Tier, TierChange};
 pub use doh::DohResolver;

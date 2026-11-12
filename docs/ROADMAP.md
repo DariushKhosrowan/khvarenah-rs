@@ -100,6 +100,13 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   `serve --upstream` hosts a data relay over a real egress; `forward --url`
   verifies a hop (echo RTT) then fetches a URL through it. This closes the
   final ladder rung end-to-end.
+- **Codec fuzz gate (doctrine §8.4)** — `codec_fuzz.rs`, a deterministic,
+  dependency-free CI gate that adversarially fuzzes every wire codec every
+  `cargo test` run: TunnelFrame/QNAME base32 encode→decode round-trips
+  (prefix-preserving under the DPI clamp), full ARQ sessions under random
+  loss/dup/reorder (exact in-order once-only delivery enforced), and
+  ChaCha20-Poly1305 seal/open with bit-flip tamper rejection. Seeded PRNG
+  → identical results on every machine.
 
 ## ✅ Done — Efficiency doctrine (§6.5)
 
@@ -176,8 +183,6 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 ## 🧭 Later
 
 - **Telegram bot** — drive the console (status, refill, failover) from chat.
-- **Fuzz the codecs** (QNAME/base32/ARQ/ChaCha20 frame) + adversarial
-  loss/reorder/dup simulations as a permanent CI gate.
 - **Config presets in JSON** — let users ship custom presets via files.
 - **Plugin hooks** — post-deploy / post-scan hooks.
 - **Windows installer** — Inno Setup / MSI.
