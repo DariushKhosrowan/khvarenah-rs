@@ -3485,6 +3485,11 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
             println!("  url         : {}", res.worker_url);
             println!("  account id  : {}", res.account_id);
             println!("  subdomain   : {}", res.subdomain);
+            if let Some(smoke) = &res.post_deploy_smoke {
+                println!("  smoke       : {smoke}");
+            } else {
+                println!("  smoke       : (skipped on local/mock backend)");
+            }
             println!("The fallback ladder will now probe this tunnel over HTTPS (no VPS).");
             Ok(())
         }

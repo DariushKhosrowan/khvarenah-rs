@@ -39,6 +39,10 @@ pub struct WorkerTunnelDeploy {
     pub shared_secret: String,
     pub account_id: String,
     pub subdomain: String,
+    /// One-line post-deploy smoke confirmation (real TLS + HTTP GET against the
+    /// deployed worker). `None` on the mock/local backend (tests) — the smoke
+    /// probe only runs on the live Cloudflare path.
+    pub post_deploy_smoke: Option<String>,
 }
 
 /// Deploy the worker-hosted DNS tunnel and persist the client config.
@@ -118,6 +122,9 @@ pub async fn deploy_worker_tunnel(
     // deploy via wrangler (which bundles ESM → classic). When the client
     // points at a local mock server (tests) we keep the HTTP path so the mock
     // can be asserted against.
+    // Post-deploy smoke confirmation is only run on the live Cloudflare path
+    // (the mock/local backend has no real worker to probe).
+    let mut smoke_verdict: Option<String> = None;
     if cf.is_live() {
         let wopts = crate::wrangler::WranglerDeployOpts {
             worker_name: worker_name.clone(),
@@ -135,7 +142,15 @@ pub async fn deploy_worker_tunnel(
         .await?;
         // The deployed URL is authoritative; the constructed `worker_url` is
         // only a fallback.
-        let _ = deployed;
+        let worker_url = deployed;
+        // Post-deploy smoke confirmation: hit the freshly-deployed worker over
+        // real TLS and confirm it responds. This closes the roadmap's
+        // "wrangler-free deploy confirmation" gap — a deploy that reports
+        // success but serves nothing is the silent failure we now surface.
+        // It is informative (non-fatal): Cloudflare edge propagation can lag
+        // the deploy by a few seconds, so a slow first probe must not fail the
+        // deploy. The verdict is recorded on the result and shown by CLI/GUI.
+        smoke_verdict = post_deploy_smoke(&worker_url).await;
     } else {
         let binding = serde_json::json!({
             "type": "kv_namespace",
@@ -181,6 +196,44 @@ pub async fn deploy_worker_tunnel(
         shared_secret: client_secret,
         account_id: account_id.to_string(),
         subdomain,
+        post_deploy_smoke: smoke_verdict,
+    })
+}
+
+/// Probe the freshly-deployed worker over real TLS + HTTP GET and return a
+/// one-line human verdict. `None` if the URL cannot be parsed (should not
+/// happen for a freshly-deployed workers.dev URL).
+///
+/// This is the "wrangler-free deploy confirmation" — the wrangler output only
+/// proves the deploy command succeeded, not that the worker serves traffic.
+/// The smoke probe hits the actual URL and classifies the response, so a
+/// deploy that lands but serves nothing is surfaced instead of silently
+/// accepted.
+async fn post_deploy_smoke(worker_url: &str) -> Option<String> {
+    // Strip `https://` and any path.
+    let host = worker_url
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or(worker_url);
+    let doh = crate::doh::DohResolver::new();
+    let health = crate::autopilot::probe_worker_health(host, None, Some(&doh), 8).await;
+    Some(match health {
+        crate::autopilot::WorkerHealth::Alive => format!(
+            "smoke ok: {host} answered /cdn-cgi/trace over TLS"
+        ),
+        crate::autopilot::WorkerHealth::Suspended { code } => format!(
+            "smoke warning: {host} responds but reports suspended (HTTP {code})"
+        ),
+        crate::autopilot::WorkerHealth::NotFound => format!(
+            "smoke warning: {host} responded but no worker found on the route"
+        ),
+        crate::autopilot::WorkerHealth::PathMismatch => format!(
+            "smoke warning: {host} responded on a different path"
+        ),
+        crate::autopilot::WorkerHealth::Unreachable => format!(
+            "smoke warning: {host} unreachable over TLS (edge still propagating?)"
+        ),
     })
 }
 
@@ -507,5 +560,20 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status, Some(403));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_deploy_worker_tunnel_mock_path_has_no_smoke() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _home = isolated_home();
+        let pid = fresh_profile();
+        let (base, _log) = mock_cf_server();
+        let cf = Client::with_base("tok", &base);
+        let res = deploy_worker_tunnel(&cf, "acc1", &pid, &opts())
+            .await
+            .unwrap();
+        // The smoke probe only runs on the live Cloudflare path; the mock/local
+        // backend (tests) must report None so the field is honest.
+        assert!(res.post_deploy_smoke.is_none());
     }
 }
