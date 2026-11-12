@@ -481,6 +481,9 @@ enum Command {
         /// A vless:// share-link (for paste/activate).
         #[arg(long, default_value = "")]
         link: String,
+        /// Route the probe through the local xray SOCKS5 (for NIN/blackout).
+        #[arg(long, default_value_t = false)]
+        proxy: bool,
     },
     /// Harvest free vless configs from Telegram channels (public previews,
     /// no browser needed) into a profile's node store.

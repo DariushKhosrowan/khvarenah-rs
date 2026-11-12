@@ -217,7 +217,8 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             profile,
             path,
             link,
-        } => cmd_configs(&profile, &action, &path, &link),
+            proxy,
+        } => cmd_configs(&profile, &action, &path, &link, proxy),
         Command::Harvest {
             channels,
             profile,
@@ -238,8 +239,7 @@ async fn cmd_harvest(profile: &str, channels: &str, proxy: bool) -> Result<(), C
         return Ok(());
     }
     let profile = profile.to_string();
-    let channels_owned: Vec<String> =
-        list.into_iter().map(|c| c.to_string()).collect();
+    let channels_owned: Vec<String> = list.into_iter().map(|c| c.to_string()).collect();
     let results = tokio::task::spawn_blocking(move || {
         channels_owned
             .into_iter()
@@ -3560,7 +3560,13 @@ fn cmd_platform(action: &str, dry_run: bool, mtu: u32) -> Result<(), CFError> {
 
 /// Manage native config-storage nodes: import from a v2rayN ServersStore.json,
 /// paste a single vless link, list nodes, or activate one.
-fn cmd_configs(profile: &str, action: &str, path: &str, link: &str) -> Result<(), CFError> {
+fn cmd_configs(
+    profile: &str,
+    action: &str,
+    path: &str,
+    link: &str,
+    proxy: bool,
+) -> Result<(), CFError> {
     use dastyab_core::config_store::{
         import_single_link, import_v2rayn_store, load_node_store, render_nodes, save_node_store,
     };
@@ -3651,10 +3657,74 @@ fn cmd_configs(profile: &str, action: &str, path: &str, link: &str) -> Result<()
             println!("[configs] cleared all nodes in profile '{profile}'");
             Ok(())
         }
+        "probe" => {
+            use dastyab_core::node_probe::{probe_all, NodeProbe};
+            let reports = probe_all(profile, proxy);
+            if reports.is_empty() {
+                println!("[configs] no nodes in profile '{profile}' to probe");
+                return Ok(());
+            }
+            let mut ok = 0usize;
+            let mut fail = 0usize;
+            println!(
+                "[configs] probing {} node(s) (proxy={proxy})",
+                reports.len()
+            );
+            for r in &reports {
+                match r {
+                    NodeProbe {
+                        ok: true,
+                        ms,
+                        alias,
+                        ..
+                    } => {
+                        ok += 1;
+                        println!("  [OK]   {alias} ({ms} ms)");
+                    }
+                    NodeProbe {
+                        ok: false,
+                        error: Some(e),
+                        alias,
+                        ..
+                    } => {
+                        fail += 1;
+                        println!("  [FAIL] {alias}: {e}");
+                    }
+                    NodeProbe {
+                        ok: false, alias, ..
+                    } => {
+                        fail += 1;
+                        println!("  [FAIL] {alias}: connection failed");
+                    }
+                }
+            }
+            println!("[configs] probe done: {ok} healthy, {fail} unhealthy");
+            Ok(())
+        }
+        "failover" => {
+            use dastyab_core::node_probe::failover_if_dead;
+            match failover_if_dead(profile) {
+                Some(id) => {
+                    println!("[configs] active node was unhealthy — promoted healthy node '{id}'")
+                }
+                None => {
+                    let store = load_node_store(profile);
+                    match store.active() {
+                        Some(a) if a.healthy == Some(true) => {
+                            println!("[configs] active node '{}' is healthy; no failover needed", a.id)
+                        }
+                        _ => println!(
+                            "[configs] no healthy node available to fail over to (run 'nodes probe' first)"
+                        ),
+                    }
+                }
+            }
+            Ok(())
+        }
         _ => Err(CFError::new(
             "configs",
             format!("unknown action {action:?}"),
-            "Use: import | paste | activate | list | clear",
+            "Use: import | paste | activate | list | clear | probe | failover",
         )),
     }
 }

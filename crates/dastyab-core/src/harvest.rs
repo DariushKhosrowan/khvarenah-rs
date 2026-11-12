@@ -65,9 +65,9 @@ pub fn fetch_channel_links(channel: &str, use_proxy: bool) -> Result<Vec<String>
             "Channel may not exist or preview is unavailable.",
         ));
     }
-    let body = resp.text().map_err(|e| {
-        CFError::new("harvest", format!("reading body: {e}"), "")
-    })?;
+    let body = resp
+        .text()
+        .map_err(|e| CFError::new("harvest", format!("reading body: {e}"), ""))?;
 
     let links = extract_vless_links(&body);
     Ok(links)
@@ -146,9 +146,15 @@ mod tests {
         let links = extract_vless_links(body);
         assert_eq!(links.len(), 1);
         assert!(links[0].starts_with("vless://06ef598c"));
-        assert!(links[0].contains("&host=2026.hhhhh.eu.org"), "&amp; must decode: {links:?}");
+        assert!(
+            links[0].contains("&host=2026.hhhhh.eu.org"),
+            "&amp; must decode: {links:?}"
+        );
         assert!(!links[0].contains("&amp;"));
-        assert!(!links[0].ends_with('#'), "fragment must be stripped: {links:?}");
+        assert!(
+            !links[0].ends_with('#'),
+            "fragment must be stripped: {links:?}"
+        );
     }
 
     #[test]
