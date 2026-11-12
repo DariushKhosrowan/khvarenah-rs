@@ -163,9 +163,14 @@ impl TunnelFrame {
         let core = name
             .strip_suffix(&suffix)
             .ok_or_else(|| CFError::new("dns-tunnel", "name not under base domain", ""))?;
-        let labels: Vec<&str> = core.split('.').collect();
+        let mut labels: Vec<&str> = core.split('.').collect();
         if labels.len() < 4 {
             return Err(CFError::new("dns-tunnel", "too few labels", ""));
+        }
+        // Drop trailing shaper filler labels (reserved `zz` prefix, only ever
+        // appended by entropy shaping — never part of the real frame).
+        while labels.len() > 4 && labels.last().is_some_and(|l| l.starts_with("zz")) {
+            labels.pop();
         }
         // [nonce, seq, flags, ...payload..., session]
         let seq = labels[1]
@@ -206,6 +211,59 @@ pub async fn send_receive<R: Resolver>(
     let qname = frame.encode_name_clamped(base_domain, nonce, MAX_QNAME_LEN);
     let reply = resolver.query_txt(&qname)?;
     TunnelFrame::decode_name(reply.trim_end_matches('.'), base_domain)
+}
+
+/// Shaped variant of [`send_receive`] (doctrine §5 — entropy shaping).
+///
+/// Uses a [`crate::dns_shaper::DnsShaper`] to make the outbound pattern look
+/// like ordinary recursive-DNS traffic:
+///
+/// - **Pacing**: sleeps `gap` (jittered, rate-capped) before the query.
+/// - **Decoys**: with probability `decoy_prob`, emits a plausible decoy query
+///   to an unrelated domain *instead of* (or interleaved with) the frame,
+///   so the tunnel is statistically buried in ambient DNS traffic. The decoy
+///   is sent through the same resolver (it is just a normal TXT/ANY lookup the
+///   resolver and ISP expect), so the return type collapses to "nothing to
+///   decode" and we return `Ok(None)`.
+/// - **Padding**: the emitted QNAME is padded to a discrete bucket by the
+///   shaper so its length does not leak the underlying payload size.
+///
+/// Returns `Ok(Some(frame))` when a frame was sent and decoded,
+/// `Ok(None)` when a decoy was emitted instead (the caller should just
+/// proceed to the next slot), or `Err` on resolver failure.
+pub async fn send_receive_shaped<R: Resolver>(
+    resolver: &R,
+    base_domain: &str,
+    frame: &TunnelFrame,
+    shaper: &mut crate::dns_shaper::DnsShaper,
+) -> Result<Option<TunnelFrame>, CFError> {
+    // Apply pacing before anything else.
+    let gap = shaper.next_sleep();
+    if !gap.is_zero() {
+        tokio::time::sleep(gap).await;
+    }
+
+    // Ask the shaper for a slot decision.
+    let nonce: u32 = rand::random::<u32>() & 0xFFFF;
+    let natural = frame.encode_name_clamped(base_domain, nonce, MAX_QNAME_LEN);
+    match shaper.step_frame(&natural, base_domain) {
+        crate::dns_shaper::ShaperDecision::EmitDecoy { domain } => {
+            // A decoy: a normal-looking lookup. We don't need to decode it
+            // into a frame — it's noise. We just need it to hit the wire.
+            // The resolver accepts any valid name; TXT is fine.
+            let _ = resolver.query_txt(&domain)?;
+            Ok(None)
+        }
+        crate::dns_shaper::ShaperDecision::EmitFrame { padded_name } => {
+            let reply = resolver.query_txt(&padded_name)?;
+            let decoded = TunnelFrame::decode_name(reply.trim_end_matches('.'), base_domain)?;
+            Ok(Some(decoded))
+        }
+        // step_frame never yields Sleep, but the enum requires exhaustiveness.
+        // Treat a hypothetical Sleep as "skip this slot" (pacing handled by
+        // the leading next_sleep, so nothing further is due).
+        crate::dns_shaper::ShaperDecision::Sleep(_) => Ok(None),
+    }
 }
 
 /// Authenticated variant of [`send_receive`] (doctrine B): sends a frame and
@@ -470,5 +528,90 @@ mod tests {
         let (cum, sack) = rx.ack();
         tx.on_ack(cum, sack);
         assert!(tx.is_idle());
+    }
+
+    // ---- shaped send_receive integration ----
+
+    struct RecordingResolver {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+    impl Resolver for RecordingResolver {
+        fn query_txt(&self, name: &str) -> Result<String, CFError> {
+            self.calls.lock().unwrap().push(name.to_string());
+            // Echo the problematic, as a tunnel server would.
+            Ok(name.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn send_receive_shaped_no_decoys_returns_frame() {
+        let mut cfg = crate::dns_shaper::ShaperConfig::default();
+        cfg.decoy_prob = 0.0;
+        cfg.max_gap = std::time::Duration::from_millis(1);
+        cfg.min_gap = std::time::Duration::from_millis(1);
+        let mut shaper = crate::dns_shaper::DnsShaper::new(cfg, 22);
+        let r = RecordingResolver {
+            calls: std::sync::Mutex::new(vec![]),
+        };
+        let frame = TunnelFrame {
+            session: "sess".into(),
+            seq: 7,
+            flags: 0,
+            payload: b"ping".to_vec(),
+        };
+        let got = super::send_receive_shaped(&r, "tun.example.com", &frame, &mut shaper)
+            .await
+            .expect("shaped send should succeed");
+        assert!(got.is_some(), "frame must be decoded");
+        // Exactly one query hit the wire.
+        assert_eq!(r.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_receive_shaped_pads_qname() {
+        let mut cfg = crate::dns_shaper::ShaperConfig::default();
+        cfg.decoy_prob = 0.0;
+        cfg.max_gap = std::time::Duration::from_millis(1);
+        cfg.min_gap = std::time::Duration::from_millis(1);
+        let mut shaper = crate::dns_shaper::DnsShaper::new(cfg, 23);
+        let r = RecordingResolver {
+            calls: std::sync::Mutex::new(vec![]),
+        };
+        let frame = TunnelFrame {
+            session: "sess".into(),
+            seq: 1,
+            flags: 0,
+            payload: b"short".to_vec(),
+        };
+        let _ = super::send_receive_shaped(&r, "tun.example.com", &frame, &mut shaper)
+            .await
+            .expect("shaped send should succeed");
+        let calls = r.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        // The emitted QNAME must be under the DPI cap.
+        assert!(calls[0].len() <= MAX_QNAME_LEN);
+    }
+
+    #[tokio::test]
+    async fn send_receive_shaped_decoys_emit_noise() {
+        let mut cfg = crate::dns_shaper::ShaperConfig::default();
+        cfg.decoy_prob = 1.0; // always decoy
+        cfg.max_gap = std::time::Duration::from_millis(1);
+        cfg.min_gap = std::time::Duration::from_millis(1);
+        let mut shaper = crate::dns_shaper::DnsShaper::new(cfg, 24);
+        let r = RecordingResolver {
+            calls: std::sync::Mutex::new(vec![]),
+        };
+        let frame = TunnelFrame {
+            session: "sess".into(),
+            seq: 1,
+            flags: 0,
+            payload: b"ping".to_vec(),
+        };
+        let got = super::send_receive_shaped(&r, "tun.example.com", &frame, &mut shaper)
+            .await
+            .expect("shaped send should succeed");
+        assert!(got.is_none(), "a decoy slot returns None");
+        assert_eq!(r.calls.lock().unwrap().len(), 1, "decoy query hit the wire");
     }
 }

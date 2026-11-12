@@ -59,6 +59,7 @@ pub mod desync;
 pub mod diagnose;
 pub mod diagnostics;
 pub mod dnstt_server;
+pub mod dns_shaper;
 pub mod dnstunnel;
 pub mod dnstunnel_auth;
 pub mod doctor;

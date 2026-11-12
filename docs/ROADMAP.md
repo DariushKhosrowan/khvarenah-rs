@@ -39,14 +39,15 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **TUN anti-loop routing plan** (doctrine A) — `tun_route.rs` (fwmark rule
   plan generator, validated idempotent on live host).
 - **MTU/MSS clamping plan** (doctrine D) — `tun_mtu.rs`.
+- **DNS-tunnel entropy shaping** (doctrine §5) — `dns_shaper.rs`
+  (jittered pacing + length padding + decoy queries) + `send_receive_shaped`
+  integration in the tunnel client.
 
 ## 🔜 Next — Doctrine gaps (remaining)
 
 - **Platform execution** of doctrine A/D rule plans — Linux `ip`/`iptables`
   + TUN device bring-up, WinTUN bypass, `VpnService.protect`.
 - **P2P LAN mesh** — mDNS neighbor discovery + relay (Level 4).
-- **DNS-tunnel entropy shaping** — pacing/padding + decoy queries
-  (doctrine §5).
 
 ## 🔜 Next
 
