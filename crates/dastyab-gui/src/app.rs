@@ -4063,6 +4063,9 @@ impl DastYabApp {
                                 "✅ versions-verified"
                             }
                             dastyab_core::journal::JournalKind::NodeRefill => "🔄 node-refill",
+                            dastyab_core::journal::JournalKind::AnchorsRefreshed => {
+                                "🧭 ct-anchors-refreshed"
+                            }
                         };
                         ui.label(format!("{label} — {} (t={})", e.detail, e.ts));
                     }

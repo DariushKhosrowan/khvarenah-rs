@@ -257,7 +257,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             let queries = queries.clone();
             tokio::task::spawn_blocking(move || cmd_anchors(&profile, &action, proxy, &queries))
                 .await
-                .map_err(|e| CFError::new("anchors", "spawn_blocking", &e.to_string()))?
+                .map_err(|e| CFError::new("anchors", "spawn_blocking", e.to_string()))?
         }
     }
 }
@@ -353,9 +353,7 @@ fn cmd_anchors(profile: &str, action: &str, proxy: bool, queries_csv: &str) -> R
         "prune" => {
             let dropped = dastyab_core::ct_anchors::prune_stale_anchors(profile, proxy);
             let total = dastyab_core::ct_anchors::anchor_hosts(profile).len();
-            println!(
-                "[anchors] pruned {dropped} stale anchors; {total} verified-live remain"
-            );
+            println!("[anchors] pruned {dropped} stale anchors; {total} verified-live remain");
             Ok(())
         }
         "refresh" => {

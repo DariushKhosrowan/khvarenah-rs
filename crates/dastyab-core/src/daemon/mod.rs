@@ -1431,7 +1431,9 @@ async fn run_self_maintenance(
     // anchors that no longer complete TLS. Rate-limited; requires the network.
     // The CT-anchor path uses reqwest's *blocking* client, which cannot be
     // built/dropped inside an async runtime — so run it on a blocking thread.
-    if net_up && now - state.last_anchors_refresh_ts >= crate::ct_anchors::ANCHOR_REFRESH_INTERVAL_SECS {
+    if net_up
+        && now - state.last_anchors_refresh_ts >= crate::ct_anchors::ANCHOR_REFRESH_INTERVAL_SECS
+    {
         state.last_anchors_refresh_ts = now;
         let profile_owned = profile.to_string();
         let (added, pruned) = match tokio::task::spawn_blocking(move || {

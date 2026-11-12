@@ -29,6 +29,7 @@ fn journal_kind_label(kind: &JournalKind) -> &'static str {
         JournalKind::SnapshotWritten => "workspace-snapshot",
         JournalKind::VersionVerified => "versions-verified",
         JournalKind::NodeRefill => "node-refill",
+        JournalKind::AnchorsRefreshed => "ct-anchors-refreshed",
     }
 }
 
@@ -49,6 +50,7 @@ fn journal_kind_color(kind: &JournalKind) -> egui::Color32 {
         JournalKind::SnapshotWritten => egui::Color32::from_rgb(170, 170, 255),
         JournalKind::VersionVerified => egui::Color32::from_rgb(130, 220, 130),
         JournalKind::NodeRefill => egui::Color32::from_rgb(120, 200, 255),
+        JournalKind::AnchorsRefreshed => egui::Color32::from_rgb(160, 210, 130),
     }
 }
 
