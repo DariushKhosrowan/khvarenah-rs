@@ -482,6 +482,19 @@ enum Command {
         #[arg(long, default_value = "")]
         link: String,
     },
+    /// Harvest free vless configs from Telegram channels (public previews,
+    /// no browser needed) into a profile's node store.
+    Harvest {
+        /// Comma-separated channel handles (with or without leading '@').
+        #[arg(long, default_value = "v2ray_config")]
+        channels: String,
+        /// Profile to import into (default "default").
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Route through the local xray SOCKS5 proxy (use when direct is blocked).
+        #[arg(long)]
+        proxy: bool,
+    },
 }
 
 #[derive(Subcommand)]

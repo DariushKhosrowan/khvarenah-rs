@@ -54,6 +54,7 @@ pub mod cleanip;
 pub mod config_mutation;
 pub mod config_store;
 pub mod connectivity;
+pub mod harvest;
 pub mod cycle_guard;
 pub mod daemon;
 pub mod desync;

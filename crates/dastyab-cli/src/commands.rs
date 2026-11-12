@@ -218,7 +218,55 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             path,
             link,
         } => cmd_configs(&profile, &action, &path, &link),
+        Command::Harvest {
+            channels,
+            profile,
+            proxy,
+        } => cmd_harvest(&profile, &channels, proxy).await,
     }
+}
+
+async fn cmd_harvest(profile: &str, channels: &str, proxy: bool) -> Result<(), CFError> {
+    use dastyab_core::harvest;
+    let list: Vec<&str> = channels
+        .split(',')
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if list.is_empty() {
+        eprintln!("no channels given");
+        return Ok(());
+    }
+    let profile = profile.to_string();
+    let channels_owned: Vec<String> =
+        list.into_iter().map(|c| c.to_string()).collect();
+    let results = tokio::task::spawn_blocking(move || {
+        channels_owned
+            .into_iter()
+            .map(|channel| {
+                let h = harvest::harvest_channel(&profile, &channel, proxy);
+                (channel, h)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| CFError::new("harvest", format!("join: {e}"), ""))?;
+
+    for (channel, h) in results {
+        if let Some(err) = &h.fetch_error {
+            eprintln!("[{channel}] fetch failed: {err}");
+            continue;
+        }
+        println!(
+            "[{}] found={} added={} duplicates={} invalid={}",
+            h.channel,
+            h.summary.found,
+            h.summary.added,
+            h.summary.duplicates,
+            h.summary.skipped_invalid
+        );
+    }
+    Ok(())
 }
 
 fn cmd_bundle(profile: &str, action: crate::BundleAction) -> Result<(), CFError> {
