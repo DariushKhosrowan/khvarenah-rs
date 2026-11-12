@@ -923,7 +923,7 @@ impl DastYabApp {
         let resolver_pool: Option<Vec<String>> = {
             let parsed: Vec<String> = self
                 .vps_resolvers
-                .split(|c: char| c == ',' || c == '\n' || c == ' ')
+                .split([' ', '\n', ','])
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
