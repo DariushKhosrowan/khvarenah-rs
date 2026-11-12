@@ -73,6 +73,7 @@ pub mod health;
 pub mod health_beacon;
 pub mod inventory;
 pub mod journal;
+pub mod interface_monitor;
 pub mod ledger_guard;
 pub mod liveness_sentinel;
 pub mod manifest;
