@@ -143,8 +143,12 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   `refresh` and `prune`. Closes the "daemon wire-in" half of §8.1.
 - **Wrangler-free deploy confirmation** — post-deploy smoke test that hits the
   worker URL and checks it responds.
-- **UDP-native DNS tunnel** — move the client off TCP-style framing toward the
-  low-overhead ARQ over raw UDP (5–7 byte overhead target).
+- ✅ **UDP-native DNS tunnel** — `dnstunnel_arq.rs` adds a sliding-window
+  selective-repeat ARQ transport over the DNS datagram path: bridges `ArqSender`/
+  `ArqReceiver` with the real `TunnelFrame` wire codec and a `Resolver`, ACK-driven
+  retransmission, and in-order reassembly. `dastyab dns-tunnel selftest` drives
+  it live. Verified by `cargo test -p dastyab-core dnstunnel_arq` (lossless
+  window delivery + lossy-link recovery by retransmission).
 - ✅ **Mesh relay transport (Level 4)** — forward traffic through the `best_relay`
   LAN neighbor discovered by `lan_mesh` (local hop forwarding) to complete the
   Level-4 ladder rung end-to-end. `mesh_relay.rs` provides the framed UDP relay

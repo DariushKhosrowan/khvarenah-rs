@@ -844,6 +844,26 @@ pub enum DnsTunnelAction {
         #[arg(long, default_value_t = 22)]
         port: u16,
     },
+    /// Exercise the windowed ARQ DNS transport (Level-3) against a live
+    /// resolver. Verifies the sliding-window selective-repeat transport moves
+    /// real payload chunks reliably over DNS, with ACK-driven retransmission.
+    Selftest {
+        /// Base DNS domain the tunnel answers for.
+        #[arg(long)]
+        domain: String,
+        /// Session tag.
+        #[arg(long, default_value = "selftest-sess")]
+        session: String,
+        /// In-flight window (frames).
+        #[arg(long, default_value_t = 8)]
+        window: u16,
+        /// Retransmit timeout ms.
+        #[arg(long, default_value_t = 1500)]
+        rto_ms: u64,
+        /// Number of payload chunks to send.
+        #[arg(long, default_value_t = 10)]
+        chunks: usize,
+    },
     /// Scan for working domestic (Iranian ISP) recursive resolvers and persist
     /// them as the blackout resolver pool. Run this BEFORE a lockdown.
     Resolvers {

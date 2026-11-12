@@ -64,6 +64,7 @@ pub mod diagnostics;
 pub mod dns_shaper;
 pub mod dnstt_server;
 pub mod dnstunnel;
+pub mod dnstunnel_arq;
 pub mod dnstunnel_auth;
 pub mod doctor;
 pub mod doh;

@@ -4723,6 +4723,108 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
                 ))
             }
         }
+        crate::DnsTunnelAction::Selftest {
+            domain,
+            session,
+            window,
+            rto_ms,
+            chunks,
+        } => {
+            use dastyab_core::dnstunnel_arq::DnsTunnelArq;
+            use dastyab_core::resolve_pool::{ResolverPool, IRANIAN_RESOLVER_CANDIDATES};
+            use std::time::Duration;
+
+            // Build a live resolver: prefer the persisted blackout pool, else
+            // sweep the built-in Iranian ISP seeds.
+            let timeout = Duration::from_millis(2500);
+            let pool = if let Some(cfg) = vps::load_tunnel_client_config("default") {
+                if let Some(rp) = &cfg.resolver_pool {
+                    if !rp.is_empty() {
+                        Some(ResolverPool::new(rp.clone(), timeout))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let resolver = match pool {
+                Some(p) => {
+                    println!("[selftest] using persisted resolver pool");
+                    p
+                }
+                None => {
+                    println!("[selftest] no pool persisted; sweeping seeded resolvers ...");
+                    let cands: Vec<String> = IRANIAN_RESOLVER_CANDIDATES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    let found = dastyab_core::resolve_pool::discover_open_resolvers(
+                        &cands, 32, timeout, "",
+                    )
+                    .await;
+                    if found.is_empty() {
+                        return Err(CFError::new(
+                            "dns-tunnel-selftest",
+                            "no working resolver found",
+                            "Run `dastyab dns-tunnel resolvers` first, or check connectivity.",
+                        ));
+                    }
+                    println!("[selftest] discovered {} resolver(s)", found.len());
+                    ResolverPool::new(found, timeout)
+                }
+            };
+
+            let rto = Duration::from_millis(rto_ms);
+            let mut tr = DnsTunnelArq::new(&resolver, &domain, &session, window, rto);
+            let mut total = 0usize;
+            for i in 0..chunks {
+                let payload =
+                    format!("selftest-chunk-{i:04}-{}-bytes", 32 + (i % 7) * 9).into_bytes();
+                total += payload.len();
+                tr.push(payload);
+            }
+            println!(
+                "[selftest] sending {chunks} chunks ({total} bytes) via windowed ARQ DNS transport (window={window}, rto={rto_ms}ms)"
+            );
+            let mut st = dastyab_core::dnstunnel_arq::PumpStats::default();
+            let mut delivered = 0usize;
+            let mut pumps = 0usize;
+            for _ in 0..4000 {
+                let s = tr
+                    .pump()
+                    .await
+                    .map_err(|e| CFError::new("dns-tunnel-selftest", format!("pump: {e}"), ""))?;
+                st.sent += s.sent;
+                st.retransmitted += s.retransmitted;
+                st.acked += s.acked;
+                delivered += tr.take_delivered().len();
+                pumps += 1;
+                if tr.is_idle() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            println!(
+                "[selftest] pumps={pumps} sent={} retransmitted={} acked={}",
+                st.sent, st.retransmitted, st.acked
+            );
+            if tr.is_idle() {
+                println!("[selftest] OK — all {chunks} chunks acknowledged and delivered in-order (total {delivered})");
+                Ok(())
+            } else {
+                Err(CFError::new(
+                    "dns-tunnel-selftest",
+                    format!(
+                        "transport not idle after {pumps} pumps (inflight={})",
+                        tr.inflight()
+                    ),
+                    "Resolver may be dropping all frames; check the base domain is delegated to the tunnel server.",
+                ))
+            }
+        }
         crate::DnsTunnelAction::Resolvers {
             candidates,
             concurrency,
