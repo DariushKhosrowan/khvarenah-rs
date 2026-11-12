@@ -7,6 +7,15 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **Multi-scheme node ingestion** — the node store now accepts every supported
   share-link scheme (vless, vmess, trojan, ss/ssr, hysteria2, tuic), with
   cross-scheme dedup by host+port+id (`proxy_uri`,`,config_store`).
+- **Telegram harvest: anti-bot stealth pacing** — `fetch_preview_page` now
+  calls `stealth::pre_request_pause("read")` before every t.me request, so
+  multi-page archive-depth walks and multi-channel harvests no longer trip
+  t.me's rate-limit (previously surfaced as intermittent body-decode fetch
+  errors). Respects the global `--no-stealth` toggle (doctrine §5, §6.5).
+- **Telegram harvest: archive freshness-aware** — `extract_posted_links` tags
+  each config with the message's publish epoch from the
+  `tgme_widget_message_wrap` blocks; `published_epoch` is refreshed on
+  re-harvest (never downgraded) and v2rayN export orders freshest-first.
 - **Telegram harvest upgrades** — `extract_proxy_links` recognizes all schemes;
   **archive-depth pagination** walks older posts via the `?before=<id>` cursor
   so configs long gone from the latest page are recovered (`--depth`).
