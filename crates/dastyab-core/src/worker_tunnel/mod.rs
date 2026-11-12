@@ -25,8 +25,12 @@
 //!
 //! # Scope
 //!
-//! Control plane only: flags 1/2/3. Data-plane (flags=0, actual VLESS relay)
-//! is a later step.
+//! Control-plane plus an armed data plane: flags 1/2/3 (ping/status/bootstrap)
+//! always work; the `/ws` WebSocket byte-pipe (the actual VLESS/data relay) is
+//! armed when the deploy sets `DYB_VLESS_UPSTREAM` — via the CLI's
+//! `dastyab dns-tunnel worker --vless-upstream <host>:<port>` flag. Without
+//! an upstream the `/ws` endpoint replies `500 no-upstream` (control-plane only),
+//! so the data plane is enabled explicitly, never implicitly.
 //!
 //! Files:
 //! - `bundle.rs` — the embedded worker JS (`WORKER_TUNNEL_JS`).
