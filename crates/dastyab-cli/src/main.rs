@@ -602,6 +602,20 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Compose and preview a modular VPN-tool chain (Psiphon, Tor,
+    /// v2rayN/xray, Lantern, Shadowsocks) in user-chosen order (doctrine
+    /// §8.3). Planning validates engines and assigns loopback ports; it does
+    /// NOT spawn processes yet (executor is a separate step).
+    Chain {
+        /// Action: plan | list-engines | check.
+        #[arg()]
+        action: String,
+        /// Ordered engine chain, first layer first, comma-separated using the
+        /// engine ids: psiphon, tor, v2rayn, lantern, shadowsocks, dastyab.
+        /// e.g. `--chain lantern,tor,v2rayn`. Required for `plan`.
+        #[arg(long, default_value = "")]
+        chain: String,
+    },
 }
 
 #[derive(Subcommand)]

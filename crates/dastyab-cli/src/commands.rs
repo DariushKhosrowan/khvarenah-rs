@@ -269,6 +269,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         })
         .await
         .map_err(|e| CFError::new("subscribe", "spawn_blocking", e.to_string()))?,
+        Command::Chain { action, chain } => cmd_chain(&action, &chain),
     }
 }
 
@@ -449,6 +450,77 @@ fn cmd_subscribe(
     // Block forever until killed (Ctrl-C / SIGTERM terminates naturally).
     loop {
         std::thread::park();
+    }
+}
+
+/// `dastyab chain <action> [--chain e1,e2,...]`
+///
+/// Actions:
+///   - `list-engines`: print the supported engine ids.
+///   - `plan`: parse `--chain`, run the planner, print the concrete pipeline.
+///   - `check`: verify the chain parser accepts the ordering and report
+///     any unknown engines (without requiring binaries present).
+fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
+    use dastyab_core::chain_mixer::{self, ChainConfig, Engine};
+    match action {
+        "list-engines" => {
+            let ids = [
+                Engine::Psiphon,
+                Engine::Tor,
+                Engine::V2rayN,
+                Engine::Lantern,
+                Engine::Shadowsocks,
+                Engine::DastYab,
+            ];
+            for e in ids {
+                println!(
+                    "{:<12} binary={}",
+                    e.label(),
+                    e.binary_hint().unwrap_or("(in-process)")
+                );
+            }
+            Ok(())
+        }
+        "plan" | "check" => {
+            let mut engines = Vec::new();
+            for part in chain.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                let e = match part {
+                    "psiphon" => Engine::Psiphon,
+                    "tor" => Engine::Tor,
+                    "v2rayn" | "xray" => Engine::V2rayN,
+                    "lantern" => Engine::Lantern,
+                    "shadowsocks" | "ss" => Engine::Shadowsocks,
+                    "dastyab" => Engine::DastYab,
+                    other => {
+                        return Err(CFError::new(
+                            "chain",
+                            format!("unknown engine: {other}"),
+                            "use: psiphon, tor, v2rayn, lantern, shadowsocks, dastyab",
+                        ));
+                    }
+                };
+                engines.push(e);
+            }
+            let cfg = ChainConfig { engines };
+            let planned = chain_mixer::plan_chain(&cfg, |_| None)?;
+            if action == "plan" {
+                println!("[chain] planned pipeline (client ↑ → egress ↓):");
+                print!("{}", chain_mixer::render_chain(&planned));
+                println!("[chain] egress_port={}", planned.egress_port);
+            } else {
+                println!(
+                    "[chain] valid: {} layer(s), egress_port={}",
+                    planned.layers.len(),
+                    planned.egress_port
+                );
+            }
+            Ok(())
+        }
+        other => Err(CFError::new(
+            "chain",
+            format!("unknown action: {other}"),
+            "use: plan | list-engines | check",
+        )),
     }
 }
 
