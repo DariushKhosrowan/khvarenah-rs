@@ -104,6 +104,7 @@ pub mod sni_spoof;
 pub mod status;
 pub mod stealth;
 pub mod store;
+pub mod subscription;
 pub mod tls;
 pub mod token_provision;
 pub mod token_rotate;

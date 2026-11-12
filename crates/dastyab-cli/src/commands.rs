@@ -259,6 +259,16 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
                 .await
                 .map_err(|e| CFError::new("anchors", "spawn_blocking", e.to_string()))?
         }
+        Command::Subscribe {
+            port,
+            profile,
+            only_healthy,
+            token,
+        } => tokio::task::spawn_blocking(move || {
+            cmd_subscribe(port, &profile, only_healthy, token.as_deref())
+        })
+        .await
+        .map_err(|e| CFError::new("subscribe", "spawn_blocking", e.to_string()))?,
     }
 }
 
@@ -380,6 +390,72 @@ fn cmd_anchors(profile: &str, action: &str, proxy: bool, queries_csv: &str) -> R
             "Use: discover | list | prune | refresh | clear",
         )),
     }
+}
+
+/// Start the loopback subscription server (doctrine: never stale, always a
+/// fresh healthy pool). Runs forever; Ctrl-C stops it.
+fn cmd_subscribe(
+    port: u16,
+    profile: &str,
+    only_healthy: bool,
+    token: Option<&str>,
+) -> Result<(), CFError> {
+    use dastyab_core::subscription::{self, SubscriptionConfig};
+
+    let marker = format!("dastyab-subscribe-{profile}-{port}");
+    let pid = std::process::id();
+    let lock = format!("/tmp/{marker}.lock");
+    if let Ok(existing) = std::fs::read_to_string(&lock) {
+        let existing_pid: u32 = existing.trim().parse().unwrap_or(0);
+        if existing_pid != 0 && existing_pid != pid && process_alive(existing_pid) {
+            return Err(CFError::new(
+                "subscribe",
+                format!("already running (pid {existing_pid}) on 127.0.0.1:{port}"),
+                "Stop it first (kill <pid>) or pick another --port.",
+            ));
+        }
+    }
+    let _ = std::fs::write(&lock, pid.to_string());
+
+    let cfg = SubscriptionConfig {
+        profile: profile.to_string(),
+        port,
+        only_healthy,
+        token: token.map(|s| s.to_string()),
+    };
+
+    let server =
+        subscription::serve_loopback(&cfg).map_err(|e| CFError::new("subscribe", "bind", e))?;
+
+    // Self-check: hit the feed once to prove it serves.
+    let url = format!("http://{}/subscription", server.addr);
+    let len =
+        subscription::count_get(&url).map_err(|e| CFError::new("subscribe", "self-check", e))?;
+    let _ = std::fs::remove_file(&lock);
+
+    let fmt = if only_healthy {
+        "verified-healthy"
+    } else {
+        "all"
+    };
+    println!("[subscribe] serving {fmt} pool on {}", server.addr);
+    println!("[subscribe] feed: {url}");
+    if token.is_some() {
+        println!("[subscribe] token required (?token=...)");
+    }
+    println!("[subscribe] self-check: {len} bytes (feed ready)");
+    println!("[subscribe] press Ctrl-C to stop");
+
+    // Block forever until killed (Ctrl-C / SIGTERM terminates naturally).
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Return true if a process with the given pid is alive (Unix).
+fn process_alive(pid: u32) -> bool {
+    use std::path::Path;
+    Path::new(&format!("/proc/{pid}")).exists()
 }
 
 async fn cmd_harvest(

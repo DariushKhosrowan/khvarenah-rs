@@ -584,6 +584,24 @@ enum Command {
         #[arg(long, default_value = "")]
         queries: String,
     },
+    /// Serve the healthy node pool as a local v2rayN subscription feed
+    /// (loopback HTTP). Point v2rayN at http://127.0.0.1:<port>/subscription
+    /// for an always-fresh base64 feed of verified-healthy configs with no
+    /// manual Telegram hunting (doctrine: never stop, never stale).
+    Subscribe {
+        /// Port to bind on loopback (default 10852; 0 = any free).
+        #[arg(long, short, default_value_t = dastyab_core::subscription::DEFAULT_SUBSCRIPTION_PORT)]
+        port: u16,
+        /// Profile to serve (default "default").
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Only include verified-healthy nodes (default true).
+        #[arg(long, default_value_t = true)]
+        only_healthy: bool,
+        /// Require ?token= matching this to serve content. None = open.
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
