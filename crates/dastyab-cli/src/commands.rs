@@ -3577,7 +3577,9 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
             concurrency,
             timeout_ms,
         } => {
-            use dastyab_core::resolve_pool::{discover_open_resolvers, IRANIAN_RESOLVER_CANDIDATES};
+            use dastyab_core::resolve_pool::{
+                discover_open_resolvers, IRANIAN_RESOLVER_CANDIDATES,
+            };
             let cands: Vec<String> = match candidates {
                 Some(s) if !s.trim().is_empty() => s
                     .split(',')
@@ -3585,7 +3587,10 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .collect(),
-                _ => IRANIAN_RESOLVER_CANDIDATES.iter().map(|s| s.to_string()).collect(),
+                _ => IRANIAN_RESOLVER_CANDIDATES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
             };
             println!(
                 "Scanning {} candidate resolver(s) (concurrency={}, timeout={}ms) ...",

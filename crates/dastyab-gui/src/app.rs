@@ -928,7 +928,11 @@ impl DastYabApp {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect();
-            if parsed.is_empty() { None } else { Some(parsed) }
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(parsed)
+            }
         };
         let cfg = dastyab_core::vps_deploy::TunnelClientConfig {
             host: self.vps_host.trim().to_string(),
@@ -4629,6 +4633,7 @@ mod tests {
             worker_name: Some("dyb-tun-cccc".into()),
             shared_secret: Some("x".into()),
             worker_vless_upstream: None,
+            resolver_pool: None,
         };
         dastyab_core::vps_deploy::write_tunnel_client_config(pid, &cfg).unwrap();
         // Persist the durable base link too, exactly as the real deploy paths
@@ -5037,6 +5042,7 @@ mod tests {
             vps_port: 22,
             vps_domain: String::new(),
             vps_note: String::new(),
+            vps_resolvers: String::new(),
             worker_tunnel_note: String::new(),
             hz_token: String::new(),
             hz_location: String::new(),
@@ -5257,6 +5263,7 @@ mod tests {
                 vps_port: 22,
                 vps_domain: String::new(),
                 vps_note: String::new(),
+                vps_resolvers: String::new(),
                 worker_tunnel_note: String::new(),
                 hz_token: String::new(),
                 hz_location: String::new(),
@@ -5418,6 +5425,7 @@ mod tests {
                 vps_port: 22,
                 vps_domain: String::new(),
                 vps_note: String::new(),
+                vps_resolvers: String::new(),
                 worker_tunnel_note: String::new(),
                 hz_token: String::new(),
                 hz_location: String::new(),
@@ -5618,6 +5626,7 @@ mod tests {
                 vps_port: 22,
                 vps_domain: String::new(),
                 vps_note: String::new(),
+                vps_resolvers: String::new(),
                 worker_tunnel_note: String::new(),
                 hz_token: String::new(),
                 hz_location: String::new(),
