@@ -296,6 +296,13 @@ mission: a flawless, self-healing circumvention client.
   ladder so the store is always pruned to *verified-live* configs.
 
 ### 8.2 — Performance & efficiency
+- ✅ **Multipath ARQ packet bonding** — `multipath_bond.rs`: stripe or mirror
+  frames across multiple lossy lanes (cellular, Wi-Fi, DNS tunnel) with
+  per-lane selective-repeat ARQ and global in-order reassembly. The logical
+  link survives total loss of any single path (Mirror) or heavy loss on all
+  (Stripe + retransmission). Adversarial lossy-lane simulations (40% per-lane
+  loss) pin ordered delivery; `dastyab bond selftest` runs a live 3-lane
+  check.
 - **UDP-native DNS tunnel** — move the DNS-tunnel client off TCP-style framing
   toward the low-overhead ARQ (selective-repeat) over raw UDP where the
   resolver permits it (the 5–7 byte overhead target).

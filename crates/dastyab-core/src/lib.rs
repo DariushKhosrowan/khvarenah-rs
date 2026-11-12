@@ -86,6 +86,7 @@ pub mod manifest;
 pub mod mesh_relay;
 pub mod multi_worker;
 pub mod multilayer;
+pub mod multipath_bond;
 pub mod node_probe;
 pub mod node_refill;
 pub mod platform_linux;

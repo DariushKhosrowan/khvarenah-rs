@@ -120,6 +120,13 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   LAN neighbor discovered by `lan_mesh` (local hop forwarding) to complete the
   Level-4 ladder rung end-to-end.
 - **Multi-worker management** — list/delete/update workers from one place.
+- ✅ **Multipath ARQ packet bonding** — `multipath_bond.rs`. Stripe or mirror
+  frames across multiple lossy lanes (cellular, Wi-Fi, DNS tunnel), each lane
+  running its own ARQ sender/receiver, with global bond-sequence reassembly and
+  cross-lane dedup. Survives total loss of any single path (Mirror) or heavy
+  loss on all (Stripe + selective-repeat retransmission). Adversarial lossy
+  lane simulations test do order delivery under 40% per-lane loss.
+  `dastyab bond selftest` runs a live 3-lane check.
 - **DNS smoke test** — verify a DNS record resolves through Cloudflare.
 - **GUI async/threading** — run scans in a real background task so the UI
   never blocks.

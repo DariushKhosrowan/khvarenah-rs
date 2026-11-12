@@ -486,6 +486,18 @@ enum Command {
         #[arg(long, default_value = "")]
         name: String,
     },
+    /// Multipath ARQ packet bonding: stripe or mirror frames across multiple
+    /// lossy sub-transports (cellular, Wi-Fi, DNS tunnel) with selective-repeat
+    /// retransmission and in-order reassembly, so the logical link survives the
+    /// loss of any single path (doctrine §8.2).
+    Bond {
+        /// Action: selftest.
+        #[arg()]
+        action: String,
+        /// Number of frames for the selftest (default 200).
+        #[arg(long, default_value_t = 200)]
+        frames: usize,
+    },
     /// Manage native config-storage nodes (imported from v2rayN or pasted).
     Nodes {
         /// Sub-command: import | paste | activate | list | clear | probe |

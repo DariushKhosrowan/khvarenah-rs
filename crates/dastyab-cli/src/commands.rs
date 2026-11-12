@@ -218,6 +218,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             upstream,
             name,
         } => cmd_mesh(&action, window, upstream, &name),
+        Command::Bond { action, frames } => cmd_bond(&action, frames),
         Command::Nodes {
             action,
             profile,
@@ -3739,6 +3740,108 @@ fn cmd_platform(action: &str, dry_run: bool, mtu: u32) -> Result<(), CFError> {
             "platform",
             format!("unknown action {action:?}"),
             "Use: apply | teardown | plan",
+        )),
+    }
+}
+
+/// Multipath ARQ packet-bond self-test (doctrine §8.2). Runs an adversarial
+/// lossy-lane simulation and reports that every frame was delivered in order.
+fn cmd_bond(action: &str, frames: usize) -> Result<(), CFError> {
+    let action = action.trim().to_lowercase();
+    match action.as_str() {
+        "selftest" => {
+            use dastyab_core::multipath_bond::{
+                BondPolicy, LaneId, MultipathBonder, SubmitResult,
+            };
+            use rand::Rng;
+            use std::time::Duration;
+
+            let loss = 0.35f64;
+            let lanes = [LaneId(0), LaneId(1), LaneId(2)];
+            let mut bond =
+                MultipathBonder::new(&lanes, BondPolicy::Stripe, 64, Duration::from_millis(30));
+            // Per-lane lossy channel queues (lane-local ARQ seqno -> bytes).
+            let mut ch: Vec<Vec<(u16, Vec<u8>)>> = vec![Vec::new(); lanes.len()];
+            let mut delivered = 0u64;
+            let mut expected = 0u64;
+            let mut rng = rand::thread_rng();
+
+            for _ in 0..1200 {
+                // Submit as many as the window allows.
+                while expected < frames as u64 {
+                    let payload = format!("bond-frame-{expected}").into_bytes();
+                    if !matches!(bond.submit(payload), SubmitResult::Accepted { .. }) {
+                        break;
+                    }
+                    expected += 1;
+                }
+                // Drain each lane into its lossy channel.
+                for (li, &lane) in lanes.iter().enumerate() {
+                    for (seq, bytes) in bond.drain_outgoing(lane) {
+                        if rng.gen::<f64>() > loss {
+                            ch[li].push((seq.0, bytes));
+                        }
+                    }
+                }
+                // Deliver what got through (any lane).
+                for (li, &lane) in lanes.iter().enumerate() {
+                    let q = std::mem::take(&mut ch[li]);
+                    for (seq, bytes) in q {
+                        let _ = bond.on_lane_frame(lane, dastyab_core::arq::Seqno(seq), &bytes);
+                    }
+                }
+                // ACK back on each lane.
+                for &lane in &lanes {
+                    if let Some((cum, sack)) = bond.lane_ack(lane) {
+                        bond.on_lane_ack(lane, cum, sack);
+                    }
+                }
+                // Retransmit timed-out frames back into their own lane channels.
+                // The loop runs faster than the real RTO, so use a synthetic
+                // clock well past the timeout to force retransmission.
+                let clock = std::time::Instant::now() + Duration::from_millis(500);
+                for (li, &lane) in lanes.iter().enumerate() {
+                    for s in bond.pending_retransmits(lane, clock) {
+                        if let Some(bytes) = bond.retransmit(lane, s) {
+                            if rng.gen::<f64>() > loss {
+                                ch[li].push((s.0, bytes));
+                            }
+                        }
+                    }
+                }
+                // Verify ordered delivery.
+                for (seq, _) in bond.take_delivered() {
+                    if seq != delivered {
+                        return Err(CFError::new(
+                            "bond",
+                            format!("selftest ordering violation: got {seq}, expected {delivered}"),
+                            "multipath bond reassembly",
+                        ));
+                    }
+                    delivered += 1;
+                }
+                if delivered >= frames as u64 {
+                    break;
+                }
+            }
+
+            if delivered < frames as u64 {
+                return Err(CFError::new(
+                    "bond",
+                    format!("selftest incomplete: {delivered}/{frames} frames delivered"),
+                    "multipath bond under loss",
+                ));
+            }
+            println!(
+                "[bond] selftest OK: {frames} frames delivered in order across {} lossy lanes ({loss:.0}% loss per lane)",
+                lanes.len()
+            );
+            Ok(())
+        }
+        other => Err(CFError::new(
+            "bond",
+            format!("unknown action {other:?}"),
+            "Use: bond selftest",
         )),
     }
 }
