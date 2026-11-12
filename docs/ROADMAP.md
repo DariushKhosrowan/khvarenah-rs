@@ -103,6 +103,10 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - ✅ **Periodic config-health decay** — piggyback node re-probe on the daemon's
   ladder so the store always prunes to verified-live configs
   (`node_probe::probe_stale` + hourly daemon sweep).
+- ✅ **Verified healthy nodes → v2rayN export** — `dastyab nodes
+  export-v2rayn` merges the verified-healthy pool into v2rayN's ServersStore.json
+  (dedup by host+port+uuid, atomic write, idempotent). Closes the loop:
+  harvest → probe → export healthy → v2rayN GUI.
 - **Wrangler-free deploy confirmation** — post-deploy smoke test that hits the
   worker URL and checks it responds.
 - **UDP-native DNS tunnel** — move the client off TCP-style framing toward the

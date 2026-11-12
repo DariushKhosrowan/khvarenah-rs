@@ -316,6 +316,132 @@ pub fn import_v2rayn_store(profile: &str, path: &Path) -> Result<ImportSummary, 
     Ok(summary)
 }
 
+/// v2rayN server-entry `configType` label for a share-link scheme.
+pub fn v2rayn_config_type(url: &str) -> &'static str {
+    if url.starts_with("vless://") {
+        "VLESS"
+    } else if url.starts_with("vmess://") {
+        "VMESS"
+    } else if url.starts_with("trojan://") {
+        "TROJAN"
+    } else if url.starts_with("ss://") {
+        "SS"
+    } else if url.starts_with("ssr://") {
+        "SSR"
+    } else if url.starts_with("hysteria2://") {
+        "HYSTERIA2"
+    } else if url.starts_with("tuic://") {
+        "TUIC"
+    } else {
+        "VLESS"
+    }
+}
+
+/// Identity (host, port, id) of a share-link, mirroring [`same_server`].
+fn node_identity(url: &str) -> Option<(String, String, String)> {
+    let p = crate::proxy_uri::ProxyUri::parse(url)?;
+    Some((p.host.clone(), p.port.to_string(), p.id.clone()))
+}
+
+/// Export nodes from this profile into a v2rayN `ServersStore.json`, merged
+/// with any existing servers (dedup by host+port+uuid). When `only_healthy`
+/// is true (recommended), only verified-healthy nodes are written, so the
+/// v2rayN GUI ends up with a working config set. Returns (added, dups).
+pub fn export_v2rayn_store(
+    profile: &str,
+    path: &Path,
+    only_healthy: bool,
+) -> Result<(usize, usize), CFError> {
+    let store = load_node_store(profile);
+
+    let mut value: serde_json::Value = if path.exists() {
+        let bytes = std::fs::read(path).map_err(|e| {
+            CFError::new(
+                "Export error",
+                format!("Cannot read {}: {e}", path.display()),
+                "Check the path is valid.",
+            )
+        })?;
+        serde_json::from_slice(&bytes).map_err(|e| {
+            CFError::new(
+                "Export error",
+                format!("{} is not valid JSON: {e}", path.display()),
+                "Export a fresh ServersStore.json from v2rayN.",
+            )
+        })?
+    } else {
+        serde_json::json!({"servers": []})
+    };
+
+    let servers = value
+        .get_mut("servers")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| {
+            CFError::new(
+                "Export error",
+                "No \"servers\" array found in the target file.",
+                "Pick a valid v2rayN ServersStore.json.",
+            )
+        })?;
+
+    let mut seen = std::collections::HashSet::new();
+    for s in servers.iter() {
+        if let Some(url) = s.get("url").and_then(|v| v.as_str()) {
+            if let Some(id) = node_identity(url) {
+                seen.insert(id);
+            }
+        }
+    }
+
+    let mut next_index = servers.len();
+    let mut added = 0;
+    let mut dups = 0;
+    let now_ms = (now_ts() * 1000.0) as i64;
+
+    for node in store
+        .nodes
+        .iter()
+        .filter(|n| !only_healthy || n.healthy == Some(true))
+    {
+        let id = match node_identity(&node.url) {
+            Some(id) => id,
+            None => continue,
+        };
+        if seen.contains(&id) {
+            dups += 1;
+            continue;
+        }
+        seen.insert(id);
+        let clean_url = node.url.trim_end_matches('#').to_string();
+        let alias = if node.alias.is_empty() {
+            format!("node-{}", next_index + 1)
+        } else {
+            node.alias.clone()
+        };
+        servers.push(serde_json::json!({
+            "alias": alias,
+            "index": next_index,
+            "lastV2rayEntryTime": now_ms,
+            "subId": "",
+            "url": clean_url,
+            "configType": v2rayn_config_type(&clean_url),
+            "serverUrl": clean_url,
+        }));
+        next_index += 1;
+        added += 1;
+    }
+
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|e| {
+        CFError::new(
+            "Export error",
+            format!("Cannot serialize ServersStore.json: {e}"),
+            "Internal error.",
+        )
+    })?;
+    atomic_write(path, &bytes)?;
+    Ok((added, dups))
+}
+
 /// Source label recorded on nodes imported from an autonomous/out-of-band
 /// source (Telegram archive or GitHub config repo) — distinct from a
 /// hand-pasted link so the store can track provenance and prune/audit
@@ -615,5 +741,55 @@ mod tests {
         assert_eq!(by_id("11111111").source, SOURCE_PASTED);
         assert_eq!(by_id("22222222").source, SOURCE_TELEGRAM);
         assert_eq!(by_id("33333333").source, SOURCE_GITHUB);
+    }
+
+    #[test]
+    fn export_v2rayn_roundtrip_dedups_and_filters_unhealthy() {
+        let (profile, _d) = tmp_profile();
+        // Two healthy nodes + one unhealthy node.
+        import_single_link(
+            &profile,
+            "vless://11111111-1111-1111-1111-111111111111@10.0.0.1:443?type=tcp#healthy1",
+        )
+        .unwrap();
+        import_single_link(
+            &profile,
+            "trojan://22222222-2222-2222-2222-222222222222@10.0.0.2:443?security=tls#healthy2",
+        )
+        .unwrap();
+        import_single_link(
+            &profile,
+            "vless://33333333-3333-3333-3333-333333333333@10.0.0.3:443?type=tcp#sick",
+        )
+        .unwrap();
+
+        let mut store = load_node_store(&profile);
+        for n in store.nodes.iter_mut() {
+            n.healthy = Some(n.url.contains("healthy"));
+        }
+        save_node_store(&profile, &store).unwrap();
+
+        // Existing v2rayN store containing one of the healthy nodes already.
+        let p = _d.path().join("ServersStore.json");
+        let existing = r#"{"servers":[{"alias":"prev","url":"vless://11111111-1111-1111-1111-111111111111@10.0.0.1:443?type=tcp#healthy1"}]}"#;
+        std::fs::write(&p, existing).unwrap();
+
+        let (added, dups) = export_v2rayn_store(&profile, &p, true).unwrap();
+        assert_eq!(added, 1, "only the not-yet-present healthy node is added");
+        assert_eq!(dups, 1, "already-present healthy node is skipped as dup");
+
+        let out: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let servers = out["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert!(servers
+            .iter()
+            .any(|s| s["url"].as_str().unwrap().contains("22222222")));
+        assert!(
+            !servers
+                .iter()
+                .any(|s| s["url"].as_str().unwrap().contains("33333333")),
+            "unhealthy node must not be exported"
+        );
+        assert!(servers.iter().any(|s| s["configType"] == "TROJAN"));
     }
 }

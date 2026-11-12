@@ -29,6 +29,7 @@ Per-profile JSON file (`<profile>/nodes.json`) of VLESS nodes.
 | v2rayN ServersStore.json | `dastyab nodes import --path ~/.config/v2rayN/Local/ServersStore.json` |
 | paste one link | `dastyab nodes paste --link 'vless://...'` |
 | Telegram (browser-free) | `dastyab harvest --channels v2ray_config` |
+| export healthy nodes → v2rayN | `dastyab nodes export-v2rayn --path ~/.config/v2rayN/Local/ServersStore.json` |
 
 Management:
 
@@ -42,7 +43,6 @@ Management:
 
 The ultimate point of the store is that DastYab **never sits dead** when the
 current config stops working. The `node_refill` orchestrator makes that real:
-
 - **Pure trigger** (`refill_needed`): the pool is empty, or no node is known
   healthy → a refill is warranted. A pool of never-probed nodes also counts
   (we'd rather have a surplus of verified configs than rely on unverified
@@ -57,6 +57,28 @@ current config stops working. The `node_refill` orchestrator makes that real:
   per 15 minutes so a permanently-dead pool doesn't hammer Telegram/GitHub. The
   result is logged and journaled (`NodeRefill`).
 - **CLI**: run it manually with `dastyab nodes refill`.
+
+### Feeding verified configs back into v2rayN
+
+DastYab's store is the resilient source of truth, but you may also want the
+harvested, verified-healthy configs to appear in your **v2rayN GUI** so you can
+use them there (or so v2rayN stays useful if the CLI/GUI isn't around):
+
+```
+$ dastyab nodes export-v2rayn [--path ~/.config/v2rayN/Local/ServersStore.json]
+[configs] exported healthy nodes to ...: added=298 duplicates-skipped=0
+```
+
+- Only **verified-healthy** nodes are written by default (the two-phase TLS
+  probe decides what's healthy), so v2rayN doesn't get a pile of dead configs.
+- The tool **merges** — it reads the existing `ServersStore.json`, dedups by
+  the same `(host, port, uuid)` identity the store uses, and appends only new
+  servers. Re-running is idempotent (`added=0 duplicates-skipped=N`).
+- The write is atomic (temp file + rename), so v2rayN's file is never left
+  half-written, even if v2rayN is open.
+
+This closes the loop: harvest → probe → **export healthy → v2rayN**, so the
+client GUI always mirrors the verified-live pool (doctrine §5, §6.4).
 
 ### Key design points
 

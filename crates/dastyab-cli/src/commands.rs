@@ -4086,10 +4086,26 @@ async fn cmd_configs(
             }
             Ok(())
         }
+        "export-v2rayn" => {
+            use dastyab_core::config_store::export_v2rayn_store;
+            let target = if path.is_empty() {
+                let home = std::env::var("HOME").unwrap_or_default();
+                format!("{home}/.config/v2rayN/Local/ServersStore.json")
+            } else {
+                path.to_string()
+            };
+            let (added, dups) =
+                export_v2rayn_store(profile, std::path::Path::new(&target), true)?;
+            println!(
+                "[configs] exported healthy nodes to {target}: added={} duplicates-skipped={}",
+                added, dups
+            );
+            Ok(())
+        }
         _ => Err(CFError::new(
             "configs",
             format!("unknown action {action:?}"),
-            "Use: import | paste | activate | list | clear | probe | failover | selfheal | refill",
+            "Use: import | paste | activate | list | clear | probe | failover | selfheal | refill | export-v2rayn",
         )),
     }
 }
