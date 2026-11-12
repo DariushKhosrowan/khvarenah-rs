@@ -4671,6 +4671,27 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
             println!("resolvers instead of querying the VPS directly.");
             Ok(())
         }
+        crate::DnsTunnelAction::Relay {
+            worker_url,
+            session_secret,
+            bind,
+            upstream,
+        } => {
+            use dastyab_core::worker_tunnel::data_relay::WorkerDataRelay;
+            let relay = WorkerDataRelay::new(worker_url, session_secret, upstream);
+            println!(
+                "Starting data relay: {} → worker at {}",
+                bind,
+                relay.worker_url()
+            );
+            if let Some(u) = relay.upstream() {
+                println!("  worker relays to upstream {u}");
+            }
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Run forever; Ctrl-C ends the process naturally.
+            relay.serve_local(&bind, Some(stop)).await?;
+            Ok(())
+        }
         crate::DnsTunnelAction::Deploy {
             host,
             ssh_user,

@@ -40,6 +40,7 @@
 //!   the HTTPS call.
 
 pub mod bundle;
+pub mod data_relay;
 pub mod deploy;
 pub mod resolver;
 pub mod secret;

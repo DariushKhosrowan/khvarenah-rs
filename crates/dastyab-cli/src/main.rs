@@ -855,6 +855,23 @@ pub enum DnsTunnelAction {
         #[arg(long, default_value_t = 2500)]
         timeout_ms: u64,
     },
+    /// Run the client-side data relay: bridge a local loopback listener to the
+    /// deployed worker's `/ws` WebSocket byte-pipe. Real apps connect to the
+    /// local port and their traffic flows through the Cloudflare worker tunnel.
+    Relay {
+        /// The deployed worker URL (e.g. https://dyb-tun-…sub.workers.dev).
+        #[arg(long)]
+        worker_url: String,
+        /// Shared session secret (must match DYB_SESSION_SECRET on the worker).
+        #[arg(long)]
+        session_secret: String,
+        /// Local loopback bind address (default 127.0.0.1:1089).
+        #[arg(long, default_value = "127.0.0.1:1089")]
+        bind: String,
+        /// Optional upstream host:port (informational).
+        #[arg(long)]
+        upstream: Option<String>,
+    },
 }
 
 /// Tor anonymity-network actions (egress-IP change).
