@@ -89,8 +89,9 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **Deeper autonomous recovery** — seed a rotating, verified egress-anchor set
   from more out-of-band sources (more Telegram channels + archive depth, CT
   logs, authoritative nameservers) so bootstrapping can never go circular.
-- **Periodic config-health decay** — piggyback node re-probe on the daemon's
-  ladder so the store always prunes to verified-live configs.
+- ✅ **Periodic config-health decay** — piggyback node re-probe on the daemon's
+  ladder so the store always prunes to verified-live configs
+  (`node_probe::probe_stale` + hourly daemon sweep).
 - **Wrangler-free deploy confirmation** — post-deploy smoke test that hits the
   worker URL and checks it responds.
 - **UDP-native DNS tunnel** — move the client off TCP-style framing toward the

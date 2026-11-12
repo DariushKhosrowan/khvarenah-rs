@@ -2,6 +2,26 @@
 
 ## Unreleased — 2026-11-12
 
+### Added (node provenance + periodic config-health decay)
+
+- **Node provenance tagging** — `config_store::import_single_link_source`
+  records each imported node's origin (`telegram` | `github` | `pasted`)
+  instead of hardcoding `pasted`. The Telegram harvester tags `telegram`,
+  the GitHub ingester tags `github` — so auto-recovered configs are auditable
+  and separable from manual pastes (a precondition for pruned, verified-live
+  stores).
+- **Periodic config-health decay** — `node_probe::probe_stale` re-probes a
+  bounded set (≤64/pass) of stale (≥6h) or never-checked nodes, marks dead
+  ones, and fails over if the active node died. Wired into the daemon's
+  hourly self-maintenance (`DaemonState.last_node_decay_ts`). This is the
+  "never stop verifying" half of the doctrine: even a healthy pool is
+  continuously re-checked as upstream servers churn.
+- **Wider refill channel net** — `DEFAULT_REFILL_CHANNELS` expanded from 3 to
+  11 channels, ordered by live-verified plaintext-link yield
+  (v2ray_configs_pools ≈286, MARAMBASHI ≈180, v2raycollector ≈59, …) so
+  autonomous recovery casts a wider, higher-yield net.
+
+
 ### Added (autonomous node-refill — "never run out of working configs")
 
 - **`dastyab-core::node_refill`** (new module): a single orchestrator that

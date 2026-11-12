@@ -162,6 +162,10 @@ pub struct DaemonState {
     /// `node_refill::REFILL_COOLDOWN_SECS`.
     #[serde(default)]
     pub last_refill_ts: i64,
+    /// Last epoch-seconds the periodic config-health-decay sweep ran.
+    /// Rate-limits re-probing of stale nodes to `NODE_DECAY_INTERVAL_SECS`.
+    #[serde(default)]
+    pub last_node_decay_ts: i64,
 }
 
 fn default_interval() -> u64 {
@@ -194,6 +198,7 @@ impl Default for DaemonState {
             audit: crate::daemon::autonomy_schedule::AuditSchedule::default(),
             last_snapshot_ts: 0,
             last_refill_ts: 0,
+            last_node_decay_ts: 0,
         }
     }
 }
@@ -1342,6 +1347,33 @@ async fn run_self_maintenance(
                         "version-integrity sweep: {}",
                         crate::artifact_versions::corrupt_versions_summary(&report)
                     ),
+                ));
+            }
+        }
+    }
+
+    // 6.5. Periodic config-health decay: re-probe a bounded set of stale
+    // (or never-checked) nodes so the pool never keeps verified-live configs
+    // whose servers have since died — a config that was healthy at import
+    // time is re-verified on a cadence, not only when the whole pool fails.
+    // Rate-limited (cheap, bounded: ≤NODE_DECAY_SWEEP_MAX nodes per pass) and
+    // requires the network for real probes. Fails over if the active node
+    // died since the last check.
+    if net_up && now - state.last_node_decay_ts >= crate::node_probe::NODE_DECAY_INTERVAL_SECS {
+        state.last_node_decay_ts = now;
+        let sweep = crate::node_probe::probe_stale(profile, false);
+        if sweep.probed > 0 {
+            log(&log_line(
+                "INFO",
+                &format!(
+                    "node health decay: re-probed {} ({} healthy, {} dead)",
+                    sweep.probed, sweep.healthy, sweep.unhealthy
+                ),
+            ));
+            if let Some(id) = &sweep.promoted {
+                log(&log_line(
+                    "INFO",
+                    &format!("node health decay: promoted healthy node '{id}'"),
                 ));
             }
         }

@@ -110,6 +110,17 @@ browser / OCR). Start with channels known to post raw `vless://` text (e.g.
 The harvester is a *transient* process: it fetches, imports, and exits. It
 holds no browser, no socket, no timer — nothing to keep warm.
 
+## Periodic config-health decay — keep the pool verified-live
+
+A node being *present* says nothing about whether it *still works*. The
+`node_probe::probe_stale` sweep re-probes a **bounded set** of stale (≥6h
+old) or never-checked nodes — ≤64 per pass — so even a healthy pool is
+continuously re-verified as upstream servers churn, without hammering the
+network. The daemon runs it hourly; if the active node died since its last
+check, the sweep fails over to a verified-healthy one. This is the difference
+between "imported a working config" (can go stale) and "keeping a working
+config at the front" (the doctrine).
+
 ## Tests
 
 - `config_store` — import (server, dedup, raw-link preservation), paste,

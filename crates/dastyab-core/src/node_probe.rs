@@ -260,6 +260,88 @@ pub fn selfheal(profile: &str, use_proxy: bool) -> SelfHealReport {
     }
 }
 
+/// Age (seconds) after which a node's last probe is considered stale and
+/// eligible for re-probing by the periodic health-decay sweep.
+pub const STALE_AFTER_SECS: i64 = 6 * 3600; // 6h
+
+/// Rate-limit interval (seconds) for the daemon's periodic health-decay
+/// sweep (how often it re-probes a bounded set of stale nodes).
+pub const NODE_DECAY_INTERVAL_SECS: i64 = 3600; // once per hour
+
+/// Hard bound on how many nodes one health-decay sweep re-probes. Keeps the
+/// sweep cheap (doctrine §6.5): a large pool is decayed across many passes
+/// rather than all at once, and the daemon never blocks on a full re-probe.
+pub const STALE_SWEEP_MAX: usize = 64;
+
+/// Result of a health-decay sweep over the node pool.
+#[derive(Debug, Clone, Default)]
+pub struct HealthSweepReport {
+    /// Nodes this sweep chose to re-probe (stale or never-checked).
+    pub probed: usize,
+    /// How many of those passed the live connection check.
+    pub healthy: usize,
+    /// Nodes that failed the live check.
+    pub unhealthy: usize,
+    /// If the active node was dead and we promoted a healthy one, its id.
+    pub promoted: Option<String>,
+}
+
+/// Periodic config-health decay (doctrine §5: never run on verified-live
+/// configs). Re-probes only nodes whose last check is stale (older than
+/// [`STALE_AFTER_SECS`]) or that have never been checked, up to
+/// [`STALE_SWEEP_MAX`] per pass — so a pool that once had healthy configs
+/// is continuously re-verified as their servers churn, without hammering the
+/// network or blocking the daemon. After probing, fails over to a verified
+/// healthy node if the active one died.
+///
+/// `use_proxy` routes probes through the local xray SOCKS5 (NIN).
+pub fn probe_stale(profile: &str, use_proxy: bool) -> HealthSweepReport {
+    let mut store = load_node_store(profile);
+    let now = now_ts() as i64;
+
+    // Candidate = stale (or never-checked) node, oldest-checked first so a
+    // large pool decays oldest-first across passes.
+    let mut stale: Vec<usize> = store
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| {
+            n.last_checked_epoch
+                .map(|ts| now - ts as i64 >= STALE_AFTER_SECS)
+                .unwrap_or(true)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    stale.sort_by(|&a, &b| {
+        store.nodes[a]
+            .last_checked_epoch
+            .partial_cmp(&store.nodes[b].last_checked_epoch)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    stale.truncate(STALE_SWEEP_MAX);
+
+    let mut healthy = 0usize;
+    for i in &stale {
+        let (ok, _, _) = probe_one(&store.nodes[*i], use_proxy);
+        store.nodes[*i].healthy = Some(ok);
+        store.nodes[*i].last_checked_epoch = Some(now as f64);
+        if ok {
+            healthy += 1;
+        }
+    }
+    let _ = save_node_store(profile, &store);
+
+    // Fail over if the active node died.
+    let promoted = failover_if_dead(profile);
+
+    HealthSweepReport {
+        probed: stale.len(),
+        healthy,
+        unhealthy: stale.len() - healthy,
+        promoted,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +498,67 @@ mod tests {
 
         let after = crate::config_store::load_node_store(&profile);
         assert_eq!(after.active().map(|a| a.id.as_str()), Some("alive"));
+    }
+
+    #[test]
+    fn probe_stale_only_reprobes_stale_and_never_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(dir.path().join("mem"));
+        let profile = "decay".to_string();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut store = crate::config_store::NodeStore::default();
+        let mut mk = |id: &str, url: String, last: Option<f64>, healthy: Option<bool>| {
+            crate::config_store::V2RayNode {
+                id: id.into(),
+                alias: id.into(),
+                url,
+                source_index: None,
+                source: "pasted".into(),
+                added_epoch: now_ts(),
+                last_checked_epoch: last,
+                healthy,
+            }
+        };
+        // Fresh node (checked just now) → NOT stale → skipped.
+        store.nodes.push(mk(
+            "fresh",
+            "vless://u@127.0.0.1:1?type=tcp".into(),
+            Some(now_ts()),
+            Some(true),
+        ));
+        // Stale node (checked 7h ago) → re-probed (fails, port 1 closed).
+        store.nodes.push(mk(
+            "stale_dead",
+            "vless://u@127.0.0.1:1?type=tcp".into(),
+            Some(now_ts() - STALE_AFTER_SECS as f64 - 3600.0),
+            Some(true),
+        ));
+        // Never-checked node pointing at a live listener → probed, healthy.
+        store.nodes.push(mk(
+            "never",
+            format!("vless://u@127.0.0.1:{}?type=tcp", addr.port()),
+            None,
+            None,
+        ));
+        crate::config_store::save_node_store(&profile, &store).unwrap();
+
+        let rep = probe_stale(&profile, false);
+        // fresh skipped; stale_dead + never probed.
+        assert_eq!(rep.probed, 2);
+        assert_eq!(rep.healthy, 1); // only `never` hits the live listener
+        assert_eq!(rep.unhealthy, 1); // stale_dead fails
+
+        let after = crate::config_store::load_node_store(&profile);
+        let by_id = |id: &str| after.nodes.iter().find(|n| n.id == id).unwrap();
+        // Fresh node untouched (still healthy, same check ts).
+        assert_eq!(by_id("fresh").healthy, Some(true));
+        // Stale re-probed → marked down.
+        assert_eq!(by_id("stale_dead").healthy, Some(false));
+        // Never-checked now probed → healthy.
+        assert_eq!(by_id("never").healthy, Some(true));
+        assert!(by_id("never").last_checked_epoch.is_some());
     }
 }

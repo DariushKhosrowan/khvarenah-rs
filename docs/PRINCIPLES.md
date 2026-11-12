@@ -242,6 +242,14 @@ Implemented and committed (see `ROADMAP.md`):
   one. Wired into the daemon's self-maintenance (rate-limited to once / 15
   min) and exposed as `dastyab nodes refill` — the daemon never runs dry of
   working configs.
+- **Node provenance tagging** — `config_store::import_single_link_source`
+  records each node's origin (`telegram` | `github` | `pasted`) so
+  auto-recovered configs are auditable and separable from manual pastes.
+- **Periodic config-health decay** (doctrine §5) — `node_probe::probe_stale`
+  re-probes a bounded set of stale/never-checked nodes (≥6h old, ≤64 per
+  pass) on the daemon's hourly cadence and fails over if the active node died,
+  so the pool is continuously pruned toward verified-live configs instead of
+  only reacting when the whole pool fails.
 
 Remaining gaps tracked as open work (see `ROADMAP.md` → **Doctrine gaps**):
 
