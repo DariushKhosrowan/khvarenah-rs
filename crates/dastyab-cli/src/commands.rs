@@ -15,7 +15,7 @@ use dastyab_core::{CFError, BRAND, VERSION};
 use std::path::PathBuf;
 
 use crate::{
-    BackupAction, Command, CleanipAction, DaemonAction, DnsAction, ProtectionAction, RoutesAction,
+    BackupAction, CleanipAction, Command, DaemonAction, DnsAction, ProtectionAction, RoutesAction,
     SnapshotsAction, WorkspaceAction,
 };
 use dastyab_core::remote_beacon::BeaconConfig;
@@ -201,6 +201,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::SniSpoof { action } => cmd_sni_spoof(&profile, action).await,
         Command::DnsTunnel { action } => cmd_dns_tunnel(&profile, action).await,
         Command::MultiWorker { action } => cmd_multi_worker(&profile, action).await,
+        Command::Multilayer { action } => cmd_multilayer(&profile, action).await,
         Command::Tor { action } => cmd_tor(&profile, action).await,
         Command::Journal { action } => cmd_journal(&profile, action),
         Command::Autonomy { action } => cmd_autonomy(&profile, action).await,
@@ -317,10 +318,26 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
             println!("  scan workers                : {}", c.scan_workers);
             println!("  scan timeout (s)            : {}", c.scan_timeout);
             println!("  scan ports                  : {}", c.scan_ports);
-            println!("  scan gentle                 : {}", if c.scan_gentle { "yes" } else { "no" });
-            println!("  stealth pacing              : {}", if c.stealth_enabled { "ON" } else { "OFF" });
-            println!("  protection                  : {}", if c.protection_enabled { "ON" } else { "OFF" });
-            println!("  auto token-rotate on blocked : {}", if c.auto_rotate_on_blocked { "ON" } else { "OFF" });
+            println!(
+                "  scan gentle                 : {}",
+                if c.scan_gentle { "yes" } else { "no" }
+            );
+            println!(
+                "  stealth pacing              : {}",
+                if c.stealth_enabled { "ON" } else { "OFF" }
+            );
+            println!(
+                "  protection                  : {}",
+                if c.protection_enabled { "ON" } else { "OFF" }
+            );
+            println!(
+                "  auto token-rotate on blocked : {}",
+                if c.auto_rotate_on_blocked {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            );
             println!("  light monitor cadence (s)   : {}", c.light_interval_secs);
             println!(
                 "  monitor light phase budget : {}s (configured {}s, system default 120s)",
@@ -338,10 +355,17 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
                 "  blackout poll cadence      : {}s (configured {}s, system default 60s)",
                 eff_blackout, c.network_down_sleep_secs
             );
-            println!("  blackout self-test cadence : {}s (configured {}s, system default 86400s)", c.drill_interval_secs, c.drill_interval_secs);
+            println!(
+                "  blackout self-test cadence : {}s (configured {}s, system default 86400s)",
+                c.drill_interval_secs, c.drill_interval_secs
+            );
             println!(
                 "  beacon notifications         : {}",
-                if c.beacon.as_ref().is_some_and(|b| b.enabled) { "ON" } else { "OFF" }
+                if c.beacon.as_ref().is_some_and(|b| b.enabled) {
+                    "ON"
+                } else {
+                    "OFF"
+                }
             );
             Ok(())
         }
@@ -975,8 +999,7 @@ fn cleanip_cmd(profile: &str, action: CleanipAction) -> Result<String, CFError> 
             if let Some(cc) = &country {
                 let cc_up = cc.to_uppercase();
                 rows.retain(|(_, m)| {
-                    m.country.as_ref().map(|c| c.to_uppercase()).as_deref()
-                        == Some(cc_up.as_str())
+                    m.country.as_ref().map(|c| c.to_uppercase()).as_deref() == Some(cc_up.as_str())
                 });
             }
             if let Some(q) = search {
@@ -989,11 +1012,15 @@ fn cleanip_cmd(profile: &str, action: CleanipAction) -> Result<String, CFError> 
             rows.sort_by(|(epa, ma), (epb, mb)| match sort.as_str() {
                 "port" => ma.port.cmp(&mb.port).then_with(|| epa.cmp(epb)),
                 "source" => ma.source.cmp(&mb.source).then_with(|| epa.cmp(epb)),
-                "country" => {
-                    ma.country.cmp(&mb.country).then_with(|| epa.cmp(epb))
-                }
-                "added" => ma.first_verified_at.cmp(&mb.first_verified_at).then_with(|| epa.cmp(epb)),
-                "last" => ma.last_verified_at.cmp(&mb.last_verified_at).then_with(|| epa.cmp(epb)),
+                "country" => ma.country.cmp(&mb.country).then_with(|| epa.cmp(epb)),
+                "added" => ma
+                    .first_verified_at
+                    .cmp(&mb.first_verified_at)
+                    .then_with(|| epa.cmp(epb)),
+                "last" => ma
+                    .last_verified_at
+                    .cmp(&mb.last_verified_at)
+                    .then_with(|| epa.cmp(epb)),
                 _ => epa.cmp(epb),
             });
             if json {
@@ -1022,10 +1049,9 @@ fn cleanip_cmd(profile: &str, action: CleanipAction) -> Result<String, CFError> 
                     .clone()
                     .or_else(|| {
                         let ip_part = ep.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(ep);
-                        ip_part
-                            .parse::<std::net::IpAddr>()
-                            .ok()
-                            .and_then(|ip| dastyab_core::geoip::GeoDB::load(None).country_code(&ip))
+                        ip_part.parse::<std::net::IpAddr>().ok().and_then(|ip| {
+                            dastyab_core::geoip::GeoDB::load(None).country_code(&ip)
+                        })
                     })
                     .unwrap_or_else(|| "-".to_string());
                 out.push_str(&format!(
@@ -2096,8 +2122,7 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
             // matches what actually drove the learning verdict.
             if verbose {
                 println!("\n--- light-sweep aggregate (last monitor pass) ---");
-                if let Some(light) =
-                    dastyab_core::store::profiles::load_last_light_sweep(profile)
+                if let Some(light) = dastyab_core::store::profiles::load_last_light_sweep(profile)
                 {
                     if light.total == 0 {
                         println!("  (no light sweep recorded yet — run a monitor cycle first)");
@@ -2122,9 +2147,10 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                                 println!("  {reason:?}: {count}");
                             }
                         }
-                        let (dpi, origin) = dastyab_core::worker_tunnel::secret::histogram_attribution(
-                            &light.histogram,
-                        );
+                        let (dpi, origin) =
+                            dastyab_core::worker_tunnel::secret::histogram_attribution(
+                                &light.histogram,
+                            );
                         let sig = dastyab_core::worker_tunnel::secret::classify_light_sweep(
                             light.alive as usize,
                             light.total as usize,
@@ -3358,7 +3384,6 @@ async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CF
     }
 }
 
-
 fn cmd_aistudio(action: &str) -> Result<(), CFError> {
     // Delegate to the verified, self-healing Python bridge (project-local).
     // The Python tool owns the xray tunnel + watchdog; this is a thin wrapper.
@@ -3547,6 +3572,50 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
                 ))
             }
         }
+        crate::DnsTunnelAction::Resolvers {
+            candidates,
+            concurrency,
+            timeout_ms,
+        } => {
+            use dastyab_core::resolve_pool::{discover_open_resolvers, IRANIAN_RESOLVER_CANDIDATES};
+            let cands: Vec<String> = match candidates {
+                Some(s) if !s.trim().is_empty() => s
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                _ => IRANIAN_RESOLVER_CANDIDATES.iter().map(|s| s.to_string()).collect(),
+            };
+            println!(
+                "Scanning {} candidate resolver(s) (concurrency={}, timeout={}ms) ...",
+                cands.len(),
+                concurrency,
+                timeout_ms
+            );
+            let timeout = std::time::Duration::from_millis(timeout_ms);
+            let found = discover_open_resolvers(&cands, concurrency, timeout, "").await;
+            if found.is_empty() {
+                return Err(CFError::new(
+                    "dns-tunnel",
+                    "no working domestic resolvers found",
+                    "Re-check the candidate list and that UDP 53 egress works from this network.",
+                ));
+            }
+            println!("\n{} working resolver(s) found:", found.len());
+            for r in &found {
+                println!("  {r}");
+            }
+            // Persist as the profile's blackout resolver pool.
+            let mut cfg = vps::load_tunnel_client_config(profile)
+                .unwrap_or_else(vps::TunnelClientConfig::default);
+            cfg.resolver_pool = Some(found);
+            vps::write_tunnel_client_config(profile, &cfg)?;
+            println!("\nPersisted resolver pool for profile '{profile}'.");
+            println!("The blackout DNS tunnel will now recurse through these domestic");
+            println!("resolvers instead of querying the VPS directly.");
+            Ok(())
+        }
         crate::DnsTunnelAction::Deploy {
             host,
             ssh_user,
@@ -3732,6 +3801,147 @@ fn cmd_journal(profile: &str, action: crate::JournalAction) -> Result<(), CFErro
         crate::JournalAction::Clear => {
             dastyab_core::journal::clear(profile)?;
             println!("Journal cleared for profile '{profile}'.");
+            Ok(())
+        }
+    }
+}
+
+/// Multi-layer tunnel: configure your final server (your own VPN / VLESS
+/// egress), and test AI Studio + Gemini access through the full chain.
+async fn cmd_multilayer(profile: &str, action: crate::MultilayerAction) -> Result<(), CFError> {
+    use dastyab_core::multilayer as ml;
+    match action {
+        crate::MultilayerAction::Set {
+            name,
+            link,
+            country,
+        } => {
+            let cfg = ml::FinalServerConfig {
+                name,
+                vless_link: link.clone(),
+                country_hint: country,
+            };
+            // Validate the link parses.
+            ml::parse_final_server(&cfg).map_err(|e| {
+                CFError::new(
+                    "multilayer",
+                    format!("invalid final server link: {}", e.brief()),
+                    "Provide a valid vless:// share link.",
+                )
+            })?;
+            ml::save_final_server(profile, &cfg)?;
+            println!("Final server saved for profile '{profile}':");
+            println!("  name : {}", cfg.name);
+            println!("  link : {}", cfg.vless_link);
+            println!("To test egress: dastyab multilayer probe-ai");
+            Ok(())
+        }
+        crate::MultilayerAction::Status => {
+            if let Some(cfg) = ml::load_final_server(profile) {
+                println!("Multi-layer tunnel for profile '{profile}':");
+                println!("  final server : {}", cfg.name);
+                println!("  link         : {}", cfg.vless_link);
+                if !cfg.country_hint.is_empty() {
+                    println!("  country hint : {}", cfg.country_hint);
+                }
+                let chain = ml::LayerKind::default_chain();
+                let chain_txt = chain
+                    .iter()
+                    .map(|l| l.label())
+                    .collect::<Vec<_>>()
+                    .join(" → ");
+                println!("  chain        : {chain_txt}");
+                match ml::load_gemini_key(profile) {
+                    Some(_) => println!("  gemini key   : stored (hidden)"),
+                    None => {
+                        println!("  gemini key   : not set — run `multilayer set-gemini-key <key>`")
+                    }
+                }
+            } else {
+                println!("No final server configured for profile '{profile}'.");
+                println!("Run: dastyab multilayer set --link <vless://…>");
+            }
+            Ok(())
+        }
+        crate::MultilayerAction::Clear => {
+            ml::clear_final_server(profile)?;
+            println!("Final server cleared for profile '{profile}'.");
+            Ok(())
+        }
+        crate::MultilayerAction::SetGeminiKey { key } => {
+            if key.trim().is_empty() {
+                return Err(CFError::new(
+                    "multilayer",
+                    "empty Gemini API key",
+                    "Provide your Gemini API key.",
+                ));
+            }
+            ml::save_gemini_key(profile, &key)?;
+            println!("Gemini API key stored for profile '{profile}' (kept out of git).");
+            Ok(())
+        }
+        crate::MultilayerAction::ProbeAi => {
+            if ml::load_final_server(profile).is_none() {
+                return Err(CFError::new(
+                    "multilayer",
+                    "no final server configured",
+                    "Run `dastyab multilayer set --link <vless://…>` first.",
+                ));
+            }
+            println!("Probing AI Studio + Gemini through the final-server chain…");
+            let report = ml::probe_ai_access(profile).await?;
+            for p in &report.probes {
+                let status = if p.reachable {
+                    "✓ reachable"
+                } else {
+                    "✗ blocked"
+                };
+                let ip = p.egress_ip.clone().unwrap_or_default();
+                let ip_suffix = if ip.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (egress {ip})")
+                };
+                println!("  {:<10} {status}  {}{}", p.target, p.note, ip_suffix);
+            }
+            println!(
+                "Verdict: {}",
+                if report.ok {
+                    "AI services reachable through the chain"
+                } else {
+                    "not reachable — check your final server"
+                }
+            );
+            Ok(())
+        }
+        crate::MultilayerAction::Gemini { prompt } => {
+            if ml::load_final_server(profile).is_none() {
+                return Err(CFError::new(
+                    "multilayer",
+                    "no final server configured",
+                    "Run `dastyab multilayer set --link <vless://…>` first.",
+                ));
+            }
+            if ml::load_gemini_key(profile).is_none() {
+                return Err(CFError::new(
+                    "multilayer",
+                    "no Gemini API key configured",
+                    "Run `dastyab multilayer set-gemini-key <key>` first.",
+                ));
+            }
+            println!("Calling Gemini through the final-server chain…");
+            let res = ml::probe_gemini_api(profile, &prompt).await?;
+            if res.ok {
+                println!("✓ Gemini responded (model {})", res.model);
+                if let Some(a) = &res.answer {
+                    println!();
+                    println!("{a}");
+                } else {
+                    println!("(no answer text)");
+                }
+            } else {
+                println!("✗ Gemini call failed: {}", res.note);
+            }
             Ok(())
         }
     }
@@ -4403,10 +4613,16 @@ mod tests {
     #[test]
     fn cleanip_remove_and_clear_mutate_ledger() {
         config_test_home(|id| {
-            use dastyab_core::store::profiles::{remember_clean_ip_with_source, clean_ip_meta};
+            use dastyab_core::store::profiles::{clean_ip_meta, remember_clean_ip_with_source};
             remember_clean_ip_with_source(&id, "81.0.0.1:443", "scan").unwrap();
             remember_clean_ip_with_source(&id, "8.8.8.8:443", "scan").unwrap();
-            cleanip_cmd(&id, CleanipAction::Remove { ip: "81.0.0.1:443".into() }).unwrap();
+            cleanip_cmd(
+                &id,
+                CleanipAction::Remove {
+                    ip: "81.0.0.1:443".into(),
+                },
+            )
+            .unwrap();
             let remaining = clean_ip_meta(&id);
             assert!(!remaining.contains_key("81.0.0.1:443"));
             assert!(remaining.contains_key("8.8.8.8:443"));

@@ -39,7 +39,11 @@ pub enum ConfigsAction {
     /// Rename a single config's label (opens a text dialog).
     Rename { id: u64, current: Option<String> },
     /// Export a single config to disk under the export folder.
-    ExportOne { id: u64, fmt: String, content: String },
+    ExportOne {
+        id: u64,
+        fmt: String,
+        content: String,
+    },
     /// Delete a single config (destructive confirm).
     Delete { id: u64 },
 }
@@ -278,10 +282,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut crate::app::DastYabApp) -> Option<Confi
                                         .color(GOLD_DIM)
                                         .small(),
                                     );
-                                    if ui
-                                        .button("🗑")
-                                        .on_hover_text("Delete this config")
-                                        .clicked()
+                                    if ui.button("🗑").on_hover_text("Delete this config").clicked()
                                     {
                                         action = Some(ConfigsAction::Delete { id: row.id });
                                     }

@@ -12,6 +12,15 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - Security audit, backup/restore, diagnostics, self-update, presets.
 - CLI + TUI + GUI frontends.
 - Full documentation suite + SEO-optimized README/landing.
+- **Domestic-resolver discovery (blackout)** — `resolve_pool::discover_open_resolvers`
+  + CLI `dns-tunnel resolvers` + GUI resolver-pool field.
+- **QNAME-length clamping (≤101) + resolver round-robin** in the DNS-tunnel
+  client (`encode_name_clamped`, `ResolverPool`).
+- **Free-VPS server provisioning** — `scripts/dns-tunnel-server-setup.sh` +
+  `scripts/build-dnstt-server.sh` (port 53 prep, firewall, dnstt-server
+  systemd, Dante SOCKS5 egress).
+- **Domain-selection strategy + user guide** — `docs/BLACKOUT-DNS-TUNNEL-PLAN.md`
+  §6 and `docs/USER-GUIDE-DNS-TUNNEL.md`.
 
 ## 🔜 Next
 

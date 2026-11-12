@@ -543,10 +543,7 @@ pub fn save_profile(p: &Profile) -> Result<(), CFError> {
     // newer options and the deployed base link. Refreshing on every save makes
     // auto-heal fire only on real corruption (missing/unparseable files).
     // Best-effort: a manifest refresh failure must never fail the save.
-    let _ = crate::manifest::refresh_manifest_after_write(
-        &dir,
-        crate::store::now_ts() as u64,
-    );
+    let _ = crate::manifest::refresh_manifest_after_write(&dir, crate::store::now_ts() as u64);
     Ok(())
 }
 
@@ -1705,8 +1702,14 @@ mod tests {
             remember_clean_ip(&id, "1.1.1.1:443").unwrap();
             let p = load_profile(&id);
             let m = &p.clean_ip_meta;
-            assert_eq!(m.get("81.0.0.1:443").unwrap().country.as_deref(), Some("IR"));
-            assert_eq!(m.get("104.16.55.1:443").unwrap().country.as_deref(), Some("US"));
+            assert_eq!(
+                m.get("81.0.0.1:443").unwrap().country.as_deref(),
+                Some("IR")
+            );
+            assert_eq!(
+                m.get("104.16.55.1:443").unwrap().country.as_deref(),
+                Some("US")
+            );
             assert_eq!(m.get("1.1.1.1:443").unwrap().country.as_deref(), None);
         });
     }

@@ -406,6 +406,12 @@ enum Command {
         #[command(subcommand)]
         action: MultiWorkerAction,
     },
+    /// Multi-layer tunnel: configure your final server and test AI
+    /// Studio + Gemini access through the full chain.
+    Multilayer {
+        #[command(subcommand)]
+        action: MultilayerAction,
+    },
     /// Route traffic through the Tor anonymity network to change the egress
     /// IP (private daemon + SOCKS5 proxy on the loopback interface).
     Tor {
@@ -448,7 +454,6 @@ enum Command {
         #[arg()]
         action: String,
     },
-
 }
 
 #[derive(Subcommand)]
@@ -667,6 +672,20 @@ pub enum DnsTunnelAction {
         #[arg(long, default_value_t = 22)]
         port: u16,
     },
+    /// Scan for working domestic (Iranian ISP) recursive resolvers and persist
+    /// them as the blackout resolver pool. Run this BEFORE a lockdown.
+    Resolvers {
+        /// Candidate resolver list (comma-separated); defaults to the built-in
+        /// Iranian ISP seed list.
+        #[arg(long)]
+        candidates: Option<String>,
+        /// Max concurrent probes.
+        #[arg(long, default_value_t = 32)]
+        concurrency: usize,
+        /// Per-resolver timeout ms.
+        #[arg(long, default_value_t = 2500)]
+        timeout_ms: u64,
+    },
 }
 
 /// Tor anonymity-network actions (egress-IP change).
@@ -704,6 +723,41 @@ pub enum MultiWorkerAction {
         /// Worker name to make active.
         #[arg()]
         name: String,
+    },
+}
+
+/// Multi-layer tunnel actions.
+#[derive(Subcommand)]
+pub enum MultilayerAction {
+    /// Set the final server config (your own VPN / VLESS egress).
+    Set {
+        /// Human label for this server.
+        #[arg(long, default_value = "my final server")]
+        name: String,
+        /// A vless:// share link for the final server.
+        #[arg(long)]
+        link: String,
+        /// Optional expected egress-country hint.
+        #[arg(long, default_value = "")]
+        country: String,
+    },
+    /// Show the configured final server + status.
+    Status,
+    /// Remove the final-server config.
+    Clear,
+    /// Store the Gemini API key (used only through the multi-layer tunnel).
+    SetGeminiKey {
+        /// Your Gemini API key.
+        #[arg()]
+        key: String,
+    },
+    /// Probe AI Studio + Gemini reachability through the final-server chain.
+    ProbeAi,
+    /// Make one real Gemini generateContent call through the chain.
+    Gemini {
+        /// The prompt to send.
+        #[arg(default_value = "Explain how AI works in a few words")]
+        prompt: String,
     },
 }
 

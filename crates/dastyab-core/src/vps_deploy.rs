@@ -162,6 +162,12 @@ pub struct TunnelClientConfig {
     /// Worker tunnel: configured VLESS upstream host:port (data-plane pipe).
     #[serde(default)]
     pub worker_vless_upstream: Option<String>,
+    /// Blackout-safe domestic resolver pool (raw UDP 53 resolver IPs the client
+    /// recurses *through* to reach the delegated authoritative tunnel server).
+    /// When present, the liveness probe and `send_receive` fan queries across
+    /// these instead of talking directly to the VPS IP.
+    #[serde(default)]
+    pub resolver_pool: Option<Vec<String>>,
 }
 
 impl Default for TunnelClientConfig {
@@ -176,6 +182,7 @@ impl Default for TunnelClientConfig {
             worker_name: None,
             shared_secret: None,
             worker_vless_upstream: None,
+            resolver_pool: None,
         }
     }
 }
@@ -439,6 +446,7 @@ WantedBy=multi-user.target
         worker_name: None,
         shared_secret: None,
         worker_vless_upstream: None,
+        resolver_pool: None,
     };
     write_tunnel_client_config(profile_id, &client)?;
     emit(DeployStep::ExportClientConfig, &mut completed);
@@ -578,6 +586,7 @@ mod tests {
             worker_name: None,
             shared_secret: None,
             worker_vless_upstream: None,
+            resolver_pool: None,
         };
         write_tunnel_client_config(&profile, &cfg).unwrap();
         let loaded = load_tunnel_client_config(&profile).unwrap();

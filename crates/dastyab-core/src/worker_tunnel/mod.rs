@@ -182,6 +182,7 @@ mod tests {
             worker_name: Some("dyb-tun-aaaa".into()),
             shared_secret: Some("x".into()),
             worker_vless_upstream: None,
+            resolver_pool: None,
         };
         crate::vps_deploy::write_tunnel_client_config(&pid, &cfg).unwrap();
         let link = resolve_deployed_base_link(&pid).expect("resolved from tunnel config");
@@ -227,6 +228,7 @@ mod tests {
             worker_name: Some("dyb-tun-cccc".into()),
             shared_secret: Some("x".into()),
             worker_vless_upstream: None,
+            resolver_pool: None,
         };
         crate::vps_deploy::write_tunnel_client_config(&pid, &cfg).unwrap();
 
@@ -348,7 +350,10 @@ mod tests {
         let link = resolve_deployed_base_link(&pid).expect("should resolve to the valid record");
         assert!(link.contains("104.16.9.9"), "got: {link}");
         assert!(link.contains("good111"), "got: {link}");
-        assert!(!link.contains("@:"), "must not be the empty-host record: {link}");
+        assert!(
+            !link.contains("@:"),
+            "must not be the empty-host record: {link}"
+        );
     }
 
     #[test]
@@ -368,7 +373,9 @@ mod tests {
             note: String::new(),
         };
         crate::store::profiles::remember_vless(&pid, bad).unwrap();
-        assert!(resolve_deployed_base_link(&pid).is_none(), "all records empty-host ⇒ None");
+        assert!(
+            resolve_deployed_base_link(&pid).is_none(),
+            "all records empty-host ⇒ None"
+        );
     }
-
 }

@@ -38,6 +38,10 @@ use std::fmt::Write;
 pub const MAX_LABEL: usize = 63;
 /// Max TXT reply bytes we accept.
 pub const MAX_REPLY: usize = 512;
+/// Safe per-query QNAME length cap for Iranian ISP / DPI filter hardware.
+/// Queries over ~110 chars are frequently dropped; we clamp to 101 (the
+/// documented limit used by production Iranian DNS-tunnel clients).
+pub const MAX_QNAME_LEN: usize = 101;
 
 /// Base32 alphabet (RFC 4648, lowercase, no padding). Safe for DNS labels.
 const B32: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -104,9 +108,16 @@ impl TunnelFrame {
     /// Encode the frame as a DNS name under `base_domain` (in chunks that fit
     /// in single labels, skipping the leading nonce/seq/flags labels).
     pub fn encode_name(&self, base_domain: &str, nonce: u32) -> String {
+        self.assemble_name(base_domain, nonce, &self.payload)
+    }
+
+    /// Internal frame → QNAME builder for an explicit payload slice. This is
+    /// the single source of truth for the wire format; `encode_name` passes the
+    /// full payload, `encode_name_clamped` passes a progressively-truncated one.
+    fn assemble_name(&self, base_domain: &str, nonce: u32, payload: &[u8]) -> String {
         let mut name = String::new();
         let _ = write!(name, "{nonce:x}.{}.{}", self.seq, self.flags);
-        let payload_b32 = b32_encode(&self.payload);
+        let payload_b32 = b32_encode(payload);
         // Chunk the base32 payload into <=63-char labels.
         for chunk in payload_b32.as_bytes().chunks(MAX_LABEL) {
             name.push('.');
@@ -119,6 +130,25 @@ impl TunnelFrame {
             name.pop();
         }
         format!("{name}.{base_domain}")
+    }
+
+    /// Encode the frame but guarantee the resulting QNAME is at most
+    /// `max_qname_len` characters — the DPI-lim safe limit for Iranian ISP
+    /// resolvers is ~101 (see `MAX_QNAME_LEN`). Longer payloads are truncated
+    /// (monotonic, part of the text-rate framing contract) so every query fits
+    /// well under the per-query cap and is not dropped by filter hardware.
+    pub fn encode_name_clamped(&self, base_domain: &str, nonce: u32, max_qname_len: usize) -> String {
+        let mut pl = self.payload.clone();
+        loop {
+            let name = self.assemble_name(base_domain, nonce, &pl);
+            if name.len() <= max_qname_len || pl.is_empty() {
+                return name;
+            }
+            // Drop one base32 group (6 raw bytes) and rebuild. Terminates
+            // because `pl` shrinks to empty, and an empty-payload name is short.
+            let cut = pl.len().min(6);
+            pl.truncate(pl.len() - cut);
+        }
     }
 
     /// Decode a reply domain back into a frame (server → client direction).
@@ -165,7 +195,10 @@ pub async fn send_receive<R: Resolver>(
 ) -> Result<TunnelFrame, CFError> {
     // Nonce: derive from seq + a random value to vary the query.
     let nonce: u32 = rand::random::<u32>() & 0xFFFF;
-    let qname = frame.encode_name(base_domain, nonce);
+    // Clamp the QNAME to the DPI-safe limit (≤101) so the query is not
+    // dropped by Iranian ISP filter hardware — critical for the domestic
+    // recursion path in a blackout.
+    let qname = frame.encode_name_clamped(base_domain, nonce, MAX_QNAME_LEN);
     let reply = resolver.query_txt(&qname)?;
     TunnelFrame::decode_name(reply.trim_end_matches('.'), base_domain)
 }
@@ -207,7 +240,20 @@ pub async fn probe_tunnel_live(
         flags: 1, // ping
         payload: b"alive".to_vec(),
     };
-    let qname = frame.encode_name(&cfg.base_domain, rand::random::<u32>() & 0xFFFF);
+    let nonce = rand::random::<u32>() & 0xFFFF;
+    let qname = frame.encode_name_clamped(&cfg.base_domain, nonce, MAX_QNAME_LEN);
+
+    // If a domestic resolver pool is configured, probe *through* it (the
+    // blackout-safe path — the domestic resolver recurses to our delegated
+    // authoritative server). Fall back to a direct UDP query to the VPS only
+    // when no pool is set.
+    if let Some(pool) = &cfg.resolver_pool {
+        if !pool.is_empty() {
+            let rp = crate::resolve_pool::ResolverPool::new(pool.clone(), timeout);
+            return rp.query_txt(&qname).is_ok();
+        }
+    }
+
     let id: u16 = rand::random();
     let query = crate::doh::build_dns_query_txt(&qname, id);
 
@@ -286,5 +332,43 @@ mod tests {
     #[test]
     fn rejects_name_outside_base_domain() {
         assert!(TunnelFrame::decode_name("a.b.c.evil.com", "tun.example.com").is_err());
+    }
+
+    #[test]
+    fn encode_name_clamped_stays_under_dpi_limit() {
+        // A payload too large for the DPI-safe QNAME cap must be truncated so
+        // the resulting name is always ≤ MAX_QNAME_LEN.
+        let frame = TunnelFrame {
+            session: "averylongsessiontag".into(),
+            seq: 65535,
+            flags: 0,
+            payload: vec![0x42u8; 300],
+        };
+        let name = frame.encode_name_clamped("tun.example.com", 0xFFFF, MAX_QNAME_LEN);
+        assert!(
+            name.len() <= MAX_QNAME_LEN,
+            "QNAME {name} has length {} > {MAX_QNAME_LEN}",
+            name.len()
+        );
+        // The clamped name must still decode back to the same session/frame
+        // metadata (payload is truncated, not corrupted).
+        let decoded = TunnelFrame::decode_name(&name, "tun.example.com").unwrap();
+        assert_eq!(decoded.session, "averylongsessiontag");
+        assert_eq!(decoded.seq, 65535);
+        assert_eq!(decoded.flags, 0);
+    }
+
+    #[test]
+    fn encode_name_clamped_leaves_small_payload_intact() {
+        let frame = TunnelFrame {
+            session: "s".into(),
+            seq: 9,
+            flags: 1,
+            payload: b"pong".to_vec(),
+        };
+        let name = frame.encode_name_clamped("tun.example.com", 0x1234, MAX_QNAME_LEN);
+        assert!(name.len() <= MAX_QNAME_LEN);
+        let decoded = TunnelFrame::decode_name(&name, "tun.example.com").unwrap();
+        assert_eq!(decoded.payload, b"pong");
     }
 }

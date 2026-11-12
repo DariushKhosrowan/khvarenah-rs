@@ -130,6 +130,12 @@ impl VlessProfile {
 
     /// A full xray client config (inbound socks/http + VLESS outbound).
     pub fn xray_client_json(&self) -> Result<String, CFError> {
+        self.xray_client_json_at_port(10808)
+    }
+
+    /// xray config with a custom local SOCKS5 port (used by the multi-layer
+    /// tunnel, which binds a user-chosen proxy port).
+    pub fn xray_client_json_at_port(&self, socks_port: u16) -> Result<String, CFError> {
         let mut p = self.clone();
         p.normalize();
         let sni = p.sni.clone().unwrap_or_else(|| p.address.clone());
@@ -138,10 +144,8 @@ impl VlessProfile {
         let cfg = serde_json::json!({
             "log": {"loglevel": "warning"},
             "inbounds": [
-                {"tag": "socks-in", "listen": "127.0.0.1", "port": 10808,
+                {"tag": "socks-in", "listen": "127.0.0.1", "port": socks_port,
                  "protocol": "socks", "settings": {"auth": "noauth", "udp": true}},
-                {"tag": "http-in", "listen": "127.0.0.1", "port": 10809,
-                 "protocol": "http"}
             ],
             "outbounds": [{
                 "protocol": "vless",
@@ -272,10 +276,9 @@ mod tests {
     #[test]
     fn parse_keeps_plain_path_unchanged() {
         // Un-encoded query values must still work (no double-decoding).
-        let p = VlessProfile::parse(
-            "vless://uuid@1.2.3.4:443?type=ws&path=/ws&host=h.example.com#x",
-        )
-        .unwrap();
+        let p =
+            VlessProfile::parse("vless://uuid@1.2.3.4:443?type=ws&path=/ws&host=h.example.com#x")
+                .unwrap();
         assert_eq!(p.path, "/ws");
         assert_eq!(p.header_host.as_deref(), Some("h.example.com"));
     }

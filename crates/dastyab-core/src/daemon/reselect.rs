@@ -181,6 +181,7 @@ impl<'a> RealTunnelOpener<'a> {
             worker_name: None,
             shared_secret: Some(secret),
             worker_vless_upstream: Some(upstream.clone()),
+            resolver_pool: None,
         })
     }
 }
@@ -243,6 +244,7 @@ pub fn bind_winner(profile: &str, ep: &CarrierEndpoint) -> bool {
         worker_name: None,
         shared_secret: Some(secret),
         worker_vless_upstream: Some(upstream.clone()),
+        resolver_pool: None,
     };
     crate::vps_deploy::write_tunnel_client_config(profile, &cfg).is_ok()
 }

@@ -49,6 +49,38 @@
   `deploy_worker_via_wrangler_parses_mock_output`,
   `find_wrangler_honors_env_override`.
 
+### Added (blackout DNS-tunnel productionization)
+
+- `dastyab-core` `resolve_pool.rs`: **domestic-resolver pool** — raw-UDP TXT
+  transport (`udp_query_txt`), `ResolverPool` (round-robin over many resolver IPs
+  to dodge per-IP rate limits and poisoned resolvers; implements `Resolver`), and
+  `discover_open_resolvers` (parallel scanner over Iranian ISP seed candidates).
+  `IRANIAN_RESOLVER_CANDIDATES` ships as a starting point. Tests:
+  `udp_query_txt_roundtrip_against_authoritative_handler`,
+  `resolver_pool_roundrobin_skips_dead_and_reaches_live`,
+  `discover_open_resolvers_detects_the_live_one`.
+- `dastyab-core` `dnstunnel.rs`: **QNAME clamping** — `encode_name_clamped`
+  caps the wire QNAME at `MAX_QNAME_LEN` (101), used by `send_receive` and the
+  liveness probe so every query survives Iranian DPI filter hardware. Tests:
+  `encode_name_clamped_stays_under_dpi_limit`,
+  `encode_name_clamped_leaves_small_payload_intact`.
+- `dastyab-core` `vps_deploy.rs`: `TunnelClientConfig.resolver_pool`
+  (`Option<Vec<String>>`) — when set, `probe_tunnel_live` recurses through the
+  pool instead of querying the VPS directly. Per-profile persistence.
+- `dastyab-cli`: new `dns-tunnel resolvers` subcommand — scans candidate
+  resolvers and persists the working pool to the profile.
+- `dastyab-gui`: Blackout resilience panel gains a "Resolver pool" input
+  (comma-separated IPs) saved into the VPS tunnel config.
+- `scripts/build-dnstt-server.sh`: builds the native `dnstt-server` binary for
+  x86_64/aarch64 Linux to scp to a free VPS.
+- `scripts/dns-tunnel-server-setup.sh`: turnkey provisioning for a free VPS —
+  frees port 53, opens the firewall (incl. Oracle iptables), installs the
+  `dnstt-server` systemd service + Dante SOCKS5 egress, and prints the session
+  key + client config.
+- Docs: `docs/BLACKOUT-DNS-TUNNEL-PLAN.md` §6 (domain-selection strategy: never
+  use a `.ir` domain; short numeric `.xyz` recommended) and new user guide
+  `docs/USER-GUIDE-DNS-TUNNEL.md`.
+
 ## v0.1.0 — 2026-11-07
 
 Initial Rust release.

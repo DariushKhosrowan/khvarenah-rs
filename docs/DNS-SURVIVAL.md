@@ -442,15 +442,21 @@ The ladder in this repo now has working Rust modules, all in
 | `connectivity.rs` | `FallbackLadder` state machine; ordered tiers Direct → DoH → DoT → DnsTunnel; descends after repeated failures, climbs back when a higher tier recovers. Now `Tier: Hash`, `Probe` trait fully wired. |
 | `dot.rs` | DoT transport (TLS over TCP 853) to literal pinned IPs; reuses the RFC 1035 wire helpers from `doh.rs`; filters the 198.18.x.x hijack signature. |
 | `blackout.rs` | `NetworkState` detection: system-DNS 198.18 hijack probe, `any_bootstrap_reachable` TCP sniff against literal IPs, combined `detect()` heuristic. |
-| `dnstunnel.rs` | dnscat2-style client framing: base32 DNS-label codec, chunking to 63-char labels, `TunnelFrame` encode/decode, and a `send_receive` primitive over a TXT-capable resolver. |
+| `dnstunnel.rs` | dnscat2-style client framing: base32 DNS-label codec, chunking to 63-char labels, `TunnelFrame` encode/decode, and a `send_receive` primitive over a TXT-capable resolver. Now includes **`encode_name_clamped`** (QNAME length capped at `MAX_QNAME_LEN` = 101 for Iranian DPI survival) used by `send_receive` and the liveness probe. |
+| `resolve_pool.rs` | **NEW: blackout resolver pool.** Raw-UDP TXT transport (`udp_query_txt`), `ResolverPool` (round-robin, skips dead/poisoned resolvers, implements `Resolver`), and `discover_open_resolvers` (parallel domestic-resolver scanner over Iranian ISP seed candidates). Exposes `IRANIAN_RESOLVER_CANDIDATES`. |
+| `dnstt_server.rs` | **NEW: native authoritative DNS-tunnel server** (the "server-side authoritative responder" previously left as follow-up). Implements `parse_question`, `build_dns_response_txt`, and `handle_datagram` — decodes the client's `TunnelFrame` and replies in the same TXT encoding. Also `dnstt-server` binary (CLI-compatible with the old external `dnstt-server`: `-gen-key`, `-d`, `-k`, `-u`, `-b`) serving ping/status/bootstrap commands with optional session allow-list. |
+| `multilayer.rs` | **NEW: user-facing multi-layer tunnel panel support.** `FinalServerConfig` (user's own vless final VPN) persisted per profile; `probe_ai_access` (AI Studio + Gemini reachability through the chain); `probe_gemini_api` (real generateContent through the tunnel); `TunnelMode` (device / chrome / proxy); `start_tunnel_mode` (spawn xray + optional dedicated Chrome with persisted session); local SOCKS5 proxy for any app. |
 | `doh.rs` (hardened) | per-endpoint failure blacklisting (`ENDPOINT_BLACKLIST_THRESHOLD`), reset on success, plus the existing 198.18.0.0/15 filtering. |
 
 Left for a follow-up (bookmarked in this report):
 - Anti-DPI desync connector (Zapret/GoodbyeDPI-style) — the *other* half of the
   fight, for when the border is up but DPI blocks by fingerprint.
 - `BOOTSTRAP_IPS` const table + `probe::blackout_probe` glue.
-- Server-side authoritative responder for the DNS tunnel.
+- Full-TCP data-plane egress over the DNS tunnel (the native server carries
+  control/status/bootstrap frames; for bulk traffic point MasterDnsVPN/KevinNet
+  at the same VPS — see `scripts/dns-tunnel-server-setup.sh`).
 
-Test status: 171 core tests green, including new coverage for the ladder
-evolution, DoT endpoint safety, blackout heuristics, base32 roundtrip, and
-large-payload chunking.
+Test status: 824 core tests green, including new coverage for the ladder
+evolution, DoT endpoint safety, blackout heuristics, base32 roundtrip,
+large-payload chunking, QNAME clamping, and the resolver-pool round-robin /
+discovery tests.

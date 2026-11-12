@@ -246,7 +246,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<CleanipAction> {
                                                 }
                                                 if let Some(cc) = parts.get(2) {
                                                     if !cc.is_empty() {
-                                                        tag(ui, cc, egui::Color32::from_rgb(141, 168, 190));
+                                                        tag(
+                                                            ui,
+                                                            cc,
+                                                            egui::Color32::from_rgb(141, 168, 190),
+                                                        );
                                                     }
                                                 }
                                             }

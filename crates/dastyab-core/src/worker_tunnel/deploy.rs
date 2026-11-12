@@ -187,6 +187,7 @@ pub async fn deploy_worker_tunnel(
         worker_name: Some(worker_name.clone()),
         shared_secret: Some(client_secret.clone()),
         worker_vless_upstream: opts.vless_upstream.clone(),
+        resolver_pool: None,
     };
     crate::vps_deploy::write_tunnel_client_config(profile_id, &cfg)?;
 
@@ -219,21 +220,21 @@ async fn post_deploy_smoke(worker_url: &str) -> Option<String> {
     let doh = crate::doh::DohResolver::new();
     let health = crate::autopilot::probe_worker_health(host, None, Some(&doh), 8).await;
     Some(match health {
-        crate::autopilot::WorkerHealth::Alive => format!(
-            "smoke ok: {host} answered /cdn-cgi/trace over TLS"
-        ),
-        crate::autopilot::WorkerHealth::Suspended { code } => format!(
-            "smoke warning: {host} responds but reports suspended (HTTP {code})"
-        ),
-        crate::autopilot::WorkerHealth::NotFound => format!(
-            "smoke warning: {host} responded but no worker found on the route"
-        ),
-        crate::autopilot::WorkerHealth::PathMismatch => format!(
-            "smoke warning: {host} responded on a different path"
-        ),
-        crate::autopilot::WorkerHealth::Unreachable => format!(
-            "smoke warning: {host} unreachable over TLS (edge still propagating?)"
-        ),
+        crate::autopilot::WorkerHealth::Alive => {
+            format!("smoke ok: {host} answered /cdn-cgi/trace over TLS")
+        }
+        crate::autopilot::WorkerHealth::Suspended { code } => {
+            format!("smoke warning: {host} responds but reports suspended (HTTP {code})")
+        }
+        crate::autopilot::WorkerHealth::NotFound => {
+            format!("smoke warning: {host} responded but no worker found on the route")
+        }
+        crate::autopilot::WorkerHealth::PathMismatch => {
+            format!("smoke warning: {host} responded on a different path")
+        }
+        crate::autopilot::WorkerHealth::Unreachable => {
+            format!("smoke warning: {host} unreachable over TLS (edge still propagating?)")
+        }
     })
 }
 

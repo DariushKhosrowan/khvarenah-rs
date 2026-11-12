@@ -205,7 +205,13 @@ pub fn update_config_content(id: &str, rec_id: u64, new_content: String) -> Resu
         .records
         .iter_mut()
         .find(|r| r.id == rec_id)
-        .ok_or_else(|| CFError::new("Config not found", "No generated config with that id.", "Refresh the Configs tab."))?;
+        .ok_or_else(|| {
+            CFError::new(
+                "Config not found",
+                "No generated config with that id.",
+                "Refresh the Configs tab.",
+            )
+        })?;
     rec.content = new_content;
     rec.content_sha256 = sha256_bytes(rec.content.as_bytes());
     save_generated_configs(id, &ledger)
@@ -213,14 +219,26 @@ pub fn update_config_content(id: &str, rec_id: u64, new_content: String) -> Resu
 
 /// Rename a stored config's label (its human-readable name). `None` clears
 /// the label. Used by the Configs tab's rename action.
-pub fn update_config_label(id: &str, rec_id: u64, new_label: Option<String>) -> Result<(), CFError> {
+pub fn update_config_label(
+    id: &str,
+    rec_id: u64,
+    new_label: Option<String>,
+) -> Result<(), CFError> {
     let mut ledger = load_generated_configs(id);
     let rec = ledger
         .records
         .iter_mut()
         .find(|r| r.id == rec_id)
-        .ok_or_else(|| CFError::new("Config not found", "No generated config with that id.", "Refresh the Configs tab."))?;
-    let label = new_label.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        .ok_or_else(|| {
+            CFError::new(
+                "Config not found",
+                "No generated config with that id.",
+                "Refresh the Configs tab.",
+            )
+        })?;
+    let label = new_label
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     rec.label = label;
     save_generated_configs(id, &ledger)
 }
@@ -464,7 +482,11 @@ mod tests {
         crate::store::set_mem_dir_override(test_mem_dir());
         let id = crate::store::profiles::create_profile("g4", "gen").unwrap();
         let mut ledger = GeneratedConfigsLedger::default();
-        let (f, s, c) = rec(ExportFormat::ShareLink, ConfigSource::ShareLink, "vless://a");
+        let (f, s, c) = rec(
+            ExportFormat::ShareLink,
+            ConfigSource::ShareLink,
+            "vless://a",
+        );
         let rid = ledger.push(1000, f, s, Some("home".into()), c).unwrap();
         save_generated_configs(&id, &ledger).unwrap();
 

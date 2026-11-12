@@ -15,6 +15,7 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -22,6 +23,10 @@ tempfile.workspace = true
 [[bin]]
 name = "dastyab"
 path = "src/main.rs"
+
+[[bin]]
+name = "dnstt-server"
+path = "src/bin/dnstt-server.rs"
 
 # --- Debian packaging (.deb) via cargo-deb ---------------------------
 # Used by the CI release workflow to build the Linux installer. The binary is

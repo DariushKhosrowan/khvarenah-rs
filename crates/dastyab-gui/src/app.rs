@@ -44,11 +44,12 @@ enum View {
     Tools,
     Settings,
     Autonomy,
+    Multilayer,
 }
 
 impl View {
-    /// The eleven-item sidebar, in order.
-    const ALL: [View; 11] = [
+    /// The twelve-item sidebar, in order.
+    const ALL: [View; 12] = [
         View::Dashboard,
         View::DeployScan,
         View::Profiles,
@@ -60,6 +61,7 @@ impl View {
         View::Tools,
         View::Settings,
         View::Autonomy,
+        View::Multilayer,
     ];
 
     fn label(self) -> &'static str {
@@ -75,6 +77,7 @@ impl View {
             View::Tools => "Tools",
             View::Settings => "Settings",
             View::Autonomy => "Autonomy",
+            View::Multilayer => "Multi-Layer Tunnel",
         }
     }
 
@@ -93,6 +96,7 @@ impl View {
             View::Tools => "🧰",
             View::Settings => "⚙",
             View::Autonomy => "🤖",
+            View::Multilayer => "🧅",
         }
     }
 }
@@ -235,6 +239,9 @@ pub struct DastYabApp {
     pub vps_port: u16,
     pub vps_domain: String,
     pub vps_note: String,
+    /// Domestic resolver pool (comma/newline-separated IPs) the blackout DNS
+    /// tunnel recurses through; empty = direct-to-VPS (no domestic pool).
+    pub vps_resolvers: String,
     /// Worker-hosted DNS tunnel (no VPS) note/status line.
     pub worker_tunnel_note: String,
     // zero-touch Hetzner VPS provisioning config
@@ -250,6 +257,21 @@ pub struct DastYabApp {
     pub desync_max: usize,
     pub desync_delay_us: u64,
     pub desync_note: String,
+    // multi-layer tunnel: final server + access testing
+    pub ml_link: String,
+    pub ml_name: String,
+    pub ml_country: String,
+    pub ml_gemini_key: String,
+    pub ml_prompt: String,
+    /// Tunnel mode: "device" (whole device) | "chrome" (DastYab's
+    /// dedicated Chrome for AI Studio) | "proxy" (local SOCKS5 for any app).
+    pub ml_mode: String,
+    /// Local proxy port for "proxy" mode.
+    pub ml_proxy_port: u16,
+    /// Persist the AI-Studio Chrome session (keep login between runs).
+    pub ml_chrome_persist: bool,
+    pub ml_note: String,
+    pub ml_output: String,
     // blackout drill output (self-test of the fallback ladder)
     pub drill_output: String,
     // protection daemon control
@@ -508,12 +530,23 @@ impl DastYabApp {
             vps_port: 22,
             vps_domain: String::new(),
             vps_note: String::new(),
+            vps_resolvers: String::new(),
             worker_tunnel_note: String::new(),
             desync_enabled: profile.config.desync.enabled,
             desync_min: profile.config.desync.min_fragment,
             desync_max: profile.config.desync.max_fragment,
             desync_delay_us: profile.config.desync.inter_fragment_delay_us,
             desync_note: String::new(),
+            ml_link: String::new(),
+            ml_name: String::new(),
+            ml_country: String::new(),
+            ml_gemini_key: String::new(),
+            ml_prompt: "Explain how AI works in a few words".to_string(),
+            ml_mode: "chrome".to_string(),
+            ml_proxy_port: 10850,
+            ml_chrome_persist: true,
+            ml_note: String::new(),
+            ml_output: String::new(),
             drill_output: String::new(),
             daemon_note: String::new(),
             light_timeout_s: profile.config.light_timeout_secs,
@@ -887,6 +920,16 @@ impl DastYabApp {
             self.vps_note = "Set at least the VPS host and the base DNS domain first.".to_string();
             return;
         }
+        let resolver_pool: Option<Vec<String>> = {
+            let parsed: Vec<String> = self
+                .vps_resolvers
+                .split(|c: char| c == ',' || c == '\n' || c == ' ')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if parsed.is_empty() { None } else { Some(parsed) }
+        };
         let cfg = dastyab_core::vps_deploy::TunnelClientConfig {
             host: self.vps_host.trim().to_string(),
             base_domain: self.vps_domain.trim().to_string(),
@@ -897,6 +940,7 @@ impl DastYabApp {
             worker_name: None,
             shared_secret: None,
             worker_vless_upstream: None,
+            resolver_pool,
         };
         match dastyab_core::vps_deploy::write_tunnel_client_config(&self.profile_id, &cfg) {
             Ok(()) => {
@@ -1358,6 +1402,10 @@ impl DastYabApp {
                             if task.starts_with("probe-") || task == "probe-all" {
                                 self.cleanip_test_output = summary.clone();
                                 self.note = summary.clone();
+                            } else if task.starts_with("ml-") {
+                                // Multi-layer tunnel result goes to its own pane.
+                                self.ml_output = summary.clone();
+                                self.ml_note = "Done.".to_string();
                             } else {
                                 self.note = format!("✓ {task}: {summary}");
                             }
@@ -1381,6 +1429,9 @@ impl DastYabApp {
                     if task == "autopilot" {
                         self.autopilot_on = false;
                         self.autopilot_status = format!("Autopilot error: {}", error.brief());
+                    } else if task.starts_with("ml-") {
+                        self.ml_output = format!("✗ {task} failed: {}", error.brief());
+                        self.ml_note = error.brief();
                     } else {
                         self.note = error.brief();
                         self.error_banner = Some(error.explain());
@@ -2375,9 +2426,12 @@ impl DastYabApp {
                 if self.state.beacon_outbox > 0 {
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new(format!("⚠ {} queued alerts", self.state.beacon_outbox))
-                            .color(egui::Color32::from_rgb(230, 160, 60))
-                            .small(),
+                        egui::RichText::new(format!(
+                            "⚠ {} queued alerts",
+                            self.state.beacon_outbox
+                        ))
+                        .color(egui::Color32::from_rgb(230, 160, 60))
+                        .small(),
                     );
                 }
                 if !self.running.is_empty() {
@@ -2445,6 +2499,7 @@ impl DastYabApp {
                             View::Tools => self.tools_panel(ui, p),
                             View::Settings => self.settings_panel(ui, p),
                             View::Autonomy => self.autonomy_panel(ui, p),
+                            View::Multilayer => self.multilayer_panel(ui),
                         }
                     });
                 });
@@ -3637,6 +3692,13 @@ impl DastYabApp {
             ui.add(egui::TextEdit::singleline(&mut self.vps_domain).desired_width(200.0));
         });
         ui.horizontal(|ui| {
+            ui.label("Resolver pool (comma-separated IPs):");
+            ui.add(egui::TextEdit::singleline(&mut self.vps_resolvers).desired_width(300.0));
+        });
+        ui.label("Domestic ISP resolvers the tunnel recurses through during a total");
+        ui.label("blackout. Leave empty to query the VPS directly. Scan Iranian ISP");
+        ui.label("resolver blocks to build this pool before a lockdown.");
+        ui.horizontal(|ui| {
             if ui.button("Save VPS config").clicked() {
                 self.save_vps();
             }
@@ -4173,6 +4235,141 @@ impl DastYabApp {
             );
         }
     }
+
+    /// The Multi-Layer Tunnel panel: configure your final server, choose how
+    /// the tunnel is applied (device / Chrome / local proxy), and test AI
+    /// Studio + Gemini access through the chain.
+    fn multilayer_panel(&mut self, ui: &mut egui::Ui) {
+        let action = crate::views::multilayer::show(ui, self);
+        match action {
+            Some(crate::views::multilayer::MultilayerAction::Save) => {
+                self.save_multilayer_server();
+            }
+            Some(crate::views::multilayer::MultilayerAction::Clear) => {
+                let pid = self.state.active_profile_id.clone();
+                match dastyab_core::multilayer::clear_final_server(&pid) {
+                    Ok(()) => {
+                        self.ml_note = "Final server cleared.".to_string();
+                        self.ml_link.clear();
+                    }
+                    Err(e) => self.ml_note = format!("clear failed: {}", e.brief()),
+                }
+            }
+            Some(crate::views::multilayer::MultilayerAction::SaveGeminiKey) => {
+                let pid = self.state.active_profile_id.clone();
+                let key = self.ml_gemini_key.trim().to_string();
+                if key.is_empty() {
+                    self.ml_note = "Enter the Gemini API key first.".to_string();
+                } else {
+                    match dastyab_core::multilayer::save_gemini_key(&pid, &key) {
+                        Ok(()) => self.ml_note = "Gemini API key saved.".to_string(),
+                        Err(e) => self.ml_note = format!("save failed: {}", e.brief()),
+                    }
+                }
+            }
+            Some(crate::views::multilayer::MultilayerAction::ProbeAi) => {
+                let pid = self.state.active_profile_id.clone();
+                self.spawn_ml_task("ml-probe-ai", async move {
+                    let report = dastyab_core::multilayer::probe_ai_access(&pid).await?;
+                    let mut out = String::new();
+                    for p in &report.probes {
+                        let status = if p.reachable {
+                            "✓ reachable"
+                        } else {
+                            "✗ blocked"
+                        };
+                        let mut line = format!("{:<9} {status}  {}", p.target, p.note);
+                        if let Some(ip) = &p.egress_ip {
+                            line.push_str(&format!(" (egress {ip})"));
+                        }
+                        out.push_str(&line);
+                        out.push('\n');
+                    }
+                    out.push_str(if report.ok {
+                        "Verdict: AI services reachable through the chain."
+                    } else {
+                        "Verdict: not reachable — check your final server."
+                    });
+                    Ok::<String, CFError>(out)
+                });
+            }
+            Some(crate::views::multilayer::MultilayerAction::Gemini) => {
+                let prompt = self.ml_prompt.trim().to_string();
+                let pid = self.state.active_profile_id.clone();
+                self.spawn_ml_task("ml-gemini", async move {
+                    let res = dastyab_core::multilayer::probe_gemini_api(&pid, &prompt).await?;
+                    if res.ok {
+                        let answer = res
+                            .answer
+                            .clone()
+                            .unwrap_or_else(|| "(no answer text)".to_string());
+                        Ok::<String, CFError>(format!(
+                            "✓ Gemini responded ({model}):\n{answer}",
+                            model = res.model
+                        ))
+                    } else {
+                        Ok::<String, CFError>(format!("✗ Gemini call failed: {}", res.note))
+                    }
+                });
+            }
+            Some(crate::views::multilayer::MultilayerAction::Start) => {
+                let pid = self.state.active_profile_id.clone();
+                let mode = dastyab_core::multilayer::TunnelMode::parse_mode(&self.ml_mode);
+                let port = self.ml_proxy_port;
+                let persist = self.ml_chrome_persist;
+                self.spawn_ml_task("ml-start", async move {
+                    dastyab_core::multilayer::start_tunnel_mode(&pid, mode, port, persist).await
+                });
+            }
+            None => {}
+        }
+    }
+
+    /// Persist the multi-layer final-server config from the input fields.
+    fn save_multilayer_server(&mut self) {
+        let link = self.ml_link.trim().to_string();
+        if link.is_empty() {
+            self.ml_note = "Paste a vless:// link first.".to_string();
+            return;
+        }
+        let cfg = dastyab_core::multilayer::FinalServerConfig {
+            name: if self.ml_name.trim().is_empty() {
+                "my final server".to_string()
+            } else {
+                self.ml_name.trim().to_string()
+            },
+            country_hint: self.ml_country.trim().to_string(),
+            vless_link: link.clone(),
+        };
+        // Validate before saving.
+        match dastyab_core::multilayer::parse_final_server(&cfg) {
+            Ok(_) => {
+                let pid = self.state.active_profile_id.clone();
+                match dastyab_core::multilayer::save_final_server(&pid, &cfg) {
+                    Ok(()) => self.ml_note = "Final server saved.".to_string(),
+                    Err(e) => self.ml_note = format!("save failed: {}", e.brief()),
+                }
+            }
+            Err(e) => {
+                self.ml_note = format!("Invalid vless link: {}", e.brief());
+            }
+        }
+    }
+
+    /// Spawn a multi-layer background task, wiring its result into the
+    /// multi-layer output area (and the running indicator).
+    fn spawn_ml_task<F, T, E>(&mut self, name: &str, fut: F)
+    where
+        F: std::future::Future<Output = Result<T, E>> + Send + 'static,
+        T: ToString + Send + 'static,
+        E: Into<CFError> + Send + 'static,
+    {
+        let tx = self.tx.clone();
+        let name = name.to_string();
+        self.running.push(name.clone());
+        self.ml_output = format!("⏳ {name}…");
+        bridge::spawn(&name, tx, fut);
+    }
 }
 
 /// Load the daemon state for a profile, returning None when absent/unreadable.
@@ -4466,10 +4663,7 @@ mod tests {
             let ctx = egui::Context::default();
             let prof = load_profile(pid);
 
-            for (label, w, h) in [
-                ("default", 1280.0, 800.0),
-                ("maximized", 1920.0, 1080.0),
-            ] {
+            for (label, w, h) in [("default", 1280.0, 800.0), ("maximized", 1920.0, 1080.0)] {
                 let input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -4649,7 +4843,8 @@ mod tests {
             // encoded path, plus a durable base link.
             let encoded_link =
                 "vless://11111111-2222-3333-4444-555555555555@worker.example.workers.dev:443                 ?encryption=none&security=tls&type=ws&sni=w.workers.dev&host=w.workers.dev                 &path=%2F&fp=chrome#w";
-            dastyab_core::store::profiles::set_last_deployed_base_link(pid, encoded_link).unwrap();
+            dastyab_core::store::profiles::set_last_deployed_base_link(pid, encoded_link)
+                .unwrap();
 
             let (n, _) = create_configs_from_ip(pid, "104.18.227.124").expect("config from ip");
             assert!(n >= 4);
@@ -4691,7 +4886,8 @@ mod tests {
                 Some(base.as_str())
             );
             // config-from-IP still works with no redeploy.
-            let (n, _) = create_configs_from_ip(pid, "104.16.1.1").expect("config from ip after clear");
+            let (n, _) =
+                create_configs_from_ip(pid, "104.16.1.1").expect("config from ip after clear");
             assert!(n >= 4);
         });
     }
@@ -4852,6 +5048,16 @@ mod tests {
             desync_max: 0,
             desync_delay_us: 0,
             desync_note: String::new(),
+            ml_link: String::new(),
+            ml_name: String::new(),
+            ml_country: String::new(),
+            ml_gemini_key: String::new(),
+            ml_prompt: String::new(),
+            ml_mode: "chrome".into(),
+            ml_proxy_port: 10850,
+            ml_chrome_persist: true,
+            ml_note: String::new(),
+            ml_output: String::new(),
             drill_output: String::new(),
             daemon_note: String::new(),
             light_timeout_s: 0,
@@ -5062,6 +5268,16 @@ mod tests {
                 desync_max: 0,
                 desync_delay_us: 0,
                 desync_note: String::new(),
+                ml_link: String::new(),
+                ml_name: String::new(),
+                ml_country: String::new(),
+                ml_gemini_key: String::new(),
+                ml_prompt: String::new(),
+                ml_mode: "chrome".into(),
+                ml_proxy_port: 10850,
+                ml_chrome_persist: true,
+                ml_note: String::new(),
+                ml_output: String::new(),
                 drill_output: String::new(),
                 daemon_note: String::new(),
                 light_timeout_s: 0,
@@ -5213,6 +5429,16 @@ mod tests {
                 desync_max: 0,
                 desync_delay_us: 0,
                 desync_note: String::new(),
+                ml_link: String::new(),
+                ml_name: String::new(),
+                ml_country: String::new(),
+                ml_gemini_key: String::new(),
+                ml_prompt: String::new(),
+                ml_mode: "chrome".into(),
+                ml_proxy_port: 10850,
+                ml_chrome_persist: true,
+                ml_note: String::new(),
+                ml_output: String::new(),
                 drill_output: String::new(),
                 daemon_note: String::new(),
                 light_timeout_s: 0,
@@ -5403,6 +5629,16 @@ mod tests {
                 desync_max: 0,
                 desync_delay_us: 0,
                 desync_note: String::new(),
+                ml_link: String::new(),
+                ml_name: String::new(),
+                ml_country: String::new(),
+                ml_gemini_key: String::new(),
+                ml_prompt: String::new(),
+                ml_mode: "chrome".into(),
+                ml_proxy_port: 10850,
+                ml_chrome_persist: true,
+                ml_note: String::new(),
+                ml_output: String::new(),
                 drill_output: String::new(),
                 daemon_note: String::new(),
                 light_timeout_s: 0,
@@ -5491,17 +5727,30 @@ mod tests {
             assert_ne!(edited.content_sha256, rec.content_sha256);
 
             // 2. Rename label — trimmed, cleared when blank.
-            dastyab_core::generated_configs::update_config_label(pid, rid, Some("  home-vpn  ".into()))
-                .unwrap();
+            dastyab_core::generated_configs::update_config_label(
+                pid,
+                rid,
+                Some("  home-vpn  ".into()),
+            )
+            .unwrap();
             let after = dastyab_core::generated_configs::load_generated_configs(pid);
             assert_eq!(
-                after.records.iter().find(|r| r.id == rid).unwrap().label.as_deref(),
+                after
+                    .records
+                    .iter()
+                    .find(|r| r.id == rid)
+                    .unwrap()
+                    .label
+                    .as_deref(),
                 Some("home-vpn")
             );
             dastyab_core::generated_configs::update_config_label(pid, rid, Some("  ".into()))
                 .unwrap();
             let after = dastyab_core::generated_configs::load_generated_configs(pid);
-            assert_eq!(after.records.iter().find(|r| r.id == rid).unwrap().label, None);
+            assert_eq!(
+                after.records.iter().find(|r| r.id == rid).unwrap().label,
+                None
+            );
 
             // 3. Delete — only that record removed, the rest survive.
             let total = after.records.len();

@@ -431,6 +431,7 @@ mod tests {
             worker_name: Some("w".into()),
             shared_secret: Some("0123456789abcdef0123456789abcdef".into()),
             worker_vless_upstream: None,
+            resolver_pool: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: TunnelClientConfig = serde_json::from_str(&json).unwrap();
@@ -465,6 +466,7 @@ mod tests {
             worker_name: None,
             shared_secret: None,
             worker_vless_upstream: None,
+            resolver_pool: None,
         };
         let v = probe_worker_tunnel_live(&cfg, std::time::Duration::from_millis(500));
         assert!(!v.ok);
@@ -492,6 +494,7 @@ mod tests {
                 worker_name: Some("w".into()),
                 shared_secret: Some("a".into()),
                 worker_vless_upstream: None,
+                resolver_pool: None,
             },
         )
         .unwrap();

@@ -139,9 +139,7 @@ fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // Send signal 0 (existence check) — no privileges needed.
-        unsafe {
-            libc::kill(pid as libc::pid_t, 0) == 0
-        }
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
     #[cfg(not(unix))]
     {
@@ -179,25 +177,20 @@ impl TcpConnect {
 
 /// Query the current exit IP through the Tor SOCKS5 proxy.
 pub async fn current_exit_ip(socks_port: u16) -> Result<String, CFError> {
-    let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}")).map_err(|e| {
-        CFError::new("Tor", format!("bad SOCKS proxy config: {e}"), "")
-    })?;
+    let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))
+        .map_err(|e| CFError::new("Tor", format!("bad SOCKS proxy config: {e}"), ""))?;
     let client = reqwest::Client::builder()
         .proxy(proxy)
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| CFError::new("Tor", format!("cannot build client: {e}"), ""))?;
-    let resp = client
-        .get(IP_PROBE_URL)
-        .send()
-        .await
-        .map_err(|e| {
-            CFError::new(
-                "Tor",
-                format!("exit-IP probe through SOCKS5 failed: {e}"),
-                "Is the Tor daemon running and fully bootstrapped? Try `dastyab tor start`.",
-            )
-        })?;
+    let resp = client.get(IP_PROBE_URL).send().await.map_err(|e| {
+        CFError::new(
+            "Tor",
+            format!("exit-IP probe through SOCKS5 failed: {e}"),
+            "Is the Tor daemon running and fully bootstrapped? Try `dastyab tor start`.",
+        )
+    })?;
     if !resp.status().is_success() {
         return Err(CFError::new(
             "Tor",
@@ -205,9 +198,10 @@ pub async fn current_exit_ip(socks_port: u16) -> Result<String, CFError> {
             "",
         ));
     }
-    let ip = resp.text().await.map_err(|e| {
-        CFError::new("Tor", format!("cannot read exit-IP response: {e}"), "")
-    })?;
+    let ip = resp
+        .text()
+        .await
+        .map_err(|e| CFError::new("Tor", format!("cannot read exit-IP response: {e}"), ""))?;
     let ip = ip.trim().to_string();
     if ip.is_empty() {
         return Err(CFError::new("Tor", "empty exit-IP response", ""));
@@ -255,19 +249,24 @@ pub async fn start(opts: &TorOpts) -> Result<(), CFError> {
     }
 
     let dir = tor_runtime_dir(&opts.profile);
-    std::fs::create_dir_all(dir.join("datadir")).map_err(|e| {
-        CFError::new("Tor", format!("cannot create runtime dir: {e}"), "")
-    })?;
+    std::fs::create_dir_all(dir.join("datadir"))
+        .map_err(|e| CFError::new("Tor", format!("cannot create runtime dir: {e}"), ""))?;
 
     // The daemon detaches immediately (RunAsDaemon=1); we then poll for the
     // SOCKS port and a usable circuit.
     let status = Command::new(&bin)
-        .arg("--RunAsDaemon").arg("1")
-        .arg("--DataDirectory").arg(data_dir(&opts.profile))
-        .arg("--PidFile").arg(pid_path(&opts.profile))
-        .arg("--SocksPort").arg(format!("127.0.0.1:{}", opts.socks_port))
-        .arg("--Log").arg(format!("notice file {}", log_path(&opts.profile).display()))
-        .arg("--AvoidDiskWrites").arg("1")
+        .arg("--RunAsDaemon")
+        .arg("1")
+        .arg("--DataDirectory")
+        .arg(data_dir(&opts.profile))
+        .arg("--PidFile")
+        .arg(pid_path(&opts.profile))
+        .arg("--SocksPort")
+        .arg(format!("127.0.0.1:{}", opts.socks_port))
+        .arg("--Log")
+        .arg(format!("notice file {}", log_path(&opts.profile).display()))
+        .arg("--AvoidDiskWrites")
+        .arg("1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -283,7 +282,12 @@ pub async fn start(opts: &TorOpts) -> Result<(), CFError> {
     }
 
     // Persist settings so status/renew work without re-passing ports.
-    save_settings(&opts.profile, &TorSettings { socks_port: opts.socks_port });
+    save_settings(
+        &opts.profile,
+        &TorSettings {
+            socks_port: opts.socks_port,
+        },
+    );
 
     // Wait for the SOCKS port to listen, then for a usable exit circuit.
     wait_for_bootstrap(opts).await
@@ -388,16 +392,24 @@ pub async fn status(profile: &str) -> Result<(), CFError> {
         .unwrap_or(DEFAULT_SOCKS_PORT);
 
     println!("Tor mode — profile '{profile}'");
-    println!("  binary    : {}", find_tor()?.as_deref().unwrap_or("(not found)"));
+    println!(
+        "  binary    : {}",
+        find_tor()?.as_deref().unwrap_or("(not found)")
+    );
 
     if is_running(profile) {
-        println!("  state     : running (pid {})", read_pid(profile).unwrap_or(0));
+        println!(
+            "  state     : running (pid {})",
+            read_pid(profile).unwrap_or(0)
+        );
         println!("  socks5    : 127.0.0.1:{socks_port}");
         match current_exit_ip(socks_port).await {
             Ok(ip) => println!("  exit IP   : {ip}"),
             Err(e) => {
                 println!("  exit IP   : (unavailable — {})", e.brief());
-                println!("  hint      : daemon is up but still bootstrapping; retry in a few seconds.");
+                println!(
+                    "  hint      : daemon is up but still bootstrapping; retry in a few seconds."
+                );
             }
         }
     } else {
@@ -426,7 +438,8 @@ mod tests {
         // Save to a synthetic path under the temp dir.
         let sp = dir.join("settings.json");
         std::fs::write(&sp, serde_json::to_string_pretty(&s).unwrap()).unwrap();
-        let loaded: TorSettings = serde_json::from_str(&std::fs::read_to_string(&sp).unwrap()).unwrap();
+        let loaded: TorSettings =
+            serde_json::from_str(&std::fs::read_to_string(&sp).unwrap()).unwrap();
         assert_eq!(loaded.socks_port, 9999);
         let _ = std::fs::remove_dir_all(&dir);
     }

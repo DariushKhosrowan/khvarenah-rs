@@ -2287,6 +2287,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dastyab-core",
+ "rand 0.8.8",
  "serde_json",
  "tempfile",
  "tokio",

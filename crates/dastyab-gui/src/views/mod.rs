@@ -13,6 +13,7 @@ use eframe::egui;
 pub mod cleanip;
 pub mod configs;
 pub mod history;
+pub mod multilayer;
 pub mod profiles;
 pub mod tokens;
 

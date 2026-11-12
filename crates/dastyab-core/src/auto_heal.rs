@@ -465,14 +465,13 @@ mod tests {
     fn preserve_live_base_link_keeps_live_link_when_backup_lacks_it() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("config.json");
-        let live_link = "vless://11111111-2222-3333-4444-555555555555@workers.example.workers.dev:443#dep";
+        let live_link =
+            "vless://11111111-2222-3333-4444-555555555555@workers.example.workers.dev:443#dep";
         // Live config has a newer durable base link; the backup predates it
         // (no key at all).
         std::fs::write(
             &dest,
-            format!(
-                r#"{{"protection_enabled":true,"last_deployed_base_link":"{live_link}"}}"#
-            ),
+            format!(r#"{{"protection_enabled":true,"last_deployed_base_link":"{live_link}"}}"#),
         )
         .unwrap();
         let backup = r#"{"protection_enabled":true}"#;
@@ -493,12 +492,11 @@ mod tests {
         let old_link = "vless://old-uuid@host-b.workers.dev:443#old";
         std::fs::write(
             &dest,
-            format!(
-                r#"{{"protection_enabled":true,"last_deployed_base_link":"{live_link}"}}"#
-            ),
+            format!(r#"{{"protection_enabled":true,"last_deployed_base_link":"{live_link}"}}"#),
         )
         .unwrap();
-        let backup = format!(r#"{{"protection_enabled":false,"last_deployed_base_link":"{old_link}"}}"#);
+        let backup =
+            format!(r#"{{"protection_enabled":false,"last_deployed_base_link":"{old_link}"}}"#);
         let out = preserve_live_base_link(&dest, &backup);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
