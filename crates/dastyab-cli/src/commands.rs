@@ -212,6 +212,12 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             dry_run,
             mtu,
         } => cmd_platform(&action, dry_run, mtu),
+        Command::Nodes {
+            action,
+            profile,
+            path,
+            link,
+        } => cmd_configs(&profile, &action, &path, &link),
     }
 }
 
@@ -3500,6 +3506,107 @@ fn cmd_platform(action: &str, dry_run: bool, mtu: u32) -> Result<(), CFError> {
             "platform",
             format!("unknown action {action:?}"),
             "Use: apply | teardown | plan",
+        )),
+    }
+}
+
+/// Manage native config-storage nodes: import from a v2rayN ServersStore.json,
+/// paste a single vless link, list nodes, or activate one.
+fn cmd_configs(profile: &str, action: &str, path: &str, link: &str) -> Result<(), CFError> {
+    use dastyab_core::config_store::{
+        import_single_link, import_v2rayn_store, load_node_store, render_nodes, save_node_store,
+    };
+
+    match action {
+        "import" => {
+            if path.is_empty() {
+                return Err(CFError::new(
+                    "configs",
+                    "import requires --path to a v2rayN ServersStore.json.",
+                    "Example: dastyab configs import --path ~/.config/v2rayN/Local/ServersStore.json",
+                ));
+            }
+            if !std::path::Path::new(path).exists() {
+                return Err(CFError::new(
+                    "configs",
+                    format!("file not found: {path}"),
+                    "Check the path; v2rayN stores it under ~/.config/v2rayN/Local/.",
+                ));
+            }
+            let s = import_v2rayn_store(profile, std::path::Path::new(path))?;
+            println!(
+                "[configs] imported from {path}: found={} added={} duplicates={} invalid={} non-vless={}",
+                s.found, s.added, s.duplicates, s.skipped_invalid, s.skipped_non_vless
+            );
+            println!("{}", render_nodes(profile));
+            Ok(())
+        }
+        "paste" => {
+            if link.is_empty() {
+                return Err(CFError::new(
+                    "configs",
+                    "paste requires --link with a vless:// share link.",
+                    "Example: dastyab configs paste --link 'vless://...'",
+                ));
+            }
+            let s = import_single_link(profile, link)?;
+            println!(
+                "[configs] pasted link: added={} duplicates={}",
+                s.added, s.duplicates
+            );
+            println!("{}", render_nodes(profile));
+            Ok(())
+        }
+        "activate" => {
+            let mut store = load_node_store(profile);
+            if store.nodes.is_empty() {
+                return Err(CFError::new(
+                    "configs",
+                    "no nodes to activate — import a ServersStore.json or paste a link first.",
+                    "Run: dastyab configs import --path ... or dastyab configs paste --link 'vless://...'.",
+                ));
+            }
+            let target = if link.is_empty() {
+                // Activate the first node.
+                store.nodes[0].id.clone()
+            } else if store.get(link).is_some() {
+                link.to_string()
+            } else {
+                // Treat the arg as a share link to match by URL.
+                let url = link;
+                match store.nodes.iter().find(|n| n.url == url) {
+                    Some(n) => n.id.clone(),
+                    None => {
+                        return Err(CFError::new(
+                            "configs",
+                            "no node matches --link (either an id or an exact vless URL).",
+                            "List nodes first with: dastyab configs list",
+                        ));
+                    }
+                }
+            };
+            if store.set_active(&target) {
+                save_node_store(profile, &store)?;
+                println!("[configs] activated node {target}");
+            } else {
+                println!("[configs] node {target} not found");
+            }
+            Ok(())
+        }
+        "list" => {
+            println!("{}", render_nodes(profile));
+            Ok(())
+        }
+        "clear" => {
+            let empty = dastyab_core::config_store::NodeStore::default();
+            save_node_store(profile, &empty)?;
+            println!("[configs] cleared all nodes in profile '{profile}'");
+            Ok(())
+        }
+        _ => Err(CFError::new(
+            "configs",
+            format!("unknown action {action:?}"),
+            "Use: import | paste | activate | list | clear",
         )),
     }
 }

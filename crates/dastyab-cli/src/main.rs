@@ -467,6 +467,21 @@ enum Command {
         #[arg(long, default_value_t = 1290)]
         mtu: u32,
     },
+    /// Manage native config-storage nodes (imported from v2rayN or pasted).
+    Nodes {
+        /// Sub-command: import | paste | activate | list | clear.
+        #[arg()]
+        action: String,
+        /// Profile to operate on (default "default").
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Path to a v2rayN ServersStore.json (for import).
+        #[arg(long, default_value = "")]
+        path: String,
+        /// A vless:// share-link (for paste/activate).
+        #[arg(long, default_value = "")]
+        link: String,
+    },
 }
 
 #[derive(Subcommand)]

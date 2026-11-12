@@ -59,7 +59,7 @@ impl Default for VlessProfile {
 
 /// Percent-decode a query-string value (e.g. `%2F` -> `/`). Falls back to the
 /// raw string when decoding fails or is a no-op.
-fn decode_query(v: &str) -> String {
+pub fn decode_query(v: &str) -> String {
     percent_encoding::percent_decode_str(v)
         .decode_utf8_lossy()
         .into_owned()
@@ -215,6 +215,14 @@ impl VlessProfile {
             port,
             ..Default::default()
         };
+
+        if profile.uuid.is_empty() {
+            return Err(CFError::new(
+                "Invalid vless link",
+                "Missing UUID before the '@'.",
+                "Export a valid vless link from the app.",
+            ));
+        }
 
         if let Some(q) = query {
             for pair in q.split('&') {
