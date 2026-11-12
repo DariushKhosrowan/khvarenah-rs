@@ -7,6 +7,11 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **Multi-scheme node ingestion** — the node store now accepts every supported
   share-link scheme (vless, vmess, trojan, ss/ssr, hysteria2, tuic), with
   cross-scheme dedup by host+port+id (`proxy_uri`,`,config_store`).
+- **Daemon tunnel auto-detect** — autonomous probes/refill now consult
+   (cheap 500ms SOCKS5 connect) and route
+  through the local xray tunnel under NIN, instead of hardcoding direct
+  foreign TCP. Verified: 6/6 ad-hoc checks, pool healthy set grew
+  156→317/500 after a probe pass.
 - **Telegram harvest: anti-bot stealth pacing** — `fetch_preview_page` now
   calls `stealth::pre_request_pause("read")` before every t.me request, so
   multi-page archive-depth walks and multi-channel harvests no longer trip
