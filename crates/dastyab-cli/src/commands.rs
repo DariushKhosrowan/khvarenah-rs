@@ -3431,10 +3431,17 @@ async fn cmd_sni_spoof(profile: &str, action: crate::SniSpoofAction) -> Result<(
             let worker_host = dastyab_core::autopilot::base_vless(profile)
                 .ok()
                 .map(|v| v.address);
-            let snis = sp::candidates::candidates_with_worker(worker_host.as_deref());
+            let snis_base = sp::candidates::candidates_with_worker(worker_host.as_deref());
+            // Seed the anti-DPI SNI set from verified-live CT-anchor hostnames
+            // (doctrine §5: out-of-band bootstrap, never circular). Falling back
+            // to the static defaults when no anchors exist yet is a no-op merge.
+            let ct_store = dastyab_core::ct_anchors::load_anchors(profile);
+            let ct_hosts: Vec<String> = ct_store.anchors.iter().map(|a| a.host.clone()).collect();
+            let snis = sp::candidates::merge_candidates(&snis_base, &ct_hosts);
             println!(
-                "Probing {} SNIs against {ip}:{port} (timeout {timeout_ms}ms, {workers} workers)…",
-                snis.len()
+                "Probing {} SNIs ({} from CT anchors) against {ip}:{port} (timeout {timeout_ms}ms, {workers} workers)…",
+                snis.len(),
+                ct_hosts.len()
             );
             let results = sp::scanner::scan_snis(&snis, &ip, port, timeout_ms, workers).await;
             let summary = sp::scanner::summarize(&results);

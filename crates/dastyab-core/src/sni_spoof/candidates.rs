@@ -48,6 +48,22 @@ pub fn candidates_with_worker(worker_host: Option<&str>) -> Vec<String> {
     out
 }
 
+/// Merge an extra set of candidates into a base list, de-duplicated, preserving
+/// the base ordering first. Used to fold verified-live CT-anchor hostnames into
+/// the SNI-candidate set so the anti-DPI scan/allowlist is seeded from
+/// out-of-band evidence (doctrine §5 bootstrap — never circular) in addition to
+/// the static default CDN front domains.
+pub fn merge_candidates(base: &[String], extra: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(base.len() + extra.len());
+    let mut seen = std::collections::HashSet::with_capacity(base.len() + extra.len());
+    for s in base.iter().chain(extra.iter()) {
+        if seen.insert(s.clone()) {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +99,20 @@ mod tests {
     fn test_candidates_with_worker_none_returns_defaults() {
         let c = candidates_with_worker(None);
         assert_eq!(c, default_candidates());
+    }
+
+    #[test]
+    fn test_merge_candidates_dedups_and_preserves_base_order() {
+        let base: Vec<String> = vec!["a.com".into(), "b.com".into()];
+        let extra: Vec<String> = vec!["b.com".into(), "c.com".into(), "a.com".into()];
+        let merged = merge_candidates(&base, &extra);
+        assert_eq!(merged, vec!["a.com", "b.com", "c.com"]);
+    }
+
+    #[test]
+    fn test_merge_candidates_empty_extra_returns_base() {
+        let base: Vec<String> = vec!["a.com".into(), "b.com".into()];
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(merge_candidates(&base, &empty), base);
     }
 }
