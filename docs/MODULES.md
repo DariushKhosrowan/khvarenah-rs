@@ -254,6 +254,22 @@ route. Validated against the live host (mark 0x2024 present → no-op). 6 unit
 tests.
 
 ## 25. `tun_mtu.rs` — MTU/MSS clamping (doctrine D)
-Pure generator for TCP MSS-clamp rules (`rables -t mangle -A FORWARD ... -j
+Pure generator for TCP MSS-clamp rules (`iptables -t mangle -A FORWARD ... -j
 TCPMSS`). Supports adaptive `--clamp-mss-to-pmtu` and fixed `--set-mss <mtu-40>`
 plans, both idempotent against parsed existing mangle rules. 7 unit tests.
+
+## 26. `config_store.rs` — native node store
+Per-profile, on-disk store of inbound VLESS nodes (see
+`docs/NODE-STORE-HARVEST.md`). Ingests from a v2rayN `ServersStore.json`
+(`import_v2rayn_store`), a single pasted link (`import_single_link`), or the
+Telegram harvester. Dedup by `(address, port, uuid)`; preserves every node's
+raw share-link so transport params (reality/tls/ws/grpc/xhttp) are never lost.
+7 unit tests.
+
+## 27. `harvest.rs` — browser-free Telegram config harvester
+Fetches public `https://t.me/s/<channel>` HTML previews via one blocking
+`reqwest` GET (direct or through the local xray SOCKS5), extracts and
+HTML-decodes `vless://` share-links, and imports them into the config store.
+Replaces an always-warm Telegram-web Chromium (~40% CPU) with a transient
+near-zero-CPU fetch. 4 unit tests.
+

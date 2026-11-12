@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — 2026-11-12
+
+### Added (native config-store + Telegram harvest — the "no-browser" path)
+
+- **`dastyab-core::config_store`** (new module): a per-profile, on-disk
+  store of inbound VLESS nodes. It ingests nodes from three sources:
+  - `import_v2rayn_store` — read a v2rayN `ServersStore.json` and import all
+    VLESS servers (dedup by address+port+uuid; skips non-VLESS; preserves the
+    raw share-link including reality/tls/ws/grpc/xhttp transport params).
+  - `import_single_link` — paste one `vless://` share-link.
+  - `harvest` (below) — pull configs straight from Telegram.
+  Every node keeps its **raw share-link**, so transport validation (reality
+  `pbk`/`sid`/`fp`, ws path, etc.) is never lost to re-serialization. The
+  CLI exposes `dastyab nodes import|paste|activate|list|clear`.
+- **`dastyab-core::harvest`** (new module): harvest free configs from
+  Telegram **without keeping a browser open**. Telegram publishes a public,
+  auth-free HTML preview of any channel at `https://t.me/s/<channel>`; the
+  harvester fetches it with one blocking `reqwest` GET (direct, or routed
+  through the local xray SOCKS5 with `--proxy`), extracts `vless://`
+  links, HTML-decodes `&amp;` → `&`, strips the trailing `#` fragment, and
+  imports them into the config store. This replaces a ~40% CPU warm
+  Chromium session with a near-zero-CPU fetch. Verified end-to-end against a
+  real channel. CLI: `dastyab harvest --channels v2ray_config`.
+
 ## v0.1.4 — 2026-11-11
 
 ### Fixed (worker deploy reliability + status-note auto-expiry)
