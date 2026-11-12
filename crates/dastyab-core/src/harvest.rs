@@ -64,13 +64,34 @@ pub fn build_client(use_proxy: bool) -> Result<reqwest::Client, CFError> {
         .map_err(|e| CFError::new("harvest", format!("http client: {e}"), ""))
 }
 
-/// Fetch a channel's public preview and return every `vless://` link it
+/// A single page of a channel's public preview: extracted links plus the raw
+/// message ids found on it (used as cursors to walk further back in time).
+struct PreviewPage {
+    links: Vec<String>,
+    ids: Vec<i64>,
+}
+
+/// Fetch a channel's public preview and return every supported share-link it
 /// contains, HTML-entity decoded, using a shared client.
 pub async fn fetch_channel_links_async(
     client: &reqwest::Client,
     channel: &str,
 ) -> Result<Vec<String>, CFError> {
-    let url = format!("https://t.me/s/{channel}");
+    Ok(fetch_preview_page(client, channel, None).await?.links)
+}
+
+/// Fetch one page of a channel's public preview. `before` optionally requests
+/// only messages *older* than that id (archive traversal — this is how we dig
+/// into archived chats for configs that are long gone from the latest page).
+async fn fetch_preview_page(
+    client: &reqwest::Client,
+    channel: &str,
+    before: Option<i64>,
+) -> Result<PreviewPage, CFError> {
+    let mut url = format!("https://t.me/s/{channel}");
+    if let Some(b) = before {
+        url.push_str(&format!("?before={b}"));
+    }
     let resp = client.get(&url).send().await.map_err(|e| {
         CFError::new(
             "harvest",
@@ -90,84 +111,154 @@ pub async fn fetch_channel_links_async(
         .text()
         .await
         .map_err(|e| CFError::new("harvest", format!("reading body: {e}"), ""))?;
-    Ok(extract_vless_links(&body))
+    Ok(PreviewPage {
+        links: extract_proxy_links(&body),
+        ids: extract_message_ids(&body),
+    })
 }
 
-/// Extract and HTML-decode all `vless://` links from a preview body.
-/// Handles `&amp;` → `&` so the resulting link is importable.
-pub fn extract_vless_links(body: &str) -> Vec<String> {
+/// Pull out every message id from a preview page (`data-post="chan/<id>"`).
+fn extract_message_ids(body: &str) -> Vec<i64> {
+    let mut ids = Vec::new();
+    let mut rest = body;
+    while let Some(pos) = rest.find("data-post=\"") {
+        rest = &rest[pos + "data-post=\"".len()..];
+        let end = match rest.find('"') {
+            Some(e) => e,
+            None => break,
+        };
+        let frag = &rest[..end];
+        if let Some((_, id_str)) = frag.rsplit_once('/') {
+            if let Ok(id) = id_str.parse::<i64>() {
+                ids.push(id);
+            }
+        }
+        rest = &rest[end..];
+    }
+    ids
+}
+
+/// Extract and HTML-decode every supported proxy share-link from a preview
+/// body — vless, vmess, trojan, ss, ssr, hysteria2, tuic. Handles `&amp;`
+/// → `&` so links are importable.
+pub fn extract_proxy_links(body: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for (i, token) in body.split("vless://").enumerate() {
-        // Index 0 is everything before the FIRST delimiter — not a link tail
-        // (empty only when the body starts exactly with "vless://").
-        if i == 0 || token.is_empty() {
-            continue;
+    for scheme in crate::proxy_uri::SUPPORTED_SCHEMES {
+        let marker = format!("{scheme}://");
+        for (i, token) in body.split(marker.as_str()).enumerate() {
+            // Index 0 is everything before the FIRST delimiter — not a link
+            // tail.
+            if i == 0 || token.is_empty() {
+                continue;
+            }
+            // A link ends at whitespace, `"`, `<`, or `>`.
+            let end = token
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '<' || c == '>')
+                .unwrap_or(token.len());
+            let tail = &token[..end];
+            // Strip a trailing `#` (Telegram appends it with no fragment).
+            let tail = tail.trim_end_matches('#');
+            // @-based schemes need at least an `identity@host` core; the
+            // base64 schemes (vmess/ssr) carry no '@' — the parser validates
+            // those, so invalid tails are dropped below.
+            if !tail.contains('@') && !matches!(*scheme, "vmess" | "ssr") {
+                continue;
+            }
+            let decoded = tail.replace("&amp;", "&");
+            let link = format!("{scheme}://{decoded}");
+            if crate::proxy_uri::ProxyUri::parse(&link).is_some() {
+                out.push(link);
+            }
         }
-        // A link ends at whitespace, `"`, `<`, or `>`.
-        let end = token
-            .find(|c: char| c.is_whitespace() || c == '"' || c == '<' || c == '>')
-            .unwrap_or(token.len());
-        let tail = &token[..end];
-        // Strip a trailing `#` (Telegram appends it with no fragment).
-        let tail = tail.trim_end_matches('#');
-        // A valid share-link must have a `uuid@host` core. This also rejects
-        // broken tails like "vless://%20", "vless://#" and "vless://junk".
-        if !tail.contains('@') {
-            continue;
-        }
-        let decoded = tail.replace("&amp;", "&");
-        out.push(format!("vless://{decoded}"));
     }
     out
 }
 
+/// Backwards-compatible shim: only VLESS links.
+pub fn extract_vless_links(body: &str) -> Vec<String> {
+    extract_proxy_links(body)
+        .into_iter()
+        .filter(|l| l.starts_with("vless://"))
+        .collect()
+}
+
+/// Max archive pages walked backwards per channel (each page is ~20 messages).
+pub const MAX_ARCHIVE_DEPTH: usize = 10;
+
 /// Harvest a channel into a profile's config store using a shared client.
-/// Returns how many links were found and imported.
-pub async fn harvest_channel_async(
+/// `depth` = how many preview pages to walk back into the channel's archive
+/// (1 = latest page only). Returns how many links were found and imported.
+pub async fn harvest_channel_async_depth(
     client: &reqwest::Client,
     profile: &str,
     channel: &str,
+    depth: usize,
 ) -> ChannelHarvest {
     let chan = channel.trim_start_matches('@').to_string();
     let mut harvest = ChannelHarvest {
         channel: chan.clone(),
         ..Default::default()
     };
-    match fetch_channel_links_async(client, &chan).await {
-        Ok(links) => {
-            harvest.links = links;
-            for link in &harvest.links {
-                match crate::config_store::import_single_link(profile, link) {
-                    Ok(s) => {
-                        harvest.summary.found += s.found;
-                        harvest.summary.added += s.added;
-                        harvest.summary.duplicates += s.duplicates;
-                        harvest.summary.skipped_invalid += s.skipped_invalid;
-                        harvest.summary.skipped_non_vless += s.skipped_non_vless;
-                    }
-                    Err(_) => {
-                        harvest.summary.skipped_invalid += 1;
-                    }
+    let depth = depth.clamp(1, MAX_ARCHIVE_DEPTH);
+    let mut cursor: Option<i64> = None;
+    for _ in 0..depth {
+        match fetch_preview_page(client, &chan, cursor).await {
+            Ok(page) => {
+                harvest.links.extend(page.links);
+                let min = page.ids.iter().min().copied();
+                if min != cursor && min.is_some() {
+                    cursor = min;
+                } else {
+                    break; // reached the oldest available messages
                 }
             }
-        }
-        Err(e) => {
-            harvest.fetch_error = Some(e.brief());
+            Err(e) => {
+                harvest.fetch_error = Some(e.brief());
+                break;
+            }
         }
     }
+
+    // Import everything collected; the store dedups across schemes and pages.
+    let links = std::mem::take(&mut harvest.links);
+    for link in &links {
+        match crate::config_store::import_single_link(profile, link) {
+            Ok(s) => {
+                harvest.summary.found += s.found;
+                harvest.summary.added += s.added;
+                harvest.summary.duplicates += s.duplicates;
+                harvest.summary.skipped_invalid += s.skipped_invalid;
+                harvest.summary.skipped_non_vless += s.skipped_non_vless;
+            }
+            Err(_) => {
+                harvest.summary.skipped_invalid += 1;
+            }
+        }
+    }
+    harvest.links = links;
     harvest
+}
+
+/// Single-page harvest (maintained for backward compatibility).
+pub async fn harvest_channel_async(
+    client: &reqwest::Client,
+    profile: &str,
+    channel: &str,
+) -> ChannelHarvest {
+    harvest_channel_async_depth(client, profile, channel, 1).await
 }
 
 /// Concurrently harvest many channels using one shared, connection-pooled
 /// client. `concurrency` bounds how many channel fetches are in flight at
-/// once (default-sane: 8). Returns the per-channel results in completion
-/// order (not input order); the caller pairs them via the returned channel
-/// name.
+/// once (default-sane: 8). `depth` = archive pages walked back per channel.
+/// Returns the per-channel results in completion order (not input order); the
+/// caller pairs them via the returned channel name.
 pub async fn harvest_many(
     profile: &str,
     channels: &[String],
     use_proxy: bool,
     concurrency: usize,
+    depth: usize,
 ) -> Vec<(String, ChannelHarvest)> {
     use futures_util::stream::StreamExt;
 
@@ -197,7 +288,7 @@ pub async fn harvest_many(
             let client = client.clone();
             let profile = profile.clone();
             async move {
-                let h = harvest_channel_async(&client, &profile, &channel).await;
+                let h = harvest_channel_async_depth(&client, &profile, &channel, depth).await;
                 (channel, h)
             }
         })
@@ -209,6 +300,7 @@ pub async fn harvest_many(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn extract_decodes_html_entities_and_strips_fragment() {
@@ -250,6 +342,52 @@ mod tests {
         let body = "vless://%20 vless://# vless://";
         let links = extract_vless_links(body);
         assert!(links.is_empty(), "expected no valid links, got {links:?}");
+    }
+
+    #[test]
+    fn extract_multi_scheme_links() {
+        let body = concat!(
+            "vless://06ef598c-1555-4887-b3f9-08214a2f6792@104.17.72.206:443?type=ws#v ",
+            "trojan://pw@ali.example.com:8443#tr ",
+            "ss://chacha20-ietf-poly1305:k@1.2.3.4:8388#ss ",
+            "hysteria2://tok@107.189.20.41:8443#hy2 ",
+            "http://not-a-proxy.com/foo ",
+            "garbage token",
+        );
+        let links = extract_proxy_links(body);
+        assert_eq!(links.len(), 4);
+        assert!(links.iter().any(|l| l.starts_with("vless://")));
+        assert!(links.iter().any(|l| l.starts_with("trojan://")));
+        assert!(links.iter().any(|l| l.starts_with("ss://")));
+        assert!(links.iter().any(|l| l.starts_with("hysteria2://")));
+    }
+
+    #[test]
+    fn extract_vmess_and_ssr_base64() {
+        let json = r#"{"v":"2","ps":"vm","add":"198.51.100.9","port":"443","id":"7748b328-f0e8-40ab-b2e3-9a1c2c22d111","aid":"0"}"#;
+        let vb64 = base64::engine::general_purpose::STANDARD.encode(json);
+        let ssr = "95.85.234.66:10001:auth_aes128_md5:aes-128-ctr:tls1.2_ticket_auth:Zm9vYmFy";
+        let sb64 = base64::engine::general_purpose::STANDARD.encode(ssr);
+        let body = format!("vmess://{vb64} ssr://{sb64}");
+        let links = extract_proxy_links(&body);
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().any(|l| l.starts_with("vmess://")));
+        assert!(links.iter().any(|l| l.starts_with("ssr://")));
+    }
+
+    #[test]
+    fn message_id_cursors_are_extracted() {
+        let body = r#"
+            <div class="tgme_widget_message" data-post="chan/12345">…</div>
+            <div class="tgme_widget_message" data-post="chan/12340">…</div>
+        "#;
+        let ids = extract_message_ids(body);
+        assert_eq!(ids, vec![12345, 12340]);
+    }
+
+    #[test]
+    fn message_ids_empty_for_no_posts() {
+        assert!(extract_message_ids("no posts here").is_empty());
     }
 
     /// Serve the minimal t.me/s preview HTML for any path on a spawned local

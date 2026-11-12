@@ -219,16 +219,18 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             link,
             proxy,
             channels,
-        } => cmd_configs(&profile, &action, &path, &link, proxy, &channels).await,
+            depth,
+        } => cmd_configs(&profile, &action, &path, &link, proxy, &channels, depth).await,
         Command::Harvest {
             channels,
             profile,
             proxy,
-        } => cmd_harvest(&profile, &channels, proxy).await,
+            depth,
+        } => cmd_harvest(&profile, &channels, proxy, depth).await,
     }
 }
 
-async fn cmd_harvest(profile: &str, channels: &str, proxy: bool) -> Result<(), CFError> {
+async fn cmd_harvest(profile: &str, channels: &str, proxy: bool, depth: usize) -> Result<(), CFError> {
     use dastyab_core::harvest;
     let list: Vec<String> = channels
         .split(',')
@@ -242,7 +244,7 @@ async fn cmd_harvest(profile: &str, channels: &str, proxy: bool) -> Result<(), C
     // Concurrent, connection-pooled harvest: one shared async client across
     // all channels (TLS keep-alive reuse), bounded in-flight fetches.
     let concurrency = list.len().min(8);
-    let results = harvest::harvest_many(profile, &list, proxy, concurrency).await;
+    let results = harvest::harvest_many(profile, &list, proxy, concurrency, depth).await;
 
     for (channel, h) in results {
         if let Some(err) = &h.fetch_error {
@@ -3560,6 +3562,7 @@ async fn cmd_configs(
     link: &str,
     proxy: bool,
     channels: &str,
+    depth: usize,
 ) -> Result<(), CFError> {
     use dastyab_core::config_store::{
         import_single_link, import_v2rayn_store, load_node_store, render_nodes, save_node_store,
@@ -3737,7 +3740,7 @@ async fn cmd_configs(
                     },
                     chan_list.len()
                 );
-                cmd_harvest(profile, channels, proxy).await?;
+                cmd_harvest(profile, channels, proxy, depth).await?;
             }
 
             let rep = selfheal(profile, proxy);

@@ -489,9 +489,13 @@ enum Command {
         /// `selfheal`, to refill an empty/all-dead pool).
         #[arg(long, default_value = "")]
         channels: String,
+        /// How many archive pages to walk back per channel (default 3).
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
     },
-    /// Harvest free vless configs from Telegram channels (public previews,
-    /// no browser needed) into a profile's node store.
+    /// Harvest free configs from Telegram channels (public previews,
+    /// no browser needed) into a profile's node store. Any supported scheme
+    /// is imported (vless, vmess, trojan, ss, ssr, hysteria2, tuic).
     Harvest {
         /// Comma-separated channel handles (with or without leading '@').
         #[arg(long, default_value = "v2ray_config")]
@@ -502,6 +506,9 @@ enum Command {
         /// Route through the local xray SOCKS5 proxy (use when direct is blocked).
         #[arg(long)]
         proxy: bool,
+        /// How many archive pages to walk back per channel (default 3).
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
     },
 }
 

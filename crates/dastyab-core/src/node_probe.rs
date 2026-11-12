@@ -45,27 +45,11 @@ pub struct NodeProbe {
     pub error: Option<String>,
 }
 
-/// Parse `host:port` out of a raw vless share-link.
-///
-/// Accepts `vless://uuid@host:port?params#frag`. Returns `None` for malformed
-/// URLs (no `@`, no port, non-numeric port).
+/// Parse `host:port` out of any supported share-link (vless, vmess, trojan,
+/// ss, ssr, hysteria2, tuic). Returns `None` for malformed/unsupported URLs.
 pub fn parse_host_port(url: &str) -> Option<(String, u16)> {
-    let after = url.strip_prefix("vless://")?;
-    // Split uuid@host:port. Require a non-empty uuid segment.
-    let mut parts = after.split('@');
-    let uuid = parts.next()?;
-    if uuid.is_empty() {
-        return None;
-    }
-    let host_port = parts.next()?;
-    // Cut at the first of the query/fragment/path delimiters.
-    let host_port = host_port.split(['?', '#', '/']).next()?;
-    let (host, port) = host_port.rsplit_once(':')?;
-    let port: u16 = port.parse().ok()?;
-    if host.is_empty() || port == 0 {
-        return None;
-    }
-    Some((host.to_string(), port))
+    let uri = crate::proxy_uri::ProxyUri::parse(url)?;
+    Some((uri.host, uri.port))
 }
 
 /// Connect through the local xray SOCKS5 (addr:PROXY_SOCKS_PORT) to
@@ -225,9 +209,7 @@ pub fn failover_if_dead(profile: &str) -> Option<String> {
         .iter()
         .find(|n| n.healthy == Some(true))
         .map(|n| n.id.clone());
-    let Some(id) = cand_id else {
-        return None;
-    };
+    let id = cand_id?;
     store.set_active(&id);
     let _ = save_node_store(profile, &store);
     Some(id)
