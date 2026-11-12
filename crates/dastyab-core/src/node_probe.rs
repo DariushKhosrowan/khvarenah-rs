@@ -214,6 +214,19 @@ fn tls_handshake_ok(s: &mut TcpStream, sni: &str) -> bool {
 
 /// Probe a single node. Returns (ok, ms, error).
 ///
+/// Shallow probe: is the local xray SOCKS5 tunnel reachable? Used by the
+/// daemon to decide whether to route autonomous probes/refill through the
+/// tunnel (NIN) instead of direct foreign TCP (which is severed in Iran).
+/// Cheap and bounded — a single connect with a short timeout; never blocks a
+/// tick for long.
+pub fn tunnel_available() -> bool {
+    let proxy_addr: SocketAddr = match format!("127.0.0.1:{PROXY_SOCKS_PORT}").parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&proxy_addr, Duration::from_millis(500)).is_ok()
+}
+
 /// `use_proxy` routes the connection through the local xray SOCKS5 so the
 /// probe works even when direct foreign TCP is severed (NIN).
 ///

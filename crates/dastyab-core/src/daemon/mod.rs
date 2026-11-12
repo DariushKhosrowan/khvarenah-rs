@@ -1364,10 +1364,12 @@ async fn run_self_maintenance(
     // time is re-verified on a cadence, not only when the whole pool fails.
     // Rate-limited (cheap, bounded: ≤NODE_DECAY_SWEEP_MAX nodes per pass) and
     // requires the network for real probes. Fails over if the active node
-    // died since the last check.
+    // died since the last check. Routes through the local SOCKS5 tunnel when
+    // it is up (auto-detected), since direct foreign TCP is severed under NIN.
     if net_up && now - state.last_node_decay_ts >= crate::node_probe::NODE_DECAY_INTERVAL_SECS {
         state.last_node_decay_ts = now;
-        let sweep = crate::node_probe::probe_stale(profile, false);
+        let use_proxy = crate::node_probe::tunnel_available();
+        let sweep = crate::node_probe::probe_stale(profile, use_proxy);
         if sweep.probed > 0 {
             log(&log_line(
                 "INFO",
@@ -1391,13 +1393,15 @@ async fn run_self_maintenance(
     // the "never run out of working configs" doctrine (§5). Requires the
     // network (harvest fetches) and is rate-limited to once per cooldown
     // window so a permanently-dead pool doesn't hammer Telegram/GitHub on
-    // every tick.
+    // every tick. Routes through the local SOCKS5 tunnel when it is up
+    // (auto-detected), since direct foreign TCP is severed under NIN.
     if net_up && now - state.last_refill_ts >= crate::node_refill::REFILL_COOLDOWN_SECS {
         let needs =
             crate::node_refill::refill_needed(&crate::config_store::load_node_store(profile));
         if let Some(reason) = needs {
             state.last_refill_ts = now;
-            let report = crate::node_refill::run_refill(profile, false).await;
+            let use_proxy = crate::node_probe::tunnel_available();
+            let report = crate::node_refill::run_refill(profile, use_proxy).await;
             log(&log_line(
                 "INFO",
                 &format!(
