@@ -312,6 +312,15 @@ mission: a flawless, self-healing circumvention client.
 ### 8.3 — Survivability & UX
 - **P2P LAN mesh (Level 4)** — mDNS/raw-UDP neighbor discovery + relay through
   any peer that still holds an upstream uplink.
+- **Modular VPN-tool chain mixer** — allow the user to compose and reorder a
+  chain of *external transport engines* (Psiphon, Tor, v2rayN/xray, Lantern,
+  Shadowsocks-2022, etc.) as stacked layers, e.g.
+  `Lantern → Tor → v2rayN(REALITY) → egress`, each layer handing off the next
+  on a loopback SOCKS5/HTTP port. The user picks which tools join and in what
+  order per profile; a planner validates each binary is present, assigns ports,
+  spawns the pipeline in order, and probes the final egress end-to-end before
+  declaring the chain healthy. If any layer dies, the ladder skips it and
+  re-races (doctrine §3, §5 — never stop, never circular).
 - **Wrangler-free deploy confirmation** — smoke-test the deployed worker URL
   post-deploy.
 - **Telegram bot control** — drive the console (status, refill, failover)

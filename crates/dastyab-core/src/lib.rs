@@ -50,6 +50,7 @@ pub mod bootstrap_diagnose;
 pub mod carrier_pool;
 pub mod carrier_refresh;
 pub mod cf;
+pub mod chain_mixer;
 pub mod cleanip;
 pub mod config_mutation;
 pub mod config_store;
