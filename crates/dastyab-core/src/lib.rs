@@ -86,6 +86,7 @@ pub mod status;
 pub mod stealth;
 pub mod store;
 pub mod tls;
+pub mod tor;
 pub mod token_provision;
 pub mod token_rotate;
 pub mod vless;

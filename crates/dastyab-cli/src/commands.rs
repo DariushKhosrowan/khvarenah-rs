@@ -201,6 +201,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         Command::SniSpoof { action } => cmd_sni_spoof(&profile, action).await,
         Command::DnsTunnel { action } => cmd_dns_tunnel(&profile, action).await,
         Command::MultiWorker { action } => cmd_multi_worker(&profile, action).await,
+        Command::Tor { action } => cmd_tor(&profile, action).await,
         Command::Journal { action } => cmd_journal(&profile, action),
         Command::Autonomy { action } => cmd_autonomy(&profile, action).await,
         Command::Onboard { action } => cmd_onboard(&profile, action),
@@ -3541,6 +3542,21 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
             }
             Ok(())
         }
+    }
+}
+
+/// Tor anonymity-network CLI surface: start/stop/renew/status.
+async fn cmd_tor(profile: &str, action: crate::TorAction) -> Result<(), CFError> {
+    use dastyab_core::tor;
+    match action {
+        crate::TorAction::Start { socks_port } => {
+            let opts = tor::TorOpts::new(profile.to_string(), socks_port);
+            println!("Starting Tor (SOCKS5 on 127.0.0.1:{socks_port}) ...");
+            tor::start(&opts).await
+        }
+        crate::TorAction::Stop => tor::stop(profile),
+        crate::TorAction::Renew => tor::renew(profile).await,
+        crate::TorAction::Status => tor::status(profile).await,
     }
 }
 

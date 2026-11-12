@@ -406,6 +406,12 @@ enum Command {
         #[command(subcommand)]
         action: MultiWorkerAction,
     },
+    /// Route traffic through the Tor anonymity network to change the egress
+    /// IP (private daemon + SOCKS5 proxy on the loopback interface).
+    Tor {
+        #[command(subcommand)]
+        action: TorAction,
+    },
     /// Durable daemon journal: blackout/rescue/outbox events recorded across
     /// crashes and restarts. The blackout-resilience audit trail.
     Journal {
@@ -646,6 +652,23 @@ pub enum DnsTunnelAction {
         #[arg(long, default_value_t = 22)]
         port: u16,
     },
+}
+
+/// Tor anonymity-network actions (egress-IP change).
+#[derive(Subcommand)]
+pub enum TorAction {
+    /// Start the private Tor daemon and wait for a usable circuit.
+    Start {
+        /// Local SOCKS5 port for the Tor proxy (default 9050).
+        #[arg(long, default_value_t = 9050)]
+        socks_port: u16,
+    },
+    /// Stop the Tor daemon.
+    Stop,
+    /// Restart Tor — guaranteed fresh circuit, new exit IP.
+    Renew,
+    /// Show whether Tor is running and the current exit IP.
+    Status,
 }
 
 /// Multi-worker parallel redundancy actions.
