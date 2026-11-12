@@ -217,7 +217,8 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             window,
             upstream,
             name,
-        } => cmd_mesh(&action, window, upstream, &name),
+            url,
+        } => cmd_mesh(&action, window, upstream, &name, &url),
         Command::Bond { action, frames } => cmd_bond(&action, frames),
         Command::Nodes {
             action,
@@ -4039,7 +4040,13 @@ fn cmd_bond(action: &str, frames: usize) -> Result<(), CFError> {
 /// Level-4 intranet P2P LAN mesh (PRINCIPLES §3 Level 4). Discovers other
 /// DastYab instances on the local network and reports the best relay
 /// candidate (a peer with a live upstream uplink).
-fn cmd_mesh(action: &str, window: u64, upstream: bool, name: &str) -> Result<(), CFError> {
+fn cmd_mesh(
+    action: &str,
+    window: u64,
+    upstream: bool,
+    name: &str,
+    url: &str,
+) -> Result<(), CFError> {
     use dastyab_core::lan_mesh;
     let action = action.trim().to_lowercase();
     let now = dastyab_core::store::profiles::now_ts() as u64;
@@ -4166,16 +4173,37 @@ fn cmd_mesh(action: &str, window: u64, upstream: bool, name: &str) -> Result<(),
                 "[mesh] hosting relay listener on UDP {} for {window}s (ctr-c to stop)…",
                 lan_mesh::UDP_PORT
             );
-            let serve = dastyab_core::mesh_relay::serve_once(
-                std::net::SocketAddr::new(
-                    std::net::Ipv4Addr::UNSPECIFIED.into(),
-                    lan_mesh::UDP_PORT,
-                ),
-                window,
+            let bind = std::net::SocketAddr::new(
+                std::net::Ipv4Addr::UNSPECIFIED.into(),
+                lan_mesh::UDP_PORT,
             );
-            match serve {
-                Ok(answered) => {
-                    println!("[mesh] relay listener stopped; answered {answered} hop probe(s)");
+            // When we advertise an uplink, actually serve data forwarding
+            // through our own working egress (so peers can hop through us).
+            // Otherwise we answer echo probes only (verify hop connectivity).
+            // NOTE: the real egress uses reqwest::blocking (a tokio runtime
+            // inside), so it must run on a dedicated OS thread — never inside
+            // the CLI's async runtime (dropping a runtime in an async context
+            // panics).
+            let handle = std::thread::spawn(move || {
+                if upstream {
+                    let egress = dastyab_core::mesh_relay::RealRelayEgress::default();
+                    dastyab_core::mesh_relay::serve_with_egress(bind, window, &egress)
+                } else {
+                    dastyab_core::mesh_relay::serve_with_egress(
+                        bind,
+                        window,
+                        &dastyab_core::mesh_relay::NoopEgress,
+                    )
+                }
+            });
+            let out = handle
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("relay listener thread panicked")));
+            match out {
+                Ok((answered, forwarded)) => {
+                    println!(
+                        "[mesh] relay listener stopped; answered {answered} hop probe(s), forwarded {forwarded} data frame(s)"
+                    );
                     Ok(())
                 }
                 Err(e) => Err(CFError::new(
@@ -4185,10 +4213,82 @@ fn cmd_mesh(action: &str, window: u64, upstream: bool, name: &str) -> Result<(),
                 )),
             }
         }
+        "forward" => {
+            if url.is_empty() {
+                return Err(CFError::new(
+                    "mesh",
+                    "forward requires --url to fetch through the mesh relay",
+                    "Example: dastyab mesh forward --url https://example.com/",
+                ));
+            }
+            let (table, heard) = lan_mesh::discover_once(&host, &label, upstream, window, now);
+            match table.best_relay(now) {
+                Some(b) => {
+                    let timeout = std::time::Duration::from_secs(lan_mesh::NEIGHBOR_TIMEOUT_SECS);
+                    // Verify the hop first (echo), then fetch through it.
+                    match dastyab_core::mesh_relay::echo_probe(b.addr, timeout) {
+                        Ok(Some(rtt_ms)) => {
+                            table.observe_rtt(&b.peer_id, rtt_ms);
+                            println!(
+                                "[mesh] relay verified @ {} (hop rtt={rtt_ms}ms), forwarding {url}…",
+                                b.addr
+                            );
+                            let req = dastyab_core::mesh_relay::EgressRequest {
+                                method: "GET".to_string(),
+                                url: url.to_string(),
+                                body: Vec::new(),
+                            };
+                            match dastyab_core::mesh_relay::forward_data(b.addr, &req, timeout) {
+                                Ok(dastyab_core::mesh_relay::ForwardOutcome::Ok(reply)) => {
+                                    let body = String::from_utf8_lossy(&reply.body);
+                                    println!(
+                                        "[mesh] hop reply: HTTP {} ({} bytes)\n{}",
+                                        reply.status,
+                                        reply.body.len(),
+                                        if body.len() > 500 {
+                                            format!("{}…", &body[..500])
+                                        } else {
+                                            body.to_string()
+                                        }
+                                    );
+                                    Ok(())
+                                }
+                                Ok(dastyab_core::mesh_relay::ForwardOutcome::Error(e)) => Err(
+                                    CFError::new("mesh", format!("relay forward failed: {e}"), ""),
+                                ),
+                                Err(e) => Err(CFError::new(
+                                    "mesh",
+                                    format!("relay forward socket error: {e}"),
+                                    "",
+                                )),
+                            }
+                        }
+                        Ok(None) => Err(CFError::new(
+                            "mesh",
+                            format!(
+                                "relay candidate {} @ {} did NOT answer the hop probe (no relay listener on its relay port)",
+                                b.name, b.addr
+                            ),
+                            "Start `dastyab mesh serve --upstream` on the peer (or check the relay port), then retry.",
+                        )),
+                        Err(e) => Err(CFError::new(
+                            "mesh",
+                            format!("relay probe failed for {} @ {}: {e}", b.name, b.addr),
+                            "Is the peer reachable and its relay port open?",
+                        )),
+                    }
+                }
+                None => Err(CFError::new(
+                    "mesh",
+                    format!("no relay candidate found (heard {heard} datagram(s))"),
+                    "Ensure another DastYab instance with a live uplink runs on this LAN, then retry.",
+                )),
+            }
+        }
         other => Err(CFError::new(
             "mesh",
             format!("unknown action {other:?}"),
-            "Use: discover | listen | relay | serve",
+            "Use: discover | listen | relay | serve | forward",
         )),
     }
 }

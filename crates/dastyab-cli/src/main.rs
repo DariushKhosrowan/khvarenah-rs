@@ -472,7 +472,7 @@ enum Command {
     /// local hop relay during a total blackout. The final rung of the
     /// resilience ladder (PRINCIPLES §3 Level 4).
     Mesh {
-        /// Action: discover | listen | relay | serve.
+        /// Action: discover | listen | relay | serve | forward.
         #[arg()]
         action: String,
         /// Seconds to listen for beacons during discovery (default 6).
@@ -485,6 +485,9 @@ enum Command {
         /// Host label advertised in beacons (default: hostname).
         #[arg(long, default_value = "")]
         name: String,
+        /// URL to fetch through the mesh (real `forward` action).
+        #[arg(long, default_value = "")]
+        url: String,
     },
     /// Multipath ARQ packet bonding: stripe or mirror frames across multiple
     /// lossy sub-transports (cellular, Wi-Fi, DNS tunnel) with selective-repeat

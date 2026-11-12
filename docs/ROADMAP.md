@@ -92,11 +92,14 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 
 ## ✅ Done — Doctrine gaps
 
-- **P2P LAN mesh — discovery + relay selection (Level 4)** — `lan_mesh.rs`
+- **P2P LAN mesh — discovery + relay selection + transport (Level 4)** — `lan_mesh.rs`
   broadcast-beacon discovery + neighbor table + `best_relay` candidate
-  selection, exposed as `dastyab mesh {discover|listen|relay}`. This closes
-  the final ladder rung's discovery half; a relay **transport** that forwards
-  traffic through the candidate is tracked as follow-up below.
+  selection, exposed as `dastyab mesh {discover|listen|relay}`; plus the
+  relay **transport** (`mesh_relay.rs`) that forwards traffic through a
+  verified candidate and is exposed as `dastyab mesh {serve|forward}`.
+  `serve --upstream` hosts a data relay over a real egress; `forward --url`
+  verifies a hop (echo RTT) then fetches a URL through it. This closes the
+  final ladder rung end-to-end.
 
 ## ✅ Done — Efficiency doctrine (§6.5)
 
@@ -142,9 +145,12 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   worker URL and checks it responds.
 - **UDP-native DNS tunnel** — move the client off TCP-style framing toward the
   low-overhead ARQ over raw UDP (5–7 byte overhead target).
-- **Mesh relay transport (Level 4)** — forward traffic through the `best_relay`
+- ✅ **Mesh relay transport (Level 4)** — forward traffic through the `best_relay`
   LAN neighbor discovered by `lan_mesh` (local hop forwarding) to complete the
-  Level-4 ladder rung end-to-end.
+  Level-4 ladder rung end-to-end. `mesh_relay.rs` provides the framed UDP relay
+  protocol (echo probes + data forwarding); `dastyab mesh {serve|forward}` host
+  the relay over a real egress and fetch URLs through a verified hop (echo RTT
+  gating). Verified live end-to-end in the CLI, commit below.
 - **Multi-worker management** — list/delete/update workers from one place.
 - ✅ **Multipath ARQ packet bonding** — `multipath_bond.rs`. Stripe or mirror
   frames across multiple lossy lanes (cellular, Wi-Fi, DNS tunnel), each lane
