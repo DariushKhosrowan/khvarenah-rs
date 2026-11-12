@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use crate::config_store::{load_node_store, save_node_store, V2RayNode};
+use crate::config_store::{load_node_store, save_node_store};
 use crate::multilayer::PROXY_SOCKS_PORT;
 use crate::store::profiles::now_ts;
 
@@ -222,21 +222,18 @@ fn tls_handshake_ok(s: &mut TcpStream, sni: &str) -> bool {
 /// a real TLS handshake verification (doctrine §6.4 — no fabricated success).
 /// A server that accepts TCP but does not produce a TLS response is marked
 /// unhealthy, so the pool is never populated with silent-TCP blackholes.
-fn probe_one(node: &V2RayNode, use_proxy: bool) -> (bool, u128, Option<String>) {
-    let (host, port) = match parse_host_port(&node.url) {
+fn probe_one(url: &str, use_proxy: bool) -> (bool, u128, Option<String>) {
+    let (host, port) = match parse_host_port(url) {
         Some(x) => x,
         None => {
             return (
                 false,
                 0,
-                Some(format!(
-                    "unparseable URL: {}",
-                    &node.url[..node.url.len().min(24)]
-                )),
+                Some(format!("unparseable URL: {}", &url[..url.len().min(24)])),
             );
         }
     };
-    let tls = link_uses_tls(&node.url);
+    let tls = link_uses_tls(url);
     // Resolve the host. Prefer a numeric IP; fall back to a DNS lookup.
     let ip = match host.parse::<std::net::IpAddr>() {
         Ok(ip) => ip,
@@ -282,13 +279,55 @@ fn probe_one(node: &V2RayNode, use_proxy: bool) -> (bool, u128, Option<String>) 
     }
 }
 
-/// Probe every node in the profile's store and persist the health state.
-/// Returns the per-node reports.
+/// Probe every node in the profile's store (bounded-concurrency: workers
+/// probe in parallel over a shared atomic cursor — the pool can be large, and
+/// serial probing would wall-clock at the sum of N timeouts). Persists the
+/// health state. Returns the per-node reports.
 pub fn probe_all(profile: &str, use_proxy: bool) -> Vec<NodeProbe> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let mut store = load_node_store(profile);
-    let mut reports = Vec::with_capacity(store.nodes.len());
-    for node in &mut store.nodes {
-        let (ok, ms, err) = probe_one(node, use_proxy);
+    let n = store.nodes.len();
+    let urls: Vec<String> = store.nodes.iter().map(|node| node.url.clone()).collect();
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    let workers = n.clamp(1, 8);
+    let next = AtomicUsize::new(0);
+
+    // workers threads each pull indices off the shared cursor.
+    let results: Vec<Option<(bool, u128, Option<String>)>> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let urls = &urls;
+            let next = &next;
+            handles.push(s.spawn(move || {
+                let mut local: Vec<(usize, bool, u128, Option<String>)> = Vec::new();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= urls.len() {
+                        break;
+                    }
+                    let (ok, ms, err) = probe_one(&urls[i], use_proxy);
+                    local.push((i, ok, ms, err));
+                }
+                local
+            }));
+        }
+        let mut results: Vec<Option<(bool, u128, Option<String>)>> = (0..n).map(|_| None).collect();
+        for h in handles {
+            for (i, ok, ms, err) in h.join().unwrap_or_default() {
+                results[i] = Some((ok, ms, err));
+            }
+        }
+        results
+    });
+
+    let mut reports = Vec::with_capacity(n);
+    for (node, r) in store.nodes.iter_mut().zip(results.iter()) {
+        let (ok, ms, err) = r
+            .clone()
+            .unwrap_or((false, 0, Some("probe worker panicked".into())));
         node.healthy = Some(ok);
         node.last_checked_epoch = Some(now_ts());
         reports.push(NodeProbe {
@@ -435,7 +474,7 @@ pub fn probe_stale(profile: &str, use_proxy: bool) -> HealthSweepReport {
 
     let mut healthy = 0usize;
     for i in &stale {
-        let (ok, _, _) = probe_one(&store.nodes[*i], use_proxy);
+        let (ok, _, _) = probe_one(&store.nodes[*i].url, use_proxy);
         store.nodes[*i].healthy = Some(ok);
         store.nodes[*i].last_checked_epoch = Some(now as f64);
         if ok {
@@ -495,8 +534,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("vless://uuid@127.0.0.1:{}?type=tcp", addr.port());
-        let node = fake_node(&url);
-        let (ok, _, _) = probe_one(&node, false);
+        let (ok, _, _) = probe_one(&url, false);
         assert!(ok, "probe against a live listener should succeed");
     }
 
@@ -507,8 +545,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let url = format!("vless://uuid@127.0.0.1:{}?type=tcp", addr.port());
-        let node = fake_node(&url);
-        let (ok, _, _) = probe_one(&node, false);
+        let (ok, _, _) = probe_one(&url, false);
         assert!(!ok, "probe to a closed port should fail");
     }
 
@@ -534,8 +571,7 @@ mod tests {
             "vless://uuid@127.0.0.1:{}?security=tls&type=ws",
             addr.port()
         );
-        let node = fake_node(&url);
-        let (ok, _, err) = probe_one(&node, false);
+        let (ok, _, err) = probe_one(&url, false);
         assert!(!ok, "plain-TCP server must not pass a TLS probe");
         assert!(err.is_some());
     }
@@ -564,8 +600,7 @@ mod tests {
             "vless://uuid@127.0.0.1:{}?security=tls&type=ws",
             addr.port()
         );
-        let node = fake_node(&url);
-        let (ok, _, _) = probe_one(&node, false);
+        let (ok, _, _) = probe_one(&url, false);
         assert!(ok, "TLS-speaking server should pass the TLS probe");
     }
 

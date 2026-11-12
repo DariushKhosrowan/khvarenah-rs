@@ -242,6 +242,23 @@ Implemented and committed (see `ROADMAP.md`):
   one. Wired into the daemon's self-maintenance (rate-limited to once / 15
   min) and exposed as `dastyab nodes refill` — the daemon never runs dry of
   working configs.
+- **Systematic Telegram graph discovery** (doctrine §5) — `harvest.rs`
+  `extract_external_channel_handles` + `discover_related_channels` crawl the
+  cross-referenced channels a yielding channel links to (t.me/<handle> hrefs
+  and @handle mentions, filtered for non-channel/reserved paths) and probe
+  them, so the harvest net grows from what *actually works* instead of a
+  hardcoded closed list. One-hop, bounded per seed; merged into `harvest
+  --discover --save` and the refill net.
+- **TLS-verified node probing** (doctrine §6.4, no fabricated success) — the
+  node probe is now two-phase: a cheap TCP reachability check, then — for
+  transports that declare TLS (vless security=tls|reality|xtls, trojan,
+  hysteria2, tuic) — a real minimal TLS handshake (ClientHello + SNI) is
+  required before a node is marked healthy. Silent-TCP blackholes and
+  non-TLS servers are correctly rejected, so the pool is pruned to genuinely
+  working configs (`probe_one` / `tls_handshake_ok`).
+- **Bounded-concurrency probing** (doctrine §6.5) — `probe_all` runs a
+  bounded worker pool (≤8) over a shared atomic cursor, so probing a large
+  pool wall-clocks at the slowest worker, not the sum of N timeouts.
 - **Node provenance tagging** — `config_store::import_single_link_source`
   records each node's origin (`telegram` | `github` | `pasted`) so
   auto-recovered configs are auditable and separable from manual pastes.

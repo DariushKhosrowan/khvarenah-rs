@@ -96,6 +96,10 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **Deeper autonomous recovery** — seed a rotating, verified egress-anchor set
   from more out-of-band sources (more Telegram channels + archive depth, CT
   logs, authoritative nameservers) so bootstrapping can never go circular.
+  Partial: Telegram **systematic graph discovery** (`harvest --discover` now
+  crawls cross-referenced channels from yielding seeds and probes them, so the
+  net self-expands beyond hardcoded seeds). Remaining: CT logs + authoritative
+  nameserver anchors.
 - ✅ **Periodic config-health decay** — piggyback node re-probe on the daemon's
   ladder so the store always prunes to verified-live configs
   (`node_probe::probe_stale` + hourly daemon sweep).

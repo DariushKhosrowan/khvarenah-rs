@@ -529,7 +529,9 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         depth: usize,
         /// Systematic discovery: probe `DISCOVER_CANDIDATE_CHANNELS` (plus any
-        /// `--channels`) and print their live plaintext-link yield, ranked.
+        /// `--channels`), then automatically EXPAND the net by crawling the
+        /// cross-referenced channels found on the yielding seeds and probing
+        /// those too — so the channel net grows from what actually works.
         #[arg(long)]
         discover: bool,
         /// With `--discover`: persist the channels that yielded ≥1 link to the
