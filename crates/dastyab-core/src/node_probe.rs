@@ -508,6 +508,7 @@ mod tests {
             source_index: None,
             source: "pasted".into(),
             added_epoch: now_ts(),
+            published_epoch: None,
             last_checked_epoch: None,
             healthy: None,
         }
@@ -690,6 +691,7 @@ mod tests {
             source_index: None,
             source: "pasted".into(),
             added_epoch: crate::store::profiles::now_ts(),
+            published_epoch: None,
             last_checked_epoch: None,
             healthy: Some(false),
         };
@@ -700,6 +702,7 @@ mod tests {
             source_index: None,
             source: "pasted".into(),
             added_epoch: crate::store::profiles::now_ts(),
+            published_epoch: None,
             last_checked_epoch: None,
             healthy: None,
         };
@@ -738,6 +741,7 @@ mod tests {
                 source_index: None,
                 source: "pasted".into(),
                 added_epoch: now_ts(),
+                published_epoch: None,
                 last_checked_epoch: last,
                 healthy,
             }

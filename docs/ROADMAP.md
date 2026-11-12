@@ -10,6 +10,12 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **Telegram harvest upgrades** — `extract_proxy_links` recognizes all schemes;
   **archive-depth pagination** walks older posts via the `?before=<id>` cursor
   so configs long gone from the latest page are recovered (`--depth`).
+- **Freshness-aware harvesting & export** — the archive crawler now records the
+  **per-message publish epoch** of every link (`extract_posted_links`),
+  persists it on nodes as `published_epoch` (refreshed to the newest seen on
+  re-harvest, never downgraded), and the v2rayN export orders **freshest-first**
+  so the most recently public configs (most likely still live) are prioritized.
+  Free configs rot fast; freshness makes the survivable pool last longer.
 - **GitHub config-source ingestion** (`dastyab sources ingest`) — discovers the
   `v2ray-configs` topic + curated repos, fetches plain & base64 subscription
   files, validates links, and imports into the store.

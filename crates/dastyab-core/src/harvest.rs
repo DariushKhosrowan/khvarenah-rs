@@ -41,6 +41,8 @@ pub struct ChannelHarvest {
     pub channel: String,
     /// Raw vless links found on the preview (HTML-decoded).
     pub links: Vec<String>,
+    /// `(link, publish-epoch)` pairs with per-message freshness (0.0 unknown).
+    pub posts: Vec<(String, f64)>,
     /// Import summary from config_store.
     pub summary: config_store::ImportSummary,
     /// Fetch error, if the preview could not be retrieved.
@@ -69,6 +71,9 @@ pub fn build_client(use_proxy: bool) -> Result<reqwest::Client, CFError> {
 struct PreviewPage {
     links: Vec<String>,
     ids: Vec<i64>,
+    /// `(link, publish-epoch)` pairs — each link tagged with the Telegram
+    /// message time it appeared in (0.0 when the timestamp was unparseable).
+    posts: Vec<(String, f64)>,
 }
 
 /// Fetch a channel's public preview and return every supported share-link it
@@ -111,9 +116,12 @@ async fn fetch_preview_page(
         .text()
         .await
         .map_err(|e| CFError::new("harvest", format!("reading body: {e}"), ""))?;
+    let posts = extract_posted_links(&body);
+    let links = posts.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>();
     Ok(PreviewPage {
-        links: extract_proxy_links(&body),
+        links,
         ids: extract_message_ids(&body),
+        posts,
     })
 }
 
@@ -180,6 +188,56 @@ pub fn extract_vless_links(body: &str) -> Vec<String> {
         .into_iter()
         .filter(|l| l.starts_with("vless://"))
         .collect()
+}
+
+/// Split a Telegram preview page into per-message blocks, returning each
+/// supported share-link together with the epoch (unix seconds) its message was
+/// posted. Links whose message time cannot be parsed get `0.0`.
+pub fn extract_posted_links(body: &str) -> Vec<(String, f64)> {
+    // Each message is a `<div class="tgme_widget_message_wrap ...">` block.
+    // We split on that full wrapper class — NOT the bare `tgme_widget_message`
+    // substring, which also matches many nested sub-elements (`_wrap`,
+    // `_text`, `_meta`, ...) and would fragment one message into many pieces,
+    // detaching the `<time>` from its links.
+    let marker = "tgme_widget_message_wrap";
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(pos) = rest.find(marker) {
+        let block_start = pos;
+        let tail = &rest[block_start + marker.len()..];
+        let block_end = match tail.find(marker) {
+            Some(e) => block_start + marker.len() + e,
+            None => rest.len(),
+        };
+        let block = &rest[..block_end];
+        let epoch = extract_time_epoch(block);
+        for link in extract_proxy_links(block) {
+            if !out.iter().any(|(l, _)| *l == link) {
+                out.push((link, epoch));
+            }
+        }
+        rest = &rest[block_end..];
+    }
+    out
+}
+
+/// Parse the first `<time datetime="...">` from a message block into an epoch
+/// (chrono RFC3339). Returns `0.0` when absent/unparseable.
+fn extract_time_epoch(block: &str) -> f64 {
+    const MARK: &str = "datetime=\"";
+    let Some(pos) = block.find(MARK) else {
+        return 0.0;
+    };
+    let tail = &block[pos + MARK.len()..];
+    let end = match tail.find('"') {
+        Some(e) => e,
+        None => return 0.0,
+    };
+    let raw = &tail[..end];
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(dt) => dt.timestamp() as f64,
+        Err(_) => 0.0,
+    }
 }
 
 /// Max archive pages walked backwards per channel (each page is ~20 messages).
@@ -441,6 +499,7 @@ pub async fn harvest_channel_async_depth(
         match fetch_preview_page(client, &chan, cursor).await {
             Ok(page) => {
                 harvest.links.extend(page.links);
+                harvest.posts.extend(page.posts);
                 let min = page.ids.iter().min().copied();
                 if min != cursor && min.is_some() {
                     cursor = min;
@@ -456,12 +515,18 @@ pub async fn harvest_channel_async_depth(
     }
 
     // Import everything collected; the store dedups across schemes and pages.
-    let links = std::mem::take(&mut harvest.links);
-    for link in &links {
-        match crate::config_store::import_single_link_source(
+    let posts = std::mem::take(&mut harvest.posts);
+    for (link, published_epoch) in &posts {
+        let epoch = if *published_epoch > 0.0 {
+            Some(*published_epoch)
+        } else {
+            None
+        };
+        match crate::config_store::import_single_link_source_ts(
             profile,
             link,
             crate::config_store::SOURCE_TELEGRAM,
+            epoch,
         ) {
             Ok(s) => {
                 harvest.summary.found += s.found;
@@ -475,7 +540,7 @@ pub async fn harvest_channel_async_depth(
             }
         }
     }
-    harvest.links = links;
+    harvest.posts = posts;
     harvest
 }
 
@@ -724,6 +789,7 @@ mod tests {
                 source_index: None,
                 source: "pasted".into(),
                 added_epoch: crate::store::profiles::now_ts(),
+                published_epoch: None,
                 last_checked_epoch: None,
                 healthy: None,
             };
@@ -753,5 +819,41 @@ mod tests {
         // Missing file → empty default.
         let empty = load_discovered_channels(&profile);
         assert_eq!(empty.channels.len(), 2);
+    }
+
+    #[test]
+    fn extract_posted_links_tags_each_link_with_its_message_time() {
+        let body = r#"
+<div class="tgme_widget_message_wrap js-widget_message_wrap" data-post="chan1/100">
+  <div class="tgme_widget_message_text">
+    <time datetime="2024-06-01T10:30:00+03:30">10:30</time>
+    vless://7748b328-f0e8-40ab-b2e3-9a1c2c22d111@1.2.3.4:443?type=tcp#fresh
+  </div>
+</div>
+<div class="tgme_widget_message_wrap js-widget_message_wrap" data-post="chan1/99">
+  <div class="tgme_widget_message_text">
+    <time datetime="2024-05-31T09:00:00+03:30">09:00</time>
+    vless://aaaaaaaa-0000-0000-0000-000000000000@5.6.7.8:443?type=ws&path=%2F#older
+  </div>
+</div>
+"#;
+        let posts = extract_posted_links(body);
+        assert_eq!(posts.len(), 2, "one link per message block");
+        // Newer message first (document order), both with real timestamps.
+        let (l1, t1) = &posts[0];
+        let (l2, t2) = &posts[1];
+        assert!(l1.starts_with("vless://7748b328"));
+        assert!(l2.starts_with("vless://aaaaaaaa"));
+        assert!(t1 > t2, "newer post has a larger epoch");
+        // 2024-06-01T10:30:00+03:30 == 2024-06-01T07:00:00Z
+        assert_eq!(*t1, 1717225200.0);
+        // No timestamp → 0.0 still emits the link (never drop a config).
+        let posted = extract_posted_links(
+            r#"<div class="tgme_widget_message_wrap js-widget_message_wrap" data-post="chan1/1">
+    vless://7748b328-f0e8-40ab-b2e3-9a1c2c22d111@1.2.3.4:443?type=tcp#n
+</div>"#,
+        );
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0].1, 0.0);
     }
 }

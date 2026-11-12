@@ -170,6 +170,7 @@ mod tests {
             source_index: None,
             source: "test".into(),
             added_epoch: now_ts(),
+            published_epoch: None,
             last_checked_epoch: None,
             healthy,
         }

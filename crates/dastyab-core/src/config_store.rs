@@ -50,6 +50,11 @@ pub struct V2RayNode {
     /// Epoch (unix seconds) when this node was imported.
     #[serde(default)]
     pub added_epoch: f64,
+    /// Epoch (unix seconds) when the *source* published this config (e.g. the
+    /// Telegram archive message time). `None` when unknown. Lets export
+    /// prioritize the freshest (most likely still-live) free configs.
+    #[serde(default)]
+    pub published_epoch: Option<f64>,
     /// Epoch of the last time a probe touched this node.
     #[serde(default)]
     pub last_checked_epoch: Option<f64>,
@@ -301,6 +306,7 @@ pub fn import_v2rayn_store(profile: &str, path: &Path) -> Result<ImportSummary, 
             source_index: Some(i as u32),
             source: "v2rayn".to_string(),
             added_epoch: now_ts(),
+            published_epoch: None,
             last_checked_epoch: None,
             healthy: None,
         };
@@ -398,9 +404,18 @@ pub fn export_v2rayn_store(
     let mut dups = 0;
     let now_ms = (now_ts() * 1000.0) as i64;
 
-    for node in store
-        .nodes
-        .iter()
+    // Export freshest-first: free configs rot fast, so the most recently
+    // published are the most likely to still be live. Nodes with a known
+    // publish time rank above those without; ties fall back to added_epoch.
+    let mut ranked: Vec<&V2RayNode> = store.nodes.iter().collect();
+    ranked.sort_by(|a, b| {
+        let ka = (a.published_epoch, a.added_epoch);
+        let kb = (b.published_epoch, b.added_epoch);
+        kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for node in ranked
+        .into_iter()
         .filter(|n| !only_healthy || n.healthy == Some(true))
     {
         let id = match node_identity(&node.url) {
@@ -466,6 +481,19 @@ pub fn import_single_link_source(
     link: &str,
     source: &str,
 ) -> Result<ImportSummary, CFError> {
+    import_single_link_source_ts(profile, link, source, None)
+}
+
+/// [`import_single_link_source`] with an optional *published* epoch. When the
+/// source exposes when it posted the config (e.g. the Telegram archive message
+/// time), record it so the freshest, most likely still-live free configs can
+/// be prioritized on export.
+pub fn import_single_link_source_ts(
+    profile: &str,
+    link: &str,
+    source: &str,
+    published_epoch: Option<f64>,
+) -> Result<ImportSummary, CFError> {
     let link = link.trim();
     let uri = crate::proxy_uri::ProxyUri::parse(link).ok_or_else(|| {
         CFError::new(
@@ -488,6 +516,7 @@ pub fn import_single_link_source(
         source_index: None,
         source: source.to_string(),
         added_epoch: now_ts(),
+        published_epoch,
         last_checked_epoch: None,
         healthy: None,
     };
@@ -500,6 +529,16 @@ pub fn import_single_link_source(
     if store.upsert(node) {
         summary.added = 1;
     } else {
+        // Already-known config: refresh its published timestamp when this pass
+        // carries a newer one (or the first we have seen) so age data stays
+        // accurate across repeated harvest runs.
+        if let Some(ts) = published_epoch {
+            if let Some(existing) = store.nodes.iter_mut().find(|e| same_server(&e.url, link)) {
+                if existing.published_epoch.is_none_or(|p| ts > p) {
+                    existing.published_epoch = Some(ts);
+                }
+            }
+        }
         summary.duplicates = 1;
     }
     save_node_store(profile, &store)?;
@@ -791,5 +830,45 @@ mod tests {
             "unhealthy node must not be exported"
         );
         assert!(servers.iter().any(|s| s["configType"] == "TROJAN"));
+    }
+
+    #[test]
+    fn import_with_published_epoch_records_and_refreshes_freshness() {
+        let (profile, _d) = tmp_profile();
+        let link = "vless://7748b328-f0e8-40ab-b2e3-9a1c2c22d111@1.2.3.4:443?type=tcp#f";
+
+        // First import carries a publish epoch.
+        let s1 = import_single_link_source_ts(&profile, link, "telegram", Some(1000.0)).unwrap();
+        assert_eq!(s1.added, 1);
+        let store = load_node_store(&profile);
+        assert_eq!(store.nodes[0].published_epoch, Some(1000.0));
+
+        // Duplicate import with a NEWER publish epoch → duplicate, but the
+        // recorded freshness is refreshed (no double-add).
+        let s2 = import_single_link_source_ts(&profile, link, "telegram", Some(2000.0)).unwrap();
+        assert_eq!(s2.added, 0);
+        assert_eq!(s2.duplicates, 1);
+        let store = load_node_store(&profile);
+        assert_eq!(store.nodes.len(), 1);
+        assert_eq!(store.nodes[0].published_epoch, Some(2000.0));
+
+        // Duplicate import with an OLDER epoch must NOT downgrade freshness.
+        import_single_link_source_ts(&profile, link, "telegram", Some(500.0)).unwrap();
+        let store = load_node_store(&profile);
+        assert_eq!(store.nodes[0].published_epoch, Some(2000.0));
+
+        // No published epoch → field stays None.
+        import_single_link(
+            &profile,
+            "vless://aaaaaaaa-0000-0000-0000-000000000000@9.9.9.9:443?type=tcp#n",
+        )
+        .unwrap();
+        let store = load_node_store(&profile);
+        let n = store
+            .nodes
+            .iter()
+            .find(|x| x.url.contains("9.9.9.9"))
+            .unwrap();
+        assert_eq!(n.published_epoch, None);
     }
 }
