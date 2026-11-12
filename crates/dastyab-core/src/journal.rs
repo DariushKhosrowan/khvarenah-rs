@@ -56,6 +56,9 @@ pub enum JournalKind {
     SnapshotWritten,
     /// The version-integrity sweep ran (detail = corrupt/orphan/missing counts).
     VersionVerified,
+    /// An autonomous node-refill pass ran because the pool had no known-healthy
+    /// config (detail = reason + added/probed/healthy/promoted counts).
+    NodeRefill,
 }
 
 /// One durable journal entry.

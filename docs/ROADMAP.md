@@ -13,6 +13,13 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **GitHub config-source ingestion** (`dastyab sources ingest`) — discovers the
   `v2ray-configs` topic + curated repos, fetches plain & base64 subscription
   files, validates links, and imports into the store.
+- **Autonomous node-refill** (`core/src/node_refill.rs`) — when the node pool
+  has no known-healthy config, DastYab **self-recovers**: it deep-harvests
+  Telegram channel archives + GitHub config repos, probes every recovered node,
+  and promotes a working one. Wired into the daemon (rate-limited to once per
+  15 min) so a dead pool is topped up with zero human intervention; also
+  exposed as `dastyab nodes refill`. Doctrine §5 (zero-config, never run
+  out of working configs).
 
 ## ✅ Done (v0.1.x)
 
@@ -64,10 +71,30 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **WinTUN / `VpnService.protect`** platform execution (Windows/Android).
 - **P2P LAN mesh** — mDNS neighbor discovery + relay (Level 4).
 
+## ✅ Done — Efficiency doctrine (§6.5)
+
+- **Pooled shared HTTP client** across harvest/GitHub ingest/probes (one TLS
+  connection pool per run) — `harvest::build_client`, `gh_sources::build_client`.
+- **Bounded concurrency** (`buffer_unordered`, ≤8 in flight) so wall-clock
+  scales with the slowest path, not the sum.
+- **Rate-limited expensive loops** — node-refill ≤ once/15 min
+  (`node_refill::REFILL_COOLDOWN_SECS`), integrity sweep ≤ once/day.
+- **Cheapest-first probes** — local/on-disk work runs regardless of network;
+  ladder probes ordered cheapest→most expensive.
+- **Minimal DNS payloads** — QNAME clamp ≤101, base32/base64url unpadded,
+  EDNS0 ≤1232 bytes.
+
 ## 🔜 Next
 
+- **Deeper autonomous recovery** — seed a rotating, verified egress-anchor set
+  from more out-of-band sources (more Telegram channels + archive depth, CT
+  logs, authoritative nameservers) so bootstrapping can never go circular.
+- **Periodic config-health decay** — piggyback node re-probe on the daemon's
+  ladder so the store always prunes to verified-live configs.
 - **Wrangler-free deploy confirmation** — post-deploy smoke test that hits the
   worker URL and checks it responds.
+- **UDP-native DNS tunnel** — move the client off TCP-style framing toward the
+  low-overhead ARQ over raw UDP (5–7 byte overhead target).
 - **Multi-worker management** — list/delete/update workers from one place.
 - **DNS smoke test** — verify a DNS record resolves through Cloudflare.
 - **GUI async/threading** — run scans in a real background task so the UI
@@ -76,14 +103,20 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 
 ## 🧭 Later
 
-- **Telegram bot** — drive the console from chat.
+- **Telegram bot** — drive the console (status, refill, failover) from chat.
+- **Fuzz the codecs** (QNAME/base32/ARQ/ChaCha20 frame) + adversarial
+  loss/reorder/dup simulations as a permanent CI gate.
 - **Config presets in JSON** — let users ship custom presets via files.
 - **Plugin hooks** — post-deploy / post-scan hooks.
 - **Windows installer** — Inno Setup / MSI.
 - **Notarized macOS app** for the GUI.
+- **Edge-caching resolved clean IPs** so re-scans are incremental, not from
+  scratch.
 
 ## 🧪 Always
 
-- Keep `cargo clippy --workspace` clean.
+- Keep `cargo clippy --workspace -- -D warnings` clean.
+- Keep `cargo fmt` clean.
 - Keep tests green.
 - Keep docs in sync.
+

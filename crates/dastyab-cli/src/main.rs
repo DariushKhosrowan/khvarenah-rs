@@ -470,7 +470,7 @@ enum Command {
     /// Manage native config-storage nodes (imported from v2rayN or pasted).
     Nodes {
         /// Sub-command: import | paste | activate | list | clear | probe |
-        /// failover | selfheal.
+        /// failover | selfheal | refill.
         #[arg()]
         action: String,
         /// Profile to operate on (default "default").

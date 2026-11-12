@@ -28,6 +28,7 @@ fn journal_kind_label(kind: &JournalKind) -> &'static str {
         JournalKind::AutoHealed => "auto-healed",
         JournalKind::SnapshotWritten => "workspace-snapshot",
         JournalKind::VersionVerified => "versions-verified",
+        JournalKind::NodeRefill => "node-refill",
     }
 }
 
@@ -47,6 +48,7 @@ fn journal_kind_color(kind: &JournalKind) -> egui::Color32 {
         JournalKind::AutoHealed => egui::Color32::from_rgb(150, 230, 150),
         JournalKind::SnapshotWritten => egui::Color32::from_rgb(170, 170, 255),
         JournalKind::VersionVerified => egui::Color32::from_rgb(130, 220, 130),
+        JournalKind::NodeRefill => egui::Color32::from_rgb(120, 200, 255),
     }
 }
 

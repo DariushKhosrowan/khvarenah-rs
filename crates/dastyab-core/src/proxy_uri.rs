@@ -26,15 +26,8 @@
 use base64::Engine;
 
 /// Proxy URI schemes the node store / harvester understand.
-pub const SUPPORTED_SCHEMES: &[&str] = &[
-    "vless",
-    "vmess",
-    "trojan",
-    "ss",
-    "ssr",
-    "hysteria2",
-    "tuic",
-];
+pub const SUPPORTED_SCHEMES: &[&str] =
+    &["vless", "vmess", "trojan", "ss", "ssr", "hysteria2", "tuic"];
 
 /// Normalized view of a single share-link.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,7 +165,13 @@ fn parse_ss(out: &mut ProxyUri, rest: &str) -> bool {
     }
     // Whole-link base64 form: `ss://BASE64(method:password@host:port)`.
     // Some clients also append `#frag` — strip the fragment before decoding.
-    let b64_candidate = rest.split(['?']).next().unwrap_or(rest).split('#').next().unwrap_or(rest);
+    let b64_candidate = rest
+        .split(['?'])
+        .next()
+        .unwrap_or(rest)
+        .split('#')
+        .next()
+        .unwrap_or(rest);
     let decoded = match b64_decode(b64_candidate) {
         Some(d) => d,
         None => return false,
@@ -311,7 +310,8 @@ mod tests {
 
     #[test]
     fn hysteria2_parses() {
-        let u = ProxyUri::parse("hysteria2://open-token@107.189.20.41:8443?insecure=1#hy2").unwrap();
+        let u =
+            ProxyUri::parse("hysteria2://open-token@107.189.20.41:8443?insecure=1#hy2").unwrap();
         assert_eq!(u.id, "open-token");
         assert_eq!(u.host, "107.189.20.41");
         assert_eq!(u.port, 8443);
@@ -344,8 +344,7 @@ mod tests {
     fn ss_sip002_base64_userinfo() {
         // Subscriptions use SIP002: only the `method:password` part is base64,
         // followed by @host:port#frag.
-        let userinfo = base64::engine::general_purpose::STANDARD
-            .encode("aes-256-gcm:supersecret");
+        let userinfo = base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:supersecret");
         let link = format!("ss://{userinfo}@198.244.201.129:19999#London");
         let u = ProxyUri::parse(&link).unwrap();
         assert_eq!(u.id, "aes-256-gcm:supersecret");

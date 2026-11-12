@@ -38,6 +38,26 @@ Management:
 | activate a node | `dastyab nodes activate --link <node-id-or-url>` |
 | clear all | `dastyab nodes clear` |
 
+## Autonomous refill — "never run out of working configs"
+
+The ultimate point of the store is that DastYab **never sits dead** when the
+current config stops working. The `node_refill` orchestrator makes that real:
+
+- **Pure trigger** (`refill_needed`): the pool is empty, or no node is known
+  healthy → a refill is warranted. A pool of never-probed nodes also counts
+  (we'd rather have a surplus of verified configs than rely on unverified
+  ones).
+- **Recovery** (`run_refill`): deep-harvests the default Telegram channel
+  archives (6 pages each, so old configs are recovered) and ingests GitHub
+  config repos, then probes every recovered node and promotes a verified-healthy
+  one. `--proxy` routes every fetch/probe through the local xray SOCKS5 for
+  NIN/blackout use.
+- **Daemon integration**: the persistent daemon runs a refill pass whenever the
+  network is up and the pool has no known-healthy node — rate-limited to once
+  per 15 minutes so a permanently-dead pool doesn't hammer Telegram/GitHub. The
+  result is logged and journaled (`NodeRefill`).
+- **CLI**: run it manually with `dastyab nodes refill`.
+
 ### Key design points
 
 - **Raw links are preserved.** Every node keeps the original share-link

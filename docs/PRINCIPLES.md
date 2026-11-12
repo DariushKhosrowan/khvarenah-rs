@@ -174,6 +174,33 @@ Because this tool is used under state pressure, quality is a survival property:
 4. **No fabricated success.** Probes must verify real end-to-end reachability
    and never report false confidence.
 
+### 6.5 — Efficiency doctrine (every cycle earns its keep)
+
+Under a blackout, DastYab runs on limited bandwidth, CPU, and battery.
+Efficiency is a survival property, not a nicety:
+
+1. **One client, pooled, reused.** All network I/O (harvest, GitHub ingest,
+   probes, DoH/DoT, DNS-tunnel queries) shares a single connection-pooled
+   HTTP/TLS client per run — TLS handshakes and TCP connections are reused
+   across every request, never rebuilt per operation.
+2. **Concurrency with a bound.** Parallel work uses `buffer_unordered` over a
+   fixed in-flight budget (default ≤8); wall-clock time scales with the
+   slowest path, not the sum of all work — but never floods the transport or
+   trips rate-limiters.
+3. **Rate-limit the expensive.** Recovery/refresh/rotation loops that hit
+   remote services (Telegram, GitHub, Cloudflare API) are throttled to a
+   cooldown (e.g. refill ≤ once/15 min, version sweep ≤ once/day). A dead
+   pool must not hammer its sources on every tick.
+4. **Do the cheapest useful thing first.** Ladder probes are ordered
+   cheapest→most expensive; local/on-disk work (manifest verify, backups,
+   integrity sweeps) runs regardless of network because it costs nothing.
+5. **No busy-waiting.** Sleeps use real timers; unneeded polling is skipped
+   (e.g. integrity sweep rate-limited to once/day).
+6. **Minimal payloads.** QNAME clamping, base32/base64url without padding,
+   and EDNS0 buffer negotiation (≤1232 bytes) keep every DNS-tunnel packet as
+   small as the protocol allows — less bytes = less bandwidth = harder to
+   spot.
+
 ---
 
 ## 7. Current status vs the doctrine
@@ -209,7 +236,57 @@ Implemented and committed (see `ROADMAP.md`):
   via `ip`/`iptables` with a **dry-run** mode for CI, RAII TUN teardown, and
   a `dastyab platform {plan|apply|teardown}` CLI command. Builds run on
   GitHub Actions runners (not the local laptop) — see `.github/workflows/`.
+- **Autonomous node-refill** (doctrine §5) — `node_refill.rs` self-recovers a
+  dead/empty node pool by deep-harvesting Telegram channel archives + GitHub
+  config repos, probing the recovered nodes, and promoting a verified-healthy
+  one. Wired into the daemon's self-maintenance (rate-limited to once / 15
+  min) and exposed as `dastyab nodes refill` — the daemon never runs dry of
+  working configs.
 
 Remaining gaps tracked as open work (see `ROADMAP.md` → **Doctrine gaps**):
 
 - [ ] **P2P LAN mesh** — mDNS neighbor discovery + relay (Level 4).
+
+---
+
+## 8. Future developments — the road ahead
+
+These are the planned advances that keep DastYab ahead of the blackout curve.
+They are not priority-ordered here (see `ROADMAP.md` for that); all serve the
+mission: a flawless, self-healing circumvention client.
+
+### 8.1 — Hardening & autonomy
+- **WinTUN / `VpnService.protect` platform execution** — apply the doctrine
+  A/D network rules on Windows and Android, not just Linux.
+- **Deeper autonomous recovery** — seed a *rotating, verified* set of egress
+  anchors from more out-of-band sources (more Telegram channels + archive
+  depth, CT logs, DNS-visible authoritative nameservers) so bootstrapping can
+  never go circular.
+- **Periodic config-health decay** — piggyback node re-probe on the daemon's
+  ladder so the store is always pruned to *verified-live* configs.
+
+### 8.2 — Performance & efficiency
+- **UDP-native DNS tunnel** — move the DNS-tunnel client off TCP-style framing
+  toward the low-overhead ARQ (selective-repeat) over raw UDP where the
+  resolver permits it (the 5–7 byte overhead target).
+- **Edge-caching resolved clean IPs** so re-scans are incremental, not from
+  scratch.
+
+### 8.3 — Survivability & UX
+- **P2P LAN mesh (Level 4)** — mDNS/raw-UDP neighbor discovery + relay through
+  any peer that still holds an upstream uplink.
+- **Wrangler-free deploy confirmation** — smoke-test the deployed worker URL
+  post-deploy.
+- **Telegram bot control** — drive the console (status, refill, failover)
+  from chat when GUI/CLI are unavailable.
+
+### 8.4 — Engineering rigor
+- **Fuzz the codecs** (QNAME/base32/ARQ/ChaCha20 frame) and adversarial
+  loss/reorder/dup simulations as a permanent CI gate.
+- **Windows installer + notarized macOS app** for first-class desktop reach.
+- **Keyring integration** — optional OS keychain for token storage.
+
+All of the above are gated by the same standards: `cargo fmt` clean,
+`cargo clippy --workspace -- -D warnings` clean, `cargo test --workspace`
+green, and every claim backed by a real probe (no fabricated success).
+

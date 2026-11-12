@@ -157,6 +157,11 @@ pub struct DaemonState {
     /// Last epoch-seconds a scheduled workspace snapshot was written.
     #[serde(default)]
     pub last_snapshot_ts: i64,
+    /// Last epoch-seconds an autonomous node-refill pass ran. Rate-limits the
+    /// dead-pool recovery (telegram+github harvest + probe) to once per
+    /// `node_refill::REFILL_COOLDOWN_SECS`.
+    #[serde(default)]
+    pub last_refill_ts: i64,
 }
 
 fn default_interval() -> u64 {
@@ -188,6 +193,7 @@ impl Default for DaemonState {
             last_self_ping_ts: 0,
             audit: crate::daemon::autonomy_schedule::AuditSchedule::default(),
             last_snapshot_ts: 0,
+            last_refill_ts: 0,
         }
     }
 }
@@ -1340,8 +1346,46 @@ async fn run_self_maintenance(
             }
         }
     }
-}
 
+    // 7. Autonomous node-refill: if the node pool has no known-healthy
+    // config, recover fresh share-links from Telegram archives (deep crawl)
+    // + GitHub config repos, probe them, and promote a working node. This is
+    // the "never run out of working configs" doctrine (§5). Requires the
+    // network (harvest fetches) and is rate-limited to once per cooldown
+    // window so a permanently-dead pool doesn't hammer Telegram/GitHub on
+    // every tick.
+    if net_up && now - state.last_refill_ts >= crate::node_refill::REFILL_COOLDOWN_SECS {
+        let needs =
+            crate::node_refill::refill_needed(&crate::config_store::load_node_store(profile));
+        if let Some(reason) = needs {
+            state.last_refill_ts = now;
+            let report = crate::node_refill::run_refill(profile, false).await;
+            log(&log_line(
+                "INFO",
+                &format!(
+                    "node refill: {reason} → telegram +{} ch (added {}), github +{} nodes, probed {} ({} healthy)",
+                    report.telegram_channels,
+                    report.telegram_added,
+                    report.github_added,
+                    report.probed,
+                    report.healthy
+                ),
+            ));
+            let _ = crate::journal::append(
+                profile,
+                crate::journal::JournalKind::NodeRefill,
+                &format!(
+                    "reason={reason} tg_added={} gh_added={} probed={} healthy={} promoted={:?}",
+                    report.telegram_added,
+                    report.github_added,
+                    report.probed,
+                    report.healthy,
+                    report.promoted
+                ),
+            );
+        }
+    }
+}
 /// Auto-heal step (daemon self-maintenance). Runs on every tick, detects
 /// critical-artifact drift via the manifest, and restores from the newest
 /// verifying backup. Never heals from an unverified source; always journaled.

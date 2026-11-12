@@ -90,15 +90,23 @@ pub fn build_client(use_proxy: bool) -> Result<reqwest::Client, CFError> {
             .map_err(|e| CFError::new("github-src", format!("proxy cfg: {e}"), ""))?;
         builder = builder.proxy(proxy);
     }
-    builder.build().map_err(|e| CFError::new("github-src", format!("http client: {e}"), ""))
+    builder
+        .build()
+        .map_err(|e| CFError::new("github-src", format!("http client: {e}"), ""))
 }
 
 /// Discover repositories from the `v2ray-configs` GitHub topic. Returns
 /// `(repo_slug, default_branch)` pairs. Uses the GitHub REST search API.
-pub async fn discover_topic_repos(client: &reqwest::Client) -> Result<Vec<(String, String)>, CFError> {
+pub async fn discover_topic_repos(
+    client: &reqwest::Client,
+) -> Result<Vec<(String, String)>, CFError> {
     let url = format!("https://api.github.com/search/repositories?q=topic:{TOPIC}&per_page=100");
     let resp = client.get(&url).send().await.map_err(|e| {
-        CFError::new("github-src", format!("topic search failed: {e}"), "Check network / proxy.")
+        CFError::new(
+            "github-src",
+            format!("topic search failed: {e}"),
+            "Check network / proxy.",
+        )
     })?;
     if resp.status().as_u16() != 200 {
         return Err(CFError::new(
@@ -107,7 +115,10 @@ pub async fn discover_topic_repos(client: &reqwest::Client) -> Result<Vec<(Strin
             "GitHub may be rate-limiting; retry later.",
         ));
     }
-    let body = resp.text().await.map_err(|e| CFError::new("github-src", format!("reading body: {e}"), ""))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| CFError::new("github-src", format!("reading body: {e}"), ""))?;
     let v: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| CFError::new("github-src", format!("bad JSON: {e}"), ""))?;
     let mut out = Vec::new();
@@ -129,16 +140,27 @@ pub async fn discover_topic_repos(client: &reqwest::Client) -> Result<Vec<(Strin
 /// Resolve the default branch for a known repo without searching the topic.
 async fn resolve_branch(client: &reqwest::Client, repo: &str) -> Result<String, CFError> {
     let url = format!("https://api.github.com/repos/{repo}");
-    let resp = client.get(&url).send().await.map_err(|e| {
-        CFError::new("github-src", format!("repo {repo} lookup failed: {e}"), "")
-    })?;
+    let resp =
+        client.get(&url).send().await.map_err(|e| {
+            CFError::new("github-src", format!("repo {repo} lookup failed: {e}"), "")
+        })?;
     if resp.status().as_u16() != 200 {
-        return Err(CFError::new("github-src", format!("repo {repo} returned HTTP {}", resp.status()), ""));
+        return Err(CFError::new(
+            "github-src",
+            format!("repo {repo} returned HTTP {}", resp.status()),
+            "",
+        ));
     }
-    let body = resp.text().await.map_err(|e| CFError::new("github-src", format!("reading body: {e}"), ""))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| CFError::new("github-src", format!("reading body: {e}"), ""))?;
     let v: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| CFError::new("github-src", format!("bad JSON: {e}"), ""))?;
-    Ok(v.get("default_branch").and_then(|x| x.as_str()).unwrap_or("main").to_string())
+    Ok(v.get("default_branch")
+        .and_then(|x| x.as_str())
+        .unwrap_or("main")
+        .to_string())
 }
 
 /// Candidate file name suffixes we consider config-bearing.
@@ -208,13 +230,22 @@ pub async fn fetch_repo_links(
 ) -> Result<Vec<String>, CFError> {
     // List the tree to find config file paths.
     let tree_url = format!("https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1");
-    let resp = client.get(&tree_url).send().await.map_err(|e| {
-        CFError::new("github-src", format!("tree {repo} failed: {e}"), "")
-    })?;
+    let resp = client
+        .get(&tree_url)
+        .send()
+        .await
+        .map_err(|e| CFError::new("github-src", format!("tree {repo} failed: {e}"), ""))?;
     if resp.status().as_u16() != 200 {
-        return Err(CFError::new("github-src", format!("tree {repo} returned HTTP {}", resp.status()), ""));
+        return Err(CFError::new(
+            "github-src",
+            format!("tree {repo} returned HTTP {}", resp.status()),
+            "",
+        ));
     }
-    let body = resp.text().await.map_err(|e| CFError::new("github-src", format!("reading body: {e}"), ""))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| CFError::new("github-src", format!("reading body: {e}"), ""))?;
     let v: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| CFError::new("github-src", format!("bad JSON: {e}"), ""))?;
 
@@ -244,7 +275,9 @@ pub async fn fetch_repo_links(
         if resp.status().as_u16() != 200 {
             continue;
         }
-        let Ok(body) = resp.text().await else { continue };
+        let Ok(body) = resp.text().await else {
+            continue;
+        };
         all.extend(extract_links(&body));
     }
     Ok(all)
@@ -278,7 +311,9 @@ pub async fn ingest_github(
     for repo in KNOWN_REPOS {
         let repo = repo.to_string();
         if seen.insert(repo.clone()) {
-            let branch = resolve_branch(&client, &repo).await.unwrap_or_else(|_| "main".to_string());
+            let branch = resolve_branch(&client, &repo)
+                .await
+                .unwrap_or_else(|_| "main".to_string());
             sources.push((repo, branch));
         }
     }
@@ -288,7 +323,9 @@ pub async fn ingest_github(
             continue;
         }
         seen.insert(repo.clone());
-        let branch = resolve_branch(&client, &repo).await.unwrap_or_else(|_| "main".to_string());
+        let branch = resolve_branch(&client, &repo)
+            .await
+            .unwrap_or_else(|_| "main".to_string());
         sources.push((repo, branch));
     }
 
@@ -324,7 +361,8 @@ mod tests {
         use base64::Engine;
         // One plain vless, one base64-encoded vless.
         let plain = "vless://06ef598c-1555-4887-b3f9-08214a2f6792@104.17.72.206:443?type=ws#v";
-        let b64 = base64::engine::general_purpose::STANDARD.encode("vless://7748b328-f0e8-40ab-b2e3-9a1c2c22d111@127.0.0.1:443?type=ws#t");
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode("vless://7748b328-f0e8-40ab-b2e3-9a1c2c22d111@127.0.0.1:443?type=ws#t");
         let body = format!("{plain}\n{b64}\n# a comment\n");
         let links = extract_links(&body);
         assert_eq!(links.len(), 2, "plain + base64 must both be extracted");

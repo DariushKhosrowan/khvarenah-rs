@@ -236,12 +236,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
     }
 }
 
-async fn cmd_sources(
-    profile: &str,
-    action: &str,
-    proxy: bool,
-    repos: &str,
-) -> Result<(), CFError> {
+async fn cmd_sources(profile: &str, action: &str, proxy: bool, repos: &str) -> Result<(), CFError> {
     use dastyab_core::gh_sources;
     match action {
         "ingest" | "refresh" => {
@@ -273,7 +268,12 @@ async fn cmd_sources(
     }
 }
 
-async fn cmd_harvest(profile: &str, channels: &str, proxy: bool, depth: usize) -> Result<(), CFError> {
+async fn cmd_harvest(
+    profile: &str,
+    channels: &str,
+    proxy: bool,
+    depth: usize,
+) -> Result<(), CFError> {
     use dastyab_core::harvest;
     let list: Vec<String> = channels
         .split(',')
@@ -3810,10 +3810,51 @@ async fn cmd_configs(
             }
             Ok(())
         }
+        "refill" => {
+            use dastyab_core::node_refill;
+            // Autonomous recovery: if the pool has no known-healthy config,
+            // deep-harvest Telegram archives + GitHub config repos, then probe
+            // and fail over. The `channels`/`depth` overrides are honored
+            // when supplied (CLI), otherwise the module defaults (curated
+            // channels, deep crawl) apply.
+            let depth_override = if depth > 0 {
+                depth
+            } else {
+                node_refill::DEFAULT_REFILL_DEPTH
+            };
+            let report = node_refill::run_refill_depth(profile, proxy, depth_override).await;
+            if !report.needed {
+                println!(
+                    "[configs] refill: pool already has a known-healthy node — nothing to recover"
+                );
+                return Ok(());
+            }
+            println!(
+                "[configs] refill (reason: {}):",
+                report.reason.as_deref().unwrap_or("pool degraded")
+            );
+            println!(
+                "  telegram: {} channel(s), found={} added={}",
+                report.telegram_channels, report.telegram_found, report.telegram_added
+            );
+            println!(
+                "  github  : {} repo(s) ok, added={}",
+                report.github_repos_ok, report.github_added
+            );
+            println!(
+                "  probe   : {} probed, {} healthy",
+                report.probed, report.healthy
+            );
+            match &report.promoted {
+                Some(id) => println!("  → failed over to healthy node '{id}'"),
+                None => println!("  active node unchanged (no healthy candidate)"),
+            }
+            Ok(())
+        }
         _ => Err(CFError::new(
             "configs",
             format!("unknown action {action:?}"),
-            "Use: import | paste | activate | list | clear | probe | failover | selfheal",
+            "Use: import | paste | activate | list | clear | probe | failover | selfheal | refill",
         )),
     }
 }
@@ -4468,6 +4509,7 @@ fn kind_label(k: dastyab_core::journal::JournalKind) -> &'static str {
         JournalKind::AutoHealed => "auto-healed",
         JournalKind::SnapshotWritten => "workspace-snapshot",
         JournalKind::VersionVerified => "versions-verified",
+        JournalKind::NodeRefill => "node-refill",
     }
 }
 

@@ -499,14 +499,20 @@ mod tests {
     fn import_multi_scheme_links() {
         let (profile, _d) = tmp_profile();
         // trojan
-        import_single_link(&profile, "trojan://pw@ali.example.com:8443?security=tls&sni=ali.example.com#tr")
-            .unwrap();
+        import_single_link(
+            &profile,
+            "trojan://pw@ali.example.com:8443?security=tls&sni=ali.example.com#tr",
+        )
+        .unwrap();
         // hysteria2
-        import_single_link(&profile, "hysteria2://tok@107.189.20.41:8443?insecure=1#hy2").unwrap();
+        import_single_link(
+            &profile,
+            "hysteria2://tok@107.189.20.41:8443?insecure=1#hy2",
+        )
+        .unwrap();
         // shadowsocks (plain + base64)
         import_single_link(&profile, "ss://chacha20-ietf-poly1305:k@7.7.7.7:8388#ss1").unwrap();
-        let b64 = base64::engine::general_purpose::STANDARD
-            .encode("aes-256-gcm:k2@38.4.5.6:10010");
+        let b64 = base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:k2@38.4.5.6:10010");
         import_single_link(&profile, &format!("ss://{b64}#ss2")).unwrap();
         // vmess (base64 JSON)
         let json = r#"{"v":"2","ps":"vm","add":"198.51.100.9","port":"443","id":"7748b328-f0e8-40ab-b2e3-9a1c2c22d111","aid":"0"}"#;
@@ -522,7 +528,11 @@ mod tests {
         let store = load_node_store(&profile);
         assert_eq!(store.nodes.len(), 6);
         // vmess alias prefers ps over "pasted".
-        let vm = store.nodes.iter().find(|n| n.url.starts_with("vmess://")).unwrap();
+        let vm = store
+            .nodes
+            .iter()
+            .find(|n| n.url.starts_with("vmess://"))
+            .unwrap();
         assert_eq!(vm.alias, "vm");
     }
 
@@ -531,8 +541,16 @@ mod tests {
         let (profile, _d) = tmp_profile();
         // The same server identity (host+port+uuid) expressed as vless and as
         // trojan (same id string) must dedup to a single node.
-        import_single_link(&profile, "vless://7748b328-f0e8-40ab-b2e3-9a1c2c22d111@1.2.3.4:443?type=tcp#v").unwrap();
-        import_single_link(&profile, "trojan://7748b328-f0e8-40ab-b2e3-9a1c2c22d111@1.2.3.4:443?security=tls#t").unwrap();
+        import_single_link(
+            &profile,
+            "vless://7748b328-f0e8-40ab-b2e3-9a1c2c22d111@1.2.3.4:443?type=tcp#v",
+        )
+        .unwrap();
+        import_single_link(
+            &profile,
+            "trojan://7748b328-f0e8-40ab-b2e3-9a1c2c22d111@1.2.3.4:443?security=tls#t",
+        )
+        .unwrap();
         let store = load_node_store(&profile);
         assert_eq!(store.nodes.len(), 1, "cross-scheme same server must dedup");
     }

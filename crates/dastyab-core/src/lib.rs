@@ -84,6 +84,7 @@ pub mod manifest;
 pub mod multi_worker;
 pub mod multilayer;
 pub mod node_probe;
+pub mod node_refill;
 pub mod platform_linux;
 pub mod presets;
 pub mod probe_jitter;

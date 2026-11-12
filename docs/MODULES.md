@@ -273,3 +273,11 @@ HTML-decodes `vless://` share-links, and imports them into the config store.
 Replaces an always-warm Telegram-web Chromium (~40% CPU) with a transient
 near-zero-CPU fetch. 4 unit tests.
 
+## 28. `node_refill.rs` — autonomous node-refill orchestrator
+Self-recovers a dead/empty node pool: `refill_needed` is a pure decision
+predicate (empty pool or no node known healthy → harvest); `run_refill`
+deep-harvests default Telegram channel archives + GitHub config repos, probes
+every recovered node, and promotes a verified-healthy one. Wired into the
+daemon's self-maintenance (rate-limited), exposed as `dastyab nodes refill`.
+6 unit tests.
+

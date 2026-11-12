@@ -2,6 +2,24 @@
 
 ## Unreleased — 2026-11-12
 
+### Added (autonomous node-refill — "never run out of working configs")
+
+- **`dastyab-core::node_refill`** (new module): a single orchestrator that
+  self-recovers a dead/empty node pool. `refill_needed` is a pure predicate
+  (empty pool, or no node known healthy → harvest); `run_refill` deep-harvests
+  default Telegram channel archives (6 pages) + GitHub config repos, probes
+  every recovered node, and promotes a verified-healthy one. No fabricated
+  success — every "healthy" count comes from a real probe (doctrine §6.4).
+- **Daemon integration**: `run_self_maintenance` now runs a refill pass when
+  the network is up and the pool has no known-healthy node, rate-limited to
+  once per `REFILL_COOLDOWN_SECS` (900s) via a new `DaemonState.last_refill_ts`
+  field. The result is logged and journaled as `JournalKind::NodeRefill`.
+- **CLI**: `dastyab nodes refill [--profile …] [--proxy] [--depth N]`
+  (depth default = 6; 0 uses the module default). It reports the trigger
+  reason, Telegram/GitHub harvest counts, probe results, and any promotion.
+- **GUI/journal surface**: the new `NodeRefill` journal kind is rendered in the
+  CLI journal listing and the GUI history (label + accent color).
+
 ### Added (native config-store + Telegram harvest — the "no-browser" path)
 
 - **`dastyab-core::config_store`** (new module): a per-profile, on-disk
