@@ -65,7 +65,11 @@ pub enum RelayFrame {
     DataAck { seq: u64 },
     /// Reply to a `Data` egress-forwarding frame carrying the relay's uplink
     /// fetch result (HTTP status + body). `body` is capped at `MAX_DATA_BODY`.
-    DataReply { seq: u64, status: u16, body: Vec<u8> },
+    DataReply {
+        seq: u64,
+        status: u16,
+        body: Vec<u8>,
+    },
     /// Failure report for a `Data` frame: malformed request, an egress
     /// transport error, or a response body too large to fit one relay
     /// datagram. The client surfaces `reason` verbatim.
@@ -312,7 +316,11 @@ pub fn serve_with_egress(
 ///
 /// This is the client half of the Level-4 data plane: after `echo_probe`
 /// verifies a hop, callers use this to fetch through it.
-pub fn forward_data(dst: SocketAddr, req: &EgressRequest, timeout: Duration) -> std::io::Result<ForwardOutcome> {
+pub fn forward_data(
+    dst: SocketAddr,
+    req: &EgressRequest,
+    timeout: Duration,
+) -> std::io::Result<ForwardOutcome> {
     let sock = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
     sock.set_read_timeout(Some(timeout))?;
 
@@ -328,13 +336,19 @@ pub fn forward_data(dst: SocketAddr, req: &EgressRequest, timeout: Duration) -> 
         let (len, _src) = match sock.recv_from(&mut buf) {
             Ok(ok) => ok,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                return Ok(ForwardOutcome::Error("relay timed out (no reply)".to_string()));
+                return Ok(ForwardOutcome::Error(
+                    "relay timed out (no reply)".to_string(),
+                ));
             }
             Err(e) => return Err(e),
         };
         if let Some(frame) = RelayFrame::decode(&buf[..len]) {
             match frame {
-                RelayFrame::DataReply { seq: s2, status, body } if s2 == seq => {
+                RelayFrame::DataReply {
+                    seq: s2,
+                    status,
+                    body,
+                } if s2 == seq => {
                     return Ok(ForwardOutcome::Ok(EgressReply { status, body }));
                 }
                 RelayFrame::DataError { seq: s2, reason } if s2 == seq => {
@@ -344,7 +358,9 @@ pub fn forward_data(dst: SocketAddr, req: &EgressRequest, timeout: Duration) -> 
             }
         }
     }
-    Ok(ForwardOutcome::Error("relay timed out (no matching reply)".to_string()))
+    Ok(ForwardOutcome::Error(
+        "relay timed out (no matching reply)".to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -381,8 +397,15 @@ mod tests {
                 payload: b"hello".to_vec(),
             },
             RelayFrame::DataAck { seq: 1 },
-            RelayFrame::DataReply { seq: 2, status: 200, body: b"pong".to_vec() },
-            RelayFrame::DataError { seq: 3, reason: "boom".to_string() },
+            RelayFrame::DataReply {
+                seq: 2,
+                status: 200,
+                body: b"pong".to_vec(),
+            },
+            RelayFrame::DataError {
+                seq: 3,
+                reason: "boom".to_string(),
+            },
         ] {
             let dec = RelayFrame::decode(&f.encode()).unwrap();
             assert_eq!(dec, f);
@@ -455,11 +478,18 @@ mod tests {
     #[test]
     fn forward_data_gets_reply_via_uplink() {
         let egress: &'static dyn RelayEgress = Box::leak(Box::new(TestEgress {
-            reply: Ok(EgressReply { status: 200, body: b"pong".to_vec() }),
+            reply: Ok(EgressReply {
+                status: 200,
+                body: b"pong".to_vec(),
+            }),
         }));
         let addr = spawn_data_server(egress);
-        match forward_data(addr, &get_req("https://example.test/health"), Duration::from_secs(5))
-            .unwrap()
+        match forward_data(
+            addr,
+            &get_req("https://example.test/health"),
+            Duration::from_secs(5),
+        )
+        .unwrap()
         {
             ForwardOutcome::Ok(reply) => {
                 assert_eq!(reply.status, 200);
@@ -475,8 +505,12 @@ mod tests {
             reply: Err("uplink unreachable".to_string()),
         }));
         let addr = spawn_data_server(egress);
-        match forward_data(addr, &get_req("https://example.test/"), Duration::from_secs(5))
-            .unwrap()
+        match forward_data(
+            addr,
+            &get_req("https://example.test/"),
+            Duration::from_secs(5),
+        )
+        .unwrap()
         {
             ForwardOutcome::Ok(_) => panic!("expected relay error, got Ok"),
             ForwardOutcome::Error(e) => assert!(e.contains("uplink unreachable"), "got: {e}"),
@@ -488,11 +522,18 @@ mod tests {
         // A body over MAX_DATA_BODY must come back as an Error naming the size.
         let big = vec![0xabu8; MAX_DATA_BODY + 1];
         let egress: &'static dyn RelayEgress = Box::leak(Box::new(TestEgress {
-            reply: Ok(EgressReply { status: 200, body: big }),
+            reply: Ok(EgressReply {
+                status: 200,
+                body: big,
+            }),
         }));
         let addr = spawn_data_server(egress);
-        match forward_data(addr, &get_req("https://example.test/big"), Duration::from_secs(5))
-            .unwrap()
+        match forward_data(
+            addr,
+            &get_req("https://example.test/big"),
+            Duration::from_secs(5),
+        )
+        .unwrap()
         {
             ForwardOutcome::Ok(_) => panic!("expected oversized-body error, got Ok"),
             ForwardOutcome::Error(e) => assert!(e.contains("too large"), "got: {e}"),
@@ -504,8 +545,12 @@ mod tests {
         let sock = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
         let addr = sock.local_addr().unwrap();
         drop(sock);
-        match forward_data(addr, &get_req("https://example.test/"), Duration::from_millis(300))
-            .unwrap()
+        match forward_data(
+            addr,
+            &get_req("https://example.test/"),
+            Duration::from_millis(300),
+        )
+        .unwrap()
         {
             ForwardOutcome::Ok(_) => panic!("expected timeout, got Ok"),
             ForwardOutcome::Error(e) => assert!(e.contains("timed out"), "got: {e}"),
@@ -517,13 +562,23 @@ mod tests {
         // A single server must still answer echo probes while also forwarding
         // data (mixed dispatch on one socket).
         let egress: &'static dyn RelayEgress = Box::leak(Box::new(TestEgress {
-            reply: Ok(EgressReply { status: 204, body: Vec::new() }),
+            reply: Ok(EgressReply {
+                status: 204,
+                body: Vec::new(),
+            }),
         }));
         let addr = spawn_data_server(egress);
         let rtt = echo_probe(addr, Duration::from_secs(5)).unwrap();
-        assert!(rtt.is_some(), "echo should still succeed on a data-serving relay");
-        match forward_data(addr, &get_req("https://example.test/"), Duration::from_secs(5))
-            .unwrap()
+        assert!(
+            rtt.is_some(),
+            "echo should still succeed on a data-serving relay"
+        );
+        match forward_data(
+            addr,
+            &get_req("https://example.test/"),
+            Duration::from_secs(5),
+        )
+        .unwrap()
         {
             ForwardOutcome::Ok(reply) => assert_eq!(reply.status, 204),
             ForwardOutcome::Error(e) => panic!("unexpected error: {e}"),
