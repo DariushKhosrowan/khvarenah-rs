@@ -288,6 +288,10 @@ async fn cmd_harvest(
 
     // Systematic discovery mode: probe candidates, print live yield, and
     // optionally persist the yielding channels for future refill passes.
+    // Discovery is **self-expanding**: after probing the hardcoded seeds, we
+    // crawl the cross-referenced channels on the *yielding* seeds and probe
+    // those too — so the net grows systematically from what actually works,
+    // never hardcoded/circular (doctrine §5).
     if discover {
         let mut candidates: Vec<String> = harvest::DISCOVER_CANDIDATE_CHANNELS
             .iter()
@@ -310,18 +314,41 @@ async fn cmd_harvest(
         }
         if winners.is_empty() {
             println!("no candidate channels yielded links");
-        } else if save {
-            harvest::save_discovered_channels(
-                profile,
-                &harvest::DiscoveredChannels {
-                    channels: winners.clone(),
-                    probed_at: dastyab_core::store::profiles::now_ts(),
-                },
-            )?;
-            println!(
-                "saved {} discovered channel(s) to profile '{profile}'",
-                winners.len()
-            );
+        } else {
+            // Expansion hop: from the yielding seeds, discover the channels
+            // they cross-reference, probe them, and add any new winners.
+            let related =
+                harvest::discover_related_channels(proxy, &winners, &candidates, 6, 8).await;
+            if !related.is_empty() {
+                println!(
+                    "expand: {} related channel(s) discovered from winners…",
+                    related.len()
+                );
+                let ryields = harvest::discover_channel_yields(proxy, &related, 8).await;
+                for (ch, n) in &ryields {
+                    if *n > 0 {
+                        println!("  [related] {ch}: {n} links");
+                        if !winners.contains(ch) {
+                            winners.push(ch.clone());
+                        }
+                    }
+                }
+            } else {
+                println!("expand: no new related channels found");
+            }
+            if save {
+                harvest::save_discovered_channels(
+                    profile,
+                    &harvest::DiscoveredChannels {
+                        channels: winners.clone(),
+                        probed_at: dastyab_core::store::profiles::now_ts(),
+                    },
+                )?;
+                println!(
+                    "saved {} discovered channel(s) to profile '{profile}'",
+                    winners.len()
+                );
+            }
         }
         return Ok(());
     }
@@ -3736,7 +3763,33 @@ fn cmd_mesh(action: &str, window: u64, upstream: bool, name: &str) -> Result<(),
                         b.name, b.addr
                     );
                     println!("[mesh] heard {heard} datagram(s)");
-                    Ok(())
+                    // Verify the hop: probe the candidate's relay port and
+                    // measure RTT through it. A successful echo turns the
+                    // candidate into a verified, usable hop.
+                    let timeout = std::time::Duration::from_secs(lan_mesh::NEIGHBOR_TIMEOUT_SECS);
+                    match dastyab_core::mesh_relay::echo_probe(b.addr, timeout) {
+                        Ok(Some(rtt_ms)) => {
+                            table.observe_rtt(&b.peer_id, rtt_ms);
+                            println!(
+                                "[mesh] relay verified @ {} (hop rtt={rtt_ms}ms) — usable as a local egress hop",
+                                b.addr
+                            );
+                            Ok(())
+                        }
+                        Ok(None) => Err(CFError::new(
+                            "mesh",
+                            format!(
+                                "relay candidate {} @ {} did NOT answer the hop probe (no relay listener on its relay port)",
+                                b.name, b.addr
+                            ),
+                            "Start `dastyab mesh serve --upstream` on the peer (or check the relay port), then retry.",
+                        )),
+                        Err(e) => Err(CFError::new(
+                            "mesh",
+                            format!("relay probe failed for {} @ {}: {e}", b.name, b.addr),
+                            "Is the peer reachable and its relay port open?",
+                        )),
+                    }
                 }
                 None => Err(CFError::new(
                     "mesh",
@@ -3745,10 +3798,34 @@ fn cmd_mesh(action: &str, window: u64, upstream: bool, name: &str) -> Result<(),
                 )),
             }
         }
+        "serve" => {
+            println!(
+                "[mesh] hosting relay listener on UDP {} for {window}s (ctr-c to stop)…",
+                lan_mesh::UDP_PORT
+            );
+            let serve = dastyab_core::mesh_relay::serve_once(
+                std::net::SocketAddr::new(
+                    std::net::Ipv4Addr::UNSPECIFIED.into(),
+                    lan_mesh::UDP_PORT,
+                ),
+                window,
+            );
+            match serve {
+                Ok(answered) => {
+                    println!("[mesh] relay listener stopped; answered {answered} hop probe(s)");
+                    Ok(())
+                }
+                Err(e) => Err(CFError::new(
+                    "mesh",
+                    format!("relay listener failed: {e}"),
+                    format!("Is UDP port {} already bound?", lan_mesh::UDP_PORT),
+                )),
+            }
+        }
         other => Err(CFError::new(
             "mesh",
             format!("unknown action {other:?}"),
-            "Use: discover | listen | relay",
+            "Use: discover | listen | relay | serve",
         )),
     }
 }

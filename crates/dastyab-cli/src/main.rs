@@ -472,7 +472,7 @@ enum Command {
     /// local hop relay during a total blackout. The final rung of the
     /// resilience ladder (PRINCIPLES §3 Level 4).
     Mesh {
-        /// Action: discover | listen | list | relay.
+        /// Action: discover | listen | relay | serve.
         #[arg()]
         action: String,
         /// Seconds to listen for beacons during discovery (default 6).
