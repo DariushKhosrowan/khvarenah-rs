@@ -753,7 +753,9 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
 /// - `peers` — show the trust ledger (who offered what, and their earned score).
 fn cmd_gossip(profile: &str, action: &str, path: &str, max: usize) -> Result<(), CFError> {
     use dastyab_core::config_store::{import_single_link_source_ts, load_node_store};
-    use dastyab_core::dtn_gossip::{GossipLedger, NodeItem, SignedBundle, SOURCE_DTN_GOSSIP};
+    use dastyab_core::dtn_gossip::{
+        node_url_fp, GossipLedger, NodeItem, SignedBundle, SOURCE_DTN_GOSSIP,
+    };
     use dastyab_core::store::profiles::profile_dir;
 
     // Durable anti-poison trust ledger lives beside the profile state.
@@ -833,6 +835,57 @@ fn cmd_gossip(profile: &str, action: &str, path: &str, max: usize) -> Result<(),
             );
             Ok(())
         }
+        "manifest" => {
+            let store = load_node_store(profile);
+            let urls: Vec<String> = store.nodes.iter().map(|n| n.url.clone()).collect();
+            let m = dastyab_core::dtn_gossip::manifest_of_urls(&urls);
+            let bytes = m.encode();
+            std::fs::write(path, &bytes).map_err(|e| {
+                CFError::new(
+                    "gossip",
+                    format!("cannot write {path}: {e}"),
+                    "check the path",
+                )
+            })?;
+            println!(
+                "[gossip] wrote IBLT manifest: {} cells, {} known nodes ({} bytes)",
+                m.cells(),
+                urls.len(),
+                bytes.len()
+            );
+            Ok(())
+        }
+        "reconcile" => {
+            let bytes = std::fs::read(path).map_err(|e| {
+                CFError::new(
+                    "gossip",
+                    format!("cannot read {path}: {e}"),
+                    "check the path",
+                )
+            })?;
+            let m = dastyab_core::iblt::Iblt::decode_bytes(&bytes).ok_or_else(|| {
+                CFError::new("gossip", "not a valid IBLT manifest", "wrong file?")
+            })?;
+            let store = load_node_store(profile);
+            let mine: Vec<u64> = store.nodes.iter().map(|n| node_url_fp(&n.url)).collect();
+            let missing = dastyab_core::dtn_gossip::missing_from_peer(&mine, &m);
+            // Map fingerprints back to our known URLs for readability; unknown
+            // ones are printed as hex so the peer can be asked for them.
+            let reverse: std::collections::HashMap<u64, String> = store
+                .nodes
+                .iter()
+                .map(|n| (node_url_fp(&n.url), n.url.clone()))
+                .collect();
+            println!("[gossip] peer has {} node(s) we lack:", missing.len());
+            for fp in missing {
+                if let Some(url) = reverse.get(&fp) {
+                    println!("  + {url}");
+                } else {
+                    println!("  + fp:{fp:016x}");
+                }
+            }
+            Ok(())
+        }
         "accept" => {
             let wire = std::fs::read(path).map_err(|e| {
                 CFError::new(
@@ -882,7 +935,13 @@ fn cmd_gossip(profile: &str, action: &str, path: &str, max: usize) -> Result<(),
                     Err(_) => skipped += 1,
                 }
             }
-            ledger.save_to(&ledger_path);
+            ledger.save_to(&ledger_path).map_err(|e| {
+                CFError::new(
+                    "gossip",
+                    format!("cannot persist trust ledger: {e}"),
+                    "check profile dir writability",
+                )
+            })?;
             println!(
                 "[gossip] accepted {added} node(s), skipped {skipped} (dups/unsupported); trust ledger persisted"
             );

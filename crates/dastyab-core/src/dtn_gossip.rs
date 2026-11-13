@@ -45,6 +45,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CFError;
+use crate::iblt::Iblt;
 use crate::store::profiles::now_ts;
 
 /// Provenance label stamped on nodes that enter the pool via DTN gossip.
@@ -81,6 +82,45 @@ impl NodeItem {
     pub fn dedup_key(&self) -> &str {
         self.url.as_str()
     }
+
+    /// Deterministic 64-bit fingerprint (stable across machines and runs).
+    pub fn fp(&self) -> u64 {
+        node_url_fp(&self.url)
+    }
+}
+
+/// Stable 64-bit fingerprint of a node URL (identity for set reconciliation).
+pub fn node_url_fp(url: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(url.as_bytes());
+    let d = h.finalize();
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&d[..8]);
+    u64::from_le_bytes(b)
+}
+
+/// Build an IBLT manifest from a list of node URLs (identity set).
+pub fn manifest_of_urls(urls: &[String]) -> crate::iblt::Iblt {
+    // Size the table at ~2× the set for clean peeling (classic IBLT guidance).
+    let cells = (urls.len() * 2).max(16);
+    let mut t = crate::iblt::Iblt::with_cells(cells);
+    for u in urls {
+        let fp = node_url_fp(u);
+        t.insert(fp, fp);
+    }
+    t
+}
+
+/// Which of the peer's node fingerprints do we lack? Deletes our items from a
+/// copy of the peer's manifest, leaving only theirs; then decodes the residue.
+pub fn missing_from_peer(mine: &[u64], peer_manifest: &crate::iblt::Iblt) -> Vec<u64> {
+    let mut diff = peer_manifest.clone();
+    for fp in mine {
+        diff.delete(*fp, *fp);
+    }
+    let (found, _leftovers) = diff.decode();
+    found.into_iter().map(|(k, _)| k).collect()
 }
 
 /// A signed, batched gossip bundle.
@@ -348,6 +388,38 @@ impl GossipLedger {
     /// Number of distinct accepted nodes.
     pub fn distinct_nodes(&self) -> usize {
         self.dedup.len()
+    }
+
+    /// Fingerprints of all nodes this ledger knows (dedup set).
+    pub fn known_fingerprints(&self) -> Vec<u64> {
+        self.dedup.iter().map(|u| node_url_fp(u)).collect()
+    }
+
+    /// Known node URLs (dedup set).
+    pub fn urls(&self) -> Vec<String> {
+        self.dedup.iter().cloned().collect()
+    }
+
+    /// Build an IBLT manifest of what this ledger knows — a compact, lossy
+    /// summary suitable for one-roundtrip reconciliation against a peer.
+    /// Size the table at ~2× the set for clean peeling.
+    pub fn manifest(&self) -> Iblt {
+        let fps = self.known_fingerprints();
+        let cells = (fps.len() * 2).max(16);
+        let mut t = Iblt::with_cells(cells);
+        for fp in fps {
+            t.insert_element(fp);
+        }
+        t
+    }
+
+    /// Reconcile a peer's IBLT manifest against what we know. Returns the
+    /// node fingerprints we are missing (peer has, we don't) — the minimal
+    /// set to pull from the peer over a single contact.
+    pub fn reconcile_with(&self, peer_manifest: &Iblt) -> Vec<u64> {
+        let mine = self.known_fingerprints();
+        let (missing_from_me, _missing_from_peer) = peer_manifest.reconcile(&mine);
+        missing_from_me
     }
 
     /// Durable snapshot of the trust ledger (anti-poison memory). Only the
@@ -700,5 +772,28 @@ mod tests {
         assert!(!out.accepted, "gated peer must stay gated after reboot");
         assert!(out.reason.unwrap().contains("trust exhausted"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ledger_manifest_reconciles_missing_nodes() {
+        let mut a = GossipLedger::new();
+        // A has {a1,a2,a3}; B has {a1,a2,b1}.
+        for u in ["vless://a1", "vless://a2", "vless://a3"] {
+            a.dedup.insert(u.to_string());
+        }
+        let mut b = GossipLedger::new();
+        for u in ["vless://a1", "vless://a2", "vless://b1"] {
+            b.dedup.insert(u.to_string());
+        }
+        // B reconciles A's manifest: B should learn it's missing a3.
+        let missing = b.reconcile_with(&a.manifest());
+        assert!(missing.contains(&node_url_fp("vless://a3")), "B missing a3");
+        assert!(!missing.contains(&node_url_fp("vless://b1")), "B has b1");
+        // And A reconciling B's manifest should show A missing b1.
+        let missing_a = a.reconcile_with(&b.manifest());
+        assert!(
+            missing_a.contains(&node_url_fp("vless://b1")),
+            "A missing b1"
+        );
     }
 }
