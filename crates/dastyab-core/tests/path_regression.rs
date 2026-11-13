@@ -109,6 +109,12 @@ fn render_canonicalizes_encoded_path_even_without_parse() {
         sni: Some("dastyab-humantest.dariuskhosrowan.workers.dev".into()),
         header_host: Some("dastyab-humantest.dariuskhosrowan.workers.dev".into()),
         name: "encoded-clean".into(),
+        pbk: None,
+        sid: None,
+        spx: None,
+        fp: None,
+        flow: None,
+        header_type: None,
     };
 
     // share link

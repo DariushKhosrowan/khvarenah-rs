@@ -23,6 +23,24 @@ pub struct VlessProfile {
     pub transport: String,
     #[serde(default = "default_name")]
     pub name: String,
+    /// REALITY public key (`pbk`), if the node is a reality config.
+    #[serde(default)]
+    pub pbk: Option<String>,
+    /// REALITY short id (`sid`).
+    #[serde(default)]
+    pub sid: Option<String>,
+    /// REALITY spiderX (`spx`).
+    #[serde(default)]
+    pub spx: Option<String>,
+    /// TLS fingerprint (`fp`, default "chrome").
+    #[serde(default)]
+    pub fp: Option<String>,
+    /// Flow control (e.g. xtls-rprx-vision).
+    #[serde(default)]
+    pub flow: Option<String>,
+    /// TCP header type (`headerType`, e.g. "none").
+    #[serde(default)]
+    pub header_type: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -53,6 +71,12 @@ impl Default for VlessProfile {
             header_host: None,
             transport: "ws".to_string(),
             name: "cf-worker-edge".to_string(),
+            pbk: None,
+            sid: None,
+            spx: None,
+            fp: None,
+            flow: None,
+            header_type: None,
         }
     }
 }
@@ -102,6 +126,12 @@ impl VlessProfile {
             header_host: Some(lan_ip.to_string()),
             transport: "ws".to_string(),
             name: "cf-worker-LOCAL (no VPN)".to_string(),
+            pbk: None,
+            sid: None,
+            spx: None,
+            fp: None,
+            flow: None,
+            header_type: None,
         }
     }
 
@@ -140,6 +170,41 @@ impl VlessProfile {
         p.normalize();
         let sni = p.sni.clone().unwrap_or_else(|| p.address.clone());
         let host = p.header_host.clone().unwrap_or_else(|| p.address.clone());
+        let fingerprint = p.fp.clone().unwrap_or_else(|| "chrome".to_string());
+
+        // Per-security TLS options (tls vs reality vs none).
+        let security_block: serde_json::Value = match p.security.as_str() {
+            "reality" => serde_json::json!({
+                "serverName": sni,
+                "fingerprint": fingerprint,
+                "publicKey": p.pbk.clone().unwrap_or_default(),
+                "shortId": p.sid.clone().unwrap_or_default(),
+                "spiderX": p.spx.clone().unwrap_or_default(),
+            }),
+            "tls" => serde_json::json!({
+                "serverName": sni,
+                "fingerprint": fingerprint,
+            }),
+            _ => serde_json::Value::Null,
+        };
+
+        // Per-transport settings.
+        let transport_block: serde_json::Value = match p.transport.as_str() {
+            "ws" => serde_json::json!({
+                "path": p.canonical_path(),
+                "headers": {"Host": host},
+            }),
+            "xhttp" => serde_json::json!({
+                "path": p.canonical_path(),
+                "host": host,
+            }),
+            "grpc" => serde_json::json!({
+                "serviceName": p.canonical_path(),
+            }),
+            _ => serde_json::json!({
+                "header": {"type": p.header_type.clone().unwrap_or_else(|| "none".to_string())},
+            }),
+        };
 
         let cfg = serde_json::json!({
             "log": {"loglevel": "warning"},
@@ -160,14 +225,35 @@ impl VlessProfile {
                     "network": p.transport,
                     "security": p.security,
                     "tlsSettings": (if p.security == "tls" {
-                        serde_json::json!({"serverName": sni, "fingerprint": "chrome"})
+                        security_block.clone()
                     } else {
                         serde_json::Value::Null
                     }),
-                    "wsSettings": {
-                        "path": p.canonical_path(),
-                        "headers": {"Host": host}
-                    }
+                    "realitySettings": (if p.security == "reality" {
+                        security_block.clone()
+                    } else {
+                        serde_json::Value::Null
+                    }),
+                    "wsSettings": (if p.transport == "ws" {
+                        transport_block.clone()
+                    } else {
+                        serde_json::Value::Null
+                    }),
+                    "xhttpSettings": (if p.transport == "xhttp" {
+                        transport_block.clone()
+                    } else {
+                        serde_json::Value::Null
+                    }),
+                    "grpcSettings": (if p.transport == "grpc" {
+                        transport_block.clone()
+                    } else {
+                        serde_json::Value::Null
+                    }),
+                    "tcpSettings": (if p.transport == "tcp" {
+                        transport_block.clone()
+                    } else {
+                        serde_json::Value::Null
+                    }),
                 }
             }]
         });
@@ -241,6 +327,12 @@ impl VlessProfile {
                     "sni" => profile.sni = Some(decode_query(v)),
                     "host" => profile.header_host = Some(decode_query(v)),
                     "path" => profile.path = decode_query(v),
+                    "pbk" => profile.pbk = Some(v.to_string()),
+                    "sid" => profile.sid = Some(v.to_string()),
+                    "spx" => profile.spx = Some(decode_query(v)),
+                    "fp" => profile.fp = Some(v.to_string()),
+                    "flow" => profile.flow = Some(v.to_string()),
+                    "headerType" => profile.header_type = Some(v.to_string()),
                     _ => {}
                 }
             }
