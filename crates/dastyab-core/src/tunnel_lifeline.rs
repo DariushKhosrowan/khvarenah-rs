@@ -364,10 +364,13 @@ pub async fn spawn_lifeline(profile: &str) -> LifelineReport {
         // The decisive check: real end-to-end egress through the tunnel.
         if egress_ok(LIFELINE_SOCKS_PORT).await {
             // Persist the child PID and set the node sticky-active so future
-            // spawn attempts prefer the known-good node first.
+            // spawn attempts prefer the known-good node first. Also record the
+            // verified-healthy verdict in the pool (doctrine §6.4): the only
+            // health signal that guarantees real traffic is egress itself.
             let _ = std::fs::write(pidfile(profile), child.id().to_string());
             let mut store2 = load_node_store(profile);
             store2.set_active(&node.id);
+            store2.set_health(&node.id, true);
             let _ = crate::config_store::save_node_store(profile, &store2);
             return LifelineReport {
                 up: true,
@@ -380,6 +383,11 @@ pub async fn spawn_lifeline(profile: &str) -> LifelineReport {
         // node presenting a real certificate). Kill it, blacklist it so we
         // don't re-test this cycle, and try the next candidate.
         remember_bad_lifeline(profile, &node_url);
+        // Record the confirmed-dead verdict in the pool so ranking/probing
+        // stop treating it as a candidate (doctrine §6.4).
+        let mut store2 = load_node_store(profile);
+        store2.set_health(&node.id, false);
+        let _ = crate::config_store::save_node_store(profile, &store2);
         let _ = child.kill();
         let _ = child.wait();
         last_error = Some(format!(

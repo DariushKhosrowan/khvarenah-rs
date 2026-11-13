@@ -108,6 +108,18 @@ impl NodeStore {
         }
     }
 
+    /// Record a verified health verdict for a node and stamp the check time.
+    /// Returns `true` if the node was found and updated.
+    pub fn set_health(&mut self, id: &str, healthy: bool) -> bool {
+        if let Some(n) = self.nodes.iter_mut().find(|n| n.id == id) {
+            n.healthy = Some(healthy);
+            n.last_checked_epoch = Some(now_ts());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Add a node if the (address, port, uuid) triple is not already present.
     /// Returns `Ok(false)` when it was a duplicate (no change).
     pub fn upsert(&mut self, node: V2RayNode) -> bool {
@@ -913,6 +925,24 @@ mod tests {
             last_checked_epoch: None,
             healthy,
         }
+    }
+
+    #[test]
+    fn set_health_records_verdict_and_timestamp() {
+        let mut s = NodeStore::default();
+        s.nodes = vec![node("n1", None), node("n2", Some(true))];
+
+        // Unknown id → false, no change.
+        assert!(!s.set_health("nope", true));
+
+        // Healthy verdict recorded.
+        assert!(s.set_health("n1", true));
+        assert_eq!(s.nodes[0].healthy, Some(true));
+        assert!(s.nodes[0].last_checked_epoch.is_some());
+
+        // Deferiorating verdict recorded.
+        assert!(s.set_health("n2", false));
+        assert_eq!(s.nodes[1].healthy, Some(false));
     }
 
     #[test]
