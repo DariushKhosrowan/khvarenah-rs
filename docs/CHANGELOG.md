@@ -2,6 +2,22 @@
 
 ## Unreleased — 2026-11-13
 
+### Added (durable gossip trust ledger — anti-poison memory survives reboots)
+
+- `GossipLedger` is now **persistent**: the per-peer trust table (anti-replay
+  epoch, offered/confirmed-live counts, earned score) is serialized to
+  `gossip_ledger.json` in the profile dir and reloaded on start. A gated
+  peer (one that only ever offered dead nodes) now *stays* gated across
+  reboots instead of resetting to a clean slate every boot — closing the
+  do-over attack on the anti-poison model.
+- `LedgerSnapshot` wire format (versioned, v1), `save_to` (write-then-rename,
+  atomic-ish), `load_from` (tolerant of missing/corrupt file — starts clean).
+- CLI: `gossip accept` now routes through the durable ledger (signature +
+  replay + trust gates) and persists it; `gossip peers` prints the real
+  persisted ledger.
+- 2 new unit tests: trust survives reload; a gated peer stays gated after
+  reload (11 gossip tests total).
+
 ### Added (air-gapped DTN gossip — Level-4 mesh extends offline)
 
 - **New `dtn_gossip` module**: store-and-forward node exchange that lets a

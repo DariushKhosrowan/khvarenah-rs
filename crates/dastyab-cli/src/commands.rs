@@ -753,14 +753,27 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
 /// - `peers` — show the trust ledger (who offered what, and their earned score).
 fn cmd_gossip(profile: &str, action: &str, path: &str, max: usize) -> Result<(), CFError> {
     use dastyab_core::config_store::{import_single_link_source_ts, load_node_store};
-    use dastyab_core::dtn_gossip::{NodeItem, SignedBundle, SOURCE_DTN_GOSSIP};
+    use dastyab_core::dtn_gossip::{GossipLedger, NodeItem, SignedBundle, SOURCE_DTN_GOSSIP};
+    use dastyab_core::store::profiles::profile_dir;
+
+    // Durable anti-poison trust ledger lives beside the profile state.
+    let ledger_path = profile_dir(profile).join("gossip_ledger.json");
 
     match action {
         "peers" => {
-            // The ledger is in-memory for now; print a hint. (Persistence of
-            // the ledger across runs is a follow-up — the trust model itself
-            // is exercised and verified above.)
-            println!("[gossip] peer trust ledger is session-scoped (persistence is a follow-up).");
+            let mut ledger = GossipLedger::new();
+            ledger.load_from(&ledger_path);
+            let peers = ledger.peers();
+            if peers.is_empty() {
+                println!("[gossip] no peer trust recorded yet.");
+            } else {
+                for p in &peers {
+                    println!(
+                        "[gossip] peer {} score={:.2} offered={} confirmed_live={} last_epoch={}",
+                        p.pk_hex, p.score, p.offered, p.confirmed_live, p.last_epoch
+                    );
+                }
+            }
             Ok(())
         }
         "make" => {
@@ -832,11 +845,22 @@ fn cmd_gossip(profile: &str, action: &str, path: &str, max: usize) -> Result<(),
                 CFError::new("gossip", "not a valid gossip bundle", "wrong file?")
             })?;
             let _vk = bundle.verify()?;
+
+            // Ingress through the durable trust ledger: signature gate, replay
+            // gate, and anti-poison trust gate all apply; then it persists.
+            let mut ledger = GossipLedger::new();
+            ledger.load_from(&ledger_path);
+            let outcome = ledger.accept_bundle(&bundle);
+            if !outcome.accepted {
+                return Err(CFError::new(
+                    "gossip",
+                    "bundle rejected",
+                    outcome.reason.unwrap_or_else(|| "unknown".into()),
+                ));
+            }
+
             let mut added = 0usize;
             let mut skipped = 0usize;
-            // Note: the trust ledger gates here are exercised at the core
-            // layer; the CLI applies the signature gate + store dedup. This
-            // keeps `accept` safe to run unattended.
             for item in &bundle.items {
                 if !item.url.starts_with("vless://")
                     && !item.url.starts_with("vmess://")
@@ -858,7 +882,10 @@ fn cmd_gossip(profile: &str, action: &str, path: &str, max: usize) -> Result<(),
                     Err(_) => skipped += 1,
                 }
             }
-            println!("[gossip] accepted {added} node(s), skipped {skipped} (dups/unsupported)",);
+            ledger.save_to(&ledger_path);
+            println!(
+                "[gossip] accepted {added} node(s), skipped {skipped} (dups/unsupported); trust ledger persisted"
+            );
             Ok(())
         }
         other => Err(CFError::new(

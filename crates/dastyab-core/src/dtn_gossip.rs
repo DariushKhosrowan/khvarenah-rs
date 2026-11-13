@@ -39,6 +39,7 @@
 //! `pending_forwards` yields the store-and-forward queue.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -173,7 +174,7 @@ impl SignedBundle {
 }
 
 /// Trust score of one peer (how much of what they offered turned out live).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerTrust {
     /// Last accepted epoch from this peer (anti-replay).
     pub last_epoch: u64,
@@ -348,6 +349,61 @@ impl GossipLedger {
     pub fn distinct_nodes(&self) -> usize {
         self.dedup.len()
     }
+
+    /// Durable snapshot of the trust ledger (anti-poison memory). Only the
+    /// per-peer trust table is persisted — the dedup set and forward queue are
+    /// transient. This is what lets an already-gated peer *stay* gated across
+    /// reboots instead of resetting to a clean slate on every boot.
+    pub fn snapshot(&self) -> LedgerSnapshot {
+        let mut peers = HashMap::new();
+        for (pk, t) in &self.peers {
+            peers.insert(hex_encode(pk), t.clone());
+        }
+        LedgerSnapshot { version: 1, peers }
+    }
+
+    /// Save the trust ledger to `path` (atomic-ish: write then rename).
+    pub fn save_to(&self, path: &Path) -> Result<(), CFError> {
+        let snap = self.snapshot();
+        let wire = serde_json::to_vec_pretty(&snap)
+            .map_err(|e| CFError::new("dtn_gossip", "serialize ledger", e.to_string()))?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &wire)
+            .map_err(|e| CFError::new("dtn_gossip", "write ledger", e.to_string()))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| CFError::new("dtn_gossip", "commit ledger", e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load a saved trust ledger, merging it into an existing (fresh) ledger.
+    /// Missing file or corrupt JSON is not an error — it just means no
+    /// durable anti-poison memory yet (we start clean).
+    pub fn load_from(&mut self, path: &Path) {
+        let wire = match std::fs::read(path) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        let snap: LedgerSnapshot = match serde_json::from_slice(&wire) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if snap.version != 1 {
+            return;
+        }
+        for (pk_hex, t) in snap.peers {
+            if let Some(pk) = hex_decode(&pk_hex) {
+                self.peers.insert(pk, t);
+            }
+        }
+    }
+}
+
+/// Durable form of the trust ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerSnapshot {
+    pub version: u32,
+    /// Peer trust keyed by hex sender public key.
+    pub peers: HashMap<String, PeerTrust>,
 }
 
 impl Default for GossipLedger {
@@ -362,6 +418,19 @@ fn hex_encode(b: &[u8]) -> String {
         s.push_str(&format!("{byte:02x}"));
     }
     s
+}
+
+fn hex_decode(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)? as u8;
+        let lo = (chunk[1] as char).to_digit(16)? as u8;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
 }
 
 /// Convenience: build a bundle of all healthy nodes from a store and sign it.
@@ -567,5 +636,69 @@ mod tests {
         assert!(q.len() <= 256, "queue must be bounded");
         assert!(!q.is_empty());
         assert_eq!(ledger.drain_forwards().len(), 0, "drained");
+    }
+
+    #[test]
+    fn trust_ledger_survives_reload() {
+        use std::path::PathBuf;
+        let key = test_signing();
+        let mut ledger = GossipLedger::new();
+        let items = vec![NodeItem {
+            url: "vless://persist-1".into(),
+            origin: "t".into(),
+            published_epoch: Some(now_ts()),
+            sender_healthy: true,
+        }];
+        let out = ledger.accept_bundle(&SignedBundle::sign(&key, 1, items).unwrap());
+        assert!(out.accepted && out.new_items == 1);
+        assert!(ledger.peers().iter().any(|p| p.offered == 1));
+
+        let path = PathBuf::from("/tmp/hermes-gossip-ledger-test.json");
+        ledger.save_to(&path).expect("save must work");
+
+        // Fresh ledger (as after a reboot) reloads the same trust.
+        let mut fresh = GossipLedger::new();
+        fresh.load_from(&path);
+        let peers = fresh.peers();
+        assert_eq!(peers.len(), 1, "trust must survive reboot");
+        assert_eq!(peers[0].offered, 1);
+        assert_eq!(peers[0].score, 1.0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gated_peer_stays_gated_after_reload() {
+        use std::path::PathBuf;
+        let key = test_signing();
+        let mut ledger = GossipLedger::new();
+        // Feed 10 all-dead offers to hit the trust gate.
+        for i in 0..10 {
+            let items = vec![NodeItem {
+                url: format!("vless://dead-{i}"),
+                origin: "t".into(),
+                published_epoch: Some(now_ts()),
+                sender_healthy: false,
+            }];
+            let out = ledger.accept_bundle(&SignedBundle::sign(&key, 100 + i, items).unwrap());
+            assert!(out.accepted, "first 10 must be accepted");
+        }
+
+        let path = PathBuf::from("/tmp/hermes-gossip-ledger-gate.json");
+        ledger.save_to(&path).expect("save must work");
+
+        // A rebooted ledger must still remember the peer is at zero trust.
+        let mut fresh = GossipLedger::new();
+        fresh.load_from(&path);
+        // 11th offer from the same peer must be gated immediately.
+        let items = vec![NodeItem {
+            url: "vless://dead-11".into(),
+            origin: "t".into(),
+            published_epoch: Some(now_ts()),
+            sender_healthy: false,
+        }];
+        let out = fresh.accept_bundle(&SignedBundle::sign(&key, 111, items).unwrap());
+        assert!(!out.accepted, "gated peer must stay gated after reboot");
+        assert!(out.reason.unwrap().contains("trust exhausted"));
+        let _ = std::fs::remove_file(&path);
     }
 }
