@@ -171,6 +171,10 @@ pub struct DaemonState {
     /// `ANCHOR_REFRESH_INTERVAL_SECS` (doctrine §6.5: rate-limit expensive).
     #[serde(default)]
     pub last_anchors_refresh_ts: i64,
+    /// Last epoch-seconds the signed OOB relay-manifest feed was ingested.
+    /// Rate-limits the signed-egress-anchor pull (doctrine §6.5).
+    #[serde(default)]
+    pub last_oob_pull_ts: i64,
 }
 
 fn default_interval() -> u64 {
@@ -205,6 +209,7 @@ impl Default for DaemonState {
             last_refill_ts: 0,
             last_node_decay_ts: 0,
             last_anchors_refresh_ts: 0,
+            last_oob_pull_ts: 0,
         }
     }
 }
@@ -1475,6 +1480,49 @@ async fn run_self_maintenance(
             &format!("added={added} pruned={pruned} total={total}"),
         );
     }
+
+    // 9. Signed OOB relay-manifest ingestion. The signed egress-anchor feed is
+    // an independent, cryptographically-verified bootstrap channel (doctrine
+    // §5/§8.1): if the operator publishes a signed relay manifest (e.g. a seed
+    // file distributed offline, or later a fetched endpoint), the client pulls
+    // it, verifies the Ed25519 signature + anti-replay seq, and imports the
+    // anchors into the same node pool as every other source. This runs even
+    // when the network is down (local seed file costs nothing — doctrine
+    // §6.5.4); a manifest that fails verification is silently discarded.
+    if crate::eob_anchor::verify_enabled()
+        && now - state.last_oob_pull_ts >= crate::eob_anchor::OOB_PULL_INTERVAL_SECS
+    {
+        state.last_oob_pull_ts = now;
+        let seed_path =
+            crate::store::profiles::profile_dir(profile).join(crate::eob_anchor::SEED_FILENAME);
+        if seed_path.exists() {
+            match crate::eob_anchor::ingest_signed_from_seed(profile, &seed_path) {
+                Ok(report) => {
+                    log(&log_line(
+                        "INFO",
+                        &format!(
+                            "oob anchors: ingested signed manifest (accepted {}, duplicates {}, rejected {})",
+                            report.accepted, report.duplicates, report.rejected
+                        ),
+                    ));
+                    let _ = crate::journal::append(
+                        profile,
+                        crate::journal::JournalKind::NodeRefill,
+                        &format!(
+                            "oob-signed accepted={} dup={} rejected={}",
+                            report.accepted, report.duplicates, report.rejected
+                        ),
+                    );
+                }
+                Err(e) => {
+                    log(&log_line(
+                        "WARN",
+                        &format!("oob anchors: seed ignored ({e})"),
+                    ));
+                }
+            }
+        }
+    }
 }
 /// Auto-heal step (daemon self-maintenance). Runs on every tick, detects
 /// critical-artifact drift via the manifest, and restores from the newest
@@ -2216,6 +2264,7 @@ mod tests {
         crate::node_refill::set_refill_enabled(false);
         crate::connectivity::set_drill_enabled(false);
         crate::ct_anchors::set_refresh_enabled(false);
+        crate::eob_anchor::set_verify_enabled(false);
         tmp
     }
 

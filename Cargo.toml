@@ -36,6 +36,7 @@ tempfile = "3"
 filetime = "0.2"
 libc = "0.2"
 sha2 = "0.10"
+ed25519-dalek = "3.0.0"
 flate2 = "1"
 tar = "0.4"
 

@@ -70,6 +70,7 @@ pub mod doctor;
 pub mod doh;
 pub mod dot;
 pub mod e2e;
+pub mod eob_anchor;
 pub mod error;
 pub mod export;
 pub mod generated_configs;
