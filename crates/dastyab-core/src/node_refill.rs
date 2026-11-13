@@ -289,10 +289,20 @@ mod tests {
         // A profile with a verified CT anchor store should synthesize candidate
         // VLESS-over-TLS links imported tagged source="ct-anchor". The nodes
         // are imported but *not* marked healthy — probe verifies them later.
-        let profile = "test_ct_reseed";
-        // Reset the profile's node store so the test is idempotent across runs
-        // (the anchor import persists to disk and would otherwise accumulate).
-        crate::config_store::save_node_store(profile, &NodeStore::default()).unwrap();
+        // Isolated profile, registered with a profile.json meta so profile_dir()
+        // resolves to its own directory (unregistered ids fall back to the real
+        // `default` profile and would contaminate it). Unique name per run so
+        // no cross-run state can skew the exact-count assertion.
+        let profile = format!("test_ct_reseed_{}", std::process::id());
+        let dir = crate::store::profiles_dir().join(&profile);
+        let _ = std::fs::create_dir_all(&dir);
+        let meta = crate::store::profiles::ProfileMeta {
+            id: profile.clone(),
+            name: profile.clone(),
+            created_at: crate::store::now_iso(),
+            description: "test".into(),
+        };
+        crate::store::write_json(&dir.join("profile.json"), &meta).unwrap();
         let store = crate::ct_anchors::CtAnchorStore {
             anchors: vec![crate::ct_anchors::CtAnchor {
                 host: "edge-proxy.example.com".into(),
@@ -301,15 +311,15 @@ mod tests {
                 via: "vless".into(),
             }],
         };
-        let path = crate::ct_anchors::anchors_path_pub(profile);
+        let path = crate::ct_anchors::anchors_path_pub(&profile);
         let _ = std::fs::create_dir_all(path.parent().expect("anchor path has a parent directory"));
         crate::store::atomic_write(&path, &serde_json::to_vec_pretty(&store).unwrap()).unwrap();
 
-        let added = reseed_from_ct_anchors(profile, false);
+        let added = reseed_from_ct_anchors(&profile, false);
         // 1 host × 7 ports = 7 candidate links.
         assert!(added >= 7, "expected ≥7 embedded nodes, got {added}");
 
-        let pool = load_node_store(profile);
+        let pool = load_node_store(&profile);
         let ct: Vec<_> = pool
             .nodes
             .iter()
@@ -319,7 +329,7 @@ mod tests {
         // None marked healthy yet (probe decides, not synthesizing).
         assert!(ct.iter().all(|n| n.healthy.is_none()));
 
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
