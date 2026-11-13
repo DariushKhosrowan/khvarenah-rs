@@ -614,97 +614,29 @@ async fn cmd_harvest(
     // hardcoded/circular (doctrine §5). The global `max_candidates` budget
     // bounds the whole walk (doctrine §6.5: never flood the transport).
     if discover {
-        let mut candidates: Vec<String> = harvest::DISCOVER_CANDIDATE_CHANNELS
-            .iter()
-            .map(|c| c.to_string())
-            .collect();
-        for c in channels.split(',') {
-            let c = c.trim().trim_start_matches('@').to_string();
-            if !c.is_empty() && !candidates.contains(&c) {
-                candidates.push(c);
-            }
+        let report = harvest::run_multi_hop_discovery(
+            profile,
+            proxy,
+            d.hops,
+            d.max_candidates,
+            depth,
+            d.save,
+        )
+        .await?;
+        for (i, ch) in report.winners.iter().enumerate() {
+            let rank = i + 1;
+            println!("  {ch}: winner #{rank}");
         }
-        let depth = depth.clamp(1, harvest::MAX_ARCHIVE_DEPTH);
-        // `budget` caps how many NEW candidates the expansion may add beyond the
-        // seed probe. It deliberately excludes the seeds: the global cap must
-        // bound the growth of the net, not block the initial probe when the seed
-        // list already exceeds the budget (doctrine §6.5).
-        let budget = d.max_candidates.max(1);
-        let expansion_rounds = d.hops.clamp(1, 6);
-        let mut winners: Vec<String> = Vec::new();
-        // Dedup guard for the full candidate set already appended (seeds + adds).
-        let mut seen_cands: std::collections::HashSet<String> =
-            candidates.iter().cloned().collect();
-        // Number of new candidates appended by expansion (budget is against this).
-        let mut added = 0usize;
-
-        let mut round = 0;
-        loop {
-            println!(
-                "hop {}: discovering {} candidate channel(s), archive depth {depth}…",
-                round + 1,
-                candidates.len()
-            );
-            let yields = harvest::discover_channel_yields(proxy, &candidates, depth, 8).await;
-            let mut round_winners = Vec::new();
-            for (ch, n) in &yields {
-                if *n > 0 {
-                    println!("  {ch}: {n} links");
-                    if !winners.contains(ch) {
-                        winners.push(ch.clone());
-                        round_winners.push(ch.clone());
-                    }
-                }
-            }
-            if round_winners.is_empty() {
-                break;
-            }
-            // Stop expanding once the hop count is consumed or the growth budget
-            // is exhausted (both in terms of additions, not seeds).
-            if round >= expansion_rounds || added >= budget {
-                break;
-            }
-            let room = budget.saturating_sub(added);
-            if room == 0 {
-                break;
-            }
-            // Expand from this round's winners, bounded by remaining budget.
-            let mut related =
-                harvest::discover_related_channels(proxy, &round_winners, &candidates, 6, depth, 8)
-                    .await;
-            related.truncate(room);
-            let new_cands: Vec<String> = related
-                .into_iter()
-                .filter(|c| seen_cands.insert(c.clone()))
-                .collect();
-            if new_cands.is_empty() {
-                break;
-            }
-            added = new_cands.len().saturating_add(added).min(budget);
-            let prev_cands = candidates.len();
-            for c in &new_cands {
-                if !candidates.contains(c) {
-                    candidates.push(c.clone());
-                }
-            }
-            println!(
-                "expand: {} new related candidate(s) (total {} → {})",
-                new_cands.len(),
-                prev_cands,
-                candidates.len()
-            );
-            round += 1;
-        }
-
-        if winners.is_empty() {
+        println!(
+            "hop(s): {} (seeds {}, candidates probed {})",
+            report.hops, report.seeds, report.candidates_total
+        );
+        if report.winners.is_empty() {
             println!("no candidate channels yielded links");
         } else if d.save {
-            // Additive: never forget a channel that once yielded.
-            let added = harvest::merge_discovered_channels(profile, &winners)?;
             println!(
                 "merged {} discovered channel(s) into profile '{profile}' ({} total)",
-                added,
-                harvest::load_discovered_channels(profile).channels.len()
+                report.persisted_new, report.persisted_total
             );
         }
         return Ok(());

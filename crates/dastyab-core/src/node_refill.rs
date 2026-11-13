@@ -26,6 +26,14 @@ use crate::config_store::{load_node_store, NodeStore};
 /// per cooldown window (not on every 300s tick).
 pub const REFILL_COOLDOWN_SECS: i64 = 900;
 
+/// Cadence for the daemon's autonomous *systematic discovery* + v2rayN
+/// export pass. Every this-many-seconds the daemon walks the multi-hop net to
+/// grow the persisted set of yielding channels ("never run out of working
+/// configs", doctrine §5) and re-export verified-healthy nodes to v2rayN so
+/// the GUI's pool stays stocked even when the external refill cron never fires
+/// (no single point of failure). 6h ≈ matches the cron cadence.
+pub const DISCOVERY_INTERVAL_SECS: i64 = 6 * 3600;
+
 /// How many archive pages to walk back per Telegram channel on refill
 /// (deeper than the interactive default — recovery wants *old* configs too).
 pub const DEFAULT_REFILL_DEPTH: usize = 6;

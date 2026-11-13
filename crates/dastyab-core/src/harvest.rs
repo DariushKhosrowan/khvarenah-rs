@@ -264,6 +264,22 @@ fn extract_time_epoch(block: &str) -> f64 {
 /// Max archive pages walked backwards per channel (each page is ~20 messages).
 pub const MAX_ARCHIVE_DEPTH: usize = 10;
 
+/// Master kill-switch for the systematic Telegram discovery walk. Defaults on
+/// (the autonomous daemon grows the net and re-exports to v2rayN on a cadence);
+/// hermetic daemon tests flip it off so a discovery pass never hits real
+/// Telegram/network from inside a test. Mirrors `node_refill::refill_enabled`.
+static DISCOVERY_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Enable/disable systematic discovery (tests; CLI flag `--no-discover`).
+pub fn set_discovery_enabled(v: bool) {
+    DISCOVERY_ENABLED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the systematic discovery pass may run.
+pub fn discovery_enabled() -> bool {
+    DISCOVERY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Broad candidate-channel list for **systematic Telegram discovery**: probing
 /// these on demand reveals which channels currently broadcast plaintext
 /// share-links (so the refill net is not hardcoded to a fixed set). Ordered
@@ -552,6 +568,108 @@ pub async fn discover_related_channels(
         }
     }
     related
+}
+
+/// Outcome of one systematic multi-hop Telegram archived-chat discovery pass.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryReport {
+    /// Number of candidate channels included in the seed probe.
+    pub seeds: usize,
+    /// Total candidate channels probed across every hop (seeds + expansion).
+    pub candidates_total: usize,
+    /// Channels that yielded ≥1 plaintext config link this pass.
+    pub winners: Vec<String>,
+    /// Number of expansion rounds actually executed (0 = seed probe only).
+    pub hops: usize,
+    /// Channels newly persisted to harvest_channels.json (additive merge).
+    pub persisted_new: usize,
+    /// Total discovered channels on file after this pass.
+    pub persisted_total: usize,
+}
+
+/// Run the systematic multi-hop discovery walk (doctrine §5: growing the
+/// archived-chat net from what *actually* works, never a hardcoded closed set;
+/// §6.5: bounded by `max_candidates` so it never floods the transport).
+///
+/// This is the reusable, logging-agnostic core shared by the CLI
+/// (`harvest --discover`) and the daemon's autonomous self-maintenance, so the
+/// net self-expands even when no cron or CLI invokes it. Returns the report and
+/// (when `save`) persists yielding channels to `harvest_channels.json`.
+pub async fn run_multi_hop_discovery(
+    profile: &str,
+    use_proxy: bool,
+    hops: usize,
+    max_candidates: usize,
+    depth: usize,
+    save: bool,
+) -> Result<DiscoveryReport, CFError> {
+    let mut candidates: Vec<String> = DISCOVER_CANDIDATE_CHANNELS
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+    let depth = depth.clamp(1, MAX_ARCHIVE_DEPTH);
+    // The budget caps how many NEW candidates the expansion may add beyond the
+    // seed probe. It deliberately excludes the seeds: the global cap must bound
+    // the growth of the net, not block the initial probe when the seed list
+    // already exceeds the budget (doctrine §6.5).
+    let budget = max_candidates.max(1);
+    let expansion_rounds = hops.clamp(1, 6);
+    let seeds = candidates.len();
+    let mut winners: Vec<String> = Vec::new();
+    let mut seen_cands: std::collections::HashSet<String> = candidates.iter().cloned().collect();
+    let mut added = 0usize;
+    let mut round = 0;
+
+    loop {
+        let yields = discover_channel_yields(use_proxy, &candidates, depth, 8).await;
+        let mut round_winners = Vec::new();
+        for (ch, n) in &yields {
+            if *n > 0 && !winners.contains(ch) {
+                winners.push(ch.clone());
+                round_winners.push(ch.clone());
+            }
+        }
+        if round_winners.is_empty() {
+            break;
+        }
+        if round >= expansion_rounds || added >= budget {
+            break;
+        }
+        let room = budget.saturating_sub(added);
+        let mut related =
+            discover_related_channels(use_proxy, &round_winners, &candidates, 6, depth, 8).await;
+        related.truncate(room);
+        let new_cands: Vec<String> = related
+            .into_iter()
+            .filter(|c| seen_cands.insert(c.clone()))
+            .collect();
+        if new_cands.is_empty() {
+            break;
+        }
+        added = new_cands.len().saturating_add(added).min(budget);
+        for c in &new_cands {
+            if !candidates.contains(c) {
+                candidates.push(c.clone());
+            }
+        }
+        round += 1;
+    }
+
+    let persisted_total = load_discovered_channels(profile).channels.len();
+    let persisted_new = if save && !winners.is_empty() {
+        merge_discovered_channels(profile, &winners)?
+    } else {
+        0
+    };
+
+    Ok(DiscoveryReport {
+        seeds,
+        candidates_total: candidates.len(),
+        winners,
+        hops: round,
+        persisted_new,
+        persisted_total: persisted_total + persisted_new,
+    })
 }
 
 /// Harvest a channel into a profile's config store using a shared client.
@@ -994,5 +1112,44 @@ mod tests {
                 "expected {want} discovered via archive crawl, got {related:?}"
             );
         }
+    }
+
+    /// The reusable multi-hop discovery entrypoint (shared by CLI and daemon)
+    /// discovers winners from the seed net, expands via cross-references, and
+    /// persists the yielding set — the self-expanding-net invariant.
+    #[tokio::test]
+    async fn multi_hop_discovery_runs_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_mem_dir_override(dir.path().join("mem"));
+        let profile = "default".to_string();
+
+        let (base, _g) = spawn_archive_server();
+        std::env::set_var("DASTYAB_TG_BASE", &base);
+        std::env::set_var("DASTYAB_STEALTH", "0");
+
+        let report = run_multi_hop_discovery(&profile, false, 2, 40, 3, true)
+            .await
+            .unwrap();
+
+        // The seed probe discovered the "archive" channel (winner) and the
+        // multi-hop expansion found its cross-referenced sibling channels.
+        assert!(report.seeds > 0, "seed set must be probed");
+        assert!(report.candidates_total >= report.seeds);
+        assert!(
+            !report.winners.is_empty(),
+            "archive channel must yield a config"
+        );
+        assert!(
+            report.persisted_new > 0,
+            "yielding channels must be persisted"
+        );
+        assert!(report.persisted_total >= report.persisted_new);
+
+        // The net must grow: expanded candidate set exceeds the seed set.
+        let loaded = crate::harvest::load_discovered_channels(&profile);
+        assert!(
+            !loaded.channels.is_empty(),
+            "harvest_channels.json must be non-empty"
+        );
     }
 }

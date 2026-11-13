@@ -162,6 +162,11 @@ pub struct DaemonState {
     /// `node_refill::REFILL_COOLDOWN_SECS`.
     #[serde(default)]
     pub last_refill_ts: i64,
+    /// Last epoch-seconds the autonomous multi-hop Telegram discovery +
+    /// v2rayN export pass ran. Rate-limits the self-expanding net walk
+    /// (doctrine §5) to `node_refill::DISCOVERY_INTERVAL_SECS`.
+    #[serde(default)]
+    pub last_discovery_ts: i64,
     /// Last epoch-seconds the periodic config-health-decay sweep ran.
     /// Rate-limits re-probing of stale nodes to `NODE_DECAY_INTERVAL_SECS`.
     #[serde(default)]
@@ -207,6 +212,7 @@ impl Default for DaemonState {
             audit: crate::daemon::autonomy_schedule::AuditSchedule::default(),
             last_snapshot_ts: 0,
             last_refill_ts: 0,
+            last_discovery_ts: 0,
             last_node_decay_ts: 0,
             last_anchors_refresh_ts: 0,
             last_oob_pull_ts: 0,
@@ -1436,6 +1442,76 @@ async fn run_self_maintenance(
         }
     }
 
+    // 7b. Autonomous systematic Telegram discovery + v2rayN export. The refill
+    // step above only reacts when the pool is *already* low (recovery). This
+    // step runs on its own slow cadence and is proactive: it walks the multi-hop
+    // archived-chat net to grow the persisted set of yielding channels (doctrine
+    // §5 — never let the net go stale) and re-exports verified-healthy nodes to
+    // the v2rayN ServersStore, so the GUI pool stays stocked even when no
+    // external cron/CLI invokes it (no single point of failure). Requires the
+    // network; rate-limited to DISCOVERY_INTERVAL_SECS.
+    if net_up
+        && crate::harvest::discovery_enabled()
+        && now - state.last_discovery_ts >= crate::node_refill::DISCOVERY_INTERVAL_SECS
+    {
+        state.last_discovery_ts = now;
+        let use_proxy = crate::node_probe::tunnel_available();
+        match crate::harvest::run_multi_hop_discovery(profile, use_proxy, 2, 60, 4, true).await {
+            Ok(report) => {
+                log(&log_line(
+                    "INFO",
+                    &format!(
+                        "autonomous discovery: seeds {} → {} candidates, {} hops, {} yielding, +{} persisted ({} total)",
+                        report.seeds,
+                        report.candidates_total,
+                        report.hops,
+                        report.winners.len(),
+                        report.persisted_new,
+                        report.persisted_total
+                    ),
+                ));
+                let _ = crate::journal::append(
+                    profile,
+                    crate::journal::JournalKind::NodeRefill,
+                    &format!(
+                        "discovery seeds={} cands={} hops={} winners={} persisted_new={}",
+                        report.seeds,
+                        report.candidates_total,
+                        report.hops,
+                        report.winners.len(),
+                        report.persisted_new
+                    ),
+                );
+                // Re-export verified-healthy nodes to the v2rayN store on the
+                // same cadence so the user-facing pool always has working configs
+                // (the user's explicit "feed v2rayN" requirement). Best-effort:
+                // a missing/unwritable ServersStore must not fail the tick.
+                if report.persisted_total > 0 {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let target = format!("{home}/.config/v2rayN/Local/ServersStore.json");
+                    match crate::config_store::export_v2rayn_store(
+                        profile,
+                        std::path::Path::new(&target),
+                        true,
+                    ) {
+                        Ok((added, dups)) => log(&log_line(
+                            "INFO",
+                            &format!("autonomous v2rayN export: +{added} healthy (dup-skipped {dups}) → {target}"),
+                        )),
+                        Err(e) => log(&log_line(
+                            "WARN",
+                            &format!("autonomous v2rayN export skipped: {e}"),
+                        )),
+                    }
+                }
+            }
+            Err(e) => log(&log_line(
+                "WARN",
+                &format!("autonomous discovery failed: {e}"),
+            )),
+        }
+    }
+
     // 8. Out-of-band CT-anchor rotation. The certificate-transparency anchor
     // set is an independent bootstrap feed (doctrine §5 — never circular).
     // Refresh it on a slow cadence so the verified-live set the runtime
@@ -2265,6 +2341,7 @@ mod tests {
         crate::connectivity::set_drill_enabled(false);
         crate::ct_anchors::set_refresh_enabled(false);
         crate::eob_anchor::set_verify_enabled(false);
+        crate::harvest::set_discovery_enabled(false);
         tmp
     }
 
@@ -2488,6 +2565,36 @@ mod tests {
         assert!(log_lines
             .iter()
             .any(|l| l.contains("version-integrity sweep")));
+    }
+
+    /// The autonomous multi-hop discovery + v2rayN export pass is rate-limited
+    /// to DISCOVERY_INTERVAL_SECS: when it just ran, a tick must NOT re-run it
+    /// (state timestamp stays put and no discovery log line is emitted).
+    #[tokio::test]
+    async fn autonomous_discovery_is_rate_limited() {
+        let _home = daemon_home();
+        let profile = crate::store::profiles::create_profile("discrate", "").unwrap();
+        // Re-enable discovery for this test (daemon_home disables it).
+        crate::harvest::set_discovery_enabled(true);
+
+        let mut state = DaemonState::default();
+        let now = crate::store::profiles::now_ts() as i64;
+        state.last_discovery_ts = now; // just ran → inside the window
+        let mut log_lines = Vec::new();
+        run_self_maintenance(&profile, &mut state, true, &mut |l| {
+            log_lines.push(l.to_string())
+        })
+        .await;
+
+        assert_eq!(
+            state.last_discovery_ts, now,
+            "discovery must be rate-limited inside the interval"
+        );
+        assert!(
+            !log_lines.iter().any(|l| l.contains("autonomous discovery")),
+            "no discovery pass may run inside the rate-limit window: {:?}",
+            log_lines
+        );
     }
 
     #[test]
