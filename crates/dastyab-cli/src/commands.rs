@@ -564,7 +564,7 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
             }
             Ok(())
         }
-        "plan" | "check" | "run" => {
+        "plan" | "check" | "run" | "supervise" => {
             let mut engines = Vec::new();
             for part in chain.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 let e = match part {
@@ -596,19 +596,76 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
                     planned.layers.len(),
                     planned.egress_port
                 );
-            } else {
-                // Execute the pipeline for real. Port readiness uses real
-                // port-open waits; egress is probed end-to-end through the
-                // client-facing port (doctrine §6.4: no fabricated success).
-                let report = block_on(chain_mixer::run_chain(
-                    &planned,
+            } else if action == "supervise" {
+                // Re-race failover (doctrine §3/§5): run the configured chain
+                // first, then degraded subsets, until one verifies real
+                // end-to-end egress. Real process launcher, real async port
+                // waits, real egress probe (no nested block_on).
+                let sup = block_on(chain_mixer::supervise_chain_async(
+                    &cfg,
+                    |_| None,
                     &chain_mixer::ProcessLauncher,
-                    |port| {
-                        block_on(chain_mixer::wait_port_open(
+                    &|port| {
+                        Box::pin(chain_mixer::wait_port_open(
                             port,
                             std::time::Duration::from_secs(8),
                         ))
                     },
+                    &|port| Box::pin(chain_mixer::chain_egress_ok(port)),
+                    8,
+                ));
+                println!("[chain] supervised over {} attempt(s)", sup.attempts);
+                if let Some(plan) = &sup.chosen_plan {
+                    println!("[chain] winning plan (client ↑ → egress ↓):");
+                    print!("{}", chain_mixer::render_chain(plan));
+                    if let Some(report) = &sup.chosen_report {
+                        println!("[chain] run report:");
+                        for l in &report.layers {
+                            let st = match l.status {
+                                chain_mixer::LayerStatus::Up => "UP",
+                                chain_mixer::LayerStatus::Skipped => "SKIPPED",
+                                chain_mixer::LayerStatus::FailedToStart => "FAILED-TO-START",
+                                chain_mixer::LayerStatus::Deferred => "DEFERRED",
+                            };
+                            println!(
+                                "  {:<10} port={:<6} {}{}",
+                                l.engine.label(),
+                                l.port,
+                                st,
+                                l.note
+                                    .as_ref()
+                                    .map(|n| format!(" ({n})"))
+                                    .unwrap_or_default()
+                            );
+                        }
+                        println!(
+                            "  degraded={} egress_port={} egress_ok={}",
+                            report.degraded,
+                            report
+                                .egress_port
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                            report.egress_ok
+                        );
+                    }
+                } else {
+                    println!("[chain] no candidate verified egress (all degraded/failed)");
+                }
+            } else {
+                // Execute the pipeline for real. Port readiness uses real
+                // async port-open waits; egress is probed end-to-end through
+                // the client-facing port (doctrine §6.4: no fabricated
+                // success). No nested block_on.
+                let report = block_on(chain_mixer::run_chain_async(
+                    &planned,
+                    &chain_mixer::ProcessLauncher,
+                    &|port| {
+                        Box::pin(chain_mixer::wait_port_open(
+                            port,
+                            std::time::Duration::from_secs(8),
+                        ))
+                    },
+                    &|port| Box::pin(chain_mixer::chain_egress_ok(port)),
                 ));
                 println!("[chain] run report:");
                 for l in &report.layers {

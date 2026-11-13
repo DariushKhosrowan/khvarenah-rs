@@ -327,10 +327,22 @@ pub async fn wait_port_open(port: u16, timeout: std::time::Duration) -> bool {
 ///
 /// `port_ready` is injectable so tests can deterministically simulate port
 /// states without binding real sockets. Production passes `wait_port_open`.
-pub async fn run_chain<L: EngineLauncher, P: Fn(u16) -> bool>(
+/// Async port-readiness probe: `Fn(u16) -> BoxFuture<bool>`.
+pub type PortReadyProbe =
+    dyn Fn(u16) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync;
+
+/// Egress probe: `Fn(u16) -> BoxFuture<bool>`, injectable so tests never need
+/// real network. Production uses [`chain_egress_ok`].
+pub type EgressProbe =
+    dyn Fn(u16) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync;
+
+/// Execute a planned chain with *async* port-readiness and egress probes
+/// (no nested `block_on`; safe to call from within a tokio runtime).
+pub async fn run_chain_async<L: EngineLauncher>(
     plan: &PlannedChain,
     launcher: &L,
-    port_ready: P,
+    port_ready: &PortReadyProbe,
+    egress_probe: &EgressProbe,
 ) -> ChainRunReport {
     let mut runs: Vec<LayerRun> = Vec::with_capacity(plan.layers.len());
     let mut degraded = 0usize;
@@ -349,7 +361,7 @@ pub async fn run_chain<L: EngineLauncher, P: Fn(u16) -> bool>(
         } else {
             match launcher.launch(layer.engine, layer.port, layer.upstream.as_deref()) {
                 Ok(()) => {
-                    if port_ready(layer.port) {
+                    if port_ready(layer.port).await {
                         status = LayerStatus::Up;
                         note = None;
                     } else {
@@ -380,7 +392,7 @@ pub async fn run_chain<L: EngineLauncher, P: Fn(u16) -> bool>(
         .find(|r| r.status == LayerStatus::Up)
         .map(|r| r.port);
     let egress_ok = match egress_port {
-        Some(p) => chain_egress_ok(p).await,
+        Some(p) => egress_probe(p).await,
         None => false,
     };
 
@@ -390,6 +402,125 @@ pub async fn run_chain<L: EngineLauncher, P: Fn(u16) -> bool>(
         egress_port,
         degraded,
     }
+}
+
+/// Bound-compatible sync entrypoint: `P: Fn(u16) -> bool` is adapted to an
+/// async probe and the real egress probe is used.
+pub async fn run_chain<L: EngineLauncher, P: Fn(u16) -> bool + Send + Sync + 'static>(
+    plan: &PlannedChain,
+    launcher: &L,
+    port_ready: P,
+) -> ChainRunReport {
+    let arc = std::sync::Arc::new(port_ready);
+    let probe =
+        move |port: u16| -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+            let arc = arc.clone();
+            Box::pin(async move { arc(port) })
+        };
+    let egress = |port: u16| -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+        Box::pin(chain_egress_ok(port))
+    };
+    run_chain_async(plan, launcher, &probe, &egress).await
+}
+
+// ---------------------------------------------------------------------------
+// Failover supervisor: re-race until a plan verifies real egress (doctrine
+// §3/§5 — never stop, never circular). Tries the user's configured chain
+// first, then in-order degraded subsets (fewer layers), capped at
+// `max_attempts`. Returns the first plan whose end-to-end egress probe
+// succeeds, or the best (least-degraded) attempt if none did.
+
+/// Result of a supervision pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainSuperviseReport {
+    /// The plan that verified egress, if any.
+    pub chosen_plan: Option<PlannedChain>,
+    /// Its run report when `chosen_plan` is present.
+    pub chosen_report: Option<ChainRunReport>,
+    /// Number of candidate chains actually executed.
+    pub attempts: usize,
+    /// True iff some candidate verified real end-to-end egress.
+    pub ok: bool,
+}
+
+/// Generate in-order, non-empty subsequences of the configured engines,
+/// largest (full chain) first so the intended composition is preferred; the
+/// degraded subsets are fallbacks for re-race.
+fn candidate_configs(cfg: &ChainConfig) -> Vec<ChainConfig> {
+    let eng = &cfg.engines;
+    let n = eng.len();
+    let mut out = Vec::new();
+    if n == 0 || n > 8 {
+        return out;
+    }
+    for mask in 1u16..(1u16 << n) {
+        let mut es = Vec::with_capacity(n);
+        for i in 0..n {
+            if mask & (1u16 << i) != 0 {
+                es.push(eng[i]);
+            }
+        }
+        out.push(ChainConfig { engines: es });
+    }
+    out.sort_by(|a, b| b.engines.len().cmp(&a.engines.len()));
+    out
+}
+
+/// Run up to `max_attempts` candidate chains (full config first, then degraded
+/// subsets) with *async* port-readiness, returning the first that verifies
+/// egress. Safe to call from within a tokio runtime (no nested block_on).
+pub async fn supervise_chain_async<L: EngineLauncher>(
+    cfg: &ChainConfig,
+    look_up: impl Fn(Engine) -> Option<String> + Copy,
+    launcher: &L,
+    port_ready: &PortReadyProbe,
+    egress_probe: &EgressProbe,
+    max_attempts: usize,
+) -> ChainSuperviseReport {
+    let mut attempts = 0usize;
+    for cand in candidate_configs(cfg) {
+        if attempts >= max_attempts {
+            break;
+        }
+        let Ok(plan) = plan_chain(&cand, look_up) else {
+            continue;
+        };
+        attempts += 1;
+        let report = run_chain_async(&plan, launcher, port_ready, egress_probe).await;
+        if report.egress_ok {
+            return ChainSuperviseReport {
+                chosen_plan: Some(plan),
+                chosen_report: Some(report),
+                attempts,
+                ok: true,
+            };
+        }
+    }
+    ChainSuperviseReport {
+        chosen_plan: None,
+        chosen_report: None,
+        attempts,
+        ok: false,
+    }
+}
+
+/// Bound-compatible sync entrypoint: `P: Fn(u16) -> bool` is adapted to an
+/// async probe.
+pub async fn supervise_chain<L: EngineLauncher, P: Fn(u16) -> bool + Send + Sync + 'static>(
+    cfg: &ChainConfig,
+    look_up: impl Fn(Engine) -> Option<String> + Copy,
+    launcher: &L,
+    port_ready: P,
+    egress_probe: &EgressProbe,
+    max_attempts: usize,
+) -> ChainSuperviseReport {
+    let arc = std::sync::Arc::new(port_ready);
+    let probe =
+        move |port: u16| -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+            let arc = arc.clone();
+            Box::pin(async move { arc(port) })
+        };
+    supervise_chain_async(cfg, look_up, launcher, &probe, egress_probe, max_attempts).await
 }
 
 #[cfg(test)]
@@ -534,10 +665,129 @@ mod tests {
         // upstream is dead), not attempted.
         let cfg = pop_chain(vec![Engine::Tor, Engine::V2rayN]);
         let planned = plan_chain(&cfg, |_| Some("/usr/bin/x".into())).unwrap();
-        let report = run_chain(&planned, &OkLauncher, |port| port != planned.layers[0].port).await;
+        let report = {
+            let first_port = planned.layers[0].port;
+            run_chain(&planned, &OkLauncher, move |port| port != first_port).await
+        };
         assert_eq!(report.layers[0].status, LayerStatus::FailedToStart);
         assert_eq!(report.layers[1].status, LayerStatus::Deferred);
         assert_eq!(report.degraded, 2);
         assert_eq!(report.egress_port, None);
+    }
+
+    // ---- Failover supervisor tests (re-race; doctrine §3/§5) ----
+
+    // Injectable egress probe factory: a probe that returns the given value
+    // for every port.
+    fn fixed_egress(value: bool) -> Box<EgressProbe> {
+        Box::new(move |_port: u16| Box::pin(async move { value }))
+    }
+
+    // A launcher that only starts engines matching `ok` (used to model a
+    // missing binary for one specific engine).
+    struct SelectiveLauncher {
+        ok: Box<dyn Fn(Engine) -> bool + Send + Sync>,
+    }
+    impl EngineLauncher for SelectiveLauncher {
+        fn launch(
+            &self,
+            engine: Engine,
+            _port: u16,
+            _upstream: Option<&str>,
+        ) -> Result<(), String> {
+            if (self.ok)(engine) {
+                Ok(())
+            } else {
+                Err(format!("missing binary for {}", engine.label()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervise_wins_full_chain_when_egress_verifies() {
+        let cfg = pop_chain(vec![Engine::Tor, Engine::V2rayN]);
+        let report = supervise_chain(
+            &cfg,
+            |_| Some("/usr/bin/x".into()),
+            &OkLauncher,
+            |_| true,
+            fixed_egress(true).as_ref(),
+            4,
+        )
+        .await;
+        assert!(report.ok);
+        assert_eq!(report.attempts, 1); // full chain first
+        let plan = report.chosen_plan.unwrap();
+        assert_eq!(plan.layers.len(), 2); // both Tor + V2rayN survived
+        assert!(report.chosen_report.unwrap().egress_ok);
+    }
+
+    #[tokio::test]
+    async fn supervise_reraces_to_degraded_subset_when_full_egress_fails() {
+        // Full chain (Tor+V2rayN) launches fine but its client-facing egress
+        // (Tor, port 10862) fails the probe; the supervisor must re-race to
+        // the degraded single-layer subset (V2rayN) and win there.
+        let cfg = pop_chain(vec![Engine::Tor, Engine::V2rayN]);
+        // Probe fails on the full chain's egress client (10862) but succeeds
+        // on the degraded V2rayN-only subset's egress (10863).
+        let probe: Box<EgressProbe> =
+            Box::new(move |port: u16| Box::pin(async move { port == 10863 }));
+        let report = supervise_chain(
+            &cfg,
+            |_| Some("/usr/bin/x".into()),
+            &OkLauncher,
+            |_| true,
+            probe.as_ref(),
+            6,
+        )
+        .await;
+        assert!(report.ok);
+        assert!(report.attempts > 1);
+        let plan = report.chosen_plan.unwrap();
+        // The winning subset is the smaller degraded chain, not the full one.
+        assert_eq!(plan.layers.len(), 1);
+        assert_eq!(plan.layers[0].engine, Engine::V2rayN);
+    }
+
+    #[tokio::test]
+    async fn supervise_reports_failure_when_no_candidate_verifies() {
+        let cfg = pop_chain(vec![Engine::Tor, Engine::V2rayN]);
+        let report = supervise_chain(
+            &cfg,
+            |_| Some("/usr/bin/x".into()),
+            &OkLauncher,
+            |_| true,
+            fixed_egress(false).as_ref(),
+            4,
+        )
+        .await;
+        assert!(!report.ok);
+        assert!(report.chosen_plan.is_none());
+        // 2 engines → 3 candidate configs; all tried, no win.
+        assert_eq!(report.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn supervise_skips_unlaunchable_engine_and_reraces() {
+        // Tor's binary is missing (SelectiveLauncher fails Tor) — the full
+        // chain can never verify; the supervisor must skip past it and win
+        // with the single-layer V2rayN subset.
+        let cfg = pop_chain(vec![Engine::Tor, Engine::V2rayN]);
+        let launcher = SelectiveLauncher {
+            ok: Box::new(|e| e != Engine::Tor),
+        };
+        let report = supervise_chain(
+            &cfg,
+            |_| Some("/usr/bin/x".into()),
+            &launcher,
+            |_| true,
+            fixed_egress(true).as_ref(),
+            6,
+        )
+        .await;
+        assert!(report.ok);
+        let plan = report.chosen_plan.unwrap();
+        assert_eq!(plan.layers.len(), 1);
+        assert_eq!(plan.layers[0].engine, Engine::V2rayN);
     }
 }
