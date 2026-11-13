@@ -236,7 +236,19 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             depth,
             discover,
             save,
-        } => cmd_harvest(&profile, &channels, proxy, depth, discover, save).await,
+            include_saved,
+        } => {
+            cmd_harvest(
+                &profile,
+                &channels,
+                proxy,
+                depth,
+                discover,
+                save,
+                include_saved,
+            )
+            .await
+        }
         Command::Sources {
             action,
             profile,
@@ -571,6 +583,7 @@ async fn cmd_harvest(
     depth: usize,
     discover: bool,
     save: bool,
+    include_saved: bool,
 ) -> Result<(), CFError> {
     use dastyab_core::harvest;
 
@@ -629,27 +642,40 @@ async fn cmd_harvest(
                 println!("expand: no new related channels found");
             }
             if save {
-                harvest::save_discovered_channels(
-                    profile,
-                    &harvest::DiscoveredChannels {
-                        channels: winners.clone(),
-                        probed_at: dastyab_core::store::profiles::now_ts(),
-                    },
-                )?;
+                // Additive: never forget a channel that once yielded.
+                let added = harvest::merge_discovered_channels(profile, &winners)?;
                 println!(
-                    "saved {} discovered channel(s) to profile '{profile}'",
-                    winners.len()
+                    "merged {} discovered channel(s) into profile '{profile}' ({} total)",
+                    added,
+                    harvest::load_discovered_channels(profile).channels.len()
                 );
             }
         }
         return Ok(());
     }
 
-    let list: Vec<String> = channels
+    let mut list: Vec<String> = channels
         .split(',')
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
         .collect();
+    // Self-expanding net: merge every previously-discovered channel that once
+    // yielded, so production harvest always includes the full archived-chat
+    // mining net (doctrine §5: never circular, never forget a source).
+    if include_saved {
+        for c in harvest::load_discovered_channels(profile).channels {
+            if !list.contains(&c) {
+                list.push(c);
+            }
+        }
+        if !list.is_empty() {
+            println!(
+                "harvesting {} channel(s) including {} saved discovered channel(s)",
+                list.len(),
+                harvest::load_discovered_channels(profile).channels.len()
+            );
+        }
+    }
     if list.is_empty() {
         eprintln!("no channels given");
         return Ok(());
@@ -4510,7 +4536,7 @@ async fn cmd_configs(
                 .collect();
             if (pool_empty || no_healthy) && !chan_list.is_empty() {
                 println!(
-                    "[configs] pool {} — harvesting {} channel(s) to refill",
+                    "[configs] pool {} — harvesting {} channel(s) to refill (incl. saved)",
                     if pool_empty {
                         "empty"
                     } else {
@@ -4518,7 +4544,7 @@ async fn cmd_configs(
                     },
                     chan_list.len()
                 );
-                cmd_harvest(profile, channels, proxy, depth, false, false).await?;
+                cmd_harvest(profile, channels, proxy, depth, false, false, true).await?;
             }
 
             let rep = selfheal(profile, proxy);

@@ -553,6 +553,11 @@ enum Command {
         /// profile so future refill passes automatically include them.
         #[arg(long)]
         save: bool,
+        /// Merge every previously-discovered channel (from harvest_channels.json)
+        /// into this harvest pass, so the self-expanding archived-chat net is
+        /// always mined in production — never just the hardcoded seeds.
+        #[arg(long)]
+        include_saved: bool,
     },
     /// Ingest free configs from GitHub sources (topic + curated repos) into
     /// a profile's node store.

@@ -325,7 +325,35 @@ pub fn load_discovered_channels(profile: &str) -> DiscoveredChannels {
     crate::store::read_or_default(&discovered_channels_path(profile))
 }
 
-/// Persist the discovered-channel set.
+/// Merge `new` channels into the persisted set (dedup, keep existing order)
+/// and overwrite with the merged set so repeated discovery passes are
+/// *additive* — the autonomous net never forgets a channel that once yielded.
+pub fn merge_discovered_channels(
+    profile: &str,
+    new: &[String],
+) -> Result<usize, crate::error::CFError> {
+    let mut existing = load_discovered_channels(profile).channels;
+    let mut added = 0;
+    for c in new {
+        let c = c.trim().trim_start_matches('@').to_string();
+        if c.is_empty() || existing.contains(&c) {
+            continue;
+        }
+        existing.push(c);
+        added += 1;
+    }
+    if added > 0 {
+        let d = DiscoveredChannels {
+            channels: existing,
+            probed_at: crate::store::profiles::now_ts(),
+        };
+        save_discovered_channels(profile, &d)?;
+    }
+    Ok(added)
+}
+
+/// Persist the discovered-channel set (replace semantics — callers that want
+/// additive growth should use [`merge_discovered_channels`]).
 pub fn save_discovered_channels(
     profile: &str,
     d: &DiscoveredChannels,
