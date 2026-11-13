@@ -3536,6 +3536,7 @@ async fn cmd_drill(profile: &str) -> Result<(), CFError> {
     .await;
     println!("Blackout drill — fallback ladder (top-down):");
     let mut survivors = 0;
+    let total = report.len();
     for (tier, verdict) in report {
         let mark = if verdict.ok { "OK  " } else { "FAIL" };
         println!("  {mark}  {}  {}", tier.label(), verdict.note);
@@ -3544,11 +3545,11 @@ async fn cmd_drill(profile: &str) -> Result<(), CFError> {
         }
     }
     println!(
-        "Result: {survivors}/4 rungs reachable. {}",
-        if survivors == 4 {
+        "Result: {survivors}/{total} rungs reachable. {}",
+        if survivors == total {
             "Full resilience."
         } else if survivors == 0 {
-            "Total blackout — consider configuring a DNS tunnel (dns-tunnel deploy)."
+            "Total blackout — consider configuring a DNS tunnel (dns-tunnel deploy) or a LAN mesh relay."
         } else {
             "Partial resilience — worst surviving rung will carry you."
         }
