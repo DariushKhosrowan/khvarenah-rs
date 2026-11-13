@@ -625,13 +625,18 @@ async fn cmd_harvest(
             }
         }
         let depth = depth.clamp(1, harvest::MAX_ARCHIVE_DEPTH);
+        // `budget` caps how many NEW candidates the expansion may add beyond the
+        // seed probe. It deliberately excludes the seeds: the global cap must
+        // bound the growth of the net, not block the initial probe when the seed
+        // list already exceeds the budget (doctrine §6.5).
         let budget = d.max_candidates.max(1);
         let expansion_rounds = d.hops.clamp(1, 6);
         let mut winners: Vec<String> = Vec::new();
-        // Track the full candidate set already probed (seeds + additions) so
-        // the global budget bounds the *total* walk, not just the expansion.
+        // Dedup guard for the full candidate set already appended (seeds + adds).
         let mut seen_cands: std::collections::HashSet<String> =
             candidates.iter().cloned().collect();
+        // Number of new candidates appended by expansion (budget is against this).
+        let mut added = 0usize;
 
         let mut round = 0;
         loop {
@@ -654,12 +659,12 @@ async fn cmd_harvest(
             if round_winners.is_empty() {
                 break;
             }
-            // Stop expanding once we've done `hops` expansion rounds beyond the
-            // seed probe, or once the global candidate budget is exhausted.
-            if round >= expansion_rounds || seen_cands.len() >= budget {
+            // Stop expanding once the hop count is consumed or the growth budget
+            // is exhausted (both in terms of additions, not seeds).
+            if round >= expansion_rounds || added >= budget {
                 break;
             }
-            let room = budget.saturating_sub(seen_cands.len());
+            let room = budget.saturating_sub(added);
             if room == 0 {
                 break;
             }
@@ -675,6 +680,7 @@ async fn cmd_harvest(
             if new_cands.is_empty() {
                 break;
             }
+            added = new_cands.len().saturating_add(added).min(budget);
             let prev_cands = candidates.len();
             for c in &new_cands {
                 if !candidates.contains(c) {
