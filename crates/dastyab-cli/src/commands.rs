@@ -591,8 +591,12 @@ async fn cmd_harvest(
                 candidates.push(c);
             }
         }
-        println!("discovering {} candidate channel(s)…", candidates.len());
-        let yields = harvest::discover_channel_yields(proxy, &candidates, 8).await;
+        println!(
+            "discovering {} candidate channel(s), archive depth {depth}…",
+            candidates.len()
+        );
+        let depth = depth.clamp(1, harvest::MAX_ARCHIVE_DEPTH);
+        let yields = harvest::discover_channel_yields(proxy, &candidates, depth, 8).await;
         let mut winners = Vec::new();
         for (ch, n) in &yields {
             if *n > 0 {
@@ -606,13 +610,13 @@ async fn cmd_harvest(
             // Expansion hop: from the yielding seeds, discover the channels
             // they cross-reference, probe them, and add any new winners.
             let related =
-                harvest::discover_related_channels(proxy, &winners, &candidates, 6, 8).await;
+                harvest::discover_related_channels(proxy, &winners, &candidates, 6, depth, 8).await;
             if !related.is_empty() {
                 println!(
                     "expand: {} related channel(s) discovered from winners…",
                     related.len()
                 );
-                let ryields = harvest::discover_channel_yields(proxy, &related, 8).await;
+                let ryields = harvest::discover_channel_yields(proxy, &related, depth, 8).await;
                 for (ch, n) in &ryields {
                     if *n > 0 {
                         println!("  [related] {ch}: {n} links");

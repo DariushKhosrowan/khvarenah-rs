@@ -66,11 +66,26 @@ pub fn build_client(use_proxy: bool) -> Result<reqwest::Client, CFError> {
         .map_err(|e| CFError::new("harvest", format!("http client: {e}"), ""))
 }
 
+/// The Telegram preview endpoint root. Mutable under `cfg(test)` so unit
+/// tests can point harvest/discovery at a local mock server without touching
+/// the network.
+fn telegram_base_url() -> String {
+    if let Ok(v) = std::env::var("DASTYAB_TG_BASE") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    "https://t.me".to_string()
+}
+
 /// A single page of a channel's public preview: extracted links plus the raw
 /// message ids found on it (used as cursors to walk further back in time).
 struct PreviewPage {
     links: Vec<String>,
     ids: Vec<i64>,
+    /// Raw HTML body of the page (retained for cross-reference crawl in
+    /// archive-aware discovery).
+    body: String,
     /// `(link, publish-epoch)` pairs — each link tagged with the Telegram
     /// message time it appeared in (0.0 when the timestamp was unparseable).
     posts: Vec<(String, f64)>,
@@ -93,7 +108,7 @@ async fn fetch_preview_page(
     channel: &str,
     before: Option<i64>,
 ) -> Result<PreviewPage, CFError> {
-    let mut url = format!("https://t.me/s/{channel}");
+    let mut url = format!("{}/s/{channel}", telegram_base_url());
     if let Some(b) = before {
         url.push_str(&format!("?before={b}"));
     }
@@ -126,6 +141,7 @@ async fn fetch_preview_page(
     Ok(PreviewPage {
         links,
         ids: extract_message_ids(&body),
+        body,
         posts,
     })
 }
@@ -318,11 +334,14 @@ pub fn save_discovered_channels(
 }
 
 /// Probe a set of candidate channels and rank them by **live** plaintext-link
-/// yield (single preview page each, no import). Returns `(channel, links)`
-/// sorted descending by yield. Does not touch the node store — pure discovery.
+/// yield, sorted descending. `depth` = how many archive pages to walk back per
+/// channel (1 = latest page only), so channels whose configs live deeper in
+/// their archive are discovered too (systematic archived-chat mining). Does
+/// not touch the node store — pure discovery.
 pub async fn discover_channel_yields(
     use_proxy: bool,
     candidates: &[String],
+    depth: usize,
     concurrency: usize,
 ) -> Vec<(String, usize)> {
     use futures_util::stream::StreamExt;
@@ -332,15 +351,29 @@ pub async fn discover_channel_yields(
         Err(_) => return Vec::new(),
     };
     let conc = concurrency.clamp(1, 8);
+    let depth = depth.clamp(1, MAX_ARCHIVE_DEPTH);
 
     let mut yields: Vec<(String, usize)> = futures_util::stream::iter(candidates.iter().cloned())
         .map(|ch| {
             let client = client.clone();
             async move {
-                let links = fetch_channel_links_async(&client, &ch)
-                    .await
-                    .unwrap_or_default();
-                (ch, links.len())
+                // Count unique config links across the archive walk.
+                let mut seen = std::collections::HashSet::new();
+                let mut before = None;
+                for _ in 0..depth {
+                    let page = match fetch_preview_page(&client, &ch, before).await {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    for l in &page.links {
+                        seen.insert(l.clone());
+                    }
+                    before = page.ids.first().copied();
+                    if before.is_none() {
+                        break;
+                    }
+                }
+                (ch, seen.len())
             }
         })
         .buffer_unordered(conc)
@@ -430,16 +463,18 @@ pub fn extract_external_channel_handles(body: &str, self_channel: &str) -> Vec<S
 }
 
 /// Systematically expand a channel net by crawling the cross-referenced
-/// channels found on a set of seed channels' previews (one raw page each).
-/// Returns the new candidate handles not already in `known`, deduped. This is
-/// bounded (one hop, one page per seed) so discovery stays cheap — the daemon
-/// refill merges these into its harvest net so it never hardcodes a closed set
-/// (doctrine §5: bootstrapping must not go circular).
+/// channels found on a set of seed channels' previews. `depth` = how many
+/// archive pages to walk back per seed. Returns the new candidate handles not
+/// already in `known`, deduped. This is bounded (one hop, `depth` pages per
+/// seed) so discovery stays cheap — the daemon refill merges these into its
+/// harvest net so it never hardcodes a closed set (doctrine §5: bootstrapping
+/// must not go circular).
 pub async fn discover_related_channels(
     use_proxy: bool,
     seeds: &[String],
     known: &[String],
     max_per_seed: usize,
+    depth: usize,
     concurrency: usize,
 ) -> Vec<String> {
     use futures_util::stream::StreamExt;
@@ -450,19 +485,26 @@ pub async fn discover_related_channels(
     };
     let conc = concurrency.clamp(1, 8);
     let max = max_per_seed.max(1);
+    let depth = depth.clamp(1, MAX_ARCHIVE_DEPTH);
 
     let seeds = seeds.to_vec();
     let bodies: Vec<(String, String)> = futures_util::stream::iter(seeds)
         .map(|seed| {
             let client = client.clone();
             async move {
-                let url = format!("https://t.me/s/{seed}");
-                let body = match client.get(&url).send().await {
-                    Ok(resp) if resp.status().as_u16() == 200 => {
-                        resp.text().await.unwrap_or_default()
+                let mut body = String::new();
+                let mut before = None;
+                for _ in 0..depth {
+                    let page = match fetch_preview_page(&client, &seed, before).await {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    body.push_str(&page.body);
+                    before = page.ids.first().copied();
+                    if before.is_none() {
+                        break;
                     }
-                    _ => String::new(),
-                };
+                }
                 (seed, body)
             }
         })
@@ -860,5 +902,69 @@ mod tests {
         );
         assert_eq!(posted.len(), 1);
         assert_eq!(posted[0].1, 0.0);
+    }
+
+    /// Serve a channel's public preview with real archive pagination:
+    /// `/s/<ch>` returns the newest page; `?before=<id>` returns an older one.
+    /// Each page carries its own vless link and cross-references another
+    /// channel. This lets us prove that archive-aware discovery actually digs
+    /// past the latest page.
+    fn spawn_archive_server() -> (String, std::net::TcpListener) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for stream in handle.incoming() {
+                let Ok(mut s) = stream else { break };
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = [0u8; 2048];
+                let Ok(n) = s.read(&mut buf) else { continue };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // body selected by the `before` cursor.
+                let body = if req.contains("before=40") {
+                    r#"<div class="tgme_widget_message_wrap js-widget_message_wrap" data-post="archive/30"><time datetime="2024-05-01T00:00:00+00:00"></time>vless://bbbbbbbb-1111-0000-0000-000000000000@3.3.3.3:443?type=tcp#p2 <a href="https://t.me/secondarc/5">x</a></div>"#
+                } else if req.contains("before=30") {
+                    r#"<div class="tgme_widget_message_wrap js-widget_message_wrap" data-post="archive/20"><time datetime="2024-04-01T00:00:00+00:00"></time>vless://cccccccc-2222-0000-0000-000000000000@4.4.4.4:443?type=tcp#p3 <a href="https://t.me/thirdarc/7">x</a></div>"#
+                } else {
+                    // newest page
+                    r#"<div class="tgme_widget_message_wrap js-widget_message_wrap" data-post="archive/40"><time datetime="2024-06-01T00:00:00+00:00"></time>vless://aaaaaaaa-1111-0000-0000-000000000000@2.2.2.2:443?type=tcp#p1 <a href="https://t.me/firstarc/3">x</a></div>"#
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(body.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), listener)
+    }
+
+    #[tokio::test]
+    async fn archive_aware_discovery_counts_links_across_pages() {
+        let (base, _g) = spawn_archive_server();
+        std::env::set_var("DASTYAB_TG_BASE", &base);
+        std::env::set_var("DASTYAB_STEALTH", "0");
+        // Re-point the module-level base URL.
+        let cands = vec!["archive".to_string()];
+
+        // depth=1: only the latest page is examined → 1 link.
+        let y1 = discover_channel_yields(false, &cands, 1, 4).await;
+        assert_eq!(y1[0].1, 1, "depth=1 sees only the newest page");
+
+        // depth=3: archive walk finds every page's link → 3 unique links.
+        let y3 = discover_channel_yields(false, &cands, 3, 4).await;
+        assert_eq!(y3[0].1, 3, "deeper archive walk surfaces older configs");
+
+        // related-channel crawl also uses depth: seeds are expanded from the
+        // cross-references found across the walked pages (3 distinct chans).
+        let related = discover_related_channels(false, &cands, &[], 10, 3, 4).await;
+        for want in ["firstarc", "secondarc", "thirdarc"] {
+            assert!(
+                related.iter().any(|r| r == want),
+                "expected {want} discovered via archive crawl, got {related:?}"
+            );
+        }
     }
 }
