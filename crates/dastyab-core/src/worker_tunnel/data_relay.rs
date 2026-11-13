@@ -97,7 +97,7 @@ impl WorkerDataRelay {
             return Err(CFError::new(
                 "worker-data-relay",
                 "cannot resolve worker URL to a host",
-                &format!("worker_url={}", self.worker_url),
+                format!("worker_url={}", self.worker_url),
             ));
         }
         Ok(format!("wss://{host}/ws"))
