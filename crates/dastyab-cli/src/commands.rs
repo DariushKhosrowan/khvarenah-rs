@@ -5137,6 +5137,37 @@ async fn cmd_configs(
             );
             Ok(())
         }
+        "export-archive" => {
+            // Offline Telegram-export archive mining (Rung -1): recover node
+            // configs from local chat_export JSON/HTML files — works with
+            // zero egress (total blackout). `path` = directory to scan.
+            use dastyab_core::tg_export::harvest_export_dir;
+            if path.is_empty() {
+                return Err(CFError::new(
+                    "nodes",
+                    "export-archive requires a --path directory".to_string(),
+                    "Use: nodes export-archive --path <path-to-telegram-export-dir>",
+                ));
+            }
+            let dir = std::path::Path::new(path);
+            if !dir.is_dir() {
+                return Err(CFError::new(
+                    "nodes",
+                    format!("not a directory: {path}"),
+                    "Point export-archive at a Telegram Desktop export folder (chat_export).",
+                ));
+            }
+            let h = harvest_export_dir(profile, dir);
+            println!(
+                "[nodes] export-archive: scanned {} file(s), links found={} added={} skipped={}",
+                h.files_scanned, h.total_found, h.total_added, h.total_skipped
+            );
+            for f in &h.files {
+                println!("  {}", f.path);
+            }
+            println!("  → configs landed in node store (tagged telegram) ready for probe/failover");
+            Ok(())
+        }
         _ => Err(CFError::new(
             "configs",
             format!("unknown action {action:?}"),

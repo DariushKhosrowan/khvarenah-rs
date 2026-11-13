@@ -2,6 +2,26 @@
 
 ## Unreleased — 2026-11-13
 
+### Added (offline Telegram-export archive mining — Rung -1 recovery)
+
+- New `tg_export.rs` module: mines **local Telegram Desktop export archives**
+  (`chat_export` JSON/HTML folders) for node share-links, with **zero
+  egress** — it is the terminal fallback rung (Rung -1) when every live
+  channel (Telegram preview, GitHub, CT/NS anchors) is unreachable under
+  total blackout.
+- `extract_b64_embedded_links()`: decodes **whole-link base64 blobs** (and
+  URL-safe variants) that are common in archived chats — a config encoded as a
+  bare base64 string is recovered, not just plaintext `scheme://` links.
+- `harvest_export_dir()` walks a directory tree, scans JSON (`messages[].text`)
+  and HTML/text files, runs any-scheme extraction (vless/vmess/trojan/ss),
+  dedups, and imports everything tagged `source=telegram` into the profile's
+  node store — ready for the normal probe/failover path.
+- CLI: `dastyab nodes export-archive --profile <p> --path <dir>` scans a
+  Telegram export folder and prints scanned/links/added/skipped counts.
+- Fixed profile-contamination bug in tests: unregistered profile ids silently
+  fell back to the real `default` profile; the harness now registers a real
+  profile (via `profile.json` meta) so verification is isolated from live data.
+
 ### Added (IBLT zero-roundtrip set reconciliation — sync node pools under blackout)
 
 - New `iblt.rs` module: **Invertible Bloom Lookup Table**. Cells carry
