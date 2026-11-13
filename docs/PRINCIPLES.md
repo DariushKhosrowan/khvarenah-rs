@@ -262,6 +262,12 @@ Implemented and committed (see `ROADMAP.md`):
 - **Node provenance tagging** — `config_store::import_single_link_source`
   records each node's origin (`telegram` | `github` | `pasted`) so
   auto-recovered configs are auditable and separable from manual pastes.
+- **Any-scheme lifeline egress** (doctrine §5: use *whatever* config works) —
+  the lifeline's `pick_candidates` and `spawn_lifeline` are no longer VLESS-only:
+  any deep-verified-healthy node (vless/vmess/trojan/ss/hysteria2/tuic) is a
+  candidate, rendered via `render_any_xray_cfg`. If every VLESS node dies but a
+  working vmess/ss/trojan survives, DastYab now tunnels through it instead of
+  staying down.
 - **Periodic config-health decay** (doctrine §5) — `node_probe::probe_stale`
   re-probes a bounded set of stale/never-checked nodes (≥6h old, ≤64 per
   pass) on the daemon's hourly cadence and fails over if the active node died,

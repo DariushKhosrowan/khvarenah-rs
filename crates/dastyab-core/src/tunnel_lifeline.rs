@@ -137,18 +137,17 @@ fn pick_candidates(store: &crate::config_store::NodeStore) -> Vec<&V2RayNode> {
 
     // 1. Active + healthy.
     if let Some(a) = store.active() {
-        if a.healthy == Some(true) && a.scheme_is_vless() {
+        if a.healthy == Some(true) {
             push_unique(&mut out, a);
         }
     }
 
-    // 2. Fresh healthy vless nodes (most recent probe first).
+    // 2. Fresh healthy nodes (most recent probe first).
     let mut fresh: Vec<&V2RayNode> = store
         .nodes
         .iter()
         .filter(|n| {
             n.healthy == Some(true)
-                && n.scheme_is_vless()
                 && n.last_checked_epoch
                     .map(|t| now - t <= FRESHNESS_WINDOW)
                     .unwrap_or(false)
@@ -163,24 +162,18 @@ fn pick_candidates(store: &crate::config_store::NodeStore) -> Vec<&V2RayNode> {
         push_unique(&mut out, n);
     }
 
-    // 3. Any healthy vless node.
-    for n in store
-        .nodes
-        .iter()
-        .filter(|n| n.healthy == Some(true) && n.scheme_is_vless())
-    {
+    // 3. Any healthy node.
+    for n in store.nodes.iter().filter(|n| n.healthy == Some(true)) {
         push_unique(&mut out, n);
     }
 
     // 4. Active regardless of health.
     if let Some(a) = store.active() {
-        if a.scheme_is_vless() {
-            push_unique(&mut out, a);
-        }
+        push_unique(&mut out, a);
     }
 
-    // 5. Any other vless node.
-    for n in store.nodes.iter().filter(|n| n.scheme_is_vless()) {
+    // 5. Any other node.
+    for n in store.nodes.iter() {
         push_unique(&mut out, n);
     }
 
@@ -309,8 +302,8 @@ pub async fn spawn_lifeline(profile: &str) -> LifelineReport {
         };
         tried.push(node_alias.clone());
 
-        // Render the config.
-        let cfg_json = match render_node_config(&node_url) {
+        // Render the config (any scheme — vless/vmess/trojan/ss/hysteria2/tuic).
+        let cfg_json = match render_any_xray_cfg(&node_url, LIFELINE_SOCKS_PORT) {
             Ok(c) => c,
             Err(e) => {
                 last_error = Some(format!("node {node_alias} render config: {e}"));
@@ -406,7 +399,7 @@ pub async fn spawn_lifeline(profile: &str) -> LifelineReport {
                     e
                 }
             }
-            None => "no vless node available in pool".to_string(),
+            None => "no node available in pool".to_string(),
         }),
     }
 }
@@ -929,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_skips_non_vless() {
+    fn pick_includes_all_schemes() {
         let vmess = node(
             "vmess://abc",
             Some(true),
@@ -940,16 +933,27 @@ mod tests {
             Some(true),
             Some(crate::store::profiles::now_ts()),
         );
-        let s = store(vec![vmess, vless.clone()], None);
+        // Doctrine §5: use *whatever* config works — healthy nodes of any
+        // scheme are valid candidates, ranked equally by freshness.
+        let s = store(vec![vmess.clone(), vless.clone()], None);
         let best = pick_best_node(&s).unwrap();
-        assert!(best.url.starts_with("vless://"));
+        // Both are healthy+fresh; order is by insertion (stable), so the
+        // first healthy node is the vmess. Either is acceptable — what matters
+        // is that the vmess is NOT excluded.
+        assert!(
+            best.url == vmess.url || best.url == vless.url,
+            "healthy node of any scheme should be pickable, got {:?}",
+            best.url
+        );
+        let c = pick_candidates(&s);
+        assert_eq!(c.len(), 2, "both schemes should be candidates: {c:?}");
     }
 
     #[test]
     fn candidates_rank_and_dedup() {
         let now = crate::store::profiles::now_ts();
         // Active unhealthy (goes later, as last resort) + fresh healthy + stale
-        // healthy + a vmess (excluded).
+        // healthy + a fresh healthy vmess (now included — doctrine §5).
         let active = node(&vless_url("active"), None, None);
         let fresh = node(&vless_url("fresh"), Some(true), Some(now - 30.0));
         let stale = node(
@@ -960,23 +964,29 @@ mod tests {
         let vmess = node("vmess://abc", Some(true), Some(now - 10.0));
         let active_id = active.id.clone();
         let s = store(
-            vec![vmess, stale, fresh.clone(), active.clone()],
+            vec![vmess.clone(), stale, fresh.clone(), active.clone()],
             Some(active_id),
         );
 
         let c = pick_candidates(&s);
         let urls: Vec<&str> = c.iter().map(|n| n.url.as_str()).collect();
-        // Fresh healthy first, then stale healthy, then active, then (no other
-        // vless). vmess excluded.
-        assert_eq!(urls.len(), 3, "expected 3 candidates, got {urls:?}");
-        assert!(urls[0].contains("fresh"), "first should be fresh: {urls:?}");
+        // Fresh healthy nodes first (fresh + vmess, both fresh, stable order),
+        // then stale healthy, then active. All four included now.
+        assert_eq!(urls.len(), 4, "expected 4 candidates, got {urls:?}");
+        // First two must be the fresh healthy pair (fresh and vmess in either
+        // order — both have fresh probes).
         assert!(
-            urls[1].contains("stale"),
-            "second should be stale: {urls:?}"
+            urls[0].contains("fresh") || urls[0].contains("vmess"),
+            "first should be fresh-healthy: {urls:?}"
         );
         assert!(
-            urls[2].contains("active"),
-            "third should be active: {urls:?}"
+            urls[1].contains("fresh") || urls[1].contains("vmess"),
+            "second should be fresh-healthy: {urls:?}"
+        );
+        assert!(urls[2].contains("stale"), "third should be stale: {urls:?}");
+        assert!(
+            urls[3].contains("active"),
+            "fourth should be active: {urls:?}"
         );
         // No duplicates.
         let n = urls.len();
