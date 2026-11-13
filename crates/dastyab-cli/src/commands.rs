@@ -4886,6 +4886,26 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
             );
             let timeout = std::time::Duration::from_millis(timeout_ms);
             let found = discover_open_resolvers(&cands, concurrency, timeout, "").await;
+            let mut found = found;
+            if found.is_empty() {
+                // Fallback tier: a no working domestic resolver was discovered,
+                // try the verified-live authoritative-nameserver anchors (doctrine
+                // §8.1). Authoritative NS servers are stable and effectively
+                // unblockable — blocking them would break all DNS — so they make
+                // a resilient last-resort resolver set under total blackout.
+                use dastyab_core::ns_anchors::anchor_ips;
+                let ns_ips = anchor_ips(profile);
+                if !ns_ips.is_empty() {
+                    println!(
+                        "No domestic resolvers live; falling back to {} verified NS-anchor IPs ...",
+                        ns_ips.len()
+                    );
+                    let ns_live = discover_open_resolvers(&ns_ips, concurrency, timeout, "").await;
+                    if !ns_live.is_empty() {
+                        found = ns_live;
+                    }
+                }
+            }
             if found.is_empty() {
                 return Err(CFError::new(
                     "dns-tunnel",
