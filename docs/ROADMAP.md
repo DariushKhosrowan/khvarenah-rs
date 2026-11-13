@@ -100,6 +100,12 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   `serve --upstream` hosts a data relay over a real egress; `forward --url`
   verifies a hop (echo RTT) then fetches a URL through it. This closes the
   final ladder rung end-to-end.
+- ✅ **Daemon mesh host (Level 4, autonomous)** — `mesh_host.rs` now turns a
+  running daemon into a persistent relay node: it keeps the mesh relay
+  listener alive on UDP 5837 and advertises its beacon (with `has_uplink`)
+  on the LAN. Wired into the daemon's self-maintenance — a DastYab
+  instance with a live uplink offers itself as a hop to peers. Verified live:
+  echo probe against the running daemon relay returned RTT 14ms.
 - **Codec fuzz gate (doctrine §8.4)** — `codec_fuzz.rs`, a deterministic,
   dependency-free CI gate that adversarially fuzzes every wire codec every
   `cargo test` run: TunnelFrame/QNAME base32 encode→decode round-trips
