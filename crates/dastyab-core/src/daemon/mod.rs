@@ -141,6 +141,11 @@ pub struct DaemonState {
     /// cycle. Reset to false when the account returns to Active.
     #[serde(default)]
     pub account_rotate_exhausted_notified: bool,
+    /// Set once per blocked episode when the lifeline tunnel was auto-started
+    /// to keep local egress working while the managed CF account is down.
+    /// Reset when the account returns to Active.
+    #[serde(default)]
+    pub lifeline_auto_started: bool,
     /// Unix seconds when the current total blackout began. 0 = not in a
     /// blackout. Drives escalation (`daemon/escalation.rs`).
     #[serde(default)]
@@ -211,6 +216,7 @@ impl Default for DaemonState {
             last_drill_ts: 0,
             last_verify_ts: 0,
             account_rotate_exhausted_notified: false,
+            lifeline_auto_started: false,
             blackout_since_unix: 0,
             last_self_ping_ts: 0,
             audit: crate::daemon::autonomy_schedule::AuditSchedule::default(),
@@ -1896,6 +1902,31 @@ async fn run_scheduled_drill(
 /// Run one iteration of the daemon loop. Returns the number of seconds to
 /// sleep before the next iteration. Pure-ish: all side effects go through
 /// `probe`, `acct`, `cycle`, and the logger callback, so it is fully unit-testable.
+/// Best-effort auto-start of the lifeline tunnel when the managed egress is
+/// down/blocked. Logs once per episode. Never fails the cycle — the lifeline
+/// is a survival aid, not a gate.
+async fn try_start_lifeline(profile: &str, state: &mut DaemonState, log: &mut dyn FnMut(&str)) {
+    if state.lifeline_auto_started {
+        return;
+    }
+    let report = crate::tunnel_lifeline::spawn_lifeline(profile).await;
+    state.lifeline_auto_started = true;
+    if report.up {
+        log(&log_line(
+            "INFO",
+            "lifeline=auto-started (managed egress down; local SOCKS5 tunnel up)",
+        ));
+    } else {
+        log(&log_line(
+            "WARN",
+            &format!(
+                "lifeline=auto-start failed (error={})",
+                report.error.as_deref().unwrap_or("unknown")
+            ),
+        ));
+    }
+}
+
 pub async fn daemon_tick(
     profile: &str,
     state: &mut DaemonState,
@@ -2249,6 +2280,7 @@ pub async fn daemon_tick(
                             crate::account_state::ACCOUNT_POLL_INTERVAL_SECS
                         ),
                     ));
+                    try_start_lifeline(profile, state, log).await;
                     return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
                 }
                 log(&log_line(
@@ -2258,6 +2290,9 @@ pub async fn daemon_tick(
                         state.account_state.label()
                     ),
                 ));
+                // Managed egress is back — reset the auto-start flag so a future
+                // blocked episode can trigger the lifeline again.
+                state.lifeline_auto_started = false;
             } else {
                 // Not yet time to re-poll — hold this cycle.
                 log(&log_line(
@@ -2305,6 +2340,7 @@ pub async fn daemon_tick(
                     )
                     .await;
                 }
+                try_start_lifeline(profile, state, log).await;
                 return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
             }
             state.account_state = st;
@@ -3175,6 +3211,35 @@ mod tests {
             "no cycle while suspended"
         );
         assert!(log_lines.iter().any(|l| l.contains("waiting")));
+    }
+
+    /// When the account is still blocked after a poll, the daemon must
+    /// best-effort auto-start the lifeline tunnel (flag set once per episode).
+    #[tokio::test]
+    async fn test_daemon_autostarts_lifeline_on_still_blocked() {
+        let _home = daemon_home();
+        let profile = "default";
+        let mut state = DaemonState::default();
+        state.account_state = crate::account_state::AccountState::Suspended { since: 1 };
+        // Stale last-poll → the daemon actually probes and finds it still blocked.
+        state.last_account_poll_ts = crate::store::now_ts() as i64 - 10_000;
+        let mut probe = FakeProbe::new(true);
+        let acct = FakeAccountProbe {
+            state: crate::account_state::AccountState::Suspended { since: 1 },
+            rotate: None,
+        };
+        let cycle = FakeCycle::new(true);
+        let mut log_lines = Vec::new();
+        let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |l| {
+            log_lines.push(l.to_string());
+        })
+        .await;
+        assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert!(
+            state.lifeline_auto_started,
+            "lifeline auto-start flag should be set while blocked"
+        );
+        assert_eq!(cycle.calls.load(Ordering::SeqCst), 0);
     }
 
     /// When the account is blocked but another stored token can take over, the

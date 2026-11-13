@@ -116,6 +116,7 @@ pub mod token_rotate;
 pub mod tor;
 pub mod tun_mtu;
 pub mod tun_route;
+pub mod tunnel_lifeline;
 pub mod vless;
 pub mod vps_deploy;
 pub mod vps_provision;

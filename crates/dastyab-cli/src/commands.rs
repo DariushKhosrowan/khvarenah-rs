@@ -220,6 +220,7 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             url,
         } => cmd_mesh(&action, window, upstream, &name, &url),
         Command::Bond { action, frames } => cmd_bond(&action, frames),
+        Command::Lifeline { action, profile } => cmd_lifeline(&action, &profile).await,
         Command::Nodes {
             action,
             profile,
@@ -4085,6 +4086,53 @@ fn cmd_bond(action: &str, frames: usize) -> Result<(), CFError> {
             "bond",
             format!("unknown action {other:?}"),
             "Use: bond selftest",
+        )),
+    }
+}
+
+/// Lifeline tunnel: run a local xray egress from the best healthy config on a
+/// SOCKS5 proxy (127.0.0.1:10853). This is the "use the configs yourself when
+/// the managed egress is down" escape hatch (doctrine §2/§8.x).
+async fn cmd_lifeline(action: &str, profile: &str) -> Result<(), CFError> {
+    use dastyab_core::tunnel_lifeline::{
+        is_port_open, lifeline_status, pool_summary, spawn_lifeline, stop_lifeline,
+        LIFELINE_SOCKS_PORT,
+    };
+
+    let action = action.trim().to_lowercase();
+    match action.as_str() {
+        "start" => {
+            let report = spawn_lifeline(profile).await;
+            if report.up {
+                println!("lifeline: up (SOCKS5 127.0.0.1:{LIFELINE_SOCKS_PORT})");
+                println!("lifeline: node = {}", report.node.unwrap_or_default());
+            } else {
+                println!(
+                    "lifeline: FAILED (node={}, error={})",
+                    report.node.unwrap_or_default(),
+                    report.error.as_deref().unwrap_or("unknown")
+                );
+            }
+            Ok(())
+        }
+        "stop" => {
+            stop_lifeline(profile);
+            println!("lifeline: stop requested");
+            Ok(())
+        }
+        "status" => {
+            let report = lifeline_status(profile).await;
+            let up = is_port_open(LIFELINE_SOCKS_PORT).await;
+            let (total, vless) = pool_summary(profile);
+            println!("lifeline: up={up} (SOCKS5 127.0.0.1:{LIFELINE_SOCKS_PORT})");
+            println!("lifeline: node = {}", report.node.unwrap_or_default());
+            println!("lifeline: pool = {total} nodes, {vless} vless");
+            Ok(())
+        }
+        other => Err(CFError::new(
+            "Lifeline",
+            format!("unknown action '{other}'"),
+            "Use start | stop | status.",
         )),
     }
 }

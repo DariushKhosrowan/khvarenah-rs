@@ -501,6 +501,17 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         frames: usize,
     },
+    /// Lifeline tunnel: run a local xray egress from the best healthy config
+    /// when the primary managed egress is down/blocked (doctrine §2/§8.x).
+    /// Exposes a SOCKS5 proxy on 127.0.0.1:10853.
+    Lifeline {
+        /// Action: start | stop | status.
+        #[arg()]
+        action: String,
+        /// Profile to operate on (default "default").
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
     /// Manage native config-storage nodes (imported from v2rayN or pasted).
     Nodes {
         /// Sub-command: import | paste | activate | list | clear | probe |
