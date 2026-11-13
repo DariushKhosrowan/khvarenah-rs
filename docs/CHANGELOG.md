@@ -2,6 +2,22 @@
 
 ## Unreleased — 2026-11-13
 
+### Added (chain egress-IP risk + Shir-o-Khorshid + corrective-layer support)
+
+- **`Engine::ShirOKhorshid`**: new chain engine (label `shirokhorshid`,
+  binary hint `gost`, default port 10866) for the doctrine §3 L2
+  Shir-o-Khorshid forward-proxy pipeline (Rathole/GOST/smux over TLS).
+- **`Engine::egress_risk() -> EgressRisk`**: classifies the public exit IP a
+  chain's outermost layer presents. Tor=Risky (flagged/blocked by major
+  services), Psiphon/Lantern=Moderate, V2rayN/Shadowsocks/ShirOKhorshid/
+  DastYab=Clean.
+- **`ChainRunReport.egress_risk`**: computed from the outermost (internet-
+  facing) Up layer, so a clean corrective layer *after* tor correctly yields a
+  clean exit. CLI warns prominently when the exit IP is risky/flagged and
+  recommends `--chain tor,shirokhorshid` (or `tor,v2rayn`) to correct it.
+- **Verification**: 3 new chain tests (risk classification, engine validity,
+  outermost-layer risk); full core suite green, clippy clean.
+
 ### Added (Level-4 P2P LAN mesh — the final resilience-ladder rung)
 
 - **`dastyab-core::lan_mesh`** (new module): intranet P2P discovery via a
