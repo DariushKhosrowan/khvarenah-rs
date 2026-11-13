@@ -558,6 +558,7 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
                 Engine::V2rayN,
                 Engine::Lantern,
                 Engine::Shadowsocks,
+                Engine::ShirOKhorshid,
                 Engine::DastYab,
             ];
             for e in ids {
@@ -578,12 +579,13 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
                     "v2rayn" | "xray" => Engine::V2rayN,
                     "lantern" => Engine::Lantern,
                     "shadowsocks" | "ss" => Engine::Shadowsocks,
+                    "shirokhorshid" | "skh" => Engine::ShirOKhorshid,
                     "dastyab" => Engine::DastYab,
                     other => {
                         return Err(CFError::new(
                             "chain",
                             format!("unknown engine: {other}"),
-                            "use: psiphon, tor, v2rayn, lantern, shadowsocks, dastyab",
+                            "use: psiphon, tor, v2rayn, lantern, shadowsocks, shirokhorshid, dastyab",
                         ));
                     }
                 };
@@ -673,6 +675,7 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
                                 .unwrap_or_else(|| "-".into()),
                             report.egress_ok
                         );
+                        print_egress_risk_warning(report);
                     }
                 } else {
                     println!("[chain] no candidate verified egress (all degraded/failed)");
@@ -721,6 +724,7 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
                         .unwrap_or_else(|| "-".into()),
                     report.egress_ok
                 );
+                print_egress_risk_warning(&report);
             }
             Ok(())
         }
@@ -729,6 +733,34 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
             format!("unknown action: {other}"),
             "use: plan | list-engines | check",
         )),
+    }
+}
+
+/// Print a prominent warning when the chain's public exit IP is risky/flagged
+/// (e.g. a Tor exit node). The user can then choose to keep the tunnel as a
+/// last resort or add a corrective layer (doctrine §3 L2, §4.3).
+fn print_egress_risk_warning(report: &dastyab_core::chain_mixer::ChainRunReport) {
+    use dastyab_core::chain_mixer::EgressRisk;
+    let Some(risk) = report.egress_risk else {
+        return;
+    };
+    match risk {
+        EgressRisk::Clean => {}
+        EgressRisk::Moderate => {
+            println!(
+                "[chain] ⚠ output IP: moderate-risk exit (circumvention provider). \
+                 It may be rate-limited or geo-blocked by some services."
+            );
+        }
+        EgressRisk::Risky => {
+            println!(
+                "[chain] ⚠⚠ RISKY OUTPUT IP: the public exit is a Tor/onion node. \
+                 Major services (Google, streaming, banking) frequently block Tor \
+                 exits — sites may return 403/429 even though the tunnel is up. \
+                 To correct the exit IP, add a Clean egress layer AFTER tor, e.g. \
+                 --chain tor,shirokhorshid or --chain tor,v2rayn."
+            );
+        }
     }
 }
 

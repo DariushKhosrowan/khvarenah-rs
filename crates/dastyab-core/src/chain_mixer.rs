@@ -34,8 +34,26 @@ pub enum Engine {
     Lantern,
     /// Shadowsocks-2022 client (direct AEAD egress).
     Shadowsocks,
+    /// Shir-o-Khorshid architecture (doctrine §3 L2): forward through an
+    /// intermediate domestic datacenter proxy pipeline (Rathole / GOST/
+    /// smux over TLS) on an Iranian VPS.
+    ShirOKhorshid,
     /// The app's own stack (multilayer tunnel tiers: doh/dot/dnstunnel).
     DastYab,
+}
+
+/// Reputation of the public exit IP a chain's outermost layer will present.
+/// A risky exit (e.g. a Tor exit node) is frequently flagged/blocked by
+/// mainstream services (Google, streaming, banking) and can be a red flag
+/// to DPI — so the CLI warns before the user relies on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EgressRisk {
+    /// Likely-residential / hosted IP; low false-positive flag rate.
+    Clean,
+    /// Circumvention provider exit; may be rate-limited or geo-blocked.
+    Moderate,
+    /// Known-flagged exit (Tor/onion); may be blocked by major services.
+    Risky,
 }
 
 impl Engine {
@@ -47,6 +65,7 @@ impl Engine {
             Engine::V2rayN => "v2rayn",
             Engine::Lantern => "lantern",
             Engine::Shadowsocks => "shadowsocks",
+            Engine::ShirOKhorshid => "shirokhorshid",
             Engine::DastYab => "dastyab",
         }
     }
@@ -84,6 +103,10 @@ impl Engine {
                 "-p".to_string(),
                 port.to_string(),
             ],
+            // Shir-o-Khorshid: forward local SOCKS5 into a domestic TLS relay
+            // (gost `-L` in plain SOCKS5 mode). The domestic hop is what
+            // launders the exit's reputation behind the Iranian VPS.
+            Engine::ShirOKhorshid => vec!["-L".to_string(), format!("socks5://127.0.0.1:{port}")],
             Engine::DastYab => vec![],
         }
     }
@@ -98,7 +121,23 @@ impl Engine {
             Engine::V2rayN => Some("xray"),
             Engine::Lantern => Some("lantern"),
             Engine::Shadowsocks => Some("sslocal"),
+            // gost is the reference Shir-o-Khorshid forward-proxy pipeline.
+            Engine::ShirOKhorshid => Some("gost"),
             Engine::DastYab => None,
+        }
+    }
+
+    /// Classify the reputation of the public exit IP this engine presents.
+    /// Used to warn when the outermost chain layer is risky (e.g. Tor exit
+    /// nodes are flagged/blocked by major services) so the user is never
+    /// surprised by a malicious-looking or blocked output IP.
+    pub fn egress_risk(self) -> EgressRisk {
+        match self {
+            Engine::Tor => EgressRisk::Risky,
+            Engine::Psiphon | Engine::Lantern => EgressRisk::Moderate,
+            Engine::V2rayN | Engine::Shadowsocks | Engine::ShirOKhorshid | Engine::DastYab => {
+                EgressRisk::Clean
+            }
         }
     }
 }
@@ -144,6 +183,7 @@ fn default_port(engine: Engine) -> u16 {
         Engine::V2rayN => 10863,
         Engine::Lantern => 10864,
         Engine::Shadowsocks => 10865,
+        Engine::ShirOKhorshid => 10866,
         Engine::DastYab => crate::multilayer::PROXY_SOCKS_PORT,
     }
 }
@@ -278,6 +318,10 @@ pub struct ChainRunReport {
     /// Port of the client-facing (outermost) layer when at least one layer is
     /// up; the app routes into it. `None` if every layer failed.
     pub egress_port: Option<u16>,
+    /// Reputation of the *public exit IP* (the last, internet-facing layer's
+    /// engine). `None` when no layer came up. Used to warn the user when the
+    /// output IP is risky/flagged (e.g. a Tor exit).
+    pub egress_risk: Option<EgressRisk>,
     /// Number of layers skipped/def-erred (degrading).
     pub degraded: usize,
 }
@@ -461,11 +505,20 @@ pub async fn run_chain_async<L: EngineLauncher>(
         Some(p) => egress_probe(p).await,
         None => false,
     };
+    // The public exit IP is presented by the *last* Up layer (the only layer
+    // with no upstream, i.e. the one that actually talks to the internet).
+    // Classify its engine so the caller can warn on risky/flagged outputs
+    // (e.g. a Tor exit node).
+    let egress_risk = runs
+        .iter()
+        .rfind(|r| r.status == LayerStatus::Up)
+        .map(|r| r.engine.egress_risk());
 
     ChainRunReport {
         layers: runs,
         egress_ok,
         egress_port,
+        egress_risk,
         degraded,
     }
 }
@@ -817,6 +870,35 @@ mod tests {
         assert!(wait_port_open(port, Duration::from_secs(2)).await);
         drop(listener); // close it
         assert!(!wait_port_open(port, Duration::from_millis(300)).await);
+    }
+
+    #[test]
+    fn egress_risk_classifies_tor_risky_and_shiro_clean() {
+        use Engine::*;
+        assert_eq!(Tor.egress_risk(), EgressRisk::Risky);
+        assert_eq!(Psiphon.egress_risk(), EgressRisk::Moderate);
+        assert_eq!(Lantern.egress_risk(), EgressRisk::Moderate);
+        assert_eq!(V2rayN.egress_risk(), EgressRisk::Clean);
+        assert_eq!(Shadowsocks.egress_risk(), EgressRisk::Clean);
+        assert_eq!(ShirOKhorshid.egress_risk(), EgressRisk::Clean);
+        assert_eq!(DastYab.egress_risk(), EgressRisk::Clean);
+    }
+
+    #[test]
+    fn shirokhorshid_is_a_valid_engine() {
+        assert_eq!(Engine::ShirOKhorshid.label(), "shirokhorshid");
+        assert_eq!(Engine::ShirOKhorshid.binary_hint(), Some("gost"));
+        assert_eq!(default_port(Engine::ShirOKhorshid), 10866);
+    }
+
+    #[tokio::test]
+    async fn report_egress_risk_is_from_outermost_up_layer() {
+        // Outer (internet-facing) layer is tor -> risky even though the
+        // client-facing layer is a clean v2rayn sink.
+        let cfg = pop_chain(vec![Engine::V2rayN, Engine::Tor]);
+        let planned = plan_chain(&cfg, |_| Some("/usr/bin/x".into())).unwrap();
+        let report = run_chain(&planned, &OkLauncher, |_| true).await;
+        assert_eq!(report.egress_risk, Some(EgressRisk::Risky));
     }
 
     #[tokio::test]
