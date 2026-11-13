@@ -148,6 +148,12 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   blocking thread to avoid the reqwest-blocking-under-tokio panic), prunes
   anchors that no longer complete TLS, and journals each pass. New CLI actions:
   `refresh` and `prune`. Closes the "daemon wire-in" half of §8.1.
+- ✅ **Autonomous NS-anchor rotation (daemon wire-in)** — the daemon's
+  self-maintenance now also refreshes the authoritative-nameserver anchor set
+  (`anchors ns` = root-seed probe + high-value-zone NS discovery + prune) on
+  the same cadence, giving a second independent, out-of-band DNS control-plane
+  bootstrap feed (doctrine §8.1) so bootstrapping can never go circular. Live
+  store verified: 13 root-server anchors populated.
 - **Wrangler-free deploy confirmation** — post-deploy smoke test that hits the
   worker URL and checks it responds.
 - ✅ **UDP-native DNS tunnel** — `dnstunnel_arq.rs` adds a sliding-window
