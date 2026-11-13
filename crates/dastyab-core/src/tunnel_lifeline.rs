@@ -411,6 +411,149 @@ pub async fn spawn_lifeline(profile: &str) -> LifelineReport {
     }
 }
 
+/// Results of a single deep egress-verified probe.
+#[derive(Debug, Clone, Default)]
+pub struct EgressVerifyReport {
+    /// Whether the node carried real end-to-end egress.
+    pub ok: bool,
+    /// Alias of the verified node (empty on failure).
+    pub alias: String,
+    /// Human-readable error/warning (None on success).
+    pub error: Option<String>,
+}
+
+/// Deeply verify that a node carries **real egress** by spawning a fresh xray
+/// client for it on a *dedicated* local SOCKS5 port (never the live lifeline
+/// port 10853), confirming end-to-end traffic (doctrine §6.4 — no fabricated
+/// success), then tearing the temporary xray down.
+///
+/// This closes the gap between the shallow TLS probe (`node_probe::probe_one`,
+/// which only proves a server speaks TLS) and the decisive check that a node
+/// actually proxies traffic. The daemon can use it to re-verify the pool's
+/// healthy set without disturbing the running tunnel.
+pub async fn deep_verify_egress(_profile: &str, node: &V2RayNode) -> EgressVerifyReport {
+    // Pick a dedicated verification port — base port + (hash of node id) to
+    // spread concurrent verifications and avoid colliding with the live
+    // lifeline (10853) or the standard SOCKS ports.
+    let base = 10900u16;
+    let port = base
+        + (node
+            .id
+            .bytes()
+            .fold(0u16, |acc, b| acc.wrapping_add(b as u16))
+            % 400);
+    if port == LIFELINE_SOCKS_PORT || is_port_open(port).await {
+        return EgressVerifyReport {
+            ok: false,
+            alias: node.alias.clone(),
+            error: Some("verification port busy".into()),
+        };
+    }
+    let xray = match find_xray_binary() {
+        Some(x) => x,
+        None => {
+            return EgressVerifyReport {
+                ok: false,
+                alias: node.alias.clone(),
+                error: Some("xray binary not found".into()),
+            }
+        }
+    };
+    // Render the config for this node on the dedicated port.
+    let profile_vless = match VlessProfile::parse(&node.url) {
+        Ok(p) => p,
+        Err(e) => {
+            return EgressVerifyReport {
+                ok: false,
+                alias: node.alias.clone(),
+                error: Some(format!("render config: {e}")),
+            }
+        }
+    };
+    let cfg_json = match profile_vless.xray_client_json_at_port(port) {
+        Ok(c) => c,
+        Err(e) => {
+            return EgressVerifyReport {
+                ok: false,
+                alias: node.alias.clone(),
+                error: Some(format!("render config: {e}")),
+            }
+        }
+    };
+    let cfg_path =
+        std::env::temp_dir().join(format!("dyb-egress-verify-{}.json", crate::store::new_id()));
+    if let Err(e) = std::fs::write(&cfg_path, &cfg_json) {
+        return EgressVerifyReport {
+            ok: false,
+            alias: node.alias.clone(),
+            error: Some(format!("write xray cfg: {e}")),
+        };
+    }
+    // The random temp name already provides uniqueness; no need to persist it.
+    let mut child = match std::process::Command::new(&xray)
+        .arg("run")
+        .arg("-c")
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(ch) => ch,
+        Err(e) => {
+            let _ = std::fs::remove_file(&cfg_path);
+            return EgressVerifyReport {
+                ok: false,
+                alias: node.alias.clone(),
+                error: Some(format!("spawn xray: {e}")),
+            };
+        }
+    };
+    // Do NOT delete cfg_path here: xray reads it asynchronously after spawn and
+    // deleting too early races its boot. Clean up only after we are done.
+    // Wait for the verification port to open.
+    let mut ready = false;
+    let deadline = std::time::Instant::now() + PORT_OPEN_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if is_port_open(port).await {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        // Collect any boot diagnostics to aid diagnosis (no fabricated success).
+        let mut stderr_buf = Vec::new();
+        if let Some(mut e) = child.stderr.take() {
+            use std::io::Read;
+            let _ = e.read_to_end(&mut stderr_buf);
+        }
+        return EgressVerifyReport {
+            ok: false,
+            alias: node.alias.clone(),
+            error: Some(format!(
+                "xray did not open verification port: {}",
+                String::from_utf8_lossy(&stderr_buf).trim()
+            )),
+        };
+    }
+    // The decisive check: real egress through this node.
+    let ok = egress_ok(port).await;
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&cfg_path);
+    EgressVerifyReport {
+        ok,
+        alias: node.alias.clone(),
+        error: if ok {
+            None
+        } else {
+            Some("no real egress through node".into())
+        },
+    }
+}
+
 /// Stop the lifeline tunnel (kill the child if alive).
 pub fn stop_lifeline(profile: &str) -> bool {
     let Some(pid) = read_pid(profile) else {

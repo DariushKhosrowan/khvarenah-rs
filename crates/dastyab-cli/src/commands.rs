@@ -4539,6 +4539,48 @@ async fn cmd_configs(
             println!("[configs] probe done: {ok} healthy, {fail} unhealthy");
             Ok(())
         }
+        "verify-egress" => {
+            use dastyab_core::config_store::{load_node_store, save_node_store};
+            use dastyab_core::tunnel_lifeline::deep_verify_egress;
+            let store = load_node_store(profile);
+            let mut candidates: Vec<_> = store
+                .nodes
+                .iter()
+                .filter(|n| n.healthy != Some(false))
+                .take(6)
+                .cloned()
+                .collect();
+            if candidates.is_empty() {
+                println!("[configs] no nodes to deep-verify (import nodes first)");
+                return Ok(());
+            }
+            println!(
+                "[configs] deeply verifying real egress for {} node(s)…",
+                candidates.len()
+            );
+            let mut ok = 0usize;
+            for node in &mut candidates {
+                let r = deep_verify_egress(profile, node).await;
+                let mut s = load_node_store(profile);
+                if let Some(n) = s.nodes.iter_mut().find(|n| n.id == node.id) {
+                    n.healthy = Some(r.ok);
+                    n.last_checked_epoch = Some(dastyab_core::store::now_ts());
+                }
+                let _ = save_node_store(profile, &s);
+                if r.ok {
+                    ok += 1;
+                    println!("  [OK]   {} (real egress)", r.alias);
+                } else {
+                    println!(
+                        "  [FAIL] {}: {}",
+                        r.alias,
+                        r.error.clone().unwrap_or_default()
+                    );
+                }
+            }
+            println!("[configs] deep egress verify done: {ok} verified working");
+            Ok(())
+        }
         "failover" => {
             use dastyab_core::node_probe::failover_if_dead;
             match failover_if_dead(profile) {

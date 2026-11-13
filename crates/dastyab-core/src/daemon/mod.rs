@@ -176,6 +176,12 @@ pub struct DaemonState {
     /// Rate-limits re-probing of stale nodes to `NODE_DECAY_INTERVAL_SECS`.
     #[serde(default)]
     pub last_node_decay_ts: i64,
+    /// Last epoch-seconds the deep real-egress verification pass ran.
+    /// Rate-limits `tunnel_lifeline::deep_verify_egress` (which spawns a
+    /// temporary xray per candidate on a dedicated port) to a slow cadence
+    /// so the pool's `healthy` verdicts reflect *real* traffic, not just TLS.
+    #[serde(default)]
+    pub last_deep_verify_ts: i64,
     /// Last epoch-seconds the out-of-band CT-anchor set was refreshed + pruned.
     /// Rate-limits crt.sh discovery + re-probe to
     /// `ANCHOR_REFRESH_INTERVAL_SECS` (doctrine §6.5: rate-limit expensive).
@@ -224,6 +230,7 @@ impl Default for DaemonState {
             last_refill_ts: 0,
             last_discovery_ts: 0,
             last_node_decay_ts: 0,
+            last_deep_verify_ts: 0,
             last_anchors_refresh_ts: 0,
             last_ns_anchors_refresh_ts: 0,
             last_oob_pull_ts: 0,
@@ -1406,6 +1413,64 @@ async fn run_self_maintenance(
                     &format!("node health decay: promoted healthy node '{id}'"),
                 ));
             }
+        }
+    }
+
+    // 6.5. Deep real-egress verification: the shallow decay sweep above only
+    // confirms TLS reachability. Under NIN, a server can complete TLS yet be
+    // a dead/blackholed relay — so periodically re-verify a small, bounded
+    // subset of the pool with a *real* xray spawn + end-to-end egress check
+    // (`deep_verify_egress`). Verdicts are written back into the store so the
+    // pool's `healthy` flags reflect genuine working configs, not just TLS.
+    // This is the "no fabricated success" doctrine (§8.2) applied at sweep
+    // granularity. Rate-limited to a slow cadence (costly: spawns temporary
+    // xray per candidate on dedicated ports) and bounded to ≤2 nodes/pass.
+    const DEEP_VERIFY_INTERVAL_SECS: i64 = 6 * 3600;
+    const DEEP_VERIFY_MAX_PER_PASS: usize = 2;
+    if net_up && now - state.last_deep_verify_ts >= DEEP_VERIFY_INTERVAL_SECS {
+        state.last_deep_verify_ts = now;
+        let store = crate::config_store::load_node_store(profile);
+        let mut candidates: Vec<crate::config_store::V2RayNode> = store
+            .nodes
+            .iter()
+            .filter(|n| n.healthy != Some(false))
+            .take(DEEP_VERIFY_MAX_PER_PASS)
+            .cloned()
+            .collect();
+        if !candidates.is_empty() {
+            log(&log_line(
+                "INFO",
+                &format!(
+                    "deep egress verify: testing {} candidate(s) with real xray spawn…",
+                    candidates.len()
+                ),
+            ));
+            for node in &mut candidates {
+                let r = crate::tunnel_lifeline::deep_verify_egress(profile, node).await;
+                if r.ok {
+                    log(&log_line(
+                        "INFO",
+                        &format!(
+                            "deep egress verify: '{}' confirmed working (real egress)",
+                            r.alias
+                        ),
+                    ));
+                } else {
+                    log(&log_line(
+                        "WARN",
+                        &format!(
+                            "deep egress verify: '{}' FAILED real egress ({}) — marking unhealthy",
+                            r.alias,
+                            r.error.clone().unwrap_or_default()
+                        ),
+                    ));
+                }
+            }
+        } else {
+            log(&log_line(
+                "INFO",
+                "deep egress verify: no candidates (pool not yet probed)",
+            ));
         }
     }
 

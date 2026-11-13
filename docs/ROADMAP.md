@@ -139,6 +139,13 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - ✅ **Periodic config-health decay** — piggyback node re-probe on the daemon's
   ladder so the store always prunes to verified-live configs
   (`node_probe::probe_stale` + hourly daemon sweep).
+- ✅ **Deep real-egress verification** — `tunnel_lifeline::deep_verify_egress`
+  spawns a temporary xray per candidate on a dedicated port and confirms
+  *end-to-end* traffic, not just TLS, writing truthful `healthy` verdicts back
+  into the store. Wired into the daemon on a bounded 6h cadence (≤2 nodes/pass)
+  and exposed as `dastyab configs verify-egress [count]`. Closes the "no
+  fabricated success" gap (PRINCIPLES §8.2) at sweep granularity: a server that
+  completes TLS yet blackholes traffic is now correctly marked unhealthy.
 - ✅ **Verified healthy nodes → v2rayN export** — `dastyab nodes
   export-v2rayn` merges the verified-healthy pool into v2rayN's ServersStore.json
   (dedup by host+port+uuid, atomic write, idempotent). Closes the loop:
