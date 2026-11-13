@@ -116,15 +116,44 @@ impl NodeStore {
         }
         self.nodes.insert(0, node);
         if self.nodes.len() > MAX_NODES {
-            self.nodes.truncate(MAX_NODES);
-            // If the active node fell off the end, unset it.
-            if let Some(a) = &self.active_id {
-                if self.get(a).is_none() {
-                    self.active_id = None;
-                }
-            }
+            self.retain_capacity();
         }
         true
+    }
+
+    /// Truncate to `MAX_NODES` without ever evicting the active node or a
+    /// verified-healthy node (doctrine §6.4: never silently lose known-good
+    /// configs). Protected nodes are kept; the rest are pruned oldest-first,
+    /// so a bulk harvest never clobbers the working anchor the tunnel depends on.
+    fn retain_capacity(&mut self) {
+        let active = self.active_id.clone();
+        let protected: Vec<String> = self
+            .nodes
+            .iter()
+            .filter_map(|n| {
+                let is_active = active.as_deref() == Some(n.id.as_str());
+                let healthy = n.healthy == Some(true);
+                (is_active || healthy).then(|| n.id.clone())
+            })
+            .collect();
+        // Order: protected first (active first), then the newest remaining nodes.
+        let mut ordered: Vec<V2RayNode> = Vec::with_capacity(MAX_NODES);
+        for id in &protected {
+            if let Some(pos) = self.nodes.iter().position(|n| &n.id == id) {
+                ordered.push(self.nodes.remove(pos));
+            }
+        }
+        if ordered.len() >= MAX_NODES {
+            ordered.truncate(MAX_NODES);
+            self.nodes = ordered;
+            return;
+        }
+        // Fill the remaining slots with the newest non-protected nodes.
+        let fill = MAX_NODES - ordered.len();
+        let mut rest: Vec<V2RayNode> = std::mem::take(&mut self.nodes);
+        rest.truncate(fill);
+        ordered.extend(rest);
+        self.nodes = ordered;
     }
 }
 
@@ -870,5 +899,71 @@ mod tests {
             .find(|x| x.url.contains("9.9.9.9"))
             .unwrap();
         assert_eq!(n.published_epoch, None);
+    }
+
+    fn node(id: &str, healthy: Option<bool>) -> V2RayNode {
+        V2RayNode {
+            id: id.to_string(),
+            alias: id.to_string(),
+            url: format!("vless://{}@1.2.3.4:443?type=tcp#{id}", "a".repeat(36)),
+            source_index: None,
+            source: "telegram".to_string(),
+            added_epoch: 0.0,
+            published_epoch: None,
+            last_checked_epoch: None,
+            healthy,
+        }
+    }
+
+    #[test]
+    fn retain_capacity_keeps_active_and_healthy() {
+        let mut s = NodeStore::default();
+        s.nodes = vec![
+            node("dead1", Some(false)),
+            node("dead2", Some(false)),
+            node("healthy", Some(true)),
+            node("active", None),
+            node("dead3", Some(false)),
+            node("unprobed", None),
+        ];
+        // active + healthy must be kept; the rest pruned newest-first down to
+        // the fill budget (simulate a store at capacity).
+        s.active_id = Some("active".to_string());
+        // Fill the store well past MAX_NODES to force truncation.
+        s.nodes = Vec::new();
+        s.nodes.push(node("active", Some(true)));
+        s.nodes.push(node("healthy", Some(true)));
+        for i in 0..1200 {
+            s.nodes.push(node(&format!("n{i:04}"), Some(false)));
+        }
+        s.nodes.push(node("active", Some(false))); // dup id — should not matter
+        s.active_id = Some("active".to_string());
+        s.retain_capacity();
+        assert_eq!(s.nodes.len(), MAX_NODES);
+        // protected pair is present
+        assert!(s.nodes.iter().any(|n| n.id == "active"));
+        assert!(s.nodes.iter().any(|n| n.id == "healthy"));
+    }
+
+    #[test]
+    fn upsert_never_evicts_verified_healthy_or_active() {
+        let (profile, _d) = tmp_profile();
+        let mut store = load_node_store(&profile);
+        // Establish an active, verified-healthy anchor.
+        store.nodes.push(node("anchor", Some(true)));
+        store.set_active("anchor");
+        save_node_store(&profile, &store);
+
+        // Bulk-import 510 fresh nodes (past MAX_NODES).
+        for i in 0..510 {
+            let uuid = format!("00000000-0000-0000-0000-{i:012}");
+            let link = format!("vless://{uuid}@10.0.0.{ip}:443?type=tcp#t{i}", ip = i % 250);
+            import_single_link(&profile, &link).unwrap();
+        }
+        let final_store = load_node_store(&profile);
+        assert_eq!(final_store.nodes.len(), MAX_NODES);
+        // The anchor must still be present and active.
+        assert!(final_store.nodes.iter().any(|n| n.id == "anchor"));
+        assert_eq!(final_store.active_id.as_deref(), Some("anchor"));
     }
 }
