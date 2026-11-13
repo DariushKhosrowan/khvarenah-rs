@@ -1600,6 +1600,30 @@ async fn run_self_maintenance(
         );
     }
 
+    // 8c. Level-4 mesh host (doctrine §3/§8.3). When we have a live uplink,
+    // offer ourselves as a relay hop to peers on the LAN: keep the mesh relay
+    // data-plane listener alive and advertise our beacon with
+    // `has_uplink=true`. The host is a process-singleton background actor
+    // (relay + beacon threads); this step just keeps it started and syncs
+    // its advertised uplink state with the daemon's current reality. It runs
+    // whenever the network is up (and keeps answering echo probes while down,
+    // via the host's own fallback). Idempotent + cheap — no rate-limit
+    // needed since `ensure_started` is a no-op after first spawn and
+    // `set_uplink` is an atomic store.
+    {
+        let host = crate::mesh_host::MeshHost::global();
+        host.set_uplink(net_up);
+        let peer_id = std::env::var("HOSTNAME").unwrap_or_else(|_| format!("dyb-{profile}"));
+        host.ensure_started(&peer_id, &format!("dyb-{profile}"));
+        if net_up && !host.is_started() {
+            // first tick with net up: log that we are now offering ourselves
+            log(&log_line(
+                "INFO",
+                "mesh host: offering relay hop on the LAN (level-4 mesh)",
+            ));
+        }
+    }
+
     // 9. Signed OOB relay-manifest ingestion. The signed egress-anchor feed is
     // an independent, cryptographically-verified bootstrap channel (doctrine
     // §5/§8.1): if the operator publishes a signed relay manifest (e.g. a seed

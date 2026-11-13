@@ -86,6 +86,7 @@ pub mod lan_mesh;
 pub mod ledger_guard;
 pub mod liveness_sentinel;
 pub mod manifest;
+pub mod mesh_host;
 pub mod mesh_relay;
 pub mod multi_worker;
 pub mod multilayer;
