@@ -135,8 +135,11 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   Done: Telegram **systematic graph discovery** (`harvest --discover` now
   crawls cross-referenced channels from yielding seeds and probes them, so the
   net self-expands beyond hardcoded seeds), **CT-log anchors**, and their
-  **daemon wire-in as a reseed source**. Remaining: authoritative nameserver
-  anchors fed into the pool.
+  **daemon wire-in as a reseed source**. Done: **authoritative nameserver
+  anchors** (`ns_anchors.rs`) are now fed into the pool as a second
+  out-of-band reseed source — `reseed_from_ns_anchors` synthesizes
+  VLESS-over-TLS candidates tagged `ns-anchor` and the probe pass verifies real
+  TLS before any enter the healthy set (`node_refill.rs` source 4).
 - ✅ **Periodic config-health decay** — piggyback node re-probe on the daemon's
   ladder so the store always prunes to verified-live configs
   (`node_probe::probe_stale` + hourly daemon sweep).

@@ -508,6 +508,9 @@ pub const SOURCE_PASTED: &str = "pasted";
 /// Node provenance for configs recovered from verified CT-log egress anchors
 /// (doctrine §8.1) — the out-of-band reseed source.
 pub const SOURCE_CT_ANCHOR: &str = "ct-anchor";
+/// Node provenance for configs recovered from verified authoritative-nameserver
+/// anchors (doctrine §8.1) — a second independent out-of-band reseed source.
+pub const SOURCE_NS_ANCHOR: &str = "ns-anchor";
 
 /// Paste a single share-link into the profile's node store. Any supported
 /// scheme is accepted (vless, vmess, trojan, ss, ssr, hysteria2, tuic).

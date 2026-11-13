@@ -296,11 +296,14 @@ mission: a flawless, self-healing circumvention client.
   depth, CT logs, DNS-visible authoritative nameservers) so bootstrapping can
   never go circular. Done: Telegram systematic graph discovery
   (`harvest --discover`), **CT-log anchor discovery** (`anchors discover`,
-  `ct_anchors.rs`), and **daemon wire-in of the CT anchor set as a reseed
+  `ct_anchors.rs`), **daemon wire-in of the CT anchor set as a reseed
   source** (`anchors reseed` / refill source 3: verified CT anchors are
   turned into candidate VLESS-over-TLS nodes, imported tagged `ct-anchor`,
-  then probe-verified so only genuinely-live nodes enter the healthy pool).
-  Remaining: authoritative nameserver anchors.
+  then probe-verified so only genuinely-live nodes enter the healthy pool),
+  and **daemon wire-in of authoritative nameserver anchors as a second reseed
+  source** (`ns_anchors.rs` / refill source 4: verified NS anchor IPs are
+  turned into candidate VLESS-over-TLS nodes, imported tagged `ns-anchor`,
+  then probe-verified).
 - **Periodic config-health decay** — piggyback node re-probe on the daemon's
   ladder so the store is always pruned to *verified-live* configs.
 

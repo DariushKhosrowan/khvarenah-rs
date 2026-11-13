@@ -1495,10 +1495,12 @@ async fn run_self_maintenance(
             log(&log_line(
                 "INFO",
                 &format!(
-                    "node refill: {reason} → telegram +{} ch (added {}), github +{} nodes, probed {} ({} healthy)",
+                    "node refill: {reason} → telegram +{} ch (added {}), github +{} nodes, ct-anchor +{}, ns-anchor +{}, probed {} ({} healthy)",
                     report.telegram_channels,
                     report.telegram_added,
                     report.github_added,
+                    report.ct_reseed_added,
+                    report.ns_reseed_added,
                     report.probed,
                     report.healthy
                 ),
@@ -1507,9 +1509,11 @@ async fn run_self_maintenance(
                 profile,
                 crate::journal::JournalKind::NodeRefill,
                 &format!(
-                    "reason={reason} tg_added={} gh_added={} probed={} healthy={} promoted={:?}",
+                    "reason={reason} tg_added={} gh_added={} ct_added={} ns_added={} probed={} healthy={} promoted={:?}",
                     report.telegram_added,
                     report.github_added,
+                    report.ct_reseed_added,
+                    report.ns_reseed_added,
                     report.probed,
                     report.healthy,
                     report.promoted

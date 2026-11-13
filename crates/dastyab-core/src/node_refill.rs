@@ -95,6 +95,9 @@ pub struct RefillReport {
     /// New nodes added to the store from verified CT-log egress anchors
     /// (doctrine §8.1 out-of-band reseed source).
     pub ct_reseed_added: usize,
+    /// New nodes added from verified authoritative-nameserver anchors (doctrine
+    /// §8.1) — the second independent out-of-band reseed source.
+    pub ns_reseed_added: usize,
     /// Total nodes probed after harvest.
     pub probed: usize,
     /// Nodes that passed the live probe.
@@ -183,6 +186,15 @@ pub async fn run_refill_depth(profile: &str, use_proxy: bool, depth: usize) -> R
     // of them enters the healthy set (no fabricated success).
     report.ct_reseed_added = reseed_from_ct_anchors(profile, use_proxy);
 
+    // --- Source 4: verified authoritative-nameserver anchors (doctrine §8.1) ---
+    // A second independent out-of-band bootstrap feed (beyond CT logs): the
+    // root-servers.org / zone-NS discovery in ns_anchors.rs yields verified
+    // authoritative server IPs. We synthesize VLESS-over-TLS candidates on the
+    // same common proxy ports and import them tagged `ns-anchor`. As with CT
+    // anchors, nothing is marked healthy here — the probe pass below requires a
+    // real TLS handshake before a node may enter the healthy set.
+    report.ns_reseed_added = reseed_from_ns_anchors(profile);
+
     // --- Probe everything, then fail over to a working node ---
     let healed = crate::node_probe::selfheal(profile, use_proxy);
     report.probed = healed.probed;
@@ -228,6 +240,44 @@ pub fn reseed_from_ct_anchors(profile: &str, _use_proxy: bool) -> usize {
                 "vless://{uuid}@{host}:{port}?security=tls&encryption=none&type=tcp&headerType=none#{alias}"
             );
             if let Ok(sum) = import_single_link_source(profile, &link, SOURCE_CT_ANCHOR) {
+                added += sum.added;
+            }
+        }
+    }
+    added
+}
+
+/// Reseed the node pool from verified authoritative-nameserver anchors (doctrine
+/// §8.1 — the second independent out-of-band bootstrap feed, alongside CT logs).
+///
+/// Each verified NS anchor is an authoritative server IP (e.g. a root server or
+/// a high-value zone's NS). We synthesize VLESS-over-TLS share-links on the
+/// common proxy ports and import them tagged `ns-anchor`. As with CT anchors,
+/// nodes are *not* marked healthy here — the caller's probe pass (`selfheal`)
+/// verifies a real TLS handshake end-to-end before anything enters the healthy
+/// set (doctrine §6.4: no fabricated success). Returns new nodes added.
+pub fn reseed_from_ns_anchors(profile: &str) -> usize {
+    use crate::config_store::{import_single_link_source, SOURCE_NS_ANCHOR};
+    let store = crate::ns_anchors::load_anchors(profile);
+    if store.anchors.is_empty() {
+        return 0;
+    }
+    let mut added = 0usize;
+    for a in &store.anchors {
+        let ip = a.ip.trim();
+        if ip.is_empty() {
+            continue;
+        }
+        for &port in CT_ANCHOR_PROBE_PORTS {
+            if port == 0 {
+                continue;
+            }
+            let uuid = crate::worker::generate_uuid();
+            let alias = format!("ns-{ip}:{port}");
+            let link = format!(
+                "vless://{uuid}@{ip}:{port}?security=tls&encryption=none&type=tcp&headerType=none#{alias}"
+            );
+            if let Ok(sum) = import_single_link_source(profile, &link, SOURCE_NS_ANCHOR) {
                 added += sum.added;
             }
         }
@@ -328,6 +378,51 @@ mod tests {
         assert_eq!(ct.len(), 7);
         // None marked healthy yet (probe decides, not synthesizing).
         assert!(ct.iter().all(|n| n.healthy.is_none()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ns_reseed_synthesizes_anchors_into_pool() {
+        // Parallel to the CT-anchor reseed: a profile with a verified NS-anchor
+        // store synthesizes candidate VLESS-over-TLS links tagged source="ns-anchor",
+        // imported but not marked healthy (probe verifies later). Hermetic:
+        // registered unique profile, removed on teardown.
+        let profile = format!("test_ns_reseed_{}", std::process::id());
+        let dir = crate::store::profiles_dir().join(&profile);
+        let _ = std::fs::create_dir_all(&dir);
+        let meta = crate::store::profiles::ProfileMeta {
+            id: profile.clone(),
+            name: profile.clone(),
+            created_at: crate::store::now_iso(),
+            description: "test".into(),
+        };
+        crate::store::write_json(&dir.join("profile.json"), &meta).unwrap();
+        let store = crate::ns_anchors::NsAnchorStore {
+            anchors: vec![crate::ns_anchors::NsAnchor {
+                ip: "198.41.0.4".into(),
+                via: "google.com".into(),
+                verified_epoch: now_ts(),
+                ms: 100,
+            }],
+        };
+        let path = crate::ns_anchors::anchors_path_pub(&profile);
+        let _ = std::fs::create_dir_all(path.parent().expect("anchor path has a parent directory"));
+        crate::store::atomic_write(&path, &serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+
+        let added = reseed_from_ns_anchors(&profile);
+        // 1 anchor × 7 ports = 7 candidate links.
+        assert!(added >= 7, "expected ≥7 embedded nodes, got {added}");
+
+        let pool = load_node_store(&profile);
+        let ns: Vec<_> = pool
+            .nodes
+            .iter()
+            .filter(|n| n.source == crate::config_store::SOURCE_NS_ANCHOR)
+            .collect();
+        assert_eq!(ns.len(), 7);
+        // None marked healthy yet (probe decides, not synthesizing).
+        assert!(ns.iter().all(|n| n.healthy.is_none()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
