@@ -176,6 +176,10 @@ pub struct DaemonState {
     /// `ANCHOR_REFRESH_INTERVAL_SECS` (doctrine §6.5: rate-limit expensive).
     #[serde(default)]
     pub last_anchors_refresh_ts: i64,
+    /// Last epoch-seconds the authoritative-nameserver anchor set was refreshed
+    /// + pruned (doctrine §8.1). Mirrors the CT-anchor rotation cadence.
+    #[serde(default)]
+    pub last_ns_anchors_refresh_ts: i64,
     /// Last epoch-seconds the signed OOB relay-manifest feed was ingested.
     /// Rate-limits the signed-egress-anchor pull (doctrine §6.5).
     #[serde(default)]
@@ -215,6 +219,7 @@ impl Default for DaemonState {
             last_discovery_ts: 0,
             last_node_decay_ts: 0,
             last_anchors_refresh_ts: 0,
+            last_ns_anchors_refresh_ts: 0,
             last_oob_pull_ts: 0,
         }
     }
@@ -1554,6 +1559,44 @@ async fn run_self_maintenance(
             profile,
             crate::journal::JournalKind::AnchorsRefreshed,
             &format!("added={added} pruned={pruned} total={total}"),
+        );
+    }
+
+    // 8b. Authoritative-nameserver anchor rotation (doctrine §8.1). This is a
+    // second independent out-of-band bootstrap feed: the DNS control plane
+    // itself. Root-server seeds are probed, high-value zones are queried for
+    // their NS records, and verified-live authoritative IPs are kept. Running
+    // it in the daemon means the NS-anchor set (which the runtime can consult
+    // as a non-circular reseed/tunnel-hop source) is maintained autonomously.
+    // Fully async (UDP raw exchange) so it is awaited directly. Rate-limited.
+    if net_up
+        && now - state.last_ns_anchors_refresh_ts
+            >= crate::ns_anchors::NS_ANCHOR_REFRESH_INTERVAL_SECS
+    {
+        state.last_ns_anchors_refresh_ts = now;
+        const NS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+        let resolvers: Vec<String> = crate::resolve_pool::IRANIAN_RESOLVER_CANDIDATES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (added, pruned) = crate::ns_anchors::refresh_ns_anchors(
+            profile,
+            &resolvers,
+            crate::ns_anchors::DEFAULT_ZONES,
+            NS_TIMEOUT,
+        )
+        .await;
+        let total = crate::ns_anchors::anchor_ips(profile).len();
+        log(&log_line(
+            "INFO",
+            &format!(
+                "ns anchors: refreshed (+{added} new, pruned {pruned} dead, {total} verified-live)"
+            ),
+        ));
+        let _ = crate::journal::append(
+            profile,
+            crate::journal::JournalKind::AnchorsRefreshed,
+            &format!("ns added={added} pruned={pruned} total={total}"),
         );
     }
 

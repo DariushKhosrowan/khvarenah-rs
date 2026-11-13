@@ -80,6 +80,10 @@ const MAX_ANCHORS: usize = 200;
 /// re-probed (and dropped if they no longer answer).
 pub const MAX_ANCHOR_AGE_SECS: f64 = 30.0 * 24.0 * 3600.0;
 
+/// Cadence for the daemon's autonomous NS-anchor refresh (mirrors the CT-anchor
+/// rotation at the same rate so both out-of-band bootstrap feeds stay verified).
+pub const NS_ANCHOR_REFRESH_INTERVAL_SECS: i64 = 6 * 3600;
+
 /// A single verified authoritative-nameserver anchor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NsAnchor {
