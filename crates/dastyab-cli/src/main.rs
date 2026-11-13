@@ -27,6 +27,10 @@ struct Cli {
     #[arg(long, global = true)]
     no_stealth: bool,
 
+    /// UI language: en | fa (default: en, or $DASTYAB_LANG).
+    #[arg(long, global = true)]
+    lang: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -1474,7 +1478,13 @@ async fn main() {
         dastyab_core::stealth::set_enabled(false);
     }
 
-    if let Err(e) = commands::run(cli.profile, cli.command).await {
+    if let Err(e) = commands::run(
+        cli.profile,
+        dastyab_core::i18n::resolve_lang(cli.lang.as_deref()),
+        cli.command,
+    )
+    .await
+    {
         eprintln!("\u{1b}[31m✗ {}\u{1b}[0m", e.explain());
         std::process::exit(1);
     }

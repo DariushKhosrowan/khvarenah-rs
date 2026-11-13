@@ -86,6 +86,9 @@ def is_running():
 def start(server_index=0):
     if is_running():
         print(f"[aistudio] Tunnel already running on 127.0.0.1:{SOCK}")
+        # Still honor the user's intent: they asked to open AI Studio.
+        print(f"[aistudio] Opening AI Studio through the existing tunnel...")
+        launch_browser()
         return False, None
     pool = json.load(open(POOL))
     if not pool:

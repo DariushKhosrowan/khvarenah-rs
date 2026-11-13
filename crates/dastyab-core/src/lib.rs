@@ -79,6 +79,7 @@ pub mod gh_sources;
 pub mod harvest;
 pub mod health;
 pub mod health_beacon;
+pub mod i18n;
 pub mod interface_monitor;
 pub mod inventory;
 pub mod journal;

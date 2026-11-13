@@ -20,17 +20,22 @@ use crate::{
 };
 use dastyab_core::remote_beacon::BeaconConfig;
 /// Run a command. `profile` is the active profile id.
-pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
+pub async fn run(
+    profile: String,
+    lang: dastyab_core::i18n::Lang,
+    cmd: Command,
+) -> Result<(), CFError> {
+    let i18n = dastyab_core::i18n::I18n::new(lang);
     match cmd {
         Command::Profiles => cmd_profiles(),
         Command::ProfileCreate { name, description } => {
             let id = create_profile(&name, &description)?;
-            println!("Created profile '{name}' (id: {id})");
+            println!("{} '{name}' (id: {id})", i18n.t("profile.created"));
             Ok(())
         }
         Command::ProfileDelete { id } => {
             delete_profile(&id)?;
-            println!("Deleted profile '{id}'");
+            println!("{} '{id}'", i18n.t("profile.deleted"));
             Ok(())
         }
         Command::ProfileRename { id, name } => {
@@ -606,12 +611,33 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
                     |_| None,
                     &chain_mixer::ProcessLauncher,
                     &|port| {
+                        // Cold-start engines (tor, etc.) can take 20-40s to
+                        // reach a usable SocksPort. Readiness must be patient
+                        // or the supervisor always abandons them during a
+                        // blackout before they can ever verify.
                         Box::pin(chain_mixer::wait_port_open(
                             port,
-                            std::time::Duration::from_secs(8),
+                            std::time::Duration::from_secs(60),
                         ))
                     },
-                    &|port| Box::pin(chain_mixer::chain_egress_ok(port)),
+                    &|port| {
+                        // Patient egress probe: cold-start engines (tor etc.)
+                        // can take 20-40s to route; re-probe over a grace
+                        // window instead of giving up after one check.
+                        Box::pin(async move {
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(90);
+                            loop {
+                                if chain_mixer::chain_egress_ok(port).await {
+                                    return true;
+                                }
+                                if std::time::Instant::now() >= deadline {
+                                    return false;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            }
+                        })
+                    },
                     8,
                 ));
                 println!("[chain] supervised over {} attempt(s)", sup.attempts);
@@ -4044,8 +4070,6 @@ fn cmd_aistudio(action: &str) -> Result<(), CFError> {
 
 /// Execute the doctrine A+D platform network rules (anti-loop fwmark
 /// routing + TCP MSS clamp). Supports:
-///   dastyab platform apply      -- install rules (needs root)
-///   dastyab platform teardown   -- remove rules we installed
 ///   dastyab platform plan       -- just print what would run (dry-run)
 /// Pass `--dry-run` to preview any action without touching the system.
 fn cmd_platform(action: &str, dry_run: bool, mtu: u32) -> Result<(), CFError> {
