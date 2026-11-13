@@ -192,9 +192,210 @@ pub fn render_chain(planned: &PlannedChain) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Runtime: execute a planned chain.
+//
+// The planner (above) turns the user's ordered engine list into a concrete,
+// port-assigned pipeline. This runtime actually *runs* it: it spawns each
+// layer, waits for its loopback SOCKS5 port to open, wires upstreams, and —
+// only once every layer is up — runs the decisive end-to-end egress probe
+// through the client-facing (outermost) port.
+//
+// Degrade semantics (doctrine §3, §5 — never stop, never circular): a layer
+// whose engine the launcher cannot satisfy (binary missing) or that fails to
+// open its port within the budget is *skipped*, not fatal. The chain still
+// runs with the remaining layers; the report records the skip so the caller
+// can surface it. Only a chain where no layer comes up is reported as down.
+// ---------------------------------------------------------------------------
+
+/// Per-layer runtime status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LayerStatus {
+    /// Engine satisfied and port opened; ready to pass traffic.
+    Up,
+    /// Engine could not be satisfied (binary missing / launcher error).
+    Skipped,
+    /// Engine launched but its port did not open in time.
+    FailedToStart,
+    /// The layer was not attempted because a required upstream never came up
+    /// (a chain can't hand off to a dead layer).
+    Deferred,
+}
+
+/// Result of executing one layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerRun {
+    pub engine: Engine,
+    pub port: u16,
+    pub status: LayerStatus,
+    /// Human-readable reason when not `Up`.
+    pub note: Option<String>,
+}
+
+/// Full result of running a chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChainRunReport {
+    pub layers: Vec<LayerRun>,
+    /// Whether the whole chain carried real end-to-end egress.
+    pub egress_ok: bool,
+    /// Port of the client-facing (outermost) layer when at least one layer is
+    /// up; the app routes into it. `None` if every layer failed.
+    pub egress_port: Option<u16>,
+    /// Number of layers skipped/def-erred (degrading).
+    pub degraded: usize,
+}
+
+/// Seam for launching an external transport engine. Production uses
+/// `ProcessLauncher`; tests inject a fake so no real VPN binary is required.
+pub trait EngineLauncher: Send + Sync {
+    /// Start `engine` listening on loopback `port`, forwarding chain the
+    /// optional `upstream` (`socks5h://127.0.0.1:<prev>`). Return `Ok(())`
+    /// once the process is spawned and its SOCKS5 port accepts TCP connects.
+    /// Return `Err` if the engine cannot be started at all (e.g. missing
+    /// binary) — the runtime treats that as a skip.
+    fn launch(&self, engine: Engine, port: u16, upstream: Option<&str>) -> Result<(), String>;
+}
+
+/// A launcher that spawns real processes. Uses each engine's `binary_hint`
+/// with argument conventions for ` --socks5 <port>` and `--upstream <url>`.
+/// This is the production path; the *verification* of a chain (port open +
+/// egress) is identical to the injectable launcher, so tests exercise the
+/// same runtime logic.
+pub struct ProcessLauncher;
+
+impl EngineLauncher for ProcessLauncher {
+    fn launch(&self, engine: Engine, port: u16, upstream: Option<&str>) -> Result<(), String> {
+        let Some(bin) = engine.binary_hint() else {
+            // In-process stack (DastYab) is handled by the caller; the
+            // runner treats it as satisfied without spawning an external proc.
+            return Ok(());
+        };
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("--socks5").arg(port.to_string());
+        if let Some(up) = upstream {
+            cmd.arg("--upstream").arg(up);
+        }
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // `spawn` errors (binary not found) → Err → skip.
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("spawn {bin}: {e}"))
+    }
+}
+
+/// Probe a SOCKS5 port for real end-to-end egress (mirrors the lifeline's
+/// decisive check). Returns true only when a real outside server answers.
+pub async fn chain_egress_ok(port: u16) -> bool {
+    let Ok(proxy) = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}")) else {
+        return false;
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .proxy(proxy)
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get("https://www.gstatic.com/generate_204")
+        .send()
+        .await
+        .is_ok()
+}
+
+/// Wait (up to `timeout`) for `port` to accept TCP connects on loopback.
+pub async fn wait_port_open(port: u16, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Execute a planned chain. Each layer is spawned via `launcher` in order
+/// (client-facing first). A layer that can't start or whose port isn't
+/// reported ready (via `port_ready`) is skipped; its downstream layers are
+/// deferred (a chain can't hand off to a dead layer). Finally, the
+/// client-facing port is egress-probed.
+///
+/// `port_ready` is injectable so tests can deterministically simulate port
+/// states without binding real sockets. Production passes `wait_port_open`.
+pub async fn run_chain<L: EngineLauncher, P: Fn(u16) -> bool>(
+    plan: &PlannedChain,
+    launcher: &L,
+    port_ready: P,
+) -> ChainRunReport {
+    let mut runs: Vec<LayerRun> = Vec::with_capacity(plan.layers.len());
+    let mut degraded = 0usize;
+    // Whether the previous (upstream) layer came up; the next layer hands
+    // into it, so a dead upstream defers everything below it.
+    let mut previous_up = true;
+
+    for layer in &plan.layers {
+        let needed = previous_up;
+        let status;
+        let note;
+        if !needed {
+            status = LayerStatus::Deferred;
+            note = Some("upstream layer not up; deferred".to_string());
+            degraded += 1;
+        } else {
+            match launcher.launch(layer.engine, layer.port, layer.upstream.as_deref()) {
+                Ok(()) => {
+                    if port_ready(layer.port) {
+                        status = LayerStatus::Up;
+                        note = None;
+                    } else {
+                        status = LayerStatus::FailedToStart;
+                        note = Some("port did not open in time".to_string());
+                        degraded += 1;
+                    }
+                }
+                Err(e) => {
+                    status = LayerStatus::Skipped;
+                    note = Some(format!("launcher: {e}"));
+                    degraded += 1;
+                }
+            }
+        }
+        previous_up = status == LayerStatus::Up;
+        runs.push(LayerRun {
+            engine: layer.engine,
+            port: layer.port,
+            status,
+            note,
+        });
+    }
+
+    // Only probe egress if at least one layer came up.
+    let egress_port = runs
+        .iter()
+        .find(|r| r.status == LayerStatus::Up)
+        .map(|r| r.port);
+    let egress_ok = match egress_port {
+        Some(p) => chain_egress_ok(p).await,
+        None => false,
+    };
+
+    ChainRunReport {
+        layers: runs,
+        egress_ok,
+        egress_port,
+        degraded,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn pop_chain(engines: Vec<Engine>) -> ChainConfig {
         ChainConfig { engines }
@@ -245,5 +446,98 @@ mod tests {
         assert_eq!(Engine::V2rayN.binary_hint(), Some("xray"));
         assert_eq!(Engine::Psiphon.binary_hint(), Some("psiphon-tunnel-core"));
         assert_eq!(Engine::DastYab.binary_hint(), None);
+    }
+
+    // ---- Runtime tests (injectable launcher; no real VPN binaries) ----
+
+    // Launchers never touch real sockets: a launcher that returns Err models
+    // a missing binary (→ Skipped); one that returns Ok models a launchable
+    // engine. Port readiness is injected separately as `port_ready`, so tests
+    // are fully deterministic and can't contaminate each other.
+    struct ErrLauncher; // returns Err -> Skipped
+    struct OkLauncher; // returns Ok -> port_ready decides Up vs FailedToStart
+
+    impl EngineLauncher for OkLauncher {
+        fn launch(
+            &self,
+            _engine: Engine,
+            _port: u16,
+            _upstream: Option<&str>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl EngineLauncher for ErrLauncher {
+        fn launch(
+            &self,
+            engine: Engine,
+            _port: u16,
+            _upstream: Option<&str>,
+        ) -> Result<(), String> {
+            Err(format!("missing binary for {}", engine.label()))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_chain_all_up_egress_not_faked() {
+        let cfg = pop_chain(vec![Engine::V2rayN, Engine::Tor]);
+        let planned = plan_chain(&cfg, |_| Some("/usr/bin/x".into())).unwrap();
+        let report = run_chain(&planned, &OkLauncher, |_| true).await;
+        assert_eq!(report.layers.len(), 2);
+        assert!(report.layers.iter().all(|l| l.status == LayerStatus::Up));
+        assert_eq!(report.degraded, 0);
+        // egress probe against a port with no real server → false (no
+        // fabricated success), but the layers are all Up.
+        assert!(!report.egress_ok);
+        assert_eq!(report.egress_port, Some(planned.egress_port));
+    }
+
+    #[tokio::test]
+    async fn run_chain_skips_missing_binary() {
+        let cfg = pop_chain(vec![Engine::V2rayN, Engine::Tor]);
+        let planned = plan_chain(&cfg, |_| Some("/usr/bin/x".into())).unwrap();
+        let report = run_chain(&planned, &ErrLauncher, |_| true).await;
+        // First layer can't start → skipped; downstream sees dead upstream →
+        // deferred. Both are degradation, none up, no egress.
+        assert_eq!(report.layers[0].status, LayerStatus::Skipped);
+        assert_eq!(report.layers[1].status, LayerStatus::Deferred);
+        assert_eq!(report.degraded, 2);
+        assert_eq!(report.egress_port, None);
+        assert!(!report.egress_ok);
+    }
+
+    #[tokio::test]
+    async fn run_chain_port_never_opens_is_failedtostart() {
+        let cfg = pop_chain(vec![Engine::V2rayN]);
+        let planned = plan_chain(&cfg, |_| Some("/usr/bin/x".into())).unwrap();
+        let report = run_chain(&planned, &OkLauncher, |_| false).await;
+        assert_eq!(report.layers[0].status, LayerStatus::FailedToStart);
+        assert_eq!(report.degraded, 1);
+        assert_eq!(report.egress_port, None);
+    }
+
+    #[tokio::test]
+    async fn wait_port_open_detects_real_listener() {
+        // Real network: a genuine listener must be detected; a closed port
+        // must drain the small timeout. No fakes.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(wait_port_open(port, Duration::from_secs(2)).await);
+        drop(listener); // close it
+        assert!(!wait_port_open(port, Duration::from_millis(300)).await);
+    }
+
+    #[tokio::test]
+    async fn run_chain_defers_downstream_when_egress_fails() {
+        // First layer fails to start; the second must be Deferred (its
+        // upstream is dead), not attempted.
+        let cfg = pop_chain(vec![Engine::Tor, Engine::V2rayN]);
+        let planned = plan_chain(&cfg, |_| Some("/usr/bin/x".into())).unwrap();
+        let report = run_chain(&planned, &OkLauncher, |port| port != planned.layers[0].port).await;
+        assert_eq!(report.layers[0].status, LayerStatus::FailedToStart);
+        assert_eq!(report.layers[1].status, LayerStatus::Deferred);
+        assert_eq!(report.degraded, 2);
+        assert_eq!(report.egress_port, None);
     }
 }

@@ -289,7 +289,16 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
         })
         .await
         .map_err(|e| CFError::new("subscribe", "spawn_blocking", e.to_string()))?,
-        Command::Chain { action, chain } => cmd_chain(&action, &chain),
+        Command::Chain { action, chain } => {
+            // `chain run` spawns real transport processes and blocks on port
+            // waits / egress probes, which needs its own runtime; route the
+            // whole handler onto a blocking thread (mirrors Anchors).
+            let action = action.clone();
+            let chain = chain.clone();
+            tokio::task::spawn_blocking(move || cmd_chain(&action, &chain))
+                .await
+                .map_err(|e| CFError::new("chain", "spawn_blocking", e.to_string()))?
+        }
     }
 }
 
@@ -555,7 +564,7 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
             }
             Ok(())
         }
-        "plan" | "check" => {
+        "plan" | "check" | "run" => {
             let mut engines = Vec::new();
             for part in chain.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 let e = match part {
@@ -581,11 +590,53 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
                 println!("[chain] planned pipeline (client ↑ → egress ↓):");
                 print!("{}", chain_mixer::render_chain(&planned));
                 println!("[chain] egress_port={}", planned.egress_port);
-            } else {
+            } else if action == "check" {
                 println!(
                     "[chain] valid: {} layer(s), egress_port={}",
                     planned.layers.len(),
                     planned.egress_port
+                );
+            } else {
+                // Execute the pipeline for real. Port readiness uses real
+                // port-open waits; egress is probed end-to-end through the
+                // client-facing port (doctrine §6.4: no fabricated success).
+                let report = block_on(chain_mixer::run_chain(
+                    &planned,
+                    &chain_mixer::ProcessLauncher,
+                    |port| {
+                        block_on(chain_mixer::wait_port_open(
+                            port,
+                            std::time::Duration::from_secs(8),
+                        ))
+                    },
+                ));
+                println!("[chain] run report:");
+                for l in &report.layers {
+                    let st = match l.status {
+                        chain_mixer::LayerStatus::Up => "UP",
+                        chain_mixer::LayerStatus::Skipped => "SKIPPED",
+                        chain_mixer::LayerStatus::FailedToStart => "FAILED-TO-START",
+                        chain_mixer::LayerStatus::Deferred => "DEFERRED",
+                    };
+                    println!(
+                        "  {:<10} port={:<6} {}{}",
+                        l.engine.label(),
+                        l.port,
+                        st,
+                        l.note
+                            .as_ref()
+                            .map(|n| format!(" ({n})"))
+                            .unwrap_or_default()
+                    );
+                }
+                println!(
+                    "  degraded={} egress_port={} egress_ok={}",
+                    report.degraded,
+                    report
+                        .egress_port
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    report.egress_ok
                 );
             }
             Ok(())
