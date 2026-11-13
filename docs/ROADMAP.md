@@ -162,6 +162,14 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   protocol (echo probes + data forwarding); `dastyab mesh {serve|forward}` host
   the relay over a real egress and fetch URLs through a verified hop (echo RTT
   gating). Verified live end-to-end in the CLI, commit below.
+- ✅ **Level-4 wired into the resilience ladder** — `Tier::MeshRelay` (rank 4,
+  label `mesh-relay`) is now the final rung of `TIER_ORDER`. `probe_mesh_relay`
+  runs a 2s LAN neighbor sweep off the tokio executor, picks `best_relay`
+  (prefers live uplink + low RTT) and echo-probes the relay port. Wired into both
+  `RealLadderProbe` / `OwnedLadderProbe` and `drill_all_tiers`, so the daemon
+  auto-descends into mesh when all higher tiers fail, and `dastyab drill`
+  reports all five rungs live (`3/5` in production: direct/doh/dot up,
+  dns-tunnel unconfigured, mesh sees a peer but no live uplink).
 - ✅ **Multi-worker management** — list/delete/update workers from one place.
   `dastyab multi-worker {status|deploy|failover|set-active|delete}`. The
   `delete` action removes the remote CF script via the API, drops it from the
