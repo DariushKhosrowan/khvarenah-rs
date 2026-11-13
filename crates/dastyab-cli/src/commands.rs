@@ -387,6 +387,27 @@ fn cmd_anchors(profile: &str, action: &str, proxy: bool, queries_csv: &str) -> R
             println!("[anchors] pruned {dropped} stale anchors; {total} verified-live remain");
             Ok(())
         }
+        "reseed" => {
+            // Consume the verified CT-anchor set as a node-pool reseed source
+            // (doctrine §8.1). Synthesized VLESS-over-TLS candidates are
+            // imported tagged "ct-anchor"; they are *not* marked healthy here —
+            // probe them afterwards so only genuinely-live nodes enter the
+            // healthy set (no fabricated success).
+            let added = dastyab_core::node_refill::reseed_from_ct_anchors(profile, proxy);
+            println!(
+                "[anchors] reseed: imported {added} CT-anchor candidate node(s) into pool (probe to verify)"
+            );
+            if added > 0 {
+                let task = dastyab_core::node_probe::probe_all(profile, proxy);
+                let alive = task.iter().filter(|p| p.ok).count();
+                println!(
+                    "[anchors] reseed probe: {}/{} new CT-anchor nodes verified healthy end-to-end",
+                    alive,
+                    task.len()
+                );
+            }
+            Ok(())
+        }
         "ns" => {
             // Authoritative-nameserver anchor discovery (doctrine §8.1): use
             // the DNS control plane itself as an independent, out-of-band
@@ -4693,6 +4714,10 @@ async fn cmd_configs(
             println!(
                 "  github  : {} repo(s) ok, added={}",
                 report.github_repos_ok, report.github_added
+            );
+            println!(
+                "  ct-anchor: added={} (out-of-band reseed)",
+                report.ct_reseed_added
             );
             println!(
                 "  probe   : {} probed, {} healthy",

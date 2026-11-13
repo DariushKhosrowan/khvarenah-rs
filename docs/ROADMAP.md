@@ -132,10 +132,11 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **Deeper autonomous recovery** — seed a rotating, verified egress-anchor set
   from more out-of-band sources (more Telegram channels + archive depth, CT
   logs, authoritative nameservers) so bootstrapping can never go circular.
-  Partial: Telegram **systematic graph discovery** (`harvest --discover` now
+  Done: Telegram **systematic graph discovery** (`harvest --discover` now
   crawls cross-referenced channels from yielding seeds and probes them, so the
-  net self-expands beyond hardcoded seeds). Remaining: CT logs + authoritative
-  nameserver anchors.
+  net self-expands beyond hardcoded seeds), **CT-log anchors**, and their
+  **daemon wire-in as a reseed source**. Remaining: authoritative nameserver
+  anchors fed into the pool.
 - ✅ **Periodic config-health decay** — piggyback node re-probe on the daemon's
   ladder so the store always prunes to verified-live configs
   (`node_probe::probe_stale` + hourly daemon sweep).
@@ -165,6 +166,12 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   blocking thread to avoid the reqwest-blocking-under-tokio panic), prunes
   anchors that no longer complete TLS, and journals each pass. New CLI actions:
   `refresh` and `prune`. Closes the "daemon wire-in" half of §8.1.
+- ✅ **CT-anchor set consumed as a reseed source** — `dastyab anchors reseed`
+  turns verified CT anchors into candidate VLESS-over-TLS nodes (common proxy
+  ports), imports them tagged `ct-anchor`, and probe-verifies them so only
+  genuinely-live nodes enter the healthy pool. Also wired inline into
+  `run_refill_depth` as refill source 3, so the daemon autonomously consumes CT
+  anchors whenever the pool degrades. Closes the "reseed source" half of §8.1.
 - ✅ **Autonomous NS-anchor rotation (daemon wire-in)** — the daemon's
   self-maintenance now also refreshes the authoritative-nameserver anchor set
   (`anchors ns` = root-seed probe + high-value-zone NS discovery + prune) on

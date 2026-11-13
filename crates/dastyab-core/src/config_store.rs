@@ -505,6 +505,9 @@ pub fn export_v2rayn_store(
 pub const SOURCE_TELEGRAM: &str = "telegram";
 pub const SOURCE_GITHUB: &str = "github";
 pub const SOURCE_PASTED: &str = "pasted";
+/// Node provenance for configs recovered from verified CT-log egress anchors
+/// (doctrine §8.1) — the out-of-band reseed source.
+pub const SOURCE_CT_ANCHOR: &str = "ct-anchor";
 
 /// Paste a single share-link into the profile's node store. Any supported
 /// scheme is accepted (vless, vmess, trojan, ss, ssr, hysteria2, tuic).
