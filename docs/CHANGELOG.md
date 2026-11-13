@@ -2,6 +2,24 @@
 
 ## Unreleased — 2026-11-13
 
+### Added (IBLT zero-roundtrip set reconciliation — sync node pools under blackout)
+
+- New `iblt.rs` module: **Invertible Bloom Lookup Table**. Cells carry
+  `(count, key_sum, value_sum)` — 20 bytes each; `insert`/`delete` are
+  XOR-symmetric, and `decode` peels "pure" cells (count ±1) to recover the
+  full `(key, value)` set that was inserted minus deleted. Sized at ~2× the
+  set for clean peeling.
+- Gossip sync can now ask for *exactly what's missing* instead of shipping a
+  full node pool: `manifest_of_urls()` builds an IBLT from a node set, and
+  `missing_from_peer()` subtracts our items from a copy of the peer's manifest
+  and decodes the residue → only the nodes we lack remain.
+- `node_url_fp()` gives a stable 64-bit identity for a node URL, so both sides
+  agree on what an element means without sending URLs up front.
+- CLI: `dastyab gossip manifest --profile <p> --path <file>` writes an IBLT
+  for the profile's node store (500 nodes → 1000 cells / 20KB); `dastyab
+  gossip reconcile --profile <p> --path <peer_manifest>` reads a peer manifest
+  and prints what we lack (URL if known, fingerprint hex otherwise).
+
 ### Added (durable gossip trust ledger — anti-poison memory survives reboots)
 
 - `GossipLedger` is now **persistent**: the per-peer trust table (anti-replay
