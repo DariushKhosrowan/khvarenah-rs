@@ -236,6 +236,8 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
             depth,
             discover,
             save,
+            hops,
+            max_candidates,
             include_saved,
         } => {
             cmd_harvest(
@@ -244,7 +246,11 @@ pub async fn run(profile: String, cmd: Command) -> Result<(), CFError> {
                 proxy,
                 depth,
                 discover,
-                save,
+                DiscoverOpts {
+                    save,
+                    hops,
+                    max_candidates,
+                },
                 include_saved,
             )
             .await
@@ -576,13 +582,25 @@ fn process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// Options controlling the systematic multi-hop Telegram archived-chat
+/// discovery mode (`--discover`) of `cmd_harvest`.
+#[derive(Clone, Copy)]
+struct DiscoverOpts {
+    /// Persist yielding channels to harvest_channels.json (additive merging).
+    save: bool,
+    /// Number of expansion rounds beyond the seed probe (clamped 1..=6).
+    hops: usize,
+    /// Global cap on total candidate channels probed (doctrine §6.5).
+    max_candidates: usize,
+}
+
 async fn cmd_harvest(
     profile: &str,
     channels: &str,
     proxy: bool,
     depth: usize,
     discover: bool,
-    save: bool,
+    d: DiscoverOpts,
     include_saved: bool,
 ) -> Result<(), CFError> {
     use dastyab_core::harvest;
@@ -590,9 +608,11 @@ async fn cmd_harvest(
     // Systematic discovery mode: probe candidates, print live yield, and
     // optionally persist the yielding channels for future refill passes.
     // Discovery is **self-expanding**: after probing the hardcoded seeds, we
-    // crawl the cross-referenced channels on the *yielding* seeds and probe
-    // those too — so the net grows systematically from what actually works,
-    // never hardcoded/circular (doctrine §5).
+    // crawl the cross-referenced channels on the *yielding* seeds for up to
+    // `hops` expansion rounds, probing each round's new finds too — so the
+    // archived-chat net grows systematically from what actually works, never
+    // hardcoded/circular (doctrine §5). The global `max_candidates` budget
+    // bounds the whole walk (doctrine §6.5: never flood the transport).
     if discover {
         let mut candidates: Vec<String> = harvest::DISCOVER_CANDIDATE_CHANNELS
             .iter()
@@ -604,52 +624,82 @@ async fn cmd_harvest(
                 candidates.push(c);
             }
         }
-        println!(
-            "discovering {} candidate channel(s), archive depth {depth}…",
-            candidates.len()
-        );
         let depth = depth.clamp(1, harvest::MAX_ARCHIVE_DEPTH);
-        let yields = harvest::discover_channel_yields(proxy, &candidates, depth, 8).await;
-        let mut winners = Vec::new();
-        for (ch, n) in &yields {
-            if *n > 0 {
-                println!("  {ch}: {n} links");
-                winners.push(ch.clone());
-            }
-        }
-        if winners.is_empty() {
-            println!("no candidate channels yielded links");
-        } else {
-            // Expansion hop: from the yielding seeds, discover the channels
-            // they cross-reference, probe them, and add any new winners.
-            let related =
-                harvest::discover_related_channels(proxy, &winners, &candidates, 6, depth, 8).await;
-            if !related.is_empty() {
-                println!(
-                    "expand: {} related channel(s) discovered from winners…",
-                    related.len()
-                );
-                let ryields = harvest::discover_channel_yields(proxy, &related, depth, 8).await;
-                for (ch, n) in &ryields {
-                    if *n > 0 {
-                        println!("  [related] {ch}: {n} links");
-                        if !winners.contains(ch) {
-                            winners.push(ch.clone());
-                        }
+        let budget = d.max_candidates.max(1);
+        let expansion_rounds = d.hops.clamp(1, 6);
+        let mut winners: Vec<String> = Vec::new();
+        // Track the full candidate set already probed (seeds + additions) so
+        // the global budget bounds the *total* walk, not just the expansion.
+        let mut seen_cands: std::collections::HashSet<String> =
+            candidates.iter().cloned().collect();
+
+        let mut round = 0;
+        loop {
+            println!(
+                "hop {}: discovering {} candidate channel(s), archive depth {depth}…",
+                round + 1,
+                candidates.len()
+            );
+            let yields = harvest::discover_channel_yields(proxy, &candidates, depth, 8).await;
+            let mut round_winners = Vec::new();
+            for (ch, n) in &yields {
+                if *n > 0 {
+                    println!("  {ch}: {n} links");
+                    if !winners.contains(ch) {
+                        winners.push(ch.clone());
+                        round_winners.push(ch.clone());
                     }
                 }
-            } else {
-                println!("expand: no new related channels found");
             }
-            if save {
-                // Additive: never forget a channel that once yielded.
-                let added = harvest::merge_discovered_channels(profile, &winners)?;
-                println!(
-                    "merged {} discovered channel(s) into profile '{profile}' ({} total)",
-                    added,
-                    harvest::load_discovered_channels(profile).channels.len()
-                );
+            if round_winners.is_empty() {
+                break;
             }
+            // Stop expanding once we've done `hops` expansion rounds beyond the
+            // seed probe, or once the global candidate budget is exhausted.
+            if round >= expansion_rounds || seen_cands.len() >= budget {
+                break;
+            }
+            let room = budget.saturating_sub(seen_cands.len());
+            if room == 0 {
+                break;
+            }
+            // Expand from this round's winners, bounded by remaining budget.
+            let mut related =
+                harvest::discover_related_channels(proxy, &round_winners, &candidates, 6, depth, 8)
+                    .await;
+            related.truncate(room);
+            let new_cands: Vec<String> = related
+                .into_iter()
+                .filter(|c| seen_cands.insert(c.clone()))
+                .collect();
+            if new_cands.is_empty() {
+                break;
+            }
+            let prev_cands = candidates.len();
+            for c in &new_cands {
+                if !candidates.contains(c) {
+                    candidates.push(c.clone());
+                }
+            }
+            println!(
+                "expand: {} new related candidate(s) (total {} → {})",
+                new_cands.len(),
+                prev_cands,
+                candidates.len()
+            );
+            round += 1;
+        }
+
+        if winners.is_empty() {
+            println!("no candidate channels yielded links");
+        } else if d.save {
+            // Additive: never forget a channel that once yielded.
+            let added = harvest::merge_discovered_channels(profile, &winners)?;
+            println!(
+                "merged {} discovered channel(s) into profile '{profile}' ({} total)",
+                added,
+                harvest::load_discovered_channels(profile).channels.len()
+            );
         }
         return Ok(());
     }
@@ -4544,7 +4594,20 @@ async fn cmd_configs(
                     },
                     chan_list.len()
                 );
-                cmd_harvest(profile, channels, proxy, depth, false, false, true).await?;
+                cmd_harvest(
+                    profile,
+                    channels,
+                    proxy,
+                    depth,
+                    false,
+                    DiscoverOpts {
+                        save: false,
+                        hops: 1,
+                        max_candidates: 60,
+                    },
+                    true,
+                )
+                .await?;
             }
 
             let rep = selfheal(profile, proxy);

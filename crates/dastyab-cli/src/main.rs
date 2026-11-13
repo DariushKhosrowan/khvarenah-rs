@@ -553,6 +553,17 @@ enum Command {
         /// profile so future refill passes automatically include them.
         #[arg(long)]
         save: bool,
+        /// With `--discover`: how many expansion hops to walk (each hop probes
+        /// the channels cross-referenced by the previous hop's winners). 1 =
+        /// single-hop (default). Bounded by a global candidate budget so
+        /// systematic archived-chat mining never floods the transport
+        /// (doctrine §6.5).
+        #[arg(long, default_value_t = 1)]
+        hops: usize,
+        /// With `--discover`: cap on total candidate channels probed across all
+        /// hops (default 60). Prevents unbounded graph explosion.
+        #[arg(long, default_value_t = 60)]
+        max_candidates: usize,
         /// Merge every previously-discovered channel (from harvest_channels.json)
         /// into this harvest pass, so the self-expanding archived-chat net is
         /// always mined in production — never just the hardcoded seeds.
