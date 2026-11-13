@@ -49,6 +49,24 @@ pub const DEFAULT_REFILL_CHANNELS: &[&str] = &[
     "configs_v2ray",
 ];
 
+/// Gate for the daemon's autonomous refill. Production defaults to enabled.
+/// Unit tests disable it (via `daemon_home`) so a daemon tick never triggers a
+/// live Telegram/GitHub harvest in a hermetic test (which would block on the
+/// network and hang the suite). Tests that specifically exercise refill
+/// re-enable it explicitly.
+static REFILL_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Set whether autonomous refill may run. Tests set this to `false` to keep
+/// daemon unit tests offline.
+pub fn set_refill_enabled(v: bool) {
+    REFILL_ENABLED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether autonomous refill may run (production default: true).
+pub fn refill_enabled() -> bool {
+    REFILL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Structured outcome of one refill pass.
 #[derive(Debug, Clone, Default)]
 pub struct RefillReport {

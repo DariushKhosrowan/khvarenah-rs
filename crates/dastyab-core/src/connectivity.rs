@@ -11,6 +11,22 @@ use std::pin::Pin;
 
 use crate::dnstunnel::Resolver as _;
 
+/// Gate for the scheduled blackout drill (`drill_all_tiers`). Production
+/// defaults to enabled. Hermetic daemon unit tests disable it (via
+/// `daemon_home`) so a daemon tick never performs a live fallback-ladder
+/// probe just because `last_drill_ts` defaulted to 0.
+static DRILL_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Returns whether the scheduled blackout drill is enabled.
+pub fn drill_enabled() -> bool {
+    DRILL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Enables/disables the scheduled blackout drill (test-only API).
+pub fn set_drill_enabled(on: bool) {
+    DRILL_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Ordered transport tiers, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Tier {

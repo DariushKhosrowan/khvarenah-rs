@@ -39,6 +39,23 @@ use crate::multilayer::PROXY_SOCKS_PORT;
 use crate::store::atomic_write;
 use crate::store::profiles::{now_ts, profile_dir};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Gate for the out-of-band CT-anchor refresh. Production defaults to enabled.
+/// Hermetic daemon unit tests disable it (via `daemon_home`) so a daemon tick
+/// never triggers a live crt.sh/CT-log query from zeroed state counters.
+static REFRESH_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Set whether the CT-anchor refresh may run.
+pub fn set_refresh_enabled(v: bool) {
+    REFRESH_ENABLED.store(v, Ordering::Relaxed);
+}
+
+/// Whether the CT-anchor refresh may run.
+pub fn refresh_enabled() -> bool {
+    REFRESH_ENABLED.load(Ordering::Relaxed)
+}
+
 /// crt.sh endpoint (JSON output).
 const CRT_SH: &str = "https://crt.sh/?q={query}&output=json";
 

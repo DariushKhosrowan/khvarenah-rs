@@ -1395,7 +1395,10 @@ async fn run_self_maintenance(
     // window so a permanently-dead pool doesn't hammer Telegram/GitHub on
     // every tick. Routes through the local SOCKS5 tunnel when it is up
     // (auto-detected), since direct foreign TCP is severed under NIN.
-    if net_up && now - state.last_refill_ts >= crate::node_refill::REFILL_COOLDOWN_SECS {
+    if net_up
+        && crate::node_refill::refill_enabled()
+        && now - state.last_refill_ts >= crate::node_refill::REFILL_COOLDOWN_SECS
+    {
         let needs =
             crate::node_refill::refill_needed(&crate::config_store::load_node_store(profile));
         if let Some(reason) = needs {
@@ -1436,6 +1439,7 @@ async fn run_self_maintenance(
     // The CT-anchor path uses reqwest's *blocking* client, which cannot be
     // built/dropped inside an async runtime — so run it on a blocking thread.
     if net_up
+        && crate::ct_anchors::refresh_enabled()
         && now - state.last_anchors_refresh_ts >= crate::ct_anchors::ANCHOR_REFRESH_INTERVAL_SECS
     {
         state.last_anchors_refresh_ts = now;
@@ -1636,6 +1640,13 @@ async fn run_scheduled_drill(
     now: i64,
     log: &mut dyn FnMut(&str),
 ) {
+    // Hermetic daemon unit tests disable the scheduled drill so a tick never
+    // performs a live fallback-ladder probe (real network) just because
+    // `last_drill_ts` defaulted to 0. Production default: enabled.
+    if !crate::connectivity::drill_enabled() {
+        state.last_drill_ts = now;
+        return;
+    }
     let p = crate::store::profiles::load_profile(profile);
     let interval = crate::store::profiles::effective_drill_interval_secs(&p.config);
     if interval == 0 || now - state.last_drill_ts < interval as i64 {
@@ -2199,6 +2210,12 @@ mod tests {
     fn daemon_home() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         crate::store::set_mem_dir_override(tmp.path().join(".dastyab"));
+        // Hermetic daemon tests must never trigger a live autonomous refill
+        // (Telegram/GitHub harvest) just because the in-memory node pool is
+        // empty. Disable the gate; tests that exercise refill re-enable it.
+        crate::node_refill::set_refill_enabled(false);
+        crate::connectivity::set_drill_enabled(false);
+        crate::ct_anchors::set_refresh_enabled(false);
         tmp
     }
 
