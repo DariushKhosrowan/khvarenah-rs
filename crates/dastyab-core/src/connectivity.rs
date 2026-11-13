@@ -38,10 +38,20 @@ pub enum Tier {
     DoT,
     /// DNS tunnel — text-rate emergency channel, last resort.
     DnsTunnel,
+    /// LAN P2P mesh relay (doctrine §3 Level 4): hop traffic through a
+    /// discovered neighbor that still holds a live upstream uplink. The
+    /// final rung before a total blackout.
+    MeshRelay,
 }
 
 /// Ladder order, best first.
-pub const TIER_ORDER: &[Tier] = &[Tier::Direct, Tier::DoH, Tier::DoT, Tier::DnsTunnel];
+pub const TIER_ORDER: &[Tier] = &[
+    Tier::Direct,
+    Tier::DoH,
+    Tier::DoT,
+    Tier::DnsTunnel,
+    Tier::MeshRelay,
+];
 
 impl Tier {
     /// Index in the ladder order (0 = best).
@@ -51,6 +61,7 @@ impl Tier {
             Tier::DoH => 1,
             Tier::DoT => 2,
             Tier::DnsTunnel => 3,
+            Tier::MeshRelay => 4,
         }
     }
 
@@ -61,6 +72,7 @@ impl Tier {
             Tier::DoH => "doh",
             Tier::DoT => "dot",
             Tier::DnsTunnel => "dns-tunnel",
+            Tier::MeshRelay => "mesh-relay",
         }
     }
 }
@@ -373,6 +385,44 @@ async fn probe_tunnel(profile: &str) -> ProbeVerdict {
     }
 }
 
+/// Probe the LAN P2P mesh relay tier (doctrine §3 Level 4). Runs a short
+/// neighbor-discovery sweep and, if a peer advertising a live uplink is found
+/// and its relay port responds to an echo probe, reports the tier up. This is
+/// the probe half of the mesh rung — the actual egress forwarding goes through
+/// [`crate::mesh_relay::forward_data`] once the daemon selects this tier.
+async fn probe_mesh_relay() -> ProbeVerdict {
+    // The LAN sweep + echo probe are synchronous/blocking, so run them off the
+    // tokio executor (doctrine §6.5: don't stall the reactor).
+    tokio::task::spawn_blocking(move || {
+        let sweep_secs = 2u64;
+        let now = crate::store::profiles::now_ts() as u64;
+        let (table, heard) =
+            crate::lan_mesh::discover_once("dastyab-daemon", "dastyab", true, sweep_secs, now);
+        if heard == 0 {
+            return ProbeVerdict::down("mesh: no neighbors heard");
+        }
+        match table.best_relay(now) {
+            None => ProbeVerdict::down(format!("mesh: {} peers but no uplink relay", heard)),
+            Some(relay) => {
+                let dst = relay.addr;
+                match crate::mesh_relay::echo_probe(dst, std::time::Duration::from_secs(3)) {
+                    Ok(Some(rtt)) => {
+                        table.observe_rtt(&relay.peer_id, rtt);
+                        ProbeVerdict::up(format!(
+                            "mesh relay up via {} (rtt {}ms)",
+                            relay.name, rtt
+                        ))
+                    }
+                    Ok(None) => ProbeVerdict::down("mesh: relay hit echo timeout"),
+                    Err(e) => ProbeVerdict::down(format!("mesh: echo error {e}")),
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| ProbeVerdict::down("mesh: probe panicked"))
+}
+
 /// Probe a worker-hosted DNS tunnel: send a ping frame to the deployed worker
 /// over HTTPS and require a valid pong reply within `timeout`. Returns `Up`
 /// only on a successful round-trip.
@@ -433,6 +483,7 @@ impl Probe for RealLadderProbe<'_> {
                 let profile = self.profile;
                 Box::pin(async move { probe_tunnel(profile).await })
             }
+            Tier::MeshRelay => Box::pin(async move { probe_mesh_relay().await }),
         }
     }
 }
@@ -458,6 +509,7 @@ impl Probe for OwnedLadderProbe {
                 let profile = self.profile.clone();
                 Box::pin(async move { probe_tunnel(&profile).await })
             }
+            Tier::MeshRelay => Box::pin(async move { probe_mesh_relay().await }),
         }
     }
 }
@@ -468,7 +520,13 @@ impl Probe for OwnedLadderProbe {
 /// total blackout WITHOUT disconnecting. Pure (generic over `Probe`) so tests
 /// can script verdicts and the CLI can drive the real transports.
 pub async fn drill_all_tiers<P: Probe>(probe: P) -> Vec<(Tier, ProbeVerdict)> {
-    let order = [Tier::Direct, Tier::DoH, Tier::DoT, Tier::DnsTunnel];
+    let order = [
+        Tier::Direct,
+        Tier::DoH,
+        Tier::DoT,
+        Tier::DnsTunnel,
+        Tier::MeshRelay,
+    ];
     let mut out = Vec::with_capacity(order.len());
     for tier in order {
         let verdict = probe.probe(tier).await;
@@ -592,7 +650,10 @@ mod tests {
     #[test]
     fn ladder_order_is_best_first() {
         assert_eq!(TIER_ORDER[0], Tier::Direct);
+        assert_eq!(TIER_ORDER[1], Tier::DoH);
+        assert_eq!(TIER_ORDER[2], Tier::DoT);
         assert_eq!(TIER_ORDER[3], Tier::DnsTunnel);
+        assert_eq!(TIER_ORDER[4], Tier::MeshRelay);
     }
 
     #[tokio::test]
@@ -671,15 +732,16 @@ mod tests {
     /// The blackout drill probes every tier top-down and reports each verdict,
     /// so the user sees exactly which rung would survive a blackout.
     #[tokio::test]
-    async fn drill_reports_all_four_tiers_in_order() {
+    async fn drill_reports_all_five_tiers_in_order() {
         let mut results = HashMap::new();
         results.insert(Tier::Direct, ProbeVerdict::down("poisoned"));
         results.insert(Tier::DoH, ProbeVerdict::up("doh ok"));
         results.insert(Tier::DoT, ProbeVerdict::down("dot tls reset"));
         results.insert(Tier::DnsTunnel, ProbeVerdict::up("tunnel configured"));
+        results.insert(Tier::MeshRelay, ProbeVerdict::down("no neighbors"));
         let report = drill_all_tiers(ScriptedProbe { results }).await;
-        assert_eq!(report.len(), 4);
-        // Order is top-down: Direct, DoH, DoT, DnsTunnel.
+        assert_eq!(report.len(), 5);
+        // Order is top-down: Direct, DoH, DoT, DnsTunnel, MeshRelay.
         assert_eq!(report[0].0, Tier::Direct);
         assert!(!report[0].1.ok);
         assert_eq!(report[1].0, Tier::DoH);
@@ -688,6 +750,8 @@ mod tests {
         assert!(!report[2].1.ok);
         assert_eq!(report[3].0, Tier::DnsTunnel);
         assert!(report[3].1.ok);
+        assert_eq!(report[4].0, Tier::MeshRelay);
+        assert!(!report[4].1.ok);
     }
 
     // ── liveness_status (daemon-backed stateful probe) ──
