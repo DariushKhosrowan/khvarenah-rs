@@ -650,6 +650,19 @@ enum Command {
         #[arg(long, default_value = "")]
         chain: String,
     },
+    /// Air-gapped DTN gossip: exchange signed node bundles offline so a machine
+    /// with no WAN can bootstrap configs from a nearby peer (doctrine §3 L4+).
+    Gossip {
+        /// Action: make | verify | accept | peers.
+        #[arg()]
+        action: String,
+        /// Path to a bundle file (.json). Used by make/verify/accept.
+        #[arg(long, default_value = "")]
+        path: String,
+        /// Max items to include when making a bundle.
+        #[arg(long, default_value_t = 100)]
+        max: usize,
+    },
 }
 
 #[derive(Subcommand)]

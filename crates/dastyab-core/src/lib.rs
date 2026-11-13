@@ -69,6 +69,7 @@ pub mod dnstunnel_auth;
 pub mod doctor;
 pub mod doh;
 pub mod dot;
+pub mod dtn_gossip;
 pub mod e2e;
 pub mod eob_anchor;
 pub mod error;

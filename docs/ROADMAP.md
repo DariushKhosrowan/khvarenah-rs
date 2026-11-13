@@ -220,13 +220,11 @@ Planned work, roughly in priority order. Items marked ✅ are done.
 - **GUI async/threading** — run scans in a real background task so the UI
   never blocks.
 - **Keyring integration** — optional OS keychain for token storage.
-- **Air-gapped DTN gossip (BLE / Wi-Fi Direct)** — *recommended by the
-  Gemini boss*. Store-and-forward gossip protocol so nodes can exchange
-  encrypted, quality-tested node lists / proxy configs / low-bandwidth state
-  over BLE and Wi-Fi Direct when all WAN control channels (Telegram, DNS
-  tunnel) are severed. Epoch-based signatures + latency/uptime scores to
-  prevent poison-node injection during offline propagation. Closes the "no
-  config left" gap under a boot blackout.
+- **BLE / Wi-Fi Direct transport adapters for DTN gossip** — the core gossip
+  protocol (`dtn_gossip`, signed bundles + trust scoring + store-and-forward)
+  is implemented; what remains is the physical transport adapters that shove
+  bundles over BLE and Wi-Fi Direct (the `gossip make/verify/accept` CLI works
+  over any out-of-band channel — USB/QR/chat — today).
 
 ## 🧭 Later
 

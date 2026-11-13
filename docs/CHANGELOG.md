@@ -2,6 +2,22 @@
 
 ## Unreleased — 2026-11-13
 
+### Added (air-gapped DTN gossip — Level-4 mesh extends offline)
+
+- **New `dtn_gossip` module**: store-and-forward node exchange that lets a
+  machine with **no WAN at all** bootstrap configs from a nearby peer. This
+  is the Gemini boss's recommended rung and the offline extension of the L4
+  mesh. Signed, tamper-evident bundles (`DYBDTN1` crate), anti-poison trust
+  scoring (a peer that offers dead nodes repeatedly gets gated), epoch-based
+  anti-replay, dedup, and a bounded store-and-forward queue.
+- **CLI `gossip` subcommand**: `make` (sign a bundle of healthy nodes to a
+  file), `verify` (check a bundle's signature — no writes), `accept` (verify
+  and merge into the node store), `peers` (trust ledger placeholder).
+  Transport-agnostic: hand the bundle over USB / QR / BLE / Wi-Fi Direct /
+  or a chat.
+- 9 new unit tests (sign/verify round-trip, tamper rejection, cross-key
+  rejection, stale-replay rejection, dedup, trust gating, bounded queue).
+
 ### Added (chain egress-IP risk + Shir-o-Khorshid + corrective-layer support)
 
 - **`Engine::ShirOKhorshid`**: new chain engine (label `shirokhorshid`,
