@@ -91,6 +91,7 @@ pub mod multilayer;
 pub mod multipath_bond;
 pub mod node_probe;
 pub mod node_refill;
+pub mod ns_anchors;
 pub mod platform_linux;
 pub mod presets;
 pub mod probe_jitter;
@@ -123,7 +124,8 @@ pub mod workspace_snapshots;
 pub mod wrangler;
 
 /// Deterministic adversarial fuzz gates for the wire codecs (doctrine §8.4).
-/// A permanent CI gate, not a one-off test: seeded PRNG, no external deps.
+/// A permanent CI gate that runs on every `cargo test`. Test-only.
+#[cfg(test)]
 pub mod codec_fuzz;
 
 pub use blackout::NetworkState;

@@ -456,6 +456,36 @@ fn skip_name(bytes: &[u8], mut pos: usize) -> Result<usize, CFError> {
     }
 }
 
+/// Build a DNS query for an NS record (QTYPE=2) of `host` with the given id.
+/// Used by authoritative-nameserver anchor discovery.
+pub fn build_dns_query_ns(host: &str, id: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+
+    // Header (12 bytes)
+    out.extend_from_slice(&id.to_be_bytes()); // ID
+    out.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD=1
+    out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+
+    // QNAME: labels
+    for label in host.split('.') {
+        if label.is_empty() {
+            continue;
+        }
+        debug_assert!(label.len() <= 63);
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0); // root
+
+    // QTYPE=NS (2), QCLASS=IN
+    out.extend_from_slice(&2u16.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out
+}
+
 /// Parse a DNS response and return all A records found.
 pub fn parse_dns_response_a(bytes: &[u8]) -> Result<Vec<Ipv4Addr>, CFError> {
     if bytes.len() < 12 {
@@ -496,6 +526,101 @@ pub fn parse_dns_response_a(bytes: &[u8]) -> Result<Vec<Ipv4Addr>, CFError> {
     }
 
     Ok(ips)
+}
+
+/// Decode a possibly-compressed domain name at `pos`, returning the decoded
+/// name and the position just past the on-the-wire name. Handles compression
+/// pointers (0xC0 mask) with a cycle guard.
+fn read_name_string(bytes: &[u8], mut pos: usize) -> Result<(String, usize), CFError> {
+    let mut labels: Vec<&[u8]> = Vec::new();
+    let mut pointer_target: Option<usize> = None;
+    let mut hops = 0u32;
+    loop {
+        if pos >= bytes.len() {
+            return Err(CFError::new(
+                "DoH parse",
+                "Name ran past end of message.",
+                "",
+            ));
+        }
+        let len = bytes[pos];
+        if len & 0xC0 == 0xC0 {
+            if pos + 1 >= bytes.len() {
+                return Err(CFError::new("DoH parse", "Truncated pointer.", ""));
+            }
+            hops += 1;
+            if hops > 32 {
+                return Err(CFError::new(
+                    "DoH parse",
+                    "Compression pointer loop detected.",
+                    "",
+                ));
+            }
+            let next = ((len & 0x3F) as usize) << 8 | bytes[pos + 1] as usize;
+            if pointer_target.is_none() {
+                pointer_target = Some(pos + 2);
+            }
+            pos = next;
+        } else if len == 0 {
+            let end = pointer_target.unwrap_or(pos + 1);
+            let mut s = String::new();
+            for (i, l) in labels.iter().enumerate() {
+                if i > 0 {
+                    s.push('.');
+                }
+                s.push_str(&String::from_utf8_lossy(l));
+            }
+            if s.is_empty() {
+                s.push('.');
+            }
+            return Ok((s, end));
+        } else {
+            pos += 1;
+            if pos + len as usize > bytes.len() {
+                return Err(CFError::new("DoH parse", "Label overran message.", ""));
+            }
+            labels.push(&bytes[pos..pos + len as usize]);
+            pos += len as usize;
+        }
+    }
+}
+
+/// Parse a DNS response and return all NS-record RDATA names found (i.e. the
+/// authoritative nameservers the queried zone delegates to).
+pub fn parse_dns_response_ns(bytes: &[u8]) -> Result<Vec<String>, CFError> {
+    if bytes.len() < 12 {
+        return Err(CFError::new("DoH parse", "Response too short.", ""));
+    }
+    let qdcount = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    let ancount = u16::from_be_bytes([bytes[6], bytes[7]]) as usize;
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        pos = skip_name(bytes, pos)?;
+        pos += 4;
+        if pos > bytes.len() {
+            return Err(CFError::new("DoH parse", "Question overran message.", ""));
+        }
+    }
+    let mut nss = Vec::new();
+    for _ in 0..ancount {
+        pos = skip_name(bytes, pos)?;
+        if pos + 10 > bytes.len() {
+            return Err(CFError::new("DoH parse", "Answer header truncated.", ""));
+        }
+        let rtype = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        let rdlen = u16::from_be_bytes([bytes[pos + 8], bytes[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > bytes.len() {
+            return Err(CFError::new("DoH parse", "Answer data truncated.", ""));
+        }
+        if rtype == 2 {
+            // NS RDATA = a domain name.
+            let (name, _after) = read_name_string(bytes, pos)?;
+            nss.push(name);
+        }
+        pos += rdlen;
+    }
+    Ok(nss)
 }
 
 /// Build a synthetic DNS response with the given A records (test helper).

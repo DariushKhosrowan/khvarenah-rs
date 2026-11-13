@@ -368,6 +368,39 @@ fn cmd_anchors(profile: &str, action: &str, proxy: bool, queries_csv: &str) -> R
             println!("[anchors] pruned {dropped} stale anchors; {total} verified-live remain");
             Ok(())
         }
+        "ns" => {
+            // Authoritative-nameserver anchor discovery (doctrine §8.1): use
+            // the DNS control plane itself as an independent, out-of-band
+            // bootstrap source that survives a total blackout.
+            use dastyab_core::ns_anchors::{
+                anchor_ips, load_anchors, refresh_ns_anchors, DEFAULT_ZONES, ROOT_SERVER_SEEDS,
+            };
+            const NS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+            // Resolver list: prefer discovered Iranian resolvers, else the
+            // documented candidate list. The NS discovery is best-effort.
+            let resolvers: Vec<String> = {
+                let mut v: Vec<String> = Vec::new();
+                for s in dastyab_core::resolve_pool::IRANIAN_RESOLVER_CANDIDATES {
+                    v.push(s.to_string());
+                }
+                v
+            };
+            let zones = DEFAULT_ZONES;
+            let (added, pruned) =
+                block_on(refresh_ns_anchors(profile, &resolvers, zones, NS_TIMEOUT));
+            println!("[anchors] NS discovery pass (authoritative-nameserver control plane):");
+            println!("  root seeds : {} documented", ROOT_SERVER_SEEDS.len());
+            println!("  zones      : {}", zones.len());
+            println!("  added      : {added}");
+            println!("  pruned     : {pruned}");
+            let store = load_anchors(profile);
+            println!("  verified   : {} anchor IPs", store.anchors.len());
+            for a in &store.anchors {
+                println!("    {:<40} {}ms via={}", a.ip, a.ms, a.via);
+            }
+            let _ = anchor_ips(profile);
+            Ok(())
+        }
         "refresh" => {
             let queries: Vec<&str> = if queries_csv.trim().is_empty() {
                 DEFAULT_QUERIES.to_vec()
@@ -389,7 +422,7 @@ fn cmd_anchors(profile: &str, action: &str, proxy: bool, queries_csv: &str) -> R
         other => Err(CFError::new(
             "anchors",
             format!("unknown action '{other}'"),
-            "Use: discover | list | prune | refresh | clear",
+            "Use: discover | list | prune | ns | refresh | clear",
         )),
     }
 }
