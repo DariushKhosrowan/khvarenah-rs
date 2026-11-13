@@ -422,6 +422,260 @@ pub struct EgressVerifyReport {
     pub error: Option<String>,
 }
 
+/// Render an xray client config for **any** supported share-link scheme
+/// (vless/vmess/trojan/ss/hysteria2/tuic) with a dedicated local SOCKS5
+/// inbound. This lets `deep_verify_egress` test the real egress of the whole
+/// pool, not only VLESS nodes (doctrine §5: use *whatever* config works).
+pub fn render_any_xray_cfg(url: &str, socks_port: u16) -> Result<String, String> {
+    // VLESS has a first-class model.
+    if url.starts_with("vless://") {
+        return VlessProfile::parse(url)
+            .and_then(|p| p.xray_client_json_at_port(socks_port))
+            .map_err(|e| format!("render vless: {e}"));
+    }
+    let uri = crate::proxy_uri::ProxyUri::parse(url)
+        .ok_or_else(|| "unparsable share-link".to_string())?;
+    let cfg = match uri.scheme.as_str() {
+        "vmess" => render_vmess_cfg(&uri, socks_port)?,
+        "trojan" => render_trojan_cfg(&uri, socks_port)?,
+        "ss" => render_ss_cfg(&uri, socks_port)?,
+        "hysteria2" => render_hysteria2_cfg(&uri, socks_port)?,
+        "tuic" => render_tuic_cfg(&uri, socks_port)?,
+        other => return Err(format!("scheme '{other}' not deep-verifiable")),
+    };
+    serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize: {e}"))
+}
+
+/// Parse raw `?a=b&c=d` params from an arbitrary share-link (any scheme).
+fn raw_query_params(url: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let body = url.split('#').next().unwrap_or(url);
+    let Some(q) = body.split('?').nth(1) else {
+        return out;
+    };
+    for pair in q.split('&') {
+        let mut it = pair.splitn(2, '=');
+        if let (Some(k), Some(v)) = (it.next(), it.next()) {
+            if !k.is_empty() {
+                out.insert(crate::vless::decode_query(k), crate::vless::decode_query(v));
+            }
+        }
+    }
+    out
+}
+
+/// Shared `streamSettings` from `network`/`security`/query params.
+fn stream_block(
+    network: &str,
+    security: &str,
+    q: &std::collections::HashMap<String, String>,
+    host_default: &str,
+    sni_default: &str,
+) -> serde_json::Value {
+    let host = q
+        .get("host")
+        .cloned()
+        .unwrap_or_else(|| host_default.to_string());
+    let sni = q
+        .get("sni")
+        .cloned()
+        .unwrap_or_else(|| sni_default.to_string());
+    let network = if network.is_empty() { "tcp" } else { network };
+    let security = if security.is_empty() {
+        "none"
+    } else {
+        security
+    };
+    let tls_settings = if security == "tls" {
+        serde_json::json!({"serverName": sni, "fingerprint": "chrome"})
+    } else {
+        serde_json::Value::Null
+    };
+    let ws = if network == "ws" {
+        serde_json::json!({"path": q.get("path").cloned().unwrap_or_default(), "headers": {"Host": host}})
+    } else {
+        serde_json::Value::Null
+    };
+    let grpc = if network == "grpc" {
+        serde_json::json!({"serviceName": q.get("serviceName").cloned().unwrap_or_default()})
+    } else {
+        serde_json::Value::Null
+    };
+    let tcp = if network == "tcp" {
+        serde_json::json!({"header": {"type": q.get("type").cloned().unwrap_or_else(|| "none".into())}})
+    } else {
+        serde_json::Value::Null
+    };
+    serde_json::json!({
+        "network": network,
+        "security": security,
+        "tlsSettings": tls_settings,
+        "wsSettings": ws,
+        "grpcSettings": grpc,
+        "tcpSettings": tcp,
+    })
+}
+
+/// `socks-in` inbound shared by every rendered config.
+fn socks_inbound(socks_port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "tag": "socks-in", "listen": "127.0.0.1", "port": socks_port,
+        "protocol": "socks", "settings": {"auth": "noauth", "udp": true},
+    })
+}
+
+fn render_vmess_cfg(
+    uri: &crate::proxy_uri::ProxyUri,
+    socks_port: u16,
+) -> Result<serde_json::Value, String> {
+    // Decode the embedded JSON for transport/tls details.
+    let encoded = uri.raw.split("vmess://").nth(1).unwrap_or("");
+    let mut net = String::new();
+    let mut security = String::new();
+    let mut aid = "0".to_string();
+    let mut q = std::collections::HashMap::new();
+    if let Some(decoded) = crate::proxy_uri::b64_decode_for(encoded) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&decoded) {
+            net = v
+                .get("net")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            security = v
+                .get("tls")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(a) = v.get("aid").and_then(|x| x.as_str()) {
+                aid = a.to_string();
+            }
+            if let Some(h) = v.get("host").and_then(|x| x.as_str()) {
+                q.insert("host".into(), h.to_string());
+            }
+            if let Some(p) = v.get("path").and_then(|x| x.as_str()) {
+                q.insert("path".into(), p.to_string());
+            }
+            if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
+                q.insert("type".into(), t.to_string());
+            }
+        }
+    }
+    let outbound = serde_json::json!({
+        "protocol": "vmess",
+        "settings": {
+            "vnext": [{
+                "address": uri.host, "port": uri.port,
+                "users": [{"id": uri.id, "alterId": aid, "security": "auto"}],
+            }]
+        },
+        "streamSettings": stream_block(&net, &security, &q, &uri.host, &uri.host),
+    });
+    Ok(serde_json::json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [socks_inbound(socks_port)],
+        "outbounds": [outbound],
+    }))
+}
+
+fn render_trojan_cfg(
+    uri: &crate::proxy_uri::ProxyUri,
+    socks_port: u16,
+) -> Result<serde_json::Value, String> {
+    let q = raw_query_params(&uri.raw);
+    let security = q.get("security").cloned().unwrap_or_else(|| "tls".into());
+    let net = q.get("type").cloned().unwrap_or_else(|| "tcp".into());
+    let outbound = serde_json::json!({
+        "protocol": "trojan",
+        "settings": {
+            "servers": [{"address": uri.host, "port": uri.port, "password": uri.id}],
+        },
+        "streamSettings": stream_block(&net, &security, &q, &uri.host, &uri.host),
+    });
+    Ok(serde_json::json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [socks_inbound(socks_port)],
+        "outbounds": [outbound],
+    }))
+}
+
+fn render_ss_cfg(
+    uri: &crate::proxy_uri::ProxyUri,
+    socks_port: u16,
+) -> Result<serde_json::Value, String> {
+    // id is `method:password`.
+    let (method, password) = match uri.id.split_once(':') {
+        Some((m, p)) => (m.to_string(), p.to_string()),
+        None => return Err(format!("ss link lacks method:password: {}", uri.raw)),
+    };
+    let q = raw_query_params(&uri.raw);
+    let net = q.get("type").cloned().unwrap_or_else(|| "tcp".into());
+    let security = q.get("security").cloned().unwrap_or_else(|| "none".into());
+    let outbound = serde_json::json!({
+        "protocol": "shadowsocks",
+        "settings": {
+            "servers": [{"address": uri.host, "port": uri.port, "method": method, "password": password}],
+        },
+        "streamSettings": stream_block(&net, &security, &q, &uri.host, &uri.host),
+    });
+    Ok(serde_json::json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [socks_inbound(socks_port)],
+        "outbounds": [outbound],
+    }))
+}
+
+fn render_hysteria2_cfg(
+    uri: &crate::proxy_uri::ProxyUri,
+    socks_port: u16,
+) -> Result<serde_json::Value, String> {
+    let q = raw_query_params(&uri.raw);
+    let sni = q.get("sni").cloned().unwrap_or_else(|| uri.host.clone());
+    let outbound = serde_json::json!({
+        "protocol": "hysteria2",
+        "settings": {
+            "servers": [{
+                "address": uri.host, "port": uri.port, "password": uri.id,
+            }],
+        },
+        "streamSettings": {
+            "network": "tcp", "security": "tls",
+            "tlsSettings": {"serverName": sni, "allowInsecure": true},
+        },
+    });
+    Ok(serde_json::json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [socks_inbound(socks_port)],
+        "outbounds": [outbound],
+    }))
+}
+
+fn render_tuic_cfg(
+    uri: &crate::proxy_uri::ProxyUri,
+    socks_port: u16,
+) -> Result<serde_json::Value, String> {
+    let q = raw_query_params(&uri.raw);
+    let sni = q.get("sni").cloned().unwrap_or_else(|| uri.host.clone());
+    let outbound = serde_json::json!({
+        "protocol": "tuic",
+        "settings": {
+            "servers": [{
+                "address": uri.host, "port": uri.port,
+                "uuid": uri.id, "password": q.get("password").cloned().unwrap_or_default(),
+                "congestionControl": "bbr",
+            }],
+        },
+        "streamSettings": {
+            "network": "tcp", "security": "tls",
+            "tlsSettings": {"serverName": sni, "allowInsecure": true},
+        },
+    });
+    Ok(serde_json::json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [socks_inbound(socks_port)],
+        "outbounds": [outbound],
+    }))
+}
+
 /// Deeply verify that a node carries **real egress** by spawning a fresh xray
 /// client for it on a *dedicated* local SOCKS5 port (never the live lifeline
 /// port 10853), confirming end-to-end traffic (doctrine §6.4 — no fabricated
@@ -459,18 +713,10 @@ pub async fn deep_verify_egress(_profile: &str, node: &V2RayNode) -> EgressVerif
             }
         }
     };
-    // Render the config for this node on the dedicated port.
-    let profile_vless = match VlessProfile::parse(&node.url) {
-        Ok(p) => p,
-        Err(e) => {
-            return EgressVerifyReport {
-                ok: false,
-                alias: node.alias.clone(),
-                error: Some(format!("render config: {e}")),
-            }
-        }
-    };
-    let cfg_json = match profile_vless.xray_client_json_at_port(port) {
+    // Render the config for this node on the dedicated port. Works for every
+    // supported scheme (vless/vmess/trojan/ss/hysteria2/tuic) so deep verify
+    // covers the whole pool, not only VLESS (doctrine §5).
+    let cfg_json = match render_any_xray_cfg(&node.url, port) {
         Ok(c) => c,
         Err(e) => {
             return EgressVerifyReport {
@@ -880,5 +1126,31 @@ mod tests {
         assert!(filtered.iter().all(|n| n.url != healthy.url));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].url, fallback.url);
+    }
+
+    #[test]
+    fn render_any_supports_all_schemes() {
+        let cases = [
+            (
+                "vless://06ef598c-1555-4887-b3f9-08214a2f6792@1.2.3.4:443?encryption=none&security=reality&sni=example.com&type=tcp",
+                "vless",
+            ),
+            ("vmess://eyJ2IjoiMiIsInBzIjoiYSIsImFkZCI6IjEuMi4zLjQiLCJwb3J0IjoiNDQzIiwiaWQiOiIwNmVmNTk4Yy0xNTU1LTQ4ODctYjNmOS0wODIxNGEyZjY3OTIiLCJhaWQiOiIwIiwibmV0IjoidGNwIiwidGxzIjoidGxzIn0=", "vmess"),
+            ("trojan://password123@1.2.3.4:443?security=tls&type=tcp", "trojan"),
+            ("ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNzd29yZA@1.2.3.4:8388", "shadowsocks"),
+        ];
+        for (url, proto) in cases {
+            let cfg = render_any_xray_cfg(url, 11999).unwrap_or_else(|e| panic!("{proto}: {e}"));
+            let v: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+            let out = v["outbounds"][0].clone();
+            assert_eq!(out["protocol"], proto, "for {url}");
+            assert_eq!(v["inbounds"][0]["port"], 11999);
+        }
+    }
+
+    #[test]
+    fn render_any_rejects_garbage() {
+        assert!(render_any_xray_cfg("not-a-link", 12000).is_err());
+        assert!(render_any_xray_cfg("ss://", 12000).is_err());
     }
 }

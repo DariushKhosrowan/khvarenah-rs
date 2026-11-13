@@ -146,6 +146,10 @@ Planned work, roughly in priority order. Items marked ✅ are done.
   and exposed as `dastyab configs verify-egress [count]`. Closes the "no
   fabricated success" gap (PRINCIPLES §8.2) at sweep granularity: a server that
   completes TLS yet blackholes traffic is now correctly marked unhealthy.
+  Rendering is multi-scheme via `proxy_uri::ProxyUri` — `render_any_xray_cfg`
+  renders vless/vmess/trojan/ss/hysteria2/tuic to xray configs, so the deep
+  verify covers the whole pool, not only VLESS (doctrine §5: use *whatever*
+  config works).
 - ✅ **Verified healthy nodes → v2rayN export** — `dastyab nodes
   export-v2rayn` merges the verified-healthy pool into v2rayN's ServersStore.json
   (dedup by host+port+uuid, atomic write, idempotent). Closes the loop:

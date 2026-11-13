@@ -284,6 +284,12 @@ fn b64_decode(s: &str) -> Option<String> {
     }
 }
 
+/// Public wrapper for share-link base64 decoding (used by xray config
+/// rendering for vmess/ssr links).
+pub fn b64_decode_for(s: &str) -> Option<String> {
+    b64_decode(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
