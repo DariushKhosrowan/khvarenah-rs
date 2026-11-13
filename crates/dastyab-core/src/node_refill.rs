@@ -290,6 +290,9 @@ mod tests {
         // VLESS-over-TLS links imported tagged source="ct-anchor". The nodes
         // are imported but *not* marked healthy — probe verifies them later.
         let profile = "test_ct_reseed";
+        // Reset the profile's node store so the test is idempotent across runs
+        // (the anchor import persists to disk and would otherwise accumulate).
+        crate::config_store::save_node_store(profile, &NodeStore::default()).unwrap();
         let store = crate::ct_anchors::CtAnchorStore {
             anchors: vec![crate::ct_anchors::CtAnchor {
                 host: "edge-proxy.example.com".into(),
@@ -299,9 +302,7 @@ mod tests {
             }],
         };
         let path = crate::ct_anchors::anchors_path_pub(profile);
-        let _ = std::fs::create_dir_all(
-            path.parent().expect("anchor path has a parent directory"),
-        );
+        let _ = std::fs::create_dir_all(path.parent().expect("anchor path has a parent directory"));
         crate::store::atomic_write(&path, &serde_json::to_vec_pretty(&store).unwrap()).unwrap();
 
         let added = reseed_from_ct_anchors(profile, false);
