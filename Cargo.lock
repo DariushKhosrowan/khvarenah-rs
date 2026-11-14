@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "dastyab-cli"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "dastyab-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "dastyab-gui"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "dastyab-core",
@@ -1203,7 +1203,7 @@ dependencies = [
 
 [[package]]
 name = "dastyab-tui"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "crossterm",
  "dastyab-core",

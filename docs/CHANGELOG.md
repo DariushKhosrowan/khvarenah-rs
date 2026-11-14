@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.1.4 — 2026-11-14
+
+The first release built from the renamed tree. Earlier 0.1.x artefacts were
+produced before the rename and still report the old binary name, so they are
+superseded by this one.
+
+### Fixed
+- Release binaries now identify themselves correctly: `dastyab --version`
+  prints `dastyab 0.1.4` and `--help` describes DastYab. The 0.1.0–0.1.3
+  assets were renamed on the release page but their contents predated the
+  rename.
+- The CI gate runs again. `cargo clippy --workspace -- -D warnings` had been
+  failing on every push; the workspace is now clean under it.
+
+### Changed
+- `dastyab-core` is organised into nine domain layers (`net`, `tunnel`,
+  `egress`, `probe`, `mesh`, `discovery`, `artifact`, `trust`, `ops`) instead
+  of 93 flat sibling modules. The public surface is unchanged.
+- `supervise_chain_watch` takes `WatchProbes` and `WatchLimits` rather than
+  ten positional arguments.
+
 ## Unreleased — 2026-11-14
 
 ### Changed (project renamed: DastYab → DastYab)
