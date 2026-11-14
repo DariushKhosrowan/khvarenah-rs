@@ -17,7 +17,7 @@ edition = "2021"
 license = "MIT"
 authors = ["Dariush Khosrowan <dariush@khosrowan.ir>"]
 description = "DastYab — Cloudflare-Workers VLESS VPN console (Rust)."
-repository = "https://github.com/DariushKhosrowan/dastyab-rs"
+repository = "https://github.com/DariushKhosrowan/dastyab"
 
 [workspace.dependencies]
 # --- core logic ---

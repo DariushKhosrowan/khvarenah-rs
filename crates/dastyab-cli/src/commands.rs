@@ -4353,7 +4353,7 @@ async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CF
 fn cmd_aistudio(action: &str) -> Result<(), CFError> {
     // Delegate to the verified, self-healing Python bridge (project-local).
     // The Python tool owns the xray tunnel + watchdog; this is a thin wrapper.
-    let script = "/home/amir/Projects/dastyab-rs/dastyab-aistudio.py";
+    let script = "/home/amir/Projects/dastyab/dastyab-aistudio.py";
     let action = action.trim().to_lowercase();
 
     // Normalize a few natural spellings.

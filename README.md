@@ -73,7 +73,7 @@ The CLI ships as a single static Rust binary — no Python, no Node, no runtime
 deps. Install the latest release with one line:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DariushKhosrowan/dastyab-rs/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DariushKhosrowan/dastyab/main/scripts/install.sh | sh
 ```
 
 This detects your OS/CPU, downloads the matching binary from the latest GitHub
@@ -84,7 +84,7 @@ adds that directory to your `PATH`. Then open a new terminal and confirm:
 dastyab --version
 ```
 
-> **Windows?** Grab the portable `.zip` from the [releases page](https://github.com/DariushKhosrowan/dastyab-rs/releases).
+> **Windows?** Grab the portable `.zip` from the [releases page](https://github.com/DariushKhosrowan/dastyab/releases).
 > **Prefer a package?** A `.deb` installer is published with every release too.
 > **Build from source?** `cargo build --release` and run
 > `target/release/dastyab` (or `cargo install dastyab-cli`).
@@ -173,7 +173,7 @@ dastyab-gui
 ## Architecture at a glance
 
 ```
-dastyab-rs/
+dastyab/
 ├── crates/
 │   ├── dastyab-core/        # pure logic, no UI (the brain)
 │   │   └── src/

@@ -18,7 +18,7 @@
   `DYBMRELAY1`. Workers deployed by a pre-rename build must be redeployed, and
   nodes on the old magic tags will not peer with new ones until upgraded.
 - The `DYB_TUNNEL_BASE` default domain and the public site canonical moved to
-  `dastyab.dev`; the GitHub repository is expected to become `dastyab-rs`.
+  `dastyab.dev`; the GitHub repository is expected to become `dastyab`.
 ## Unreleased — 2026-11-13
 
 ### Added (offline Telegram-export archive mining — Rung -1 recovery)

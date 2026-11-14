@@ -427,7 +427,7 @@ recovers.
 6. DNS-tunnel client (last, but the piece that makes "survive a total
    blackout" true).
 
-*Report prepared for the dastyab-rs project. Verified against the actual
+*Report prepared for the dastyab project. Verified against the actual
 source: `crates/dastyab-core/src/doh.rs` (IP-pinned DoH + 198.18 filter),
 `crates/dastyab-core/src/health.rs` (alt-ports + WS gate), and
 `crates/dastyab-core/src/cf/ips.rs` (CF range/seed engineering).*

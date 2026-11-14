@@ -1,6 +1,6 @@
 I am the coding agent; you are the architect for the DastYab Rust workspace.
 
-Repo: ~/Projects/dastyab-rs (main branch)
+Repo: ~/Projects/dastyab (main branch)
 Top commit: a05ebf2 "probe_jitter: derive serde on ClientHelloProfile"
 Tests: 216 pass across workspace, clippy 0 warnings.
 Worker healthy (Alive). 24/7 protection daemon running under systemd.

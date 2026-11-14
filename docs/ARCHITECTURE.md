@@ -10,7 +10,7 @@ start from before reading any code.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      dastyab-rs (workspace)                   │
+│                      dastyab (workspace)                   │
 │                                                                 │
 │   ┌─────────────────────────┐   ┌─────────────────────────────┐ │
 │   │     dastyab-core      │   │      dastyab-cli         │ │
