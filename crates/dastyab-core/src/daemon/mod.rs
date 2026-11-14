@@ -1312,7 +1312,7 @@ async fn run_self_maintenance(
     // 2. Scheduled worker-signature rotation. Only when the network is up
     // (CF API redeploy requires connectivity). The liveness probe has already
     // run in `daemon_tick` and its result is passed in as `net_up`.
-    if net_up {
+    if net_up && crate::ops::airgap::online() {
         match crate::artifact::config_mutation::run_mutation_if_due::<
             crate::probe::autopilot::RealMutationPeer,
         >(profile, &crate::probe::autopilot::RealMutationPeer)
@@ -1344,7 +1344,7 @@ async fn run_self_maintenance(
     // rung, journals how many survive, and alerts if resilience has degraded.
     // Runs whenever the network is up (a probe during a full blackout would
     // just report all-down — not informative).
-    if net_up {
+    if net_up && crate::ops::airgap::online() {
         run_scheduled_drill(profile, state, now, &mut |msg| log(&log_line("INFO", msg))).await;
     }
 
@@ -1407,6 +1407,7 @@ async fn run_self_maintenance(
     // died since the last check. Routes through the local SOCKS5 tunnel when
     // it is up (auto-detected), since direct foreign TCP is severed under NIN.
     if net_up
+        && crate::ops::airgap::online()
         && now - state.last_node_decay_ts >= crate::probe::node_probe::NODE_DECAY_INTERVAL_SECS
     {
         state.last_node_decay_ts = now;
@@ -1440,7 +1441,10 @@ async fn run_self_maintenance(
     // xray per candidate on dedicated ports) and bounded to ≤2 nodes/pass.
     const DEEP_VERIFY_INTERVAL_SECS: i64 = 6 * 3600;
     const DEEP_VERIFY_MAX_PER_PASS: usize = 2;
-    if net_up && now - state.last_deep_verify_ts >= DEEP_VERIFY_INTERVAL_SECS {
+    if net_up
+        && crate::ops::airgap::online()
+        && now - state.last_deep_verify_ts >= DEEP_VERIFY_INTERVAL_SECS
+    {
         state.last_deep_verify_ts = now;
         let store = crate::artifact::config_store::load_node_store(profile);
         let mut candidates: Vec<crate::artifact::config_store::V2RayNode> = store
@@ -1496,6 +1500,7 @@ async fn run_self_maintenance(
     // every tick. Routes through the local SOCKS5 tunnel when it is up
     // (auto-detected), since direct foreign TCP is severed under NIN.
     if net_up
+        && crate::ops::airgap::online()
         && crate::probe::node_refill::refill_enabled()
         && now - state.last_refill_ts >= crate::probe::node_refill::REFILL_COOLDOWN_SECS
     {
@@ -1545,6 +1550,7 @@ async fn run_self_maintenance(
     // external cron/CLI invokes it (no single point of failure). Requires the
     // network; rate-limited to DISCOVERY_INTERVAL_SECS.
     if net_up
+        && crate::ops::airgap::online()
         && crate::discovery::harvest::discovery_enabled()
         && now - state.last_discovery_ts >= crate::probe::node_refill::DISCOVERY_INTERVAL_SECS
     {
@@ -1616,6 +1622,7 @@ async fn run_self_maintenance(
     // The CT-anchor path uses reqwest's *blocking* client, which cannot be
     // built/dropped inside an async runtime — so run it on a blocking thread.
     if net_up
+        && crate::ops::airgap::online()
         && crate::discovery::ct_anchors::refresh_enabled()
         && now - state.last_anchors_refresh_ts
             >= crate::discovery::ct_anchors::ANCHOR_REFRESH_INTERVAL_SECS
@@ -1662,6 +1669,7 @@ async fn run_self_maintenance(
     // as a non-circular reseed/tunnel-hop source) is maintained autonomously.
     // Fully async (UDP raw exchange) so it is awaited directly. Rate-limited.
     if net_up
+        && crate::ops::airgap::online()
         && now - state.last_ns_anchors_refresh_ts
             >= crate::discovery::ns_anchors::NS_ANCHOR_REFRESH_INTERVAL_SECS
     {
@@ -2039,18 +2047,20 @@ pub async fn daemon_tick(
     let net_up = status.up;
     state.network_tier = status.tier_label();
 
-    // a. Periodic self-maintenance: scheduled auto-backup (always — local,
-    // safe even during a blackout) and worker-signature rotation (only when
-    // the network is confirmed up, since it needs the CF API). These were
-    // dormant features; this is what makes the app fully automatic.
-    run_self_maintenance(profile, state, net_up, log).await;
+    // a. Periodic self-maintenance: scheduled auto-backup (local, always) and
+    // worker-signature rotation (only when the network is confirmed up, since
+    // it needs the CF API). Skipped entirely in air-gap mode so a test or an
+    // isolated run cannot reach the network through the maintenance path.
+    if crate::ops::airgap::online() {
+        run_self_maintenance(profile, state, net_up, log).await;
+    }
 
     // Scheduled autonomy audit with auto-execute (architect feature #3). Runs
     // on the audit cadence (default 15 min) and auto-applies every ACTION item
     // whose preconditions are met. CF-backed items rotate the worker secret /
     // mint a second token; config toggles (backup, mutation) flip flags.
     // Fire the AutonomyRegression beacon on a clean→dirty transition.
-    {
+    if crate::ops::airgap::online() {
         let prof = crate::store::profiles::load_profile(profile);
         let token = crate::store::profiles::get_active_token(profile)
             .ok()
@@ -2092,7 +2102,7 @@ pub async fn daemon_tick(
     // during a blackout (or a blocked channel) are delivered as soon as the
     // network returns — immediately on restore, then rate-limited so we don't
     // hammer the Telegram/webhook transport every cycle.
-    if net_up {
+    if net_up && crate::ops::airgap::online() {
         let now = crate::store::now_ts() as i64;
         let force = state.network_was_down;
         if force || should_flush_outbox(state.last_outbox_flush_ts, now, OUTBOX_FLUSH_INTERVAL_SECS)
@@ -3124,6 +3134,9 @@ mod tests {
     /// then rate-limits repeat flushes to once per interval.
     #[tokio::test]
     async fn test_daemon_flushes_outbox_when_network_up() {
+        // Exercises the online outbox path; other tests may have left the
+        // process-global air-gap switch on.
+        crate::ops::airgap::set_offline(false);
         let _home = daemon_home();
         let profile = crate::store::profiles::create_profile("default", "").unwrap();
         let mut state = DaemonState::default();
@@ -3163,6 +3176,9 @@ mod tests {
     /// rate-limit gate — that is the exact moment queued alerts must go out.
     #[tokio::test]
     async fn test_daemon_flushes_outbox_immediately_on_restore() {
+        // Exercises the online outbox path; other tests may have left the
+        // process-global air-gap switch on.
+        crate::ops::airgap::set_offline(false);
         let _home = daemon_home();
         let profile = crate::store::profiles::create_profile("default", "").unwrap();
         let mut state = DaemonState {

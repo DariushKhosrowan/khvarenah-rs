@@ -217,6 +217,11 @@ mod tests {
     use crate::daemon::DaemonState;
 
     fn fresh_state() -> DaemonState {
+        // Drills drive `daemon_tick`, whose maintenance paths open sockets when
+        // the injected probe reports a healthy network. Air-gap mode keeps the
+        // drill hermetic and fast; it changes nothing about the tick logic
+        // under test.
+        crate::ops::airgap::set_offline_thread_local(true);
         DaemonState::default()
     }
 

@@ -4350,10 +4350,60 @@ async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CF
     }
 }
 
+/// Locate the AI Studio bridge script at runtime.
+///
+/// The script ships alongside the source tree, not inside the binary, so the
+/// path must not be baked in at compile time (a build machine's path is not
+/// the user's path). Probe the documented locations, in order:
+///
+/// 1. `$DASTYAB_AISTUDIO` - explicit override.
+/// 2. Next to the running executable, and `../share/dastyab/` (FHS install).
+/// 3. `$HOME/.dastyab/bin/` - where helper scripts are staged.
+/// 4. The current directory and its `scripts/` - running from a checkout.
+fn find_aistudio_script() -> Option<std::path::PathBuf> {
+    const NAME: &str = "dastyab-aistudio.py";
+
+    if let Some(p) = std::env::var_os("DASTYAB_AISTUDIO") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(NAME));
+            if let Some(prefix) = dir.parent() {
+                candidates.push(prefix.join("share").join("dastyab").join(NAME));
+            }
+        }
+    }
+
+    if let Some(home) = dastyab_core::store::home_dir() {
+        candidates.push(home.join(".dastyab").join("bin").join(NAME));
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(NAME));
+        candidates.push(cwd.join("scripts").join(NAME));
+    }
+
+    candidates.into_iter().find(|p| p.is_file())
+}
+
 fn cmd_aistudio(action: &str) -> Result<(), CFError> {
     // Delegate to the verified, self-healing Python bridge (project-local).
     // The Python tool owns the xray tunnel + watchdog; this is a thin wrapper.
-    let script = "/home/amir/Projects/dastyab/dastyab-aistudio.py";
+    let script = find_aistudio_script().ok_or_else(|| {
+        CFError::new(
+            "AI Studio bridge not found",
+            "Could not locate dastyab-aistudio.py".to_string(),
+            "Set DASTYAB_AISTUDIO=/path/to/dastyab-aistudio.py, or run from the \
+             project checkout, or copy the script into ~/.dastyab/bin/.",
+        )
+    })?;
     let action = action.trim().to_lowercase();
 
     // Normalize a few natural spellings.
@@ -4366,11 +4416,11 @@ fn cmd_aistudio(action: &str) -> Result<(), CFError> {
     };
 
     let mut cmd = std::process::Command::new("python3");
-    cmd.arg(script).arg(&action);
+    cmd.arg(&script).arg(&action);
     let out = cmd.output().map_err(|e| {
         CFError::new(
             "Aistudio launch failed",
-            format!("Could not run {script}: {e}"),
+            format!("Could not run {}: {e}", script.display()),
             "Make sure python3 and the dastyab-aistudio.py script exist.",
         )
     })?;
