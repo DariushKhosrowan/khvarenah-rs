@@ -45,17 +45,12 @@ pub fn snapshots_dir() -> PathBuf {
     crate::store::mem_dir().join("snapshots")
 }
 
-/// File-name suffixes accepted as a workspace snapshot.
-///
-/// `.dyb-snapshot.json` is the pre-rename (`DastYab`) suffix. Snapshots
-/// written by an older build must stay listable and restorable after the
-/// upgrade, so both suffixes are accepted on read; only the current one is
-/// ever written.
-pub const SNAPSHOT_SUFFIXES: &[&str] = &[".dyb-snapshot.json", ".dyb-snapshot.json"];
+/// File-name suffix for workspace snapshots.
+pub const SNAPSHOT_SUFFIX: &str = ".dyb-snapshot.json";
 
-/// True if `name` looks like a workspace snapshot (current or pre-rename).
+/// True if `name` looks like a workspace snapshot.
 pub fn is_snapshot_name(name: &str) -> bool {
-    SNAPSHOT_SUFFIXES.iter().any(|s| name.ends_with(s))
+    name.ends_with(SNAPSHOT_SUFFIX)
 }
 
 /// Pure decision: is a snapshot due given the last one and now?
@@ -224,13 +219,13 @@ mod tests {
         crate::manifest::write_manifest(&crate::manifest::build_manifest(id).unwrap()).unwrap();
     }
 
-    /// Pre-rename (`DastYab`) snapshots must stay listable and restorable.
+    /// Only the current suffix counts as a snapshot.
     #[test]
-    fn pre_rename_snapshot_suffix_is_listed() {
-        assert!(is_snapshot_name("1000.dyb-snapshot.json"));
+    fn snapshot_suffix_is_recognized() {
         assert!(is_snapshot_name("1000.dyb-snapshot.json"));
         assert!(!is_snapshot_name("1000.json"));
         assert!(!is_snapshot_name("dyb-snapshot.json.bak"));
+        assert!(!is_snapshot_name(".dyb-snapshot.json.hidden"));
     }
 
     #[test]

@@ -1485,11 +1485,6 @@ pub enum DaemonAction {
 
 #[tokio::main]
 async fn main() {
-    // Adopt a pre-rename state directory (`~/.dastyab` -> `~/.dastyab`)
-    // before any subcommand resolves a path, so an upgrade keeps the user's
-    // existing profiles and saved secrets.
-    dastyab_core::store::adopt_legacy_mem_dir_once();
-
     // Install the process-level rustls provider before any network/TLS work
     // (core uses aws-lc-rs; reqwest pulls ring too — explicit install avoids
     // the "could not determine CryptoProvider" panic, e.g. on `drill`).
