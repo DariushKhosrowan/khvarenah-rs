@@ -4,8 +4,9 @@
 proxy stack from the command line, a terminal UI, or a desktop GUI — written
 in Rust for speed, safety, and a single static binary.**
 
-> **دستیاب (DastYab)** — *the Avestan royal glory; the divine fortune that
-> lets the wise soar beyond every wall and veil.*
+> **دستیاب (DastYab)** — *Persian for “within reach”: the thing you can lay
+> your hand on. A name for a console whose whole job is to find the reachable
+> path and keep it reachable.*
 
 | | |
 |---|---|
@@ -72,7 +73,7 @@ The CLI ships as a single static Rust binary — no Python, no Node, no runtime
 deps. Install the latest release with one line:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DariushKhosrowan/dastyab/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DariushKhosrowan/dastyab-rs/main/scripts/install.sh | sh
 ```
 
 This detects your OS/CPU, downloads the matching binary from the latest GitHub
@@ -83,7 +84,7 @@ adds that directory to your `PATH`. Then open a new terminal and confirm:
 dastyab --version
 ```
 
-> **Windows?** Grab the portable `.zip` from the [releases page](https://github.com/DariushKhosrowan/dastyab/releases).
+> **Windows?** Grab the portable `.zip` from the [releases page](https://github.com/DariushKhosrowan/dastyab-rs/releases).
 > **Prefer a package?** A `.deb` installer is published with every release too.
 > **Build from source?** `cargo build --release` and run
 > `target/release/dastyab` (or `cargo install dastyab-cli`).
@@ -172,7 +173,7 @@ dastyab-gui
 ## Architecture at a glance
 
 ```
-dastyab/
+dastyab-rs/
 ├── crates/
 │   ├── dastyab-core/        # pure logic, no UI (the brain)
 │   │   └── src/

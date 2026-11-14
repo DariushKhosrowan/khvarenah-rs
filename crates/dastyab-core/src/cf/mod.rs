@@ -132,7 +132,7 @@ impl Client {
             token: token.trim().to_string(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(25))
-                .user_agent("dastyab")
+                .user_agent("dastyab-rs")
                 .build()
                 .expect("failed to build HTTP client"),
             timeout: std::time::Duration::from_secs(25),

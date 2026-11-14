@@ -28,9 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use dastyab_core::dnstt_server::{
-    handle_datagram, BootstrapInfo, DnsTunnelServer, TunnelHandler,
-};
+use dastyab_core::dnstt_server::{handle_datagram, BootstrapInfo, DnsTunnelServer, TunnelHandler};
 
 const DEFAULT_PORT: u16 = 53;
 const MAX_DATAGRAM: usize = 512;

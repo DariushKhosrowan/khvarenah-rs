@@ -198,7 +198,7 @@ impl CarrierRefresher {
             let handle = scope.spawn(move || {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(HTTP_TIMEOUT)
-                    .user_agent("dastyab-carrier-refresh")
+                    .user_agent("dastyab-rs-carrier-refresh")
                     .build()
                     .map_err(|e| RefreshError::Transport(format!("client: {e}")))?;
                 let resp = client

@@ -218,7 +218,7 @@ async fn fetch_fresh() -> Result<(Vec<Cidr>, String), CFError> {
     // 1) structured JSON API
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
-        .user_agent("dastyab")
+        .user_agent("dastyab-rs")
         .build()
         .map_err(|e| CFError::new("Network error", format!("{e}"), "Internal error."))?;
     match client.get(OFFICIAL_API_URL).send().await {

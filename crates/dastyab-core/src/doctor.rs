@@ -445,7 +445,7 @@ pub fn newest_snapshot(snapshots_dir: &Path) -> Option<PathBuf> {
         if !p
             .file_name()
             .and_then(|s| s.to_str())
-            .map(|s| s.ends_with(".dyb-snapshot.json"))
+            .map(crate::workspace_snapshots::is_snapshot_name)
             .unwrap_or(false)
         {
             continue;

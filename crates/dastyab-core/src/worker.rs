@@ -129,10 +129,9 @@ pub fn find_valid_worker_js(explicit: Option<&Path>) -> Option<Vec<u8>> {
                     return Some(bytes);
                 }
             }
-            Ok((false, why)) => eprintln!(
-                "[dastyab] worker candidate {} invalid: {why}",
-                c.display()
-            ),
+            Ok((false, why)) => {
+                eprintln!("[dastyab] worker candidate {} invalid: {why}", c.display())
+            }
             Err(_) => {}
         }
     }

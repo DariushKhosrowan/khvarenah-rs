@@ -2,8 +2,8 @@
 //! rename / delete actions, plus per-profile token counts, creation time, and
 //! a one-click backup/export for the selected profile.
 
-use eframe::egui;
 use dastyab_core::store::profiles::set_active_profile;
+use eframe::egui;
 
 use crate::app::DastYabApp;
 use crate::state::ProfileSummary;
@@ -170,10 +170,7 @@ pub fn show(
 }
 
 /// Run an action that requires a dialog. Returns the dialog to open, if any.
-pub fn run_action(
-    app: &mut DastYabApp,
-    action: ProfilesAction,
-) -> Option<crate::dialogs::Dialog> {
+pub fn run_action(app: &mut DastYabApp, action: ProfilesAction) -> Option<crate::dialogs::Dialog> {
     use crate::app::PendingDialogAction;
     match action {
         ProfilesAction::Switch(id) => {

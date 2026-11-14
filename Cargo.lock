@@ -1136,6 +1136,84 @@ dependencies = [
 ]
 
 [[package]]
+name = "dastyab-cli"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dastyab-core",
+ "rand 0.8.8",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "dastyab-core"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "chacha20poly1305",
+ "chrono",
+ "ed25519-dalek",
+ "filetime",
+ "flate2",
+ "futures-util",
+ "libc",
+ "percent-encoding",
+ "qrcode",
+ "rand 0.8.8",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+ "uuid",
+ "webpki-roots 1.0.11",
+]
+
+[[package]]
+name = "dastyab-gui"
+version = "0.1.3"
+dependencies = [
+ "chrono",
+ "dastyab-core",
+ "eframe",
+ "egui",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "dastyab-tui"
+version = "0.1.3"
+dependencies = [
+ "crossterm",
+ "dastyab-core",
+ "ratatui",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2444,84 +2522,6 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
-
-[[package]]
-name = "dastyab-cli"
-version = "0.1.3"
-dependencies = [
- "anyhow",
- "clap",
- "dastyab-core",
- "rand 0.8.8",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "dastyab-core"
-version = "0.1.3"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "chacha20poly1305",
- "chrono",
- "ed25519-dalek",
- "filetime",
- "flate2",
- "futures-util",
- "libc",
- "percent-encoding",
- "qrcode",
- "rand 0.8.8",
- "rcgen",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tracing",
- "url",
- "uuid",
- "webpki-roots 1.0.11",
-]
-
-[[package]]
-name = "dastyab-gui"
-version = "0.1.3"
-dependencies = [
- "chrono",
- "eframe",
- "egui",
- "dastyab-core",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "dastyab-tui"
-version = "0.1.3"
-dependencies = [
- "crossterm",
- "dastyab-core",
- "ratatui",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "kurbo"

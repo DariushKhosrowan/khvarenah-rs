@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — 2026-11-14
+
+### Changed (project renamed: DastYab → DastYab)
+
+- The project is now **DastYab** (Persian: *within reach*). Every crate, binary,
+  env var, on-disk path and protocol identifier follows the new name:
+  `dastyab-core` / `dastyab-cli` / `dastyab-tui` / `dastyab-gui`, binary
+  `dastyab`, `DASTYAB_*` env vars (formerly `DASTYAB_*`), `DYB_*` short
+  prefix (formerly `DYB_*`), state under `~/.dastyab/` (formerly `~/.dastyab/`).
+- **Upgrade safety:** an existing `~/.dastyab/` is adopted on first run via a
+  single `rename(2)`, for read-only commands too — tokens, profiles and scanned
+  IPs survive the rename. Existing `*.dyb-snapshot.json` files remain listable
+  and restorable; only the new `*.dyb-snapshot.json` suffix is written.
+- **Breaking for deployed setups:** the worker session header is now
+  `X-DastYab-Session` and the mesh/DTN magic tags are `DYBMESH1` / `DYBDTN1` /
+  `DYBMRELAY1`. Workers deployed by a pre-rename build must be redeployed, and
+  nodes on the old magic tags will not peer with new ones until upgraded.
+- The `DYB_TUNNEL_BASE` default domain and the public site canonical moved to
+  `dastyab.dev`; the GitHub repository is expected to become `dastyab-rs`.
 ## Unreleased — 2026-11-13
 
 ### Added (offline Telegram-export archive mining — Rung -1 recovery)

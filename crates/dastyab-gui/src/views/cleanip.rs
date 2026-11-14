@@ -3,8 +3,8 @@
 //! delete, search, stats, copy-all, clear-all, manual add, import of
 //! known-good seeds, and a live per-entry reachability probe.
 
-use eframe::egui;
 use dastyab_core::store::profiles::{remember_clean_ip_with_source, remove_clean_ip};
+use eframe::egui;
 
 use crate::app::DastYabApp;
 use crate::views::{

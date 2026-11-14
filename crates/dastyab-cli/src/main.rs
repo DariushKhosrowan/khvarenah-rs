@@ -637,16 +637,21 @@ enum Command {
         token: Option<String>,
     },
     /// Compose and preview a modular VPN-tool chain (Psiphon, Tor,
-    /// v2rayN/xray, Lantern, Shadowsocks) in user-chosen order (doctrine
-    /// §8.3). Planning validates engines and assigns loopback ports; it does
-    /// NOT spawn processes yet (executor is a separate step).
+    /// v2rayN/xray, Lantern, Shadowsocks, Hysteria2, Tuic, Mihomo, SingBox,
+    /// SSR, custom) in user-chosen order (doctrine §8.3). Planning validates
+    /// engines and assigns loopback ports; it does NOT spawn processes yet
+    /// (executor is a separate step).
     Chain {
-        /// Action: plan | list-engines | check.
+        /// Action: plan | list-engines | check | custom-add | custom-list |
+        /// custom-rm. custom-add takes the layer spec in `--chain` as
+        /// key=value tokens (id,binary,args,label,socks5,port,risk).
         #[arg()]
         action: String,
         /// Ordered engine chain, first layer first, comma-separated using the
-        /// engine ids: psiphon, tor, v2rayn, lantern, shadowsocks, dastyab.
-        /// e.g. `--chain lantern,tor,v2rayn`. Required for `plan`.
+        /// engine ids: psiphon, tor, v2rayn, lantern, shadowsocks, hysteria2,
+        /// tuic, mihomo, singbox, ssr, dastyab, or custom:<id> for a
+        /// registered custom layer. e.g. `--chain lantern,tor,v2rayn`.
+        /// Required for `plan`.
         #[arg(long, default_value = "")]
         chain: String,
     },
@@ -1480,6 +1485,11 @@ pub enum DaemonAction {
 
 #[tokio::main]
 async fn main() {
+    // Adopt a pre-rename state directory (`~/.dastyab` -> `~/.dastyab`)
+    // before any subcommand resolves a path, so an upgrade keeps the user's
+    // existing profiles and saved secrets.
+    dastyab_core::store::adopt_legacy_mem_dir_once();
+
     // Install the process-level rustls provider before any network/TLS work
     // (core uses aws-lc-rs; reqwest pulls ring too — explicit install avoids
     // the "could not determine CryptoProvider" panic, e.g. on `drill`).

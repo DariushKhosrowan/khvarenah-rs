@@ -300,7 +300,8 @@ pub async fn run(
             // whole handler onto a blocking thread (mirrors Anchors).
             let action = action.clone();
             let chain = chain.clone();
-            tokio::task::spawn_blocking(move || cmd_chain(&action, &chain))
+            let profile = profile.clone();
+            tokio::task::spawn_blocking(move || cmd_chain(&profile, &action, &chain))
                 .await
                 .map_err(|e| CFError::new("chain", "spawn_blocking", e.to_string()))?
         }
@@ -555,19 +556,12 @@ fn cmd_subscribe(
 ///   - `plan`: parse `--chain`, run the planner, print the concrete pipeline.
 ///   - `check`: verify the chain parser accepts the ordering and report
 ///     any unknown engines (without requiring binaries present).
-fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
-    use dastyab_core::chain_mixer::{self, ChainConfig, Engine};
+///   - `custom <sub>`: add/list/rm user-registered custom engine layers.
+fn cmd_chain(profile: &str, action: &str, chain: &str) -> Result<(), CFError> {
+    use dastyab_core::chain_mixer::{self, ChainConfig};
     match action {
         "list-engines" => {
-            let ids = [
-                Engine::Psiphon,
-                Engine::Tor,
-                Engine::V2rayN,
-                Engine::Lantern,
-                Engine::Shadowsocks,
-                Engine::ShirOKhorshid,
-                Engine::DastYab,
-            ];
+            let ids = chain_mixer::builtin_engine_ids();
             for e in ids {
                 println!(
                     "{:<12} binary={}",
@@ -575,28 +569,109 @@ fn cmd_chain(action: &str, chain: &str) -> Result<(), CFError> {
                     e.binary_hint().unwrap_or("(in-process)")
                 );
             }
+            // Also list any user-registered custom layers.
+            let custom = chain_mixer::load_custom_engines(profile);
+            if !custom.is_empty() {
+                println!("\nuser-registered custom layers ({custom:?}):");
+                for c in &custom {
+                    println!(
+                        "  custom:{:<10} label={} binary={} egress={:?}",
+                        c.id, c.label, c.binary, c.egress_risk
+                    );
+                }
+            }
+            Ok(())
+        }
+        "custom-add" | "custom-set" => {
+            // `--chain` carries the spec as comma-separated key=value tokens:
+            // id=...,label=...,binary=...,args=...,socks5=...,port=...,risk=...
+            let mut id = String::new();
+            let mut label = String::new();
+            let mut binary = String::new();
+            let mut args: Vec<String> = Vec::new();
+            let mut socks5 = true;
+            let mut port = 10990u16;
+            let mut risk = chain_mixer::EgressRisk::Moderate;
+            for part in chain.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if let Some((k, v)) = part.split_once('=') {
+                    match k {
+                        "id" => id = v.to_string(),
+                        "label" => label = v.to_string(),
+                        "binary" => binary = v.to_string(),
+                        "args" => {
+                            args = v.split_whitespace().map(|s| s.to_string()).collect();
+                        }
+                        "socks5" => socks5 = v == "true" || v == "1",
+                        "port" => port = v.parse().unwrap_or(10990),
+                        "risk" => {
+                            risk = match v {
+                                "clean" => chain_mixer::EgressRisk::Clean,
+                                "risky" => chain_mixer::EgressRisk::Risky,
+                                _ => chain_mixer::EgressRisk::Moderate,
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if id.is_empty() || binary.is_empty() {
+                return Err(CFError::new(
+                    "chain custom-add",
+                    "missing required fields",
+                    "provide id=<name>,binary=<path>,args=<argv template> (optional label,socks5,port,risk)",
+                ));
+            }
+            if label.is_empty() {
+                label = id.clone();
+            }
+            let engine = chain_mixer::CustomEngine {
+                id,
+                label,
+                binary,
+                args,
+                socks5,
+                default_port: port,
+                egress_risk: risk,
+            };
+            let path = chain_mixer::register_custom_engine(profile, engine)?;
+            println!("[chain] saved custom layer to {}", path.display());
+            Ok(())
+        }
+        "custom-list" => {
+            let custom = chain_mixer::load_custom_engines(profile);
+            if custom.is_empty() {
+                println!("[chain] no custom layers registered");
+                return Ok(());
+            }
+            for c in &custom {
+                println!(
+                    "  custom:{:<10} label={} binary={} socks5={} port={} egress={:?}",
+                    c.id, c.label, c.binary, c.socks5, c.default_port, c.egress_risk
+                );
+                println!("                args={:?}", c.args);
+            }
+            Ok(())
+        }
+        "custom-rm" | "custom-del" => {
+            let id = chain.trim();
+            if id.is_empty() {
+                return Err(CFError::new(
+                    "chain custom-rm",
+                    "missing id",
+                    "usage: dastyab chain custom-rm --chain <id>",
+                ));
+            }
+            if chain_mixer::remove_custom_engine(profile, id)? {
+                println!("[chain] removed custom layer {id}");
+            } else {
+                println!("[chain] no custom layer named {id}");
+            }
             Ok(())
         }
         "plan" | "check" | "run" | "supervise" => {
             let mut engines = Vec::new();
             for part in chain.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                let e = match part {
-                    "psiphon" => Engine::Psiphon,
-                    "tor" => Engine::Tor,
-                    "v2rayn" | "xray" => Engine::V2rayN,
-                    "lantern" => Engine::Lantern,
-                    "shadowsocks" | "ss" => Engine::Shadowsocks,
-                    "shirokhorshid" | "skh" => Engine::ShirOKhorshid,
-                    "dastyab" => Engine::DastYab,
-                    other => {
-                        return Err(CFError::new(
-                            "chain",
-                            format!("unknown engine: {other}"),
-                            "use: psiphon, tor, v2rayn, lantern, shadowsocks, shirokhorshid, dastyab",
-                        ));
-                    }
-                };
-                engines.push(e);
+                engines.push(chain_mixer::parse_chain_token(part, profile)?);
             }
             let cfg = ChainConfig { engines };
             let planned = chain_mixer::plan_chain(&cfg, |_| None)?;
@@ -1181,8 +1256,7 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
             let eff_light = dastyab_core::store::profiles::effective_light_timeout_secs(c);
             let eff_deep = dastyab_core::store::profiles::effective_deep_timeout_secs(c);
             let eff_backoff = dastyab_core::store::profiles::effective_max_backoff_secs(c);
-            let eff_blackout =
-                dastyab_core::store::profiles::effective_network_down_sleep_secs(c);
+            let eff_blackout = dastyab_core::store::profiles::effective_network_down_sleep_secs(c);
             if json {
                 let obj = serde_json::json!({
                     "profile": profile,
@@ -1313,8 +1387,7 @@ fn cmd_config(profile: &str, action: crate::ConfigAction) -> Result<(), CFError>
             let eff_light = dastyab_core::store::profiles::effective_light_timeout_secs(c);
             let eff_deep = dastyab_core::store::profiles::effective_deep_timeout_secs(c);
             let eff_backoff = dastyab_core::store::profiles::effective_max_backoff_secs(c);
-            let eff_blackout =
-                dastyab_core::store::profiles::effective_network_down_sleep_secs(c);
+            let eff_blackout = dastyab_core::store::profiles::effective_network_down_sleep_secs(c);
             println!("Saved. Effective values for {profile}:");
             println!("  monitor light phase budget : {eff_light}s");
             println!("  monitor deep phase budget   : {eff_deep}s");
@@ -1940,16 +2013,16 @@ fn cleanip_cmd(profile: &str, action: CleanipAction) -> Result<String, CFError> 
                 // Prefer the stored meta country; fall back to a live geoip
                 // lookup (entries recorded before the geo-tag round have
                 // `country: None` in their meta).
-                let cc = m
-                    .country
-                    .clone()
-                    .or_else(|| {
-                        let ip_part = ep.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(ep);
-                        ip_part.parse::<std::net::IpAddr>().ok().and_then(|ip| {
-                            dastyab_core::geoip::GeoDB::load(None).country_code(&ip)
+                let cc =
+                    m.country
+                        .clone()
+                        .or_else(|| {
+                            let ip_part = ep.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(ep);
+                            ip_part.parse::<std::net::IpAddr>().ok().and_then(|ip| {
+                                dastyab_core::geoip::GeoDB::load(None).country_code(&ip)
+                            })
                         })
-                    })
-                    .unwrap_or_else(|| "-".to_string());
+                        .unwrap_or_else(|| "-".to_string());
                 out.push_str(&format!(
                     "  {ep:<24} src={:<7} port={:<5} cc={}\n",
                     m.source, m.port, cc
@@ -2128,13 +2201,8 @@ fn versions_cmd(profile: &str, action: crate::VersionsAction) -> Result<(), CFEr
             Ok(())
         }
         crate::VersionsAction::Restore { artifact, unix } => {
-            av::restore_version(
-                &dir,
-                &artifact,
-                unix,
-                dastyab_core::store::now_ts() as u64,
-            )
-            .map_err(to_verr)?;
+            av::restore_version(&dir, &artifact, unix, dastyab_core::store::now_ts() as u64)
+                .map_err(to_verr)?;
             println!("Restored '{artifact}' in profile '{profile}' to version {unix}");
             Ok(())
         }
@@ -2147,9 +2215,8 @@ fn versions_cmd(profile: &str, action: crate::VersionsAction) -> Result<(), CFEr
             Ok(())
         }
         crate::VersionsAction::Health => {
-            let health =
-                av::measure_versioning_health(&dir, dastyab_core::store::now_ts() as u64)
-                    .map_err(to_verr)?;
+            let health = av::measure_versioning_health(&dir, dastyab_core::store::now_ts() as u64)
+                .map_err(to_verr)?;
             println!("Profile: {profile}");
             println!("Version dirs: {}", health.dir_count);
             println!("Version files: {}", health.file_count);
@@ -2949,8 +3016,7 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
             // (Cause B, rescue territory).
             if verbose {
                 println!("\n--- phase-2 WS-failure histogram (last scan) ---");
-                if let Some(diag) = dastyab_core::store::profiles::load_last_diagnostics(profile)
-                {
+                if let Some(diag) = dastyab_core::store::profiles::load_last_diagnostics(profile) {
                     if diag.ws_failure_histogram.is_empty() {
                         println!("  (empty — no phase-2 probes recorded yet; run a discovery cycle first)");
                     } else {
@@ -3018,8 +3084,7 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
             // matches what actually drove the learning verdict.
             if verbose {
                 println!("\n--- light-sweep aggregate (last monitor pass) ---");
-                if let Some(light) = dastyab_core::store::profiles::load_last_light_sweep(profile)
-                {
+                if let Some(light) = dastyab_core::store::profiles::load_last_light_sweep(profile) {
                     if light.total == 0 {
                         println!("  (no light sweep recorded yet — run a monitor cycle first)");
                     } else {
@@ -3090,9 +3155,7 @@ async fn cmd_autopilot(profile: &str, action: crate::AutopilotAction) -> Result<
                 let name = match state.current {
                     dastyab_core::health::SniStrategy::WorkerOnly => "WorkerOnly",
                     dastyab_core::health::SniStrategy::GenericCfFirst => "GenericCfFirst",
-                    dastyab_core::health::SniStrategy::WorkerThenGenericCf => {
-                        "WorkerThenGenericCf"
-                    }
+                    dastyab_core::health::SniStrategy::WorkerThenGenericCf => "WorkerThenGenericCf",
                 };
                 let window: Vec<u8> = state.recent_outcomes.iter().map(|&w| u8::from(w)).collect();
                 let rate = dastyab_core::autopilot::success_rate(&state);
@@ -3540,8 +3603,7 @@ async fn daemon_loop(cfg: dastyab_core::daemon::DaemonConfig) -> Result<(), CFEr
         // (only when the account is active — never mutate a blocked account).
         if !state.account_state.blocks_cycle() {
             let peer = dastyab_core::autopilot::RealMutationPeer;
-            match dastyab_core::config_mutation::run_mutation_if_due(&active_profile, &peer).await
-            {
+            match dastyab_core::config_mutation::run_mutation_if_due(&active_profile, &peer).await {
                 Ok(Some(outcome)) => {
                     let line = log_line(
                         "INFO",
@@ -4291,7 +4353,7 @@ async fn cmd_beacon(profile: &str, action: crate::BeaconAction) -> Result<(), CF
 fn cmd_aistudio(action: &str) -> Result<(), CFError> {
     // Delegate to the verified, self-healing Python bridge (project-local).
     // The Python tool owns the xray tunnel + watchdog; this is a thin wrapper.
-    let script = "/home/amir/Projects/dastyab/dastyab-aistudio.py";
+    let script = "/home/amir/Projects/dastyab-rs/dastyab-aistudio.py";
     let action = action.trim().to_lowercase();
 
     // Normalize a few natural spellings.
@@ -4407,9 +4469,7 @@ fn cmd_bond(action: &str, frames: usize) -> Result<(), CFError> {
     let action = action.trim().to_lowercase();
     match action.as_str() {
         "selftest" => {
-            use dastyab_core::multipath_bond::{
-                BondPolicy, LaneId, MultipathBonder, SubmitResult,
-            };
+            use dastyab_core::multipath_bond::{BondPolicy, LaneId, MultipathBonder, SubmitResult};
             use rand::Rng;
             use std::time::Duration;
 
@@ -5297,10 +5357,9 @@ async fn cmd_dns_tunnel(profile: &str, action: crate::DnsTunnelAction) -> Result
                 retries: 2,
                 vless_upstream,
             };
-            let res = dastyab_core::worker_tunnel::deploy_worker_tunnel(
-                &client, &acc.id, profile, &opts,
-            )
-            .await?;
+            let res =
+                dastyab_core::worker_tunnel::deploy_worker_tunnel(&client, &acc.id, profile, &opts)
+                    .await?;
             println!("Worker DNS tunnel deployed:");
             println!("  worker      : {}", res.worker_name);
             println!("  url         : {}", res.worker_url);
@@ -5682,10 +5741,9 @@ async fn cmd_multi_worker(profile: &str, action: crate::MultiWorkerAction) -> Re
                 p.config.active_account.clone()
             };
             let peer = RealWorkerPeer;
-            let next = dastyab_core::multi_worker::delete_worker_from_set(
-                &peer, profile, &acc_id, &name,
-            )
-            .await?;
+            let next =
+                dastyab_core::multi_worker::delete_worker_from_set(&peer, profile, &acc_id, &name)
+                    .await?;
             match next {
                 Some(n) => println!("Deleted worker '{name}'. Active worker is now '{n}'."),
                 None => println!("Deleted worker '{name}'. No workers remain in the set."),
@@ -6241,8 +6299,7 @@ fn workspace_cmd(action: WorkspaceAction) -> Result<(), CFError> {
                 _ => SnapshotKind::Full,
             };
             let workspace = dastyab_core::store::mem_dir();
-            let snap =
-                snapshot_workspace(&workspace, kind, dastyab_core::store::now_ts() as u64)?;
+            let snap = snapshot_workspace(&workspace, kind, dastyab_core::store::now_ts() as u64)?;
             let dest = match output {
                 Some(p) => std::path::PathBuf::from(p),
                 None => workspace.join("workspace-snapshot.json"),

@@ -158,7 +158,7 @@ impl WorkerDataRelay {
             .uri(&endpoint)
             .header("Host", hostport.split('/').next().unwrap_or(hostport))
             .header("X-DastYab-Session", &secret)
-            .header("User-Agent", "dastyab-worker-data-relay")
+            .header("User-Agent", "dastyab-rs-worker-data-relay")
             .body(())
             .map_err(|e| CFError::new("worker-data-relay", format!("build ws request: {e}"), ""))?;
 

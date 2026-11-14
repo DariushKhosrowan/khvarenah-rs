@@ -10,7 +10,7 @@ use crate::error::CFError;
 /// GitHub repo owner.
 pub const OWNER: &str = "DariushKhosrowan";
 /// GitHub repo name.
-pub const REPO: &str = "dastyab";
+pub const REPO: &str = "dastyab-rs";
 /// GitHub API base.
 pub const GITHUB_API: &str = "https://api.github.com";
 
@@ -18,7 +18,7 @@ pub const GITHUB_API: &str = "https://api.github.com";
 pub const AUTO_UPDATE_INTERVAL_SECS: u64 = 86400;
 
 const RELEASE_LATEST: &str =
-    "https://api.github.com/repos/DariushKhosrowan/dastyab/releases/latest";
+    "https://api.github.com/repos/DariushKhosrowan/dastyab-rs/releases/latest";
 
 /// Version metadata parsed from a release tag.
 #[derive(Debug, Clone)]

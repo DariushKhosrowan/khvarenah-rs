@@ -32,14 +32,47 @@ use crate::error::CFError;
 
 pub use profiles::{now_iso, now_ts};
 
+/// Current on-disk state directory name (under `$HOME`).
+pub const MEM_DIR_NAME: &str = ".dastyab";
+
 /// Base directory for all DastYab state.
+///
+/// Adoption of a pre-rename directory happens here exactly once per process
+/// (see [`adopt_legacy_mem_dir_once`]). It lives on this path because *every*
+/// entry point resolves state through it — including the read-only commands
+/// (`profiles`, `inventory`) that never call [`ensure_mem_dir`], which are
+/// precisely the commands that must still see a user's existing state after
+/// the rename.
 pub fn mem_dir() -> PathBuf {
+    adopt_legacy_mem_dir_once();
+    raw_mem_dir()
+}
+
+/// Run [`adopt_legacy_mem_dir`] at most once per process.
+///
+/// Two guards, because this function moves a real directory:
+/// * `cfg!(test)` covers unit tests, which are the likeliest to resolve a
+///   state path while forgetting [`set_mem_dir_override`].
+/// * `DASTYAB_NO_MIGRATE` lets a harness or an operator disable it outright
+///   (integration tests are compiled without `cfg(test)`, so they need this).
+pub fn adopt_legacy_mem_dir_once() {
+    if cfg!(test) || std::env::var_os("DASTYAB_NO_MIGRATE").is_some() {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        adopt_legacy_mem_dir();
+    });
+}
+
+/// The state directory path, with no adoption side effect.
+fn raw_mem_dir() -> PathBuf {
     if let Some(override_dir) = MEM_DIR_OVERRIDE.with(|cell| cell.borrow().clone()) {
         return override_dir;
     }
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".dastyab")
+        .join(MEM_DIR_NAME)
 }
 
 /// The user's home directory (no external `dirs` dependency).
@@ -70,6 +103,54 @@ pub fn mem_override() -> Option<PathBuf> {
 /// The directory holding all profiles.
 pub fn profiles_dir() -> PathBuf {
     mem_dir().join("profiles")
+}
+
+/// Pre-rename state directory names, newest first.
+///
+/// The project was called `DastYab` before it was renamed to `DastYab`, and
+/// its state lived in `~/.dastyab`. Users who upgrade keep real tokens and
+/// scanned IPs in that directory, so it is adopted rather than abandoned.
+pub fn legacy_mem_dir_names() -> &'static [&'static str] {
+    &[".dastyab"]
+}
+
+/// Adopt a pre-rename state directory, if one exists and the current one does
+/// not. Returns the path that was adopted.
+///
+/// Best-effort and one-shot: a plain `rename(2)` inside the same home
+/// directory, so a failure (permissions, cross-device) leaves the old data
+/// untouched and the caller just starts a fresh tree. Never runs under a test
+/// override, so a unit test can never move a real user's real data.
+///
+/// Idempotent and cheap once the current directory exists: the `exists()`
+/// probe short-circuits, and `mem_dir()` calls this on every access.
+pub fn adopt_legacy_mem_dir() -> Option<PathBuf> {
+    if mem_override().is_some() {
+        return None;
+    }
+    let current = raw_mem_dir();
+    if current.exists() {
+        return None;
+    }
+    let home = home_dir()?;
+    adopt_legacy_mem_dir_at(&home, &current)
+}
+
+/// The adoption itself, with explicit paths so it is testable without
+/// mutating the process-wide `HOME`.
+///
+/// Returns the adopted path, or `None` when there is nothing to adopt.
+pub fn adopt_legacy_mem_dir_at(home: &Path, current: &Path) -> Option<PathBuf> {
+    if current.exists() {
+        return None;
+    }
+    for name in legacy_mem_dir_names() {
+        let candidate = home.join(name);
+        if candidate.is_dir() && fs::rename(&candidate, current).is_ok() {
+            return Some(current.to_path_buf());
+        }
+    }
+    None
 }
 
 /// Make the memory directory tree, chmod 700 on Unix.
@@ -275,6 +356,77 @@ pub fn new_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pre-rename state must actually be adopted: a user upgrading from the
+    /// `DastYab` layout keeps every token and scanned IP.
+    #[test]
+    fn legacy_mem_dir_is_adopted_with_contents() {
+        assert!(legacy_mem_dir_names().contains(&".dastyab"));
+
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(".dastyab");
+        fs::create_dir_all(legacy.join("profiles")).unwrap();
+        fs::write(legacy.join("token.txt"), b"live-token").unwrap();
+
+        let current = home.path().join(MEM_DIR_NAME);
+        let adopted =
+            adopt_legacy_mem_dir_at(home.path(), &current).expect("legacy dir must be adopted");
+
+        assert_eq!(adopted, current);
+        assert!(!legacy.exists(), "old dir must be gone after adoption");
+        assert_eq!(fs::read(current.join("token.txt")).unwrap(), b"live-token");
+        assert!(current.join("profiles").is_dir());
+    }
+
+    /// Adoption is one-shot: once the new directory exists it must not
+    /// clobber live state, even if a stale old directory reappears.
+    #[test]
+    fn adoption_never_overwrites_existing_state() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(".dastyab");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("token.txt"), b"stale").unwrap();
+
+        let current = home.path().join(MEM_DIR_NAME);
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("token.txt"), b"live").unwrap();
+
+        assert!(adopt_legacy_mem_dir_at(home.path(), &current).is_none());
+        assert_eq!(fs::read(current.join("token.txt")).unwrap(), b"live");
+        assert!(legacy.exists(), "stale dir left untouched");
+    }
+
+    /// The process-wide adopter must be inert under `DASTYAB_NO_MIGRATE`,
+    /// otherwise a test harness could move a real home directory.
+    #[test]
+    fn adoption_is_inert_under_no_migrate_env() {
+        // SAFETY: single-threaded test setup, and the variable is only read by
+        // `adopt_legacy_mem_dir_once`, which the `cfg!(test)` guard already
+        // short-circuits in this build.
+        std::env::set_var("DASTYAB_NO_MIGRATE", "1");
+        let before = mem_dir();
+        adopt_legacy_mem_dir_once();
+        assert_eq!(mem_dir(), before, "path resolution must not change");
+        std::env::remove_var("DASTYAB_NO_MIGRATE");
+    }
+
+    /// Adoption must be a no-op when there is nothing to adopt.
+    #[test]
+    fn adoption_is_none_without_legacy_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let current = home.path().join(MEM_DIR_NAME);
+        assert!(adopt_legacy_mem_dir_at(home.path(), &current).is_none());
+        assert!(!current.exists());
+    }
+
+    /// The adopter must never fire under a test override, or a test run could
+    /// move a developer's real secrets directory.
+    #[test]
+    fn adopt_legacy_mem_dir_is_inert_under_override() {
+        let dir = tempfile::tempdir().unwrap();
+        set_mem_dir_override(dir.path().join(".dastyab"));
+        assert!(adopt_legacy_mem_dir().is_none());
+    }
 
     #[test]
     fn atomic_write_creates_file_with_content() {

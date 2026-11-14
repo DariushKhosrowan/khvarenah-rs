@@ -38,8 +38,142 @@ pub enum Engine {
     /// intermediate domestic datacenter proxy pipeline (Rathole / GOST/
     /// smux over TLS) on an Iranian VPS.
     ShirOKhorshid,
+    /// Hysteria2 — QUIC-based, UDP/TCP hybrid, fast CN/anti-DPI obfuscation.
+    /// One of the most reliable protocols under deep-packet-injection.
+    Hysteria2,
+    /// Tuic(v5) — QUIC-based, UDP-only, very low overhead; often survives
+    /// when TCP is throttled to zero.
+    Tuic,
+    /// Mihomo (clash-meta) — rule-based multiplexing client; can route
+    /// multiple upstreams and adapt transport on the fly.
+    Mihomo,
+    /// sing-box — universal proxy core (VMess/Shadowsocks/TUIC/Hysteria2/etc.).
+    SingBox,
+    /// ShadowsocksR (ssr) — legacy obfs+protocol obfuscation; still reaches
+    /// some networks that block standard AEAD SS.
+    ShadowsocksR,
     /// The app's own stack (multilayer tunnel tiers: doh/dot/dnstunnel).
     DastYab,
+}
+
+/// A user-defined, arbitrary chain layer. This is what makes the chain a
+/// *wide-freedom platform*: the operator can inject any binary/tool as a
+/// layer, not just the built-in engines. The `args` template may contain
+/// `{port}` (this layer's loopback listen port) and `{upstream}` (the next
+/// layer's SOCKS5 URL, when present).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomEngine {
+    /// Unique id/name for the registry and `--chain` token (`custom:<id>`).
+    pub id: String,
+    /// Human label for diagnostics/UI.
+    pub label: String,
+    /// Absolute path (or PATH-resolvable name) of the binary to spawn.
+    pub binary: String,
+    /// Argument template. `{port}` and `{upstream}` are substituted.
+    pub args: Vec<String>,
+    /// Whether the process listens as SOCKS5 (true) or HTTP proxy (false).
+    pub socks5: bool,
+    /// Preferred loopback port (planner may re-assign if it collides).
+    pub default_port: u16,
+    /// Reputation of the public exit IP this layer presents.
+    pub egress_risk: EgressRisk,
+}
+
+impl CustomEngine {
+    /// Render the launch argv for this custom engine, substituting the
+    /// `{port}` and `{upstream}` placeholders.
+    pub fn render_args(&self, port: u16, upstream: Option<&str>) -> Vec<String> {
+        let args = &self.args;
+        let mut out: Vec<String> = Vec::with_capacity(args.len());
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            // No upstream: drop any segment that is (or embeds) the
+            // `{upstream}` placeholder.
+            if upstream.is_none() && a.contains("{upstream}") {
+                i += 1;
+                continue;
+            }
+            // No upstream: a flag whose *next* argv is the `{upstream}`
+            // placeholder is a dangling pair (flag + missing value) → drop
+            // both, e.g. ["-upstream", "{upstream}"].
+            if upstream.is_none()
+                && !a.contains("{port}")
+                && !a.contains("{upstream}")
+                && args.get(i + 1).map_or(false, |n| n.contains("{upstream}"))
+            {
+                i += 2;
+                continue;
+            }
+            let mut s = a.replace("{port}", &port.to_string());
+            if let Some(up) = upstream {
+                s = s.replace("{upstream}", up);
+            }
+            if !s.trim().is_empty() {
+                out.push(s);
+            }
+            i += 1;
+        }
+        out
+    }
+}
+
+/// A chain layer element: either a built-in engine or a user-defined custom
+/// engine. This is the unit the planner, launcher, and killer operate on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChainElement {
+    Builtin(Engine),
+    Custom(CustomEngine),
+}
+
+impl ChainElement {
+    pub fn label(&self) -> String {
+        match self {
+            ChainElement::Builtin(e) => e.label().to_string(),
+            ChainElement::Custom(c) => c.label.clone(),
+        }
+    }
+
+    /// The binary to spawn, or `None` for in-process layers (DastYab).
+    pub fn binary_hint(&self) -> Option<&str> {
+        match self {
+            ChainElement::Builtin(e) => e.binary_hint(),
+            ChainElement::Custom(c) => Some(&c.binary),
+        }
+    }
+
+    pub fn egress_risk(&self) -> EgressRisk {
+        match self {
+            ChainElement::Builtin(e) => e.egress_risk(),
+            ChainElement::Custom(c) => c.egress_risk.clone(),
+        }
+    }
+
+    pub fn listen_args(&self, port: u16) -> Vec<String> {
+        match self {
+            ChainElement::Builtin(e) => e.listen_args(port),
+            ChainElement::Custom(c) => c.render_args(port, None),
+        }
+    }
+
+    /// Render the full launch argv for this element, including the optional
+    /// upstream handoff. For built-ins this matches what `ProcessLauncher`
+    /// historically appended; for custom engines the template is authoritative.
+    pub fn full_args(&self, port: u16, upstream: Option<&str>) -> Vec<String> {
+        match self {
+            ChainElement::Builtin(e) => {
+                let mut args = e.listen_args(port);
+                if let Some(up) = upstream {
+                    args.push("--upstream".to_string());
+                    args.push(up.to_string());
+                }
+                args
+            }
+            ChainElement::Custom(c) => c.render_args(port, upstream),
+        }
+    }
 }
 
 /// Reputation of the public exit IP a chain's outermost layer will present.
@@ -56,6 +190,132 @@ pub enum EgressRisk {
     Risky,
 }
 
+// ---------------------------------------------------------------------------
+// Custom-engine registry (per profile): the "wide freedom" hook. A user can
+// register any binary/tool as a layer and reference it in `--chain` as
+// `custom:<id>`. The registry persists under the profile directory.
+// ---------------------------------------------------------------------------
+
+/// Path of a profile's custom-engine registry file.
+pub fn custom_engines_path(profile: &str) -> std::path::PathBuf {
+    crate::store::profiles::profile_dir(profile).join("custom_engines.json")
+}
+
+/// Load the custom-engine registry for `profile`. Missing/corrupt files are
+/// treated as an empty registry (never fatal — the built-in engines still
+/// work).
+pub fn load_custom_engines(profile: &str) -> Vec<CustomEngine> {
+    let path = custom_engines_path(profile);
+    let Ok(data) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice(&data).unwrap_or_default()
+}
+
+/// Persist the custom-engine registry for `profile`. Creates the profile dir
+/// if needed. Returns the canonical path on success.
+pub fn save_custom_engines(
+    profile: &str,
+    engines: &[CustomEngine],
+) -> Result<std::path::PathBuf, CFError> {
+    use std::io::Write;
+    let path = custom_engines_path(profile);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CFError::new(
+                "custom-engines",
+                format!("cannot create profile dir: {e}"),
+                "",
+            )
+        })?;
+    }
+    let data = serde_json::to_vec_pretty(engines)
+        .map_err(|e| CFError::new("custom-engines", format!("serialize: {e}"), ""))?;
+    let mut f = std::fs::File::create(&path)
+        .map_err(|e| CFError::new("custom-engines", format!("cannot write registry: {e}"), ""))?;
+    f.write_all(&data)
+        .map_err(|e| CFError::new("custom-engines", format!("write: {e}"), ""))?;
+    Ok(path)
+}
+
+/// Register a custom engine in `profile`'s registry. Replaces an existing
+/// entry with the same id. Returns the saved path.
+pub fn register_custom_engine(
+    profile: &str,
+    engine: CustomEngine,
+) -> Result<std::path::PathBuf, CFError> {
+    let mut all = load_custom_engines(profile);
+    all.retain(|e| e.id != engine.id);
+    all.push(engine);
+    save_custom_engines(profile, &all)
+}
+
+/// Remove a custom engine by id. Returns true if an entry was removed.
+pub fn remove_custom_engine(profile: &str, id: &str) -> Result<bool, CFError> {
+    let mut all = load_custom_engines(profile);
+    let before = all.len();
+    all.retain(|e| e.id != id);
+    if all.len() == before {
+        return Ok(false);
+    }
+    save_custom_engines(profile, &all)?;
+    Ok(true)
+}
+
+/// Resolve a `--chain` token that may be a built-in engine name or a
+/// `custom:<id>` reference. Returns the resolved `ChainElement`.
+pub fn parse_chain_token(token: &str, profile: &str) -> Result<ChainElement, CFError> {
+    if let Some(id) = token.strip_prefix("custom:") {
+        let id = id.trim();
+        let custom = load_custom_engines(profile);
+        if let Some(engine) = custom.into_iter().find(|e| e.id == id) {
+            return Ok(ChainElement::Custom(engine));
+        }
+        return Err(CFError::new(
+            "chain",
+            format!("unknown custom engine: {id}"),
+            "register it first with `dastyab nodes chain custom add`",
+        ));
+    }
+    match token {
+        "psiphon" => Ok(ChainElement::Builtin(Engine::Psiphon)),
+        "tor" => Ok(ChainElement::Builtin(Engine::Tor)),
+        "v2rayn" | "xray" => Ok(ChainElement::Builtin(Engine::V2rayN)),
+        "lantern" => Ok(ChainElement::Builtin(Engine::Lantern)),
+        "shadowsocks" | "ss" => Ok(ChainElement::Builtin(Engine::Shadowsocks)),
+        "shirokhorshid" | "skh" => Ok(ChainElement::Builtin(Engine::ShirOKhorshid)),
+        "hysteria2" | "hy2" => Ok(ChainElement::Builtin(Engine::Hysteria2)),
+        "tuic" => Ok(ChainElement::Builtin(Engine::Tuic)),
+        "mihomo" | "clash-meta" => Ok(ChainElement::Builtin(Engine::Mihomo)),
+        "singbox" | "sing-box" => Ok(ChainElement::Builtin(Engine::SingBox)),
+        "ssr" | "shadowsocksr" => Ok(ChainElement::Builtin(Engine::ShadowsocksR)),
+        "dastyab" => Ok(ChainElement::Builtin(Engine::DastYab)),
+        other => Err(CFError::new(
+            "chain",
+            format!("unknown engine or custom layer: {other}"),
+            "use a built-in (psiphon, tor, v2rayn, lantern, shadowsocks, shirokhorshid, hysteria2, tuic, mihomo, singbox, ssr, dastyab) or custom:<id>",
+        )),
+    }
+}
+
+/// All built-in engine ids, for `list-engines`.
+pub fn builtin_engine_ids() -> Vec<Engine> {
+    vec![
+        Engine::Psiphon,
+        Engine::Tor,
+        Engine::V2rayN,
+        Engine::Lantern,
+        Engine::Shadowsocks,
+        Engine::ShirOKhorshid,
+        Engine::Hysteria2,
+        Engine::Tuic,
+        Engine::Mihomo,
+        Engine::SingBox,
+        Engine::ShadowsocksR,
+        Engine::DastYab,
+    ]
+}
+
 impl Engine {
     /// Human label for diagnostics/UI.
     pub fn label(self) -> &'static str {
@@ -66,6 +326,11 @@ impl Engine {
             Engine::Lantern => "lantern",
             Engine::Shadowsocks => "shadowsocks",
             Engine::ShirOKhorshid => "shirokhorshid",
+            Engine::Hysteria2 => "hysteria2",
+            Engine::Tuic => "tuic",
+            Engine::Mihomo => "mihomo",
+            Engine::SingBox => "singbox",
+            Engine::ShadowsocksR => "shadowsocksr",
             Engine::DastYab => "dastyab",
         }
     }
@@ -107,6 +372,50 @@ impl Engine {
             // (gost `-L` in plain SOCKS5 mode). The domestic hop is what
             // launders the exit's reputation behind the Iranian VPS.
             Engine::ShirOKhorshid => vec!["-L".to_string(), format!("socks5://127.0.0.1:{port}")],
+            // Hysteria2 client: local SOCKS5 on `port`.
+            Engine::Hysteria2 => vec![
+                "client".to_string(),
+                "-c".to_string(),
+                std::env::temp_dir()
+                    .join(format!("dastyab-hysteria2-{port}.yaml"))
+                    .to_string_lossy()
+                    .into_owned(),
+                "".to_string(), // config path is generated by the caller
+            ],
+            // Tuic client: local SOCKS5 on `port`.
+            Engine::Tuic => vec![
+                "-c".to_string(),
+                std::env::temp_dir()
+                    .join(format!("dastyab-tuic-{port}.json"))
+                    .to_string_lossy()
+                    .into_owned(),
+                "".to_string(),
+            ],
+            // Mihomo (clash-meta): run with a generated base config; listen as
+            // mixed HTTP/SOCKS5 on `port`.
+            Engine::Mihomo => vec![
+                "-f".to_string(),
+                std::env::temp_dir()
+                    .join(format!("dastyab-mihomo-{port}.yaml"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            // sing-box: run with a generated JSON config; local SOCKS5 on port.
+            Engine::SingBox => vec![
+                "run".to_string(),
+                "-c".to_string(),
+                std::env::temp_dir()
+                    .join(format!("dastyab-singbox-{port}.json"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            // ShadowsocksR: sslocal-compatible; listen SOCKS5 on port.
+            Engine::ShadowsocksR => vec![
+                "-s".to_string(),
+                "127.0.0.1".to_string(),
+                "-p".to_string(),
+                port.to_string(),
+            ],
             Engine::DastYab => vec![],
         }
     }
@@ -121,8 +430,12 @@ impl Engine {
             Engine::V2rayN => Some("xray"),
             Engine::Lantern => Some("lantern"),
             Engine::Shadowsocks => Some("sslocal"),
-            // gost is the reference Shir-o-Khorshid forward-proxy pipeline.
             Engine::ShirOKhorshid => Some("gost"),
+            Engine::Hysteria2 => Some("hysteria"),
+            Engine::Tuic => Some("tuic-client"),
+            Engine::Mihomo => Some("mihomo"),
+            Engine::SingBox => Some("sing-box"),
+            Engine::ShadowsocksR => Some("ssr-local"),
             Engine::DastYab => None,
         }
     }
@@ -135,9 +448,15 @@ impl Engine {
         match self {
             Engine::Tor => EgressRisk::Risky,
             Engine::Psiphon | Engine::Lantern => EgressRisk::Moderate,
-            Engine::V2rayN | Engine::Shadowsocks | Engine::ShirOKhorshid | Engine::DastYab => {
-                EgressRisk::Clean
-            }
+            Engine::V2rayN
+            | Engine::Shadowsocks
+            | Engine::ShirOKhorshid
+            | Engine::Hysteria2
+            | Engine::Tuic
+            | Engine::Mihomo
+            | Engine::SingBox
+            | Engine::ShadowsocksR
+            | Engine::DastYab => EgressRisk::Clean,
         }
     }
 }
@@ -146,7 +465,7 @@ impl Engine {
 /// listens on (assigned by the planner).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainLayer {
-    pub engine: Engine,
+    pub engine: ChainElement,
     /// Loopback port this layer's SOCKS5 proxy binds (0 = unassigned).
     pub port: u16,
     /// Optional upstream proxy (`socks5h://127.0.0.1:<prev>`); the first layer
@@ -157,8 +476,9 @@ pub struct ChainLayer {
 /// The user's chosen, ordered engine list for one profile.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainConfig {
-    /// Ordered engines, first layer first.
-    pub engines: Vec<Engine>,
+    /// Ordered engines, first layer first. Each may be a built-in engine or a
+    /// user-defined custom layer (`ChainElement::Custom`).
+    pub engines: Vec<ChainElement>,
 }
 
 impl ChainConfig {
@@ -184,7 +504,20 @@ fn default_port(engine: Engine) -> u16 {
         Engine::Lantern => 10864,
         Engine::Shadowsocks => 10865,
         Engine::ShirOKhorshid => 10866,
+        Engine::Hysteria2 => 10867,
+        Engine::Tuic => 10868,
+        Engine::Mihomo => 10869,
+        Engine::SingBox => 10870,
+        Engine::ShadowsocksR => 10871,
         Engine::DastYab => crate::multilayer::PROXY_SOCKS_PORT,
+    }
+}
+
+/// Default loopback port for a chain element (builtin or custom).
+fn element_default_port(element: &ChainElement) -> u16 {
+    match element {
+        ChainElement::Builtin(e) => default_port(*e),
+        ChainElement::Custom(c) => c.default_port,
     }
 }
 
@@ -195,7 +528,7 @@ fn default_port(engine: Engine) -> u16 {
 /// able to degrade (doctrine §3).
 pub fn plan_chain(
     config: &ChainConfig,
-    look_up: impl Fn(Engine) -> Option<String>,
+    look_up: impl Fn(&ChainElement) -> Option<String>,
 ) -> Result<PlannedChain, CFError> {
     if config.engines.is_empty() {
         return Err(CFError::new(
@@ -207,19 +540,20 @@ pub fn plan_chain(
     // De-duplicate consecutive repeats and reject > 8 layers (sanity bound).
     let mut seen = std::collections::HashSet::new();
     let mut layers = Vec::new();
-    let mut prev: Option<Engine> = None;
-    for &eng in &config.engines {
-        if Some(eng) == prev {
+    let mut prev: Option<String> = None;
+    for eng in &config.engines {
+        let key = eng.label();
+        if Some(key.clone()) == prev {
             continue; // collapse accidental duplicates
         }
-        prev = Some(eng);
-        if !seen.insert(eng) {
+        prev = Some(key.clone());
+        if !seen.insert(key) {
             continue; // same engine already in chain at a different pos: skip
         }
         let _ = look_up(eng); // existence check (advisory)
         layers.push(ChainLayer {
-            engine: eng,
-            port: default_port(eng),
+            engine: eng.clone(),
+            port: element_default_port(eng),
             upstream: None,
         });
     }
@@ -302,7 +636,7 @@ pub enum LayerStatus {
 /// Result of executing one layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerRun {
-    pub engine: Engine,
+    pub engine: ChainElement,
     pub port: u16,
     pub status: LayerStatus,
     /// Human-readable reason when not `Up`.
@@ -334,7 +668,12 @@ pub trait EngineLauncher: Send + Sync {
     /// once the process is spawned and its SOCKS5 port accepts TCP connects.
     /// Return `Err` if the engine cannot be started at all (e.g. missing
     /// binary) — the runtime treats that as a skip.
-    fn launch(&self, engine: Engine, port: u16, upstream: Option<&str>) -> Result<(), String>;
+    fn launch(
+        &self,
+        engine: &ChainElement,
+        port: u16,
+        upstream: Option<&str>,
+    ) -> Result<(), String>;
 }
 
 /// A launcher that spawns real processes. Uses each engine's `binary_hint`
@@ -345,17 +684,19 @@ pub trait EngineLauncher: Send + Sync {
 pub struct ProcessLauncher;
 
 impl EngineLauncher for ProcessLauncher {
-    fn launch(&self, engine: Engine, port: u16, upstream: Option<&str>) -> Result<(), String> {
+    fn launch(
+        &self,
+        engine: &ChainElement,
+        port: u16,
+        upstream: Option<&str>,
+    ) -> Result<(), String> {
         let Some(bin) = engine.binary_hint() else {
             // In-process stack (DastYab) is handled by the caller; the
             // runner treats it as satisfied without spawning an external proc.
             return Ok(());
         };
         let mut cmd = std::process::Command::new(bin);
-        cmd.args(engine.listen_args(port));
-        if let Some(up) = upstream {
-            cmd.arg("--upstream").arg(up);
-        }
+        cmd.args(engine.full_args(port, upstream));
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         // `spawn` errors (binary not found) → Err → skip.
@@ -371,7 +712,7 @@ impl EngineLauncher for ProcessLauncher {
 pub trait ProcessKiller: Send + Sync {
     /// Stop the layer for `engine` on loopback `port`. Idempotent for the
     /// production impl (killing a dead process is a no-op).
-    fn kill(&self, engine: Engine, port: u16);
+    fn kill(&self, engine: &ChainElement, port: u16);
 }
 
 /// A killer that finds and kills the engine's process by binary name. Best
@@ -380,7 +721,7 @@ pub trait ProcessKiller: Send + Sync {
 pub struct SystemKiller;
 
 impl ProcessKiller for SystemKiller {
-    fn kill(&self, engine: Engine, _port: u16) {
+    fn kill(&self, engine: &ChainElement, _port: u16) {
         let Some(bin) = engine.binary_hint() else {
             return; // in-process stack: caller owns teardown
         };
@@ -469,7 +810,7 @@ pub async fn run_chain_async<L: EngineLauncher>(
             note = Some("upstream layer not up; deferred".to_string());
             degraded += 1;
         } else {
-            match launcher.launch(layer.engine, layer.port, layer.upstream.as_deref()) {
+            match launcher.launch(&layer.engine, layer.port, layer.upstream.as_deref()) {
                 Ok(()) => {
                     if port_ready(layer.port).await {
                         status = LayerStatus::Up;
@@ -489,7 +830,7 @@ pub async fn run_chain_async<L: EngineLauncher>(
         }
         previous_up = status == LayerStatus::Up;
         runs.push(LayerRun {
-            engine: layer.engine,
+            engine: layer.engine.clone(),
             port: layer.port,
             status,
             note,
@@ -576,7 +917,7 @@ fn candidate_configs(cfg: &ChainConfig) -> Vec<ChainConfig> {
         let mut es = Vec::with_capacity(n);
         for i in 0..n {
             if mask & (1u16 << i) != 0 {
-                es.push(eng[i]);
+                es.push(eng[i].clone());
             }
         }
         out.push(ChainConfig { engines: es });
@@ -590,7 +931,7 @@ fn candidate_configs(cfg: &ChainConfig) -> Vec<ChainConfig> {
 /// egress. Safe to call from within a tokio runtime (no nested block_on).
 pub async fn supervise_chain_async<L: EngineLauncher>(
     cfg: &ChainConfig,
-    look_up: impl Fn(Engine) -> Option<String> + Copy,
+    look_up: impl Fn(&ChainElement) -> Option<String> + Copy,
     launcher: &L,
     port_ready: &PortReadyProbe,
     egress_probe: &EgressProbe,
@@ -648,7 +989,7 @@ pub struct ChainWatchReport {
 /// `killer`, `port_ready`, `egress_probe`, and `stop`.
 pub async fn supervise_chain_watch<L: EngineLauncher, K: ProcessKiller>(
     cfg: &ChainConfig,
-    look_up: impl Fn(Engine) -> Option<String> + Copy,
+    look_up: impl Fn(&ChainElement) -> Option<String> + Copy,
     launcher: &L,
     killer: &K,
     port_ready: &PortReadyProbe,
@@ -695,7 +1036,7 @@ pub async fn supervise_chain_watch<L: EngineLauncher, K: ProcessKiller>(
         }
         // Teardown the dead chain, then re-race (next round).
         for layer in &plan.layers {
-            killer.kill(layer.engine, layer.port);
+            killer.kill(&layer.engine, layer.port);
         }
         if died {
             out.re_races += 1;
@@ -709,7 +1050,7 @@ pub async fn supervise_chain_watch<L: EngineLauncher, K: ProcessKiller>(
 /// async probe.
 pub async fn supervise_chain<L: EngineLauncher, P: Fn(u16) -> bool + Send + Sync + 'static>(
     cfg: &ChainConfig,
-    look_up: impl Fn(Engine) -> Option<String> + Copy,
+    look_up: impl Fn(&ChainElement) -> Option<String> + Copy,
     launcher: &L,
     port_ready: P,
     egress_probe: &EgressProbe,
@@ -730,7 +1071,9 @@ mod tests {
     use std::time::Duration;
 
     fn pop_chain(engines: Vec<Engine>) -> ChainConfig {
-        ChainConfig { engines }
+        ChainConfig {
+            engines: engines.into_iter().map(ChainElement::Builtin).collect(),
+        }
     }
 
     #[test]
@@ -769,8 +1112,11 @@ mod tests {
         let cfg = pop_chain(vec![Engine::Tor, Engine::Tor, Engine::V2rayN]);
         let planned = plan_chain(&cfg, |_| None).unwrap();
         assert_eq!(planned.layers.len(), 2);
-        assert_eq!(planned.layers[0].engine, Engine::Tor);
-        assert_eq!(planned.layers[1].engine, Engine::V2rayN);
+        assert_eq!(planned.layers[0].engine, ChainElement::Builtin(Engine::Tor));
+        assert_eq!(
+            planned.layers[1].engine,
+            ChainElement::Builtin(Engine::V2rayN)
+        );
     }
 
     #[test]
@@ -792,7 +1138,7 @@ mod tests {
     impl EngineLauncher for OkLauncher {
         fn launch(
             &self,
-            _engine: Engine,
+            _engine: &ChainElement,
             _port: u16,
             _upstream: Option<&str>,
         ) -> Result<(), String> {
@@ -803,7 +1149,7 @@ mod tests {
     impl EngineLauncher for ErrLauncher {
         fn launch(
             &self,
-            engine: Engine,
+            engine: &ChainElement,
             _port: u16,
             _upstream: Option<&str>,
         ) -> Result<(), String> {
@@ -934,12 +1280,12 @@ mod tests {
     // A launcher that only starts engines matching `ok` (used to model a
     // missing binary for one specific engine).
     struct SelectiveLauncher {
-        ok: Box<dyn Fn(Engine) -> bool + Send + Sync>,
+        ok: Box<dyn Fn(&ChainElement) -> bool + Send + Sync>,
     }
     impl EngineLauncher for SelectiveLauncher {
         fn launch(
             &self,
-            engine: Engine,
+            engine: &ChainElement,
             _port: u16,
             _upstream: Option<&str>,
         ) -> Result<(), String> {
@@ -994,7 +1340,7 @@ mod tests {
         let plan = report.chosen_plan.unwrap();
         // The winning subset is the smaller degraded chain, not the full one.
         assert_eq!(plan.layers.len(), 1);
-        assert_eq!(plan.layers[0].engine, Engine::V2rayN);
+        assert_eq!(plan.layers[0].engine, ChainElement::Builtin(Engine::V2rayN));
     }
 
     #[tokio::test]
@@ -1022,7 +1368,7 @@ mod tests {
         // with the single-layer V2rayN subset.
         let cfg = pop_chain(vec![Engine::Tor, Engine::V2rayN]);
         let launcher = SelectiveLauncher {
-            ok: Box::new(|e| e != Engine::Tor),
+            ok: Box::new(|e| e != &ChainElement::Builtin(Engine::Tor)),
         };
         let report = supervise_chain(
             &cfg,
@@ -1036,7 +1382,7 @@ mod tests {
         assert!(report.ok);
         let plan = report.chosen_plan.unwrap();
         assert_eq!(plan.layers.len(), 1);
-        assert_eq!(plan.layers[0].engine, Engine::V2rayN);
+        assert_eq!(plan.layers[0].engine, ChainElement::Builtin(Engine::V2rayN));
     }
 
     // ---- Continuous watchdog tests (never-stop loop; doctrine §3/§5) ----
@@ -1044,11 +1390,11 @@ mod tests {
     // Records kill calls so we can assert the watchdog tears down dead chains.
     #[derive(Default)]
     struct RecordingKiller {
-        killed: std::sync::Arc<std::sync::Mutex<Vec<(Engine, u16)>>>,
+        killed: std::sync::Arc<std::sync::Mutex<Vec<(ChainElement, u16)>>>,
     }
     impl ProcessKiller for RecordingKiller {
-        fn kill(&self, engine: Engine, port: u16) {
-            self.killed.lock().unwrap().push((engine, port));
+        fn kill(&self, engine: &ChainElement, port: u16) {
+            self.killed.lock().unwrap().push((engine.clone(), port));
         }
     }
 
@@ -1139,5 +1485,191 @@ mod tests {
         assert_eq!(report.re_races, 0); // never had a live chain to lose
         assert!(report.reached_budget);
         assert!(report.last_plan.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // New-engine + custom-layer tests (wide-freedom platform)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn new_powerful_builtins_exist_and_render_args() {
+        for e in [
+            Engine::Hysteria2,
+            Engine::Tuic,
+            Engine::Mihomo,
+            Engine::SingBox,
+            Engine::ShadowsocksR,
+        ] {
+            assert!(!e.label().is_empty());
+            let args = e.listen_args(10820);
+            // Every external engine must render at least a port-bearing argv.
+            assert!(
+                args.iter().any(|a| a.contains("10820")),
+                "{} should carry its listen port in argv: {args:?}",
+                e.label()
+            );
+        }
+    }
+
+    #[test]
+    fn custom_engine_template_substitution() {
+        let c = CustomEngine {
+            id: "my-tool".into(),
+            label: "My Tool".into(),
+            binary: "/usr/local/bin/mytool".into(),
+            args: vec![
+                "-listen".into(),
+                "127.0.0.1:{port}".into(),
+                "-upstream".into(),
+                "{upstream}".into(),
+            ],
+            socks5: true,
+            default_port: 10999,
+            egress_risk: EgressRisk::Moderate,
+        };
+        // With upstream: both placeholders substituted.
+        let args = c.render_args(10990, Some("socks5h://127.0.0.1:10801"));
+        assert_eq!(
+            args,
+            vec![
+                "-listen",
+                "127.0.0.1:10990",
+                "-upstream",
+                "socks5h://127.0.0.1:10801",
+            ]
+        );
+        // Without upstream: the {upstream} segment is dropped.
+        let args = c.render_args(10990, None);
+        assert_eq!(args, vec!["-listen", "127.0.0.1:10990"]);
+    }
+
+    #[test]
+    fn custom_engine_chain_element_full_args() {
+        let c = CustomEngine {
+            id: "w".into(),
+            label: "W".into(),
+            binary: "/bin/w".into(),
+            args: vec![
+                "-port".into(),
+                "{port}".into(),
+                "-up".into(),
+                "{upstream}".into(),
+            ],
+            socks5: true,
+            default_port: 10999,
+            egress_risk: EgressRisk::Clean,
+        };
+        let el = ChainElement::Custom(c);
+        assert_eq!(el.label(), "W");
+        assert_eq!(el.binary_hint(), Some("/bin/w"));
+        assert_eq!(el.egress_risk(), EgressRisk::Clean);
+        let args = el.full_args(10777, Some("socks5h://127.0.0.1:1"));
+        assert_eq!(args, vec!["-port", "10777", "-up", "socks5h://127.0.0.1:1"]);
+    }
+
+    #[test]
+    fn registry_persistence_roundtrip() {
+        crate::store::set_mem_dir_override(
+            std::env::temp_dir().join(format!("kv_custom_reg_{}", std::process::id())),
+        );
+        let custom = CustomEngine {
+            id: "my-tool".into(),
+            label: "My Tool".into(),
+            binary: "/usr/local/bin/mytool".into(),
+            args: vec!["-listen".into(), "127.0.0.1:{port}".into()],
+            socks5: true,
+            default_port: 10999,
+            egress_risk: EgressRisk::Moderate,
+        };
+        let path = register_custom_engine("default", custom.clone()).unwrap();
+        assert!(path.exists());
+
+        let loaded = load_custom_engines("default");
+        assert_eq!(loaded, vec![custom.clone()]);
+
+        // Registering same id replaces (no duplicates).
+        let mut v2 = custom.clone();
+        v2.binary = "/opt/new/bin".into();
+        register_custom_engine("default", v2.clone()).unwrap();
+        let loaded = load_custom_engines("default");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].binary, "/opt/new/bin");
+
+        assert!(remove_custom_engine("default", "my-tool").unwrap());
+        assert!(!remove_custom_engine("default", "my-tool").unwrap());
+        assert!(load_custom_engines("default").is_empty());
+    }
+
+    #[test]
+    fn parse_chain_token_handles_builtin_and_custom() {
+        crate::store::set_mem_dir_override(
+            std::env::temp_dir().join(format!("kv_parse_tok_{}", std::process::id())),
+        );
+        // Builtins.
+        assert_eq!(
+            parse_chain_token("tor", "default").unwrap(),
+            ChainElement::Builtin(Engine::Tor)
+        );
+        assert_eq!(
+            parse_chain_token("hysteria2", "default").unwrap(),
+            ChainElement::Builtin(Engine::Hysteria2)
+        );
+        assert_eq!(
+            parse_chain_token("singbox", "default").unwrap(),
+            ChainElement::Builtin(Engine::SingBox)
+        );
+        assert_eq!(
+            parse_chain_token("ssr", "default").unwrap(),
+            ChainElement::Builtin(Engine::ShadowsocksR)
+        );
+        // Unknown builtin -> error.
+        assert!(parse_chain_token("nope", "default").is_err());
+        // Custom not registered -> error.
+        assert!(parse_chain_token("custom:ghost", "default").is_err());
+        // Register then parse.
+        let c = CustomEngine {
+            id: "warp".into(),
+            label: "Warp".into(),
+            binary: "/bin/warp".into(),
+            args: vec!["-p".into(), "{port}".into()],
+            socks5: true,
+            default_port: 11000,
+            egress_risk: EgressRisk::Clean,
+        };
+        register_custom_engine("default", c.clone()).unwrap();
+        assert_eq!(
+            parse_chain_token("custom:warp", "default").unwrap(),
+            ChainElement::Custom(c)
+        );
+    }
+
+    #[test]
+    fn plan_chain_accepts_custom_layer() {
+        let c = CustomEngine {
+            id: "warp".into(),
+            label: "Warp".into(),
+            binary: "/bin/warp".into(),
+            args: vec!["-p".into(), "{port}".into()],
+            socks5: true,
+            default_port: 11000,
+            egress_risk: EgressRisk::Clean,
+        };
+        let cfg = ChainConfig {
+            engines: vec![ChainElement::Builtin(Engine::Tor), ChainElement::Custom(c)],
+        };
+        let planned = plan_chain(&cfg, |_| None).unwrap();
+        assert_eq!(planned.layers.len(), 2);
+        assert_eq!(
+            planned.layers[1].engine,
+            ChainElement::Custom(CustomEngine {
+                id: "warp".into(),
+                label: "Warp".into(),
+                binary: "/bin/warp".into(),
+                args: vec!["-p".into(), "{port}".into()],
+                socks5: true,
+                default_port: 11000,
+                egress_risk: EgressRisk::Clean,
+            })
+        );
     }
 }

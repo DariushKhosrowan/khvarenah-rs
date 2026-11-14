@@ -63,7 +63,7 @@ impl WorkerTunnelResolver {
             let handle = scope.spawn(move || {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(timeout)
-                    .user_agent("dastyab-worker-tunnel")
+                    .user_agent("dastyab-rs-worker-tunnel")
                     .build()
                     .map_err(|e| CFError::new("worker-tunnel", format!("client: {e}"), ""))?;
 

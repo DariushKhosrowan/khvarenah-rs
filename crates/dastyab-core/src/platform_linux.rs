@@ -251,8 +251,8 @@ mod tests {
     #[test]
     fn dry_run_creates_and_tears_down_tun() {
         let mut ex = PlatformExecutor::new(true);
-        let handle = ex.create_tun_interface("khv0", 1290).unwrap();
-        assert_eq!(handle.name, "khv0");
+        let handle = ex.create_tun_interface("dyb0", 1290).unwrap();
+        assert_eq!(handle.name, "dyb0");
         assert_eq!(handle.mtu, 1290);
         assert!(ex.log.iter().any(|c| c.contains("tuntap add")));
         // Dropping the handle should not error (best-effort, and in dry-run

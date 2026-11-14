@@ -5,7 +5,6 @@
 //! * Profiles — list/create/switch profiles, manage tokens & settings.
 //! * Tools — security audit, backup/restore, client-format export.
 
-use eframe::egui;
 use dastyab_core::scanner::{scan_many, scan_once, ScanParams};
 use dastyab_core::store::profiles::{
     add_token, create_profile, delete_profile, list_profiles, load_profile, remember_clean_ip,
@@ -14,6 +13,7 @@ use dastyab_core::store::profiles::{
 use dastyab_core::vless::VlessProfile;
 use dastyab_core::worker::generate_uuid;
 use dastyab_core::CFError;
+use eframe::egui;
 
 use crate::bridge;
 use crate::dialogs::{self, Dialog, DialogPayload, DialogResult};
@@ -603,8 +603,7 @@ impl DastYabApp {
     /// "why zero?" explanation for the Clean IPs view.
     fn refresh_diagnostics(&mut self) {
         use dastyab_core::diagnose::{diagnose, plain_message, Locale};
-        if let Some(diag) = dastyab_core::store::profiles::load_last_diagnostics(&self.profile_id)
-        {
+        if let Some(diag) = dastyab_core::store::profiles::load_last_diagnostics(&self.profile_id) {
             let probe = dastyab_core::diagnose::WorkerProbe::default();
             let cause = diagnose(&diag, probe);
             self.last_cause = Some(plain_message(cause, Locale::En));
@@ -1167,8 +1166,7 @@ impl DastYabApp {
         let tx2 = tx.clone();
         bridge::spawn("hz-provision", tx.clone(), async move {
             let api = dastyab_core::vps_provision::RealHetznerApi;
-            match dastyab_core::vps_provision::provision_vps(&api, &creds, &key_path, None).await
-            {
+            match dastyab_core::vps_provision::provision_vps(&api, &creds, &key_path, None).await {
                 Ok(prov) => {
                     let _ = tx2.send(crate::bridge::UiEvent::Log {
                         task: "hz-provision".to_string(),
@@ -1655,10 +1653,8 @@ impl DastYabApp {
                     }
                     Some(PendingDialogAction::ImportSeeds) => {
                         if let DialogPayload::Text(raw) = payload {
-                            match dastyab_core::cf::ips::import_manual_seeds(
-                                &self.profile_id,
-                                &raw,
-                            ) {
+                            match dastyab_core::cf::ips::import_manual_seeds(&self.profile_id, &raw)
+                            {
                                 Ok(n) => {
                                     self.state.reload_pending = true;
                                     self.note = format!(
@@ -1671,8 +1667,7 @@ impl DastYabApp {
                     }
                     Some(PendingDialogAction::ClearCleanIps) => {
                         if let DialogPayload::Confirm = payload {
-                            match dastyab_core::store::profiles::clear_clean_ips(&self.profile_id)
-                            {
+                            match dastyab_core::store::profiles::clear_clean_ips(&self.profile_id) {
                                 Ok(_) => {
                                     self.state.reload_pending = true;
                                     self.note = "All clean IPs cleared.".to_string();
@@ -1721,10 +1716,8 @@ impl DastYabApp {
                     }
                     Some(PendingDialogAction::CloneProfile(src_id)) => {
                         if let DialogPayload::Text(name) = payload {
-                            match dastyab_core::store::profiles::clone_profile(
-                                &src_id,
-                                Some(&name),
-                            ) {
+                            match dastyab_core::store::profiles::clone_profile(&src_id, Some(&name))
+                            {
                                 Ok(id) => {
                                     self.state.reload_pending = true;
                                     self.note = format!("Cloned profile → '{id}'.");
@@ -1816,8 +1809,7 @@ impl DastYabApp {
                     }
                     Some(PendingDialogAction::RestoreVersion(rel_path, unix)) => {
                         if let DialogPayload::Confirm = payload {
-                            let dir =
-                                dastyab_core::store::profiles::profile_dir(&self.profile_id);
+                            let dir = dastyab_core::store::profiles::profile_dir(&self.profile_id);
                             let now = dastyab_core::store::now_ts() as u64;
                             match dastyab_core::artifact_versions::restore_version(
                                 &dir, &rel_path, unix, now,
@@ -1842,13 +1834,10 @@ impl DastYabApp {
                                     return;
                                 }
                             };
-                            let dir =
-                                dastyab_core::store::profiles::profile_dir(&self.profile_id);
+                            let dir = dastyab_core::store::profiles::profile_dir(&self.profile_id);
                             let now = dastyab_core::store::now_ts() as u64;
-                            let plan = dastyab_core::artifact_versions::build_pitr_plan(
-                                &dir,
-                                target_unix,
-                            );
+                            let plan =
+                                dastyab_core::artifact_versions::build_pitr_plan(&dir, target_unix);
                             let preview =
                                 dastyab_core::artifact_versions::pitr_preview_markdown(&plan);
                             match dastyab_core::artifact_versions::execute_pitr_plan(
@@ -4852,8 +4841,7 @@ mod tests {
             // encoded path, plus a durable base link.
             let encoded_link =
                 "vless://11111111-2222-3333-4444-555555555555@worker.example.workers.dev:443                 ?encryption=none&security=tls&type=ws&sni=w.workers.dev&host=w.workers.dev                 &path=%2F&fp=chrome#w";
-            dastyab_core::store::profiles::set_last_deployed_base_link(pid, encoded_link)
-                .unwrap();
+            dastyab_core::store::profiles::set_last_deployed_base_link(pid, encoded_link).unwrap();
 
             let (n, _) = create_configs_from_ip(pid, "104.18.227.124").expect("config from ip");
             assert!(n >= 4);
@@ -5193,9 +5181,7 @@ mod tests {
         // state both flip, and a reload is requested. This is the bug where
         // clicking "Make active" appeared to do nothing.
         with_home(|pid| {
-            use dastyab_core::store::profiles::{
-                add_token, get_active_token, set_active_profile,
-            };
+            use dastyab_core::store::profiles::{add_token, get_active_token, set_active_profile};
             set_active_profile(pid).unwrap();
             add_token(pid, "first", "token-a-very-long-value").unwrap();
             add_token(pid, "second", "token-b-very-long-value").unwrap();

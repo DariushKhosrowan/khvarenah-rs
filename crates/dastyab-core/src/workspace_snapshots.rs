@@ -45,6 +45,19 @@ pub fn snapshots_dir() -> PathBuf {
     crate::store::mem_dir().join("snapshots")
 }
 
+/// File-name suffixes accepted as a workspace snapshot.
+///
+/// `.dyb-snapshot.json` is the pre-rename (`DastYab`) suffix. Snapshots
+/// written by an older build must stay listable and restorable after the
+/// upgrade, so both suffixes are accepted on read; only the current one is
+/// ever written.
+pub const SNAPSHOT_SUFFIXES: &[&str] = &[".dyb-snapshot.json", ".dyb-snapshot.json"];
+
+/// True if `name` looks like a workspace snapshot (current or pre-rename).
+pub fn is_snapshot_name(name: &str) -> bool {
+    SNAPSHOT_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
 /// Pure decision: is a snapshot due given the last one and now?
 pub fn is_snapshot_due(last_snapshot_ts: i64, now: i64) -> bool {
     now - last_snapshot_ts >= WORKSPACE_SNAPSHOT_INTERVAL_SECS as i64
@@ -69,7 +82,7 @@ pub fn list_snapshots(snapshots_dir: &Path) -> Vec<SnapshotEntry> {
         let is_snapshot = p
             .file_name()
             .and_then(|s| s.to_str())
-            .map(|s| s.ends_with(".dyb-snapshot.json"))
+            .map(is_snapshot_name)
             .unwrap_or(false);
         if !is_snapshot {
             continue;
@@ -209,6 +222,15 @@ mod tests {
         std::fs::write(dir.join("accounts.json"), b"{\"a\":1}").unwrap();
         std::fs::write(dir.join("config.json"), b"{\"x\":1}").unwrap();
         crate::manifest::write_manifest(&crate::manifest::build_manifest(id).unwrap()).unwrap();
+    }
+
+    /// Pre-rename (`DastYab`) snapshots must stay listable and restorable.
+    #[test]
+    fn pre_rename_snapshot_suffix_is_listed() {
+        assert!(is_snapshot_name("1000.dyb-snapshot.json"));
+        assert!(is_snapshot_name("1000.dyb-snapshot.json"));
+        assert!(!is_snapshot_name("1000.json"));
+        assert!(!is_snapshot_name("dyb-snapshot.json.bak"));
     }
 
     #[test]

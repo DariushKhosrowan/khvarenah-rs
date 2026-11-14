@@ -9,10 +9,10 @@
 //! scrollable card list. Active tokens get a gold stroke and a "● ACTIVE"
 //! badge; secondary tokens offer Make-active / Verify / Remove actions.
 
-use eframe::egui;
 use dastyab_core::store::profiles::{
     get_token, record_token_verified, remove_token, set_active_token,
 };
+use eframe::egui;
 
 use crate::app::DastYabApp;
 use crate::bridge;

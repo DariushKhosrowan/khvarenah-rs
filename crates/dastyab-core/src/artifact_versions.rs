@@ -775,8 +775,7 @@ pub fn doctor_check_version_integrity(
         return CheckResult {
             name,
             status: CheckStatus::Warn,
-            detail: "version integrity never verified — run `dastyab versions verify`"
-                .to_string(),
+            detail: "version integrity never verified — run `dastyab versions verify`".to_string(),
         };
     };
     if state.last_corrupt_count > 0 {

@@ -77,8 +77,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<MultilayerAction>
             if ui.button("🗑 Clear").clicked() {
                 action = Some(MultilayerAction::Clear);
             }
-            let has = dastyab_core::multilayer::load_final_server(&app.state.active_profile_id)
-                .is_some();
+            let has =
+                dastyab_core::multilayer::load_final_server(&app.state.active_profile_id).is_some();
             if has {
                 tag(ui, "configured", SUCCESS);
             } else {
@@ -175,8 +175,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp) -> Option<MultilayerAction>
     ui.add_space(8.0);
     let configured =
         dastyab_core::multilayer::load_final_server(&app.state.active_profile_id).is_some();
-    let has_key =
-        dastyab_core::multilayer::load_gemini_key(&app.state.active_profile_id).is_some();
+    let has_key = dastyab_core::multilayer::load_gemini_key(&app.state.active_profile_id).is_some();
     stat_chips(
         ui,
         &[

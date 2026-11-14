@@ -6,10 +6,10 @@
 //! or the whole VlessRecord stream cleared. Stats, search, and export
 //! round out the view.
 
-use eframe::egui;
 use dastyab_core::journal::JournalKind;
+use eframe::egui;
 
-use crate::app::{HistoryFilter, DastYabApp, PendingDialogAction};
+use crate::app::{DastYabApp, HistoryFilter, PendingDialogAction};
 use crate::dialogs;
 use crate::state::{format_ts, relative_ts};
 use crate::views::{section_card, stat_chips, tag, CARD, CARD_STROKE, GOLD, GOLD_DIM, TEXT};
@@ -80,11 +80,7 @@ struct Item {
 }
 
 /// Render the history view for the active profile.
-pub fn show(
-    ui: &mut egui::Ui,
-    app: &mut DastYabApp,
-    p: &dastyab_core::store::profiles::Profile,
-) {
+pub fn show(ui: &mut egui::Ui, app: &mut DastYabApp, p: &dastyab_core::store::profiles::Profile) {
     ui.heading(egui::RichText::new("History").color(GOLD));
 
     // Filter tabs + clear actions.
