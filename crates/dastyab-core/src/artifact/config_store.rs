@@ -628,7 +628,11 @@ pub fn render_nodes(profile: &str) -> String {
     out
 }
 
+// Test fixtures build configs field-by-field and serialize whole test
+// bodies behind a process-wide mutex by design; both patterns are
+// intentional here, so the lints are scoped to the test module.
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::store::set_mem_dir_override;
@@ -988,7 +992,7 @@ mod tests {
         // Establish an active, verified-healthy anchor.
         store.nodes.push(node("anchor", Some(true)));
         store.set_active("anchor");
-        save_node_store(&profile, &store);
+        save_node_store(&profile, &store).unwrap();
 
         // Bulk-import 510 fresh nodes (past MAX_NODES).
         for i in 0..510 {

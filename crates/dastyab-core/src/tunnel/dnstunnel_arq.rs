@@ -248,10 +248,13 @@ mod tests {
     /// frames with probability `loss`, and ACKs what it receives (a fresh
     /// receiver per query — representing an idempotent server that answers each
     /// frame independently with its cumulative+selective ACK).
+    /// Arrival log shared with the resolver: `(seq, payload)` in arrival order.
+    type ArrivalLog = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+
     struct LossyResolver {
         loss: f64,
         /// Received (seq, payload) in arrival order, for the "server side".
-        got: Arc<Mutex<Vec<(u64, Vec<u8>)>>>,
+        got: ArrivalLog,
     }
     impl Resolver for LossyResolver {
         fn query_txt(&self, name: &str) -> Result<String, CFError> {
@@ -305,10 +308,8 @@ mod tests {
         }
         // Pump until idle (bounded): every chunk must be ACKed and retired.
         let mut acked = 0usize;
-        let mut sent = 0usize;
         for _ in 0..400 {
             let st = tr.pump().await.expect("pump");
-            sent += st.sent;
             acked += st.acked;
             if tr.is_idle() {
                 break;
@@ -337,12 +338,10 @@ mod tests {
         }
         let mut retx_total = 0usize;
         let mut acked = 0usize;
-        let mut pumps = 0usize;
         for _ in 0..4000 {
             let st = tr.pump().await.expect("pump");
             retx_total += st.retransmitted;
             acked += st.acked;
-            pumps += 1;
             if tr.is_idle() {
                 break;
             }

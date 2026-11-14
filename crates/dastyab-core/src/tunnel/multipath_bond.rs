@@ -617,7 +617,7 @@ mod tests {
         // lost, lane 0 alone must still deliver everything in order.
         let mut b = MultipathBonder::new(&[LaneId(0), LaneId(1)], BondPolicy::Mirror, 64, RTO);
         let mut ch0 = LossyChannel::new(0.0, 1); // perfect lane
-        let mut ch1 = LossyChannel::new(1.0, 2); // 100% loss
+        let _ch1 = LossyChannel::new(1.0, 2); // 100% loss, lane 1 never delivers
 
         let total = 100usize;
         let mut submitted = 0usize;

@@ -101,7 +101,7 @@ impl CustomEngine {
             if upstream.is_none()
                 && !a.contains("{port}")
                 && !a.contains("{upstream}")
-                && args.get(i + 1).map_or(false, |n| n.contains("{upstream}"))
+                && args.get(i + 1).is_some_and(|n| n.contains("{upstream}"))
             {
                 i += 2;
                 continue;
@@ -147,7 +147,7 @@ impl ChainElement {
     pub fn egress_risk(&self) -> EgressRisk {
         match self {
             ChainElement::Builtin(e) => e.egress_risk(),
-            ChainElement::Custom(c) => c.egress_risk.clone(),
+            ChainElement::Custom(c) => c.egress_risk,
         }
     }
 
@@ -915,14 +915,14 @@ fn candidate_configs(cfg: &ChainConfig) -> Vec<ChainConfig> {
     }
     for mask in 1u16..(1u16 << n) {
         let mut es = Vec::with_capacity(n);
-        for i in 0..n {
+        for (i, e) in eng.iter().enumerate().take(n) {
             if mask & (1u16 << i) != 0 {
-                es.push(eng[i].clone());
+                es.push(e.clone());
             }
         }
         out.push(ChainConfig { engines: es });
     }
-    out.sort_by(|a, b| b.engines.len().cmp(&a.engines.len()));
+    out.sort_by_key(|c| std::cmp::Reverse(c.engines.len()));
     out
 }
 
@@ -980,6 +980,40 @@ pub struct ChainWatchReport {
     pub reached_budget: bool,
 }
 
+/// The two probes a watch loop needs: is the local port up, and does real
+/// egress work through it.
+#[derive(Clone, Copy)]
+pub struct WatchProbes<'a> {
+    /// Local port-readiness probe.
+    pub port_ready: &'a PortReadyProbe,
+    /// Real-egress probe through the chain.
+    pub egress_probe: &'a EgressProbe,
+}
+
+/// Round budget and polling cadence for [`supervise_chain_watch`].
+///
+/// Grouped into a struct so the supervisor keeps a readable signature as the
+/// watch loop grows more knobs (doctrine §5: bounded, observable re-racing).
+#[derive(Debug, Clone, Copy)]
+pub struct WatchLimits {
+    /// Candidate chains tried per round.
+    pub max_attempts: usize,
+    /// Rounds before the loop reports `reached_budget`.
+    pub max_rounds: usize,
+    /// Egress re-probe interval.
+    pub poll_interval: std::time::Duration,
+}
+
+impl Default for WatchLimits {
+    fn default() -> Self {
+        Self {
+            max_attempts: 6,
+            max_rounds: usize::MAX,
+            poll_interval: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
 /// Run a continuous chain-watch loop. Each round runs [`supervise_chain_async`];
 /// if a chain verifies real egress, the loop polls that egress port every
 /// `poll_interval`; when egress dies (re-race, doctrine §5) or no candidate
@@ -992,13 +1026,19 @@ pub async fn supervise_chain_watch<L: EngineLauncher, K: ProcessKiller>(
     look_up: impl Fn(&ChainElement) -> Option<String> + Copy,
     launcher: &L,
     killer: &K,
-    port_ready: &PortReadyProbe,
-    egress_probe: &EgressProbe,
-    max_attempts: usize,
-    max_rounds: usize,
-    poll_interval: std::time::Duration,
+    probes: WatchProbes<'_>,
+    limits: WatchLimits,
     stop: impl Fn() -> bool,
 ) -> ChainWatchReport {
+    let WatchProbes {
+        port_ready,
+        egress_probe,
+    } = probes;
+    let WatchLimits {
+        max_attempts,
+        max_rounds,
+        poll_interval,
+    } = limits;
     let mut out = ChainWatchReport::default();
     for _round in 0..max_rounds {
         if stop() {
@@ -1023,14 +1063,13 @@ pub async fn supervise_chain_watch<L: EngineLauncher, K: ProcessKiller>(
         out.last_plan = Some(plan.clone());
         // A chain is live. Watch its egress until it dies or we're told to stop.
         let egress_port = plan.egress_port;
-        let mut died = false;
         loop {
             if stop() {
                 return out;
             }
             tokio::time::sleep(poll_interval).await;
             if !egress_probe(egress_port).await {
-                died = true;
+                // Egress is gone: fall through to teardown and the next race.
                 break;
             }
         }
@@ -1038,9 +1077,8 @@ pub async fn supervise_chain_watch<L: EngineLauncher, K: ProcessKiller>(
         for layer in &plan.layers {
             killer.kill(&layer.engine, layer.port);
         }
-        if died {
-            out.re_races += 1;
-        }
+        // Reaching here always means the chain's egress died.
+        out.re_races += 1;
     }
     out.reached_budget = true;
     out
@@ -1426,11 +1464,15 @@ mod tests {
             |_| Some("/usr/bin/x".into()),
             &OkLauncher,
             &killer,
-            fixed_port(true).as_ref(),
-            dying_egress(3).as_ref(),
-            6,
-            3,
-            std::time::Duration::from_millis(1),
+            WatchProbes {
+                port_ready: fixed_port(true).as_ref(),
+                egress_probe: dying_egress(3).as_ref(),
+            },
+            WatchLimits {
+                max_attempts: 6,
+                max_rounds: 3,
+                poll_interval: std::time::Duration::from_millis(1),
+            },
             || false,
         )
         .await;
@@ -1451,11 +1493,15 @@ mod tests {
             |_| Some("/usr/bin/x".into()),
             &OkLauncher,
             &killer,
-            fixed_port(true).as_ref(),
-            dying_egress(1000).as_ref(),
-            6,
-            100,
-            std::time::Duration::from_millis(1),
+            WatchProbes {
+                port_ready: fixed_port(true).as_ref(),
+                egress_probe: dying_egress(1000).as_ref(),
+            },
+            WatchLimits {
+                max_attempts: 6,
+                max_rounds: 100,
+                poll_interval: std::time::Duration::from_millis(1),
+            },
             || true, // stop immediately
         )
         .await;
@@ -1473,11 +1519,15 @@ mod tests {
             |_| Some("/usr/bin/x".into()),
             &OkLauncher,
             &killer,
-            fixed_port(true).as_ref(),
-            fixed_egress(false).as_ref(), // nothing ever verifies
-            6,
-            4,
-            std::time::Duration::from_millis(1),
+            WatchProbes {
+                port_ready: fixed_port(true).as_ref(),
+                egress_probe: fixed_egress(false).as_ref(), // nothing ever verifies
+            },
+            WatchLimits {
+                max_attempts: 6,
+                max_rounds: 4,
+                poll_interval: std::time::Duration::from_millis(1),
+            },
             || false,
         )
         .await;

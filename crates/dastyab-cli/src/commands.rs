@@ -819,12 +819,12 @@ fn cmd_chain(profile: &str, action: &str, chain: &str) -> Result<(), CFError> {
 }
 
 /// Air-gapped DTN gossip (doctrine §3 L4+). Actions:
-/// - `make`  — sign a bundle of up to `max` healthy nodes from this profile
-///              and write it to `path` (a file you can hand to a nearby peer
-///              out-of-band: USB, QR, BLE, Wi-Fi Direct, or just a chat).
+/// - `make` — sign a bundle of up to `max` healthy nodes from this profile
+///   and write it to `path` (a file you can hand to a nearby peer out-of-band:
+///   USB, QR, BLE, Wi-Fi Direct, or just a chat).
 /// - `verify` — load a bundle from `path` and check its signature; no writes.
 /// - `accept` — load, verify, and merge a bundle's nodes into this profile's
-///              node store (only fresh/non-duplicate nodes are added).
+///   node store (only fresh/non-duplicate nodes are added).
 /// - `peers` — show the trust ledger (who offered what, and their earned score).
 fn cmd_gossip(profile: &str, action: &str, path: &str, max: usize) -> Result<(), CFError> {
     use dastyab_core::config_store::{import_single_link_source_ts, load_node_store};
@@ -6347,7 +6347,6 @@ fn workspace_cmd(action: WorkspaceAction) -> Result<(), CFError> {
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
 

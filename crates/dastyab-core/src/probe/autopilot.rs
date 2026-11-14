@@ -4748,6 +4748,7 @@ mod tests {
     /// A worker-health probe that panics if invoked — used to prove the deep
     /// phase's step-0 gate runs, and that the short-circuit does not swallow
     /// the probe.
+    #[allow(dead_code)]
     struct PanicWorkerProbe;
 
     impl WorkerHealthProbe for PanicWorkerProbe {

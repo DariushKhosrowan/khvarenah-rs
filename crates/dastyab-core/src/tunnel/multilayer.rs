@@ -638,7 +638,11 @@ pub async fn start_tunnel_mode(
     }
 }
 
+// Test fixtures build configs field-by-field and serialize whole test
+// bodies behind a process-wide mutex by design; both patterns are
+// intentional here, so the lints are scoped to the test module.
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 

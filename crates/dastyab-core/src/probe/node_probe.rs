@@ -700,7 +700,7 @@ mod tests {
         let dead = crate::artifact::config_store::V2RayNode {
             id: "dead".into(),
             alias: "dead".into(),
-            url: format!("vless://u@127.0.0.1:1?type=tcp"),
+            url: "vless://u@127.0.0.1:1?type=tcp".into(),
             source_index: None,
             source: "pasted".into(),
             added_epoch: crate::store::profiles::now_ts(),
@@ -746,7 +746,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let mut store = crate::artifact::config_store::NodeStore::default();
-        let mut mk = |id: &str, url: String, last: Option<f64>, healthy: Option<bool>| {
+        let mk = |id: &str, url: String, last: Option<f64>, healthy: Option<bool>| {
             crate::artifact::config_store::V2RayNode {
                 id: id.into(),
                 alias: id.into(),

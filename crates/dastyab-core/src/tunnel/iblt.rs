@@ -79,10 +79,9 @@ impl Iblt {
         let d = hasher.finalize();
         let mut idx = [0usize; K_HASHES];
         // Each 8-byte block of the hash becomes one index.
-        for (i, block) in d.chunks_exact(8).take(K_HASHES).enumerate() {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(block);
-            idx[i] = (u64::from_le_bytes(b) % m) as usize;
+        let (blocks, _) = d.as_chunks::<8>();
+        for (i, b) in blocks.iter().take(K_HASHES).enumerate() {
+            idx[i] = (u64::from_le_bytes(*b) % m) as usize;
         }
         idx
     }
@@ -213,12 +212,13 @@ impl Iblt {
 
     /// Deserialize from bytes produced by [`encode`].
     pub fn decode_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() % 20 != 0 {
+        if !data.len().is_multiple_of(20) {
             return None;
         }
         let n = data.len() / 20;
         let mut cells = Vec::with_capacity(n);
-        for chunk in data.chunks_exact(20) {
+        let (chunks, _) = data.as_chunks::<20>();
+        for chunk in chunks {
             let mut count = [0u8; 4];
             count.copy_from_slice(&chunk[0..4]);
             let mut ks = [0u8; 8];

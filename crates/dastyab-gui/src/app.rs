@@ -4590,7 +4590,11 @@ fn open_folder(dir: &std::path::Path) {
     let _ = std::process::Command::new(prog).arg(arg).spawn();
 }
 
+// Test fixtures build configs field-by-field and serialize whole test
+// bodies behind a process-wide mutex by design; both patterns are
+// intentional here, so the lints are scoped to the test module.
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
 
@@ -5709,7 +5713,7 @@ mod tests {
             let (n, _base) = create_configs_from_ip(pid, "104.16.1.1").expect("config from ip");
             assert!(n >= 4);
 
-            let mut ledger = dastyab_core::generated_configs::load_generated_configs(pid);
+            let ledger = dastyab_core::generated_configs::load_generated_configs(pid);
             assert!(ledger.records.len() >= 4);
             let rec = ledger.records.first().unwrap().clone();
             let rid = rec.id;

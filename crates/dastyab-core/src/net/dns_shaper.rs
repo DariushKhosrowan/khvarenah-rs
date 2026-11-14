@@ -207,16 +207,22 @@ impl DnsShaper {
     }
 }
 
+// Test fixtures build configs field-by-field and serialize whole test
+// bodies behind a process-wide mutex by design; both patterns are
+// intentional here, so the lints are scoped to the test module.
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
     #[test]
     fn rate_cap_floors_gap() {
-        let mut cfg = ShaperConfig::default();
-        cfg.max_queries_per_sec = 1000; // floor ~1ms
-        cfg.min_gap = Duration::from_millis(1);
-        cfg.max_gap = Duration::from_millis(2);
+        let cfg = ShaperConfig {
+            max_queries_per_sec: 1000, // floor ~1ms
+            min_gap: Duration::from_millis(1),
+            max_gap: Duration::from_millis(2),
+            ..Default::default()
+        };
         let mut s = DnsShaper::new(cfg, 1);
         for _ in 0..200 {
             assert!(s.next_sleep() >= Duration::from_millis(1));
@@ -225,10 +231,12 @@ mod tests {
 
     #[test]
     fn pacing_gaps_fall_in_window() {
-        let mut cfg = ShaperConfig::default();
-        cfg.min_gap = Duration::from_millis(50);
-        cfg.max_gap = Duration::from_millis(500);
-        cfg.max_queries_per_sec = 0; // disable cap flooring
+        let cfg = ShaperConfig {
+            min_gap: Duration::from_millis(50),
+            max_gap: Duration::from_millis(500),
+            max_queries_per_sec: 0, // disable cap flooring
+            ..Default::default()
+        };
         let mut s = DnsShaper::new(cfg, 2);
         let mut distinct = std::collections::HashSet::new();
         for _ in 0..500 {

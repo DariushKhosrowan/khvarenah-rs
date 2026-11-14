@@ -134,7 +134,6 @@ pub use trust::token_provision;
 pub use trust::token_rotate;
 pub use tunnel::arq;
 pub use tunnel::chain_mixer;
-pub use tunnel::codec_fuzz;
 pub use tunnel::desync;
 pub use tunnel::dnstt_server;
 pub use tunnel::dnstunnel;

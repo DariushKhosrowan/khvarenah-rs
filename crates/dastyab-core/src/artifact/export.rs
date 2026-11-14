@@ -145,16 +145,22 @@ pub fn render_all(profile: &VlessProfile) -> Vec<(String, String)> {
     out
 }
 
+// Test fixtures build configs field-by-field and serialize whole test
+// bodies behind a process-wide mutex by design; both patterns are
+// intentional here, so the lints are scoped to the test module.
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
     fn sample() -> VlessProfile {
-        let mut p = VlessProfile::default();
-        p.uuid = "12345678-1234-1234-1234-123456789abc".into();
-        p.address = "edge.workers.dev".into();
-        p.path = "/ws".into();
-        p.name = "my-config".into();
+        let mut p = VlessProfile {
+            uuid: "12345678-1234-1234-1234-123456789abc".into(),
+            address: "edge.workers.dev".into(),
+            path: "/ws".into(),
+            name: "my-config".into(),
+            ..Default::default()
+        };
         p.normalize();
         p
     }

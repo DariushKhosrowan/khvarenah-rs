@@ -347,7 +347,11 @@ impl VlessProfile {
     }
 }
 
+// Test fixtures build configs field-by-field and serialize whole test
+// bodies behind a process-wide mutex by design; both patterns are
+// intentional here, so the lints are scoped to the test module.
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -416,9 +420,11 @@ mod tests {
 
     #[test]
     fn xray_json_has_vless_outbound() {
-        let mut p = VlessProfile::default();
-        p.address = "example.workers.dev".into();
-        p.uuid = "uuid-1".into();
+        let p = VlessProfile {
+            address: "example.workers.dev".into(),
+            uuid: "uuid-1".into(),
+            ..Default::default()
+        };
         let s = p.xray_client_json().unwrap();
         assert!(s.contains("vless"));
         assert!(s.contains("socks"));

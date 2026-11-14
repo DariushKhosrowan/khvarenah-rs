@@ -179,6 +179,7 @@ pub async fn run_mutation_if_due<M: MutationPeer>(
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn with_home() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         crate::store::set_mem_dir_override(tmp.path().join(".dastyab"));

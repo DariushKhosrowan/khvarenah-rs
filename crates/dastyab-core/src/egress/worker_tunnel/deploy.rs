@@ -253,16 +253,17 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+// Test fixtures build configs field-by-field and serialize whole test
+// bodies behind a process-wide mutex by design; both patterns are
+// intentional here, so the lints are scoped to the test module.
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     /// Serialize all deploy tests: the mem-dir override is thread-local, so a
     /// leaked override from one test could bleed into another that reuses the
     /// same thread. Holding this lock for the whole test makes the isolation
     /// deterministic.
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Isolated mem dir. Keeps the TempDir alive for the whole test (its drop
-    /// would delete the dir out from under the override).
 
     /// Create a real profile and return its id. The store's `profile_dir`
     /// falls back to `default` for unknown ids; writing a profile with a

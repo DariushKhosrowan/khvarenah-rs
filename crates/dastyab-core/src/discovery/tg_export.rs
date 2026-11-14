@@ -171,13 +171,10 @@ fn scan_file(profile: &str, path: &Path) -> FileScan {
 
     let mut added = 0usize;
     for link in &links {
-        match import_single_link_source(profile, link, SOURCE_TELEGRAM) {
-            Ok(s) => {
-                if s.added > 0 {
-                    added += 1;
-                }
+        if let Ok(s) = import_single_link_source(profile, link, SOURCE_TELEGRAM) {
+            if s.added > 0 {
+                added += 1;
             }
-            Err(_) => {}
         }
     }
     scan.links_found = links.len();

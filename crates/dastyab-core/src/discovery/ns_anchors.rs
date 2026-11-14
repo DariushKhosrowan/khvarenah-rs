@@ -204,17 +204,13 @@ fn candidate_ok(ip: &std::net::Ipv4Addr) -> bool {
     }
     let o = ip.octets();
     // 10/8, 172.16/12, 192.168/16, 169.254/16, 127/8, 100.64/10, 0/8.
-    if o[0] == 10
+    !(o[0] == 10
         || (o[0] == 172 && (16..=31).contains(&o[1]))
         || (o[0] == 192 && o[1] == 168)
         || (o[0] == 169 && o[1] == 254)
         || o[0] == 127
         || (o[0] == 100 && (64..=127).contains(&o[1]))
-        || o[0] == 0
-    {
-        return false;
-    }
-    true
+        || o[0] == 0)
 }
 
 /// Run one discovery pass: query each zone via `resolvers`, probe the
@@ -414,8 +410,9 @@ mod tests {
             let (_n, peer) = sock.recv_from(&mut buf).await.unwrap();
             // reply: garbage (short, no QR bit echo)
             let _ = sock.send_to(&[0u8; 4], peer).await;
+            drop(sock);
         });
-        let _ = handle;
+        drop(handle);
         let ms = probe_ns_live(&expected, Duration::from_millis(500)).await;
         assert!(ms.is_none());
     }

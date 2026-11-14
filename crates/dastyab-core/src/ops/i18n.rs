@@ -15,9 +15,10 @@
 use std::fmt;
 
 /// Supported languages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Lang {
     /// English (default).
+    #[default]
     En,
     /// Parsi (فارسی).
     Fa,
@@ -41,12 +42,6 @@ impl Lang {
 impl fmt::Display for Lang {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.code())
-    }
-}
-
-impl Default for Lang {
-    fn default() -> Self {
-        Lang::En
     }
 }
 

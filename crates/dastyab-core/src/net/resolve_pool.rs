@@ -280,28 +280,22 @@ mod tests {
         ));
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
-            loop {
-                match sock.recv_from(&mut buf) {
-                    Ok((n, src)) => {
-                        let pkt = &buf[..n];
-                        if let Some(resp) = handle_datagram(pkt, &server) {
-                            let _ = sock.send_to(&resp, src);
-                        } else {
-                            // Not a tunnel frame → emulate an ordinary recursive
-                            // resolver that answers the query anyway.
-                            if let Ok((id, qname, _, _)) =
-                                crate::tunnel::dnstt_server::parse_question(pkt)
-                            {
-                                let resp = crate::tunnel::dnstt_server::build_dns_response_txt(
-                                    id,
-                                    &qname,
-                                    &["ok".to_string()],
-                                );
-                                let _ = sock.send_to(&resp, src);
-                            }
-                        }
+            while let Ok((n, src)) = sock.recv_from(&mut buf) {
+                let pkt = &buf[..n];
+                if let Some(resp) = handle_datagram(pkt, &server) {
+                    let _ = sock.send_to(&resp, src);
+                } else {
+                    // Not a tunnel frame → emulate an ordinary recursive
+                    // resolver that answers the query anyway.
+                    if let Ok((id, qname, _, _)) = crate::tunnel::dnstt_server::parse_question(pkt)
+                    {
+                        let resp = crate::tunnel::dnstt_server::build_dns_response_txt(
+                            id,
+                            &qname,
+                            &["ok".to_string()],
+                        );
+                        let _ = sock.send_to(&resp, src);
                     }
-                    Err(_) => break,
                 }
             }
         });

@@ -153,7 +153,7 @@ mod tests {
         host.ensure_started("test-peer", "test-node");
         assert!(host.is_started());
         // Can't join the threads, so just confirm state is consistent.
-        assert_eq!(host.has_lplink(), false);
+        assert!(!host.has_lplink());
         host.set_uplink(true);
         assert!(host.has_lplink());
     }

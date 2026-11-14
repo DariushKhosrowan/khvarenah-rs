@@ -2,6 +2,8 @@
 
 pub mod arq;
 pub mod chain_mixer;
+/// Test-only adversarial fuzz gates (see module docs).
+#[cfg(test)]
 pub mod codec_fuzz;
 pub mod desync;
 pub mod dnstt_server;
