@@ -3,7 +3,7 @@
 //! The classic ladder descends Direct → DoH → DoT → DNS-tunnel but does not
 //! *know* it is in blackout — it keeps burning cycles probing dead direct paths
 //! instead of fast-failing to the worker bootstrap and rotating carriers from
-//! the offline [`CarrierPool`](crate::carrier_pool::CarrierPool).
+//! the offline [`CarrierPool`](crate::egress::carrier_pool::CarrierPool).
 //!
 //! This module is a **pure, socket-free** controller: [`BlackoutController::next`]
 //! consumes [`BlackoutInputs`] (probe booleans + pool counts) and returns the one
@@ -11,7 +11,7 @@
 //! action against the pool (the only filesystem touch). The daemon wires these
 //! into its tier-decision seam — see [`decide_next_tier`].
 
-use crate::carrier_pool::{CarrierEndpoint, CarrierKind, CarrierPool, CarrierPoolError};
+use crate::egress::carrier_pool::{CarrierEndpoint, CarrierKind, CarrierPool, CarrierPoolError};
 use serde::{Deserialize, Serialize};
 
 /// Where the daemon currently believes it is on the connectivity ladder.
@@ -308,21 +308,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.json");
         let pool = CarrierPool::open(&path).unwrap();
-        let mut snap = crate::carrier_pool::CarrierSnapshot::new_empty(1000);
+        let mut snap = crate::egress::carrier_pool::CarrierSnapshot::new_empty(1000);
         for i in 0..n {
-            snap.endpoints.push(crate::carrier_pool::CarrierEndpoint {
-                kind: CarrierKind::WorkerData,
-                host: format!("d{i}.example.com"),
-                port: 443,
-                sni: None,
-                worker_url: None,
-                upstream: Some(format!("d{i}.example.com:443")),
-                weight: 0.9,
-                last_probe_ok_unix: None,
-                last_probe_rtt_ms: None,
-                provenance: crate::carrier_pool::CarrierProvenance::Deployed,
-                desync_strategy: None,
-            });
+            snap.endpoints
+                .push(crate::egress::carrier_pool::CarrierEndpoint {
+                    kind: CarrierKind::WorkerData,
+                    host: format!("d{i}.example.com"),
+                    port: 443,
+                    sni: None,
+                    worker_url: None,
+                    upstream: Some(format!("d{i}.example.com:443")),
+                    weight: 0.9,
+                    last_probe_ok_unix: None,
+                    last_probe_rtt_ms: None,
+                    provenance: crate::egress::carrier_pool::CarrierProvenance::Deployed,
+                    desync_strategy: None,
+                });
         }
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();

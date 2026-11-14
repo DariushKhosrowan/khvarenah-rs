@@ -98,7 +98,7 @@ pub struct DaemonState {
     pub network_was_down: bool,
     /// Account-level state (serde-default→Active so old state loads cleanly).
     #[serde(default)]
-    pub account_state: crate::account_state::AccountState,
+    pub account_state: crate::trust::account_state::AccountState,
     /// Last epoch-seconds we probed account status while waiting.
     #[serde(default)]
     pub last_account_poll_ts: i64,
@@ -211,7 +211,7 @@ impl Default for DaemonState {
             failure_streak: 0,
             current_interval_secs: DEFAULT_INITIAL_INTERVAL_SECS,
             network_was_down: false,
-            account_state: crate::account_state::AccountState::Active,
+            account_state: crate::trust::account_state::AccountState::Active,
             last_account_poll_ts: 0,
             survival_plan: String::new(),
             network_tier: String::new(),
@@ -295,7 +295,7 @@ pub fn clear_account_blocked(profile: &str) -> Result<bool, CFError> {
     if !state.account_state.blocks_cycle() {
         return Ok(false);
     }
-    state.account_state = crate::account_state::AccountState::Active;
+    state.account_state = crate::trust::account_state::AccountState::Active;
     // Force an immediate re-probe on the next tick.
     state.last_account_poll_ts = 0;
     save_daemon_state(profile, &state)?;
@@ -547,7 +547,7 @@ mod linger_tests {
 #[derive(Debug, Clone, Default)]
 pub struct NetStatus {
     pub up: bool,
-    pub tier: Option<crate::connectivity::Tier>,
+    pub tier: Option<crate::net::connectivity::Tier>,
 }
 
 impl NetStatus {
@@ -567,19 +567,20 @@ pub trait NetworkProbe: Send + Sync {
 /// (direct → DoH → DoT → DNS tunnel) and climbs back up when a higher tier
 /// returns — rather than re-probing the whole ladder from scratch every tick.
 pub struct RealNetworkProbe {
-    pub ladder: crate::connectivity::FallbackLadder<crate::connectivity::OwnedLadderProbe>,
+    pub ladder:
+        crate::net::connectivity::FallbackLadder<crate::net::connectivity::OwnedLadderProbe>,
 }
 
 impl RealNetworkProbe {
     pub fn new(profile: &str) -> Self {
-        let probe = crate::connectivity::OwnedLadderProbe {
+        let probe = crate::net::connectivity::OwnedLadderProbe {
             profile: profile.to_string(),
-            resolver: crate::doh::DohResolver::new(),
+            resolver: crate::net::doh::DohResolver::new(),
         };
         Self {
-            ladder: crate::connectivity::FallbackLadder::new(
+            ladder: crate::net::connectivity::FallbackLadder::new(
                 probe,
-                crate::connectivity::Tier::Direct,
+                crate::net::connectivity::Tier::Direct,
             ),
         }
     }
@@ -600,7 +601,7 @@ pub trait CycleRunner: Send + Sync {
         &self,
         profile: &str,
         follow: bool,
-        timeouts: crate::autopilot::MonitorTimeouts,
+        timeouts: crate::probe::autopilot::MonitorTimeouts,
     ) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>>;
 }
 
@@ -619,26 +620,27 @@ pub fn daemon_refresh_carriers(
     shared_secret: &str,
     now_unix: u64,
     log: &mut dyn FnMut(&str),
-) -> Result<(), crate::carrier_refresh::RefreshError> {
+) -> Result<(), crate::egress::carrier_refresh::RefreshError> {
     let cfg = crate::store::profiles::load_profile(profile).config;
-    let pool = crate::carrier_pool::open_profile_pool(&cfg)?;
+    let pool = crate::egress::carrier_pool::open_profile_pool(&cfg)?;
     // Anti-DPI desync connector: pick the worker's learned strategy (ladder),
     // and record the outcome so a repeated transport failure advances the
     // ladder on the next refresh (persisted on the profile).
-    let strategy = crate::worker_tunnel::secret::strategy_for_worker(&cfg, worker_url, 0);
-    let refresher = crate::carrier_refresh::CarrierRefresher::new(worker_url, shared_secret);
+    let strategy = crate::egress::worker_tunnel::secret::strategy_for_worker(&cfg, worker_url, 0);
+    let refresher =
+        crate::egress::carrier_refresh::CarrierRefresher::new(worker_url, shared_secret);
     let result = refresher.refresh_once(&pool, now_unix);
     let mut pcfg = crate::store::profiles::load_profile(profile);
     match &result {
         Ok(_) => {
-            crate::worker_tunnel::secret::record_worker_desync_success(
+            crate::egress::worker_tunnel::secret::record_worker_desync_success(
                 &mut pcfg.config,
                 worker_url,
                 strategy,
             );
         }
-        Err(crate::carrier_refresh::RefreshError::Transport(_)) => {
-            crate::worker_tunnel::secret::record_worker_desync_failure(
+        Err(crate::egress::carrier_refresh::RefreshError::Transport(_)) => {
+            crate::egress::worker_tunnel::secret::record_worker_desync_failure(
                 &mut pcfg.config,
                 worker_url,
                 strategy,
@@ -655,18 +657,18 @@ pub fn daemon_refresh_carriers(
         }
     }
     match result? {
-        crate::carrier_refresh::RefreshOutcome::Updated(r) => {
+        crate::egress::carrier_refresh::RefreshOutcome::Updated(r) => {
             log(&format!(
                 "carrier refresh: {} added, {} updated",
                 r.added, r.updated
             ));
         }
-        crate::carrier_refresh::RefreshOutcome::NotNewer { server_generation } => {
+        crate::egress::carrier_refresh::RefreshOutcome::NotNewer { server_generation } => {
             log(&format!(
                 "carrier refresh: not newer (server gen {server_generation})"
             ));
         }
-        crate::carrier_refresh::RefreshOutcome::NoSnapshot => {
+        crate::egress::carrier_refresh::RefreshOutcome::NoSnapshot => {
             log("carrier refresh: worker has no snapshot yet");
         }
     }
@@ -683,11 +685,11 @@ pub fn daemon_refresh_carriers(
 pub fn refresh_carriers_via_worker_tunnel(
     profile: &str,
     log: &mut dyn FnMut(&str),
-) -> Result<(), crate::carrier_refresh::RefreshError> {
-    let Some(cfg) = crate::vps_deploy::load_tunnel_client_config(profile) else {
+) -> Result<(), crate::egress::carrier_refresh::RefreshError> {
+    let Some(cfg) = crate::egress::vps_deploy::load_tunnel_client_config(profile) else {
         return Ok(());
     };
-    let crate::vps_deploy::TunnelMode::Worker = cfg.mode else {
+    let crate::egress::vps_deploy::TunnelMode::Worker = cfg.mode else {
         return Ok(());
     };
     let (Some(url), Some(secret)) = (cfg.worker_url.as_deref(), cfg.shared_secret.as_deref())
@@ -697,7 +699,7 @@ pub fn refresh_carriers_via_worker_tunnel(
     // Per-worker secret resolution: prefer the per-worker current secret over
     // the legacy shared secret when the profile has a per-worker entry.
     let pcfg = crate::store::profiles::load_profile(profile).config;
-    let resolved = crate::worker_tunnel::secret::resolve_worker_secret(&pcfg, url, secret);
+    let resolved = crate::egress::worker_tunnel::secret::resolve_worker_secret(&pcfg, url, secret);
     daemon_refresh_carriers(profile, url, &resolved, crate::store::now_ts() as u64, log)
 }
 
@@ -710,11 +712,11 @@ pub fn refresh_carriers_via_worker_tunnel(
 pub fn push_carriers_via_worker_tunnel(
     profile: &str,
     log: &mut dyn FnMut(&str),
-) -> Result<(), crate::carrier_refresh::RefreshError> {
-    let Some(cfg) = crate::vps_deploy::load_tunnel_client_config(profile) else {
+) -> Result<(), crate::egress::carrier_refresh::RefreshError> {
+    let Some(cfg) = crate::egress::vps_deploy::load_tunnel_client_config(profile) else {
         return Ok(());
     };
-    let crate::vps_deploy::TunnelMode::Worker = cfg.mode else {
+    let crate::egress::vps_deploy::TunnelMode::Worker = cfg.mode else {
         return Ok(());
     };
     let (Some(url), Some(secret)) = (cfg.worker_url.as_deref(), cfg.shared_secret.as_deref())
@@ -722,16 +724,16 @@ pub fn push_carriers_via_worker_tunnel(
         return Ok(());
     };
     let pcfg = crate::store::profiles::load_profile(profile).config;
-    let resolved = crate::worker_tunnel::secret::resolve_worker_secret(&pcfg, url, secret);
-    let pool = crate::carrier_pool::open_profile_pool(
+    let resolved = crate::egress::worker_tunnel::secret::resolve_worker_secret(&pcfg, url, secret);
+    let pool = crate::egress::carrier_pool::open_profile_pool(
         &crate::store::profiles::load_profile(profile).config,
     )?;
-    let refresher = crate::carrier_refresh::CarrierRefresher::new(url, resolved.as_ref());
+    let refresher = crate::egress::carrier_refresh::CarrierRefresher::new(url, resolved.as_ref());
     match refresher.push_snapshot_if_identity_changed(&pool)? {
-        crate::carrier_refresh::PushOutcome::Pushed { endpoints } => {
+        crate::egress::carrier_refresh::PushOutcome::Pushed { endpoints } => {
             log(&format!("carrier push: {endpoints} endpoints to worker"));
         }
-        crate::carrier_refresh::PushOutcome::Skipped { reason } => {
+        crate::egress::carrier_refresh::PushOutcome::Skipped { reason } => {
             log(&format!("carrier push skipped: {reason:?}"));
         }
     }
@@ -776,7 +778,7 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
                             cf.create_api_token(&account_id, &name).await
                         })
                     };
-                    crate::token_provision::ensure_minimum_tokens(
+                    crate::trust::token_provision::ensure_minimum_tokens(
                         &profile_owned,
                         2,
                         account_id.clone(),
@@ -792,10 +794,10 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
     }
 
     fn rotate_worker(&self, profile: &str) -> Result<u32, CFError> {
-        let Some(tcfg) = crate::vps_deploy::load_tunnel_client_config(profile) else {
+        let Some(tcfg) = crate::egress::vps_deploy::load_tunnel_client_config(profile) else {
             return Ok(0);
         };
-        let crate::vps_deploy::TunnelMode::Worker = tcfg.mode else {
+        let crate::egress::vps_deploy::TunnelMode::Worker = tcfg.mode else {
             return Ok(0);
         };
         let Some(worker_url) = tcfg.worker_url.as_deref() else {
@@ -803,10 +805,10 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
         };
         let mut prof = crate::store::profiles::load_profile(profile);
         let now = crate::store::now_ts() as u64;
-        crate::worker_tunnel::secret::assign_new_secret(&mut prof.config, worker_url, now)?;
+        crate::egress::worker_tunnel::secret::assign_new_secret(&mut prof.config, worker_url, now)?;
         crate::store::profiles::save_profile(&prof)?;
 
-        let opts = crate::worker_tunnel::WorkerTunnelDeployOpts {
+        let opts = crate::egress::worker_tunnel::WorkerTunnelDeployOpts {
             worker_name: tcfg.worker_name.clone(),
             session_seed: tcfg.session.clone(),
             compat_date: "2026-07-01".into(),
@@ -822,7 +824,7 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
                     .map_err(|e| CFError::new("cf-seam", format!("runtime: {e}"), ""))?;
                 rt.block_on(async move {
                     let cf = crate::cf::Client::new(&token);
-                    crate::worker_tunnel::deploy::deploy_worker_tunnel(
+                    crate::egress::worker_tunnel::deploy::deploy_worker_tunnel(
                         &cf,
                         &account_id,
                         &profile_owned,
@@ -850,11 +852,16 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
                 .map(|w| w.version)
                 .unwrap_or(0));
         };
-        let refresher = crate::carrier_refresh::CarrierRefresher::new(worker_url, &pending_secret);
+        let refresher =
+            crate::egress::carrier_refresh::CarrierRefresher::new(worker_url, &pending_secret);
         if refresher.query_self_ping().is_ok() {
-            crate::worker_tunnel::secret::promote_pending(&mut prof2.config, worker_url, now)?;
+            crate::egress::worker_tunnel::secret::promote_pending(
+                &mut prof2.config,
+                worker_url,
+                now,
+            )?;
         } else {
-            crate::worker_tunnel::secret::clear_pending(&mut prof2.config, worker_url);
+            crate::egress::worker_tunnel::secret::clear_pending(&mut prof2.config, worker_url);
         }
         let version = prof2
             .config
@@ -868,11 +875,11 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
 
     fn ensure_dns_tunnel(&self, profile: &str) -> Result<(), CFError> {
         let prof = crate::store::profiles::load_profile(profile);
-        if crate::vps_deploy::load_tunnel_client_config(profile).is_some() {
+        if crate::egress::vps_deploy::load_tunnel_client_config(profile).is_some() {
             return Ok(());
         }
         let seed = prof.config.active_account.clone();
-        let opts = crate::worker_tunnel::WorkerTunnelDeployOpts {
+        let opts = crate::egress::worker_tunnel::WorkerTunnelDeployOpts {
             worker_name: None,
             session_seed: if seed.is_empty() {
                 "default-seed".into()
@@ -892,7 +899,7 @@ impl crate::daemon::autonomy_schedule::CfApiSeam for RealCfSeam {
                     .map_err(|e| CFError::new("cf-seam", format!("runtime: {e}"), ""))?;
                 rt.block_on(async move {
                     let cf = crate::cf::Client::new(&token);
-                    crate::worker_tunnel::deploy::deploy_worker_tunnel(
+                    crate::egress::worker_tunnel::deploy::deploy_worker_tunnel(
                         &cf,
                         &account_id,
                         &profile_owned,
@@ -932,12 +939,12 @@ pub async fn run_autonomy_audit_with_seam(
     }
 
     let prof = crate::store::profiles::load_profile(profile);
-    let report = crate::autonomy::run_audit(&prof);
+    let report = crate::trust::autonomy::run_audit(&prof);
 
     let action_codes: Vec<String> = report
         .items
         .iter()
-        .filter(|i| i.status == crate::autonomy::CheckStatus::Action)
+        .filter(|i| i.status == crate::trust::autonomy::CheckStatus::Action)
         .map(|i| i.code.clone())
         .collect();
 
@@ -956,12 +963,12 @@ pub async fn run_autonomy_audit_with_seam(
                 action_codes.len()
             ),
         ));
-        let _ = crate::remote_beacon::maybe_emit(
+        let _ = crate::mesh::remote_beacon::maybe_emit(
             profile,
-            &crate::remote_beacon::BeaconEvent::AutonomyRegression {
+            &crate::mesh::remote_beacon::BeaconEvent::AutonomyRegression {
                 codes: action_codes.clone(),
             },
-            crate::diagnose::Locale::En,
+            crate::probe::diagnose::Locale::En,
         )
         .await;
     }
@@ -1038,14 +1045,14 @@ pub async fn run_autonomy_audit_with_seam(
 /// Best-effort: any failure logs and returns `None` (callers treat non-`None`
 /// as the only signal worth surfacing).
 pub fn query_worker_self_ping(profile: &str, log: &mut dyn FnMut(&str)) -> Option<u64> {
-    let cfg = crate::vps_deploy::load_tunnel_client_config(profile)?;
-    let crate::vps_deploy::TunnelMode::Worker = cfg.mode else {
+    let cfg = crate::egress::vps_deploy::load_tunnel_client_config(profile)?;
+    let crate::egress::vps_deploy::TunnelMode::Worker = cfg.mode else {
         return None;
     };
     let (url, secret) = (cfg.worker_url.as_deref()?, cfg.shared_secret.as_deref()?);
     let pcfg = crate::store::profiles::load_profile(profile).config;
-    let resolved = crate::worker_tunnel::secret::resolve_worker_secret(&pcfg, url, secret);
-    let refresher = crate::carrier_refresh::CarrierRefresher::new(url, resolved.as_ref());
+    let resolved = crate::egress::worker_tunnel::secret::resolve_worker_secret(&pcfg, url, secret);
+    let refresher = crate::egress::carrier_refresh::CarrierRefresher::new(url, resolved.as_ref());
     match refresher.query_self_ping() {
         Ok(ping) => ping,
         Err(e) => {
@@ -1068,10 +1075,10 @@ pub async fn rotate_worker_secret(
     account_id: &str,
     profile: &str,
 ) -> Result<(), CFError> {
-    let Some(tcfg) = crate::vps_deploy::load_tunnel_client_config(profile) else {
+    let Some(tcfg) = crate::egress::vps_deploy::load_tunnel_client_config(profile) else {
         return Ok(());
     };
-    let crate::vps_deploy::TunnelMode::Worker = tcfg.mode else {
+    let crate::egress::vps_deploy::TunnelMode::Worker = tcfg.mode else {
         return Ok(());
     };
     let Some(worker_url) = tcfg.worker_url.as_deref() else {
@@ -1080,18 +1087,19 @@ pub async fn rotate_worker_secret(
     // Stage a fresh pending secret.
     let mut prof = crate::store::profiles::load_profile(profile);
     let now = crate::store::now_ts() as u64;
-    crate::worker_tunnel::secret::assign_new_secret(&mut prof.config, worker_url, now)?;
+    crate::egress::worker_tunnel::secret::assign_new_secret(&mut prof.config, worker_url, now)?;
     crate::store::profiles::save_profile(&prof)?;
 
     // Redeploy with the pending secret.
-    let opts = crate::worker_tunnel::WorkerTunnelDeployOpts {
+    let opts = crate::egress::worker_tunnel::WorkerTunnelDeployOpts {
         worker_name: tcfg.worker_name.clone(),
         session_seed: tcfg.session.clone(),
         compat_date: "2026-07-01".into(),
         retries: 2,
         vless_upstream: tcfg.worker_vless_upstream.clone(),
     };
-    crate::worker_tunnel::deploy::deploy_worker_tunnel(cf, account_id, profile, &opts).await?;
+    crate::egress::worker_tunnel::deploy::deploy_worker_tunnel(cf, account_id, profile, &opts)
+        .await?;
 
     // Verify via self-ping authenticated with the pending secret.
     let mut prof2 = crate::store::profiles::load_profile(profile);
@@ -1104,12 +1112,13 @@ pub async fn rotate_worker_secret(
         // No pending yet (e.g. very first deploy) — nothing to promote.
         return Ok(());
     };
-    let refresher = crate::carrier_refresh::CarrierRefresher::new(worker_url, &pending_secret);
+    let refresher =
+        crate::egress::carrier_refresh::CarrierRefresher::new(worker_url, &pending_secret);
     if refresher.query_self_ping().is_ok() {
-        crate::worker_tunnel::secret::promote_pending(&mut prof2.config, worker_url, now)?;
+        crate::egress::worker_tunnel::secret::promote_pending(&mut prof2.config, worker_url, now)?;
     } else {
         // Verification failed — keep current active; leave pending for retry.
-        crate::worker_tunnel::secret::clear_pending(&mut prof2.config, worker_url);
+        crate::egress::worker_tunnel::secret::clear_pending(&mut prof2.config, worker_url);
     }
     crate::store::profiles::save_profile(&prof2)?;
     Ok(())
@@ -1124,13 +1133,13 @@ pub async fn rotate_worker_secret(
 /// tunnel (previously it was logged and discarded).
 pub fn exec_reselection(
     profile: &str,
-    kind: crate::carrier_pool::CarrierKind,
+    kind: crate::egress::carrier_pool::CarrierKind,
     n: usize,
     max_concurrent: usize,
     log: &mut dyn FnMut(&str),
 ) -> Option<String> {
     let cfg = crate::store::profiles::load_profile(profile).config;
-    let pool = crate::carrier_pool::open_profile_pool(&cfg).ok()?;
+    let pool = crate::egress::carrier_pool::open_profile_pool(&cfg).ok()?;
     let now = crate::store::now_ts() as u64;
     // Use select_at so endpoints in failure-cooldown are skipped; only fall
     // back to cooling endpoints when nothing else exists. This prevents a
@@ -1179,7 +1188,7 @@ pub trait AccountProbe: Send + Sync {
     fn probe_account(
         &self,
         profile: &str,
-    ) -> Pin<Box<dyn Future<Output = crate::account_state::AccountState> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = crate::trust::account_state::AccountState> + Send + '_>>;
 
     /// Attempt automatic token rotation when the active token is blocked.
     /// Returns `Some((from, to))` when another stored token verified and was
@@ -1200,9 +1209,9 @@ impl AccountProbe for RealAccountProbe {
     fn probe_account(
         &self,
         profile: &str,
-    ) -> Pin<Box<dyn Future<Output = crate::account_state::AccountState> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = crate::trust::account_state::AccountState> + Send + '_>> {
         let profile = profile.to_string();
-        Box::pin(async move { crate::account_state::probe_account_state(&profile).await })
+        Box::pin(async move { crate::trust::account_state::probe_account_state(&profile).await })
     }
 
     fn try_rotate(
@@ -1215,7 +1224,7 @@ impl AccountProbe for RealAccountProbe {
             if !p.config.auto_rotate_on_blocked {
                 return None;
             }
-            crate::token_rotate::try_auto_rotate(&profile, |tok| {
+            crate::trust::token_rotate::try_auto_rotate(&profile, |tok| {
                 let tok = tok.to_string();
                 Box::pin(async move { crate::cf::Client::new(&tok).verify_token().await.is_ok() })
             })
@@ -1233,12 +1242,12 @@ impl CycleRunner for RealCycleRunner {
         &self,
         profile: &str,
         _follow: bool,
-        timeouts: crate::autopilot::MonitorTimeouts,
+        timeouts: crate::probe::autopilot::MonitorTimeouts,
     ) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>> {
         let profile = profile.to_string();
         Box::pin(async move {
-            let params = crate::autopilot::DiscoveryParams::default();
-            let engine = crate::autopilot::AutopilotEngine::new(
+            let params = crate::probe::autopilot::DiscoveryParams::default();
+            let engine = crate::probe::autopilot::AutopilotEngine::new(
                 profile.clone(),
                 params,
                 std::time::Duration::from_secs(DEFAULT_INITIAL_INTERVAL_SECS),
@@ -1272,7 +1281,7 @@ async fn run_self_maintenance(
     let p = crate::store::profiles::load_profile(profile);
 
     // 1. Scheduled auto-backup (local — safe even during a blackout).
-    match crate::backup_autosync::run_autosync_if_due(
+    match crate::ops::backup_autosync::run_autosync_if_due(
         &p.config.backup_autosync,
         profile,
         state.last_backup_ts,
@@ -1280,9 +1289,9 @@ async fn run_self_maintenance(
     ) {
         Ok(Some(path)) => {
             state.last_backup_ts = now;
-            let _ = crate::journal::append(
+            let _ = crate::mesh::journal::append(
                 profile,
-                crate::journal::JournalKind::BackupWritten,
+                crate::mesh::journal::JournalKind::BackupWritten,
                 &path.display().to_string(),
             );
             log(&log_line(
@@ -1304,17 +1313,16 @@ async fn run_self_maintenance(
     // (CF API redeploy requires connectivity). The liveness probe has already
     // run in `daemon_tick` and its result is passed in as `net_up`.
     if net_up {
-        match crate::config_mutation::run_mutation_if_due::<crate::autopilot::RealMutationPeer>(
-            profile,
-            &crate::autopilot::RealMutationPeer,
-        )
+        match crate::artifact::config_mutation::run_mutation_if_due::<
+            crate::probe::autopilot::RealMutationPeer,
+        >(profile, &crate::probe::autopilot::RealMutationPeer)
         .await
         {
             Ok(Some(outcome)) => {
                 state.last_cycle_ts = now;
-                let _ = crate::journal::append(
+                let _ = crate::mesh::journal::append(
                     profile,
-                    crate::journal::JournalKind::MutationPerformed,
+                    crate::mesh::journal::JournalKind::MutationPerformed,
                     &format!("uuid={} path={}", outcome.new_uuid, outcome.new_path),
                 );
                 log(&log_line(
@@ -1357,22 +1365,25 @@ async fn run_self_maintenance(
     if now - state.last_verify_ts >= 86400 {
         let profile_dir = crate::store::profiles::profile_dir(profile);
         if let Ok(report) =
-            crate::artifact_versions::verify_all_versions(&profile_dir, now as u64, 2000)
+            crate::artifact::artifact_versions::verify_all_versions(&profile_dir, now as u64, 2000)
         {
             state.last_verify_ts = now;
-            let _ =
-                crate::artifact_versions::record_verify_outcome(&profile_dir, &report, now as u64);
-            let _ = crate::journal::append(
+            let _ = crate::artifact::artifact_versions::record_verify_outcome(
+                &profile_dir,
+                &report,
+                now as u64,
+            );
+            let _ = crate::mesh::journal::append(
                 profile,
-                crate::journal::JournalKind::VersionVerified,
-                &crate::artifact_versions::corrupt_versions_summary(&report),
+                crate::mesh::journal::JournalKind::VersionVerified,
+                &crate::artifact::artifact_versions::corrupt_versions_summary(&report),
             );
             if !report.corrupt.is_empty() {
                 log(&log_line(
                     "WARN",
                     &format!(
                         "version-integrity sweep: {}",
-                        crate::artifact_versions::corrupt_versions_summary(&report)
+                        crate::artifact::artifact_versions::corrupt_versions_summary(&report)
                     ),
                 ));
             } else {
@@ -1380,7 +1391,7 @@ async fn run_self_maintenance(
                     "INFO",
                     &format!(
                         "version-integrity sweep: {}",
-                        crate::artifact_versions::corrupt_versions_summary(&report)
+                        crate::artifact::artifact_versions::corrupt_versions_summary(&report)
                     ),
                 ));
             }
@@ -1395,10 +1406,12 @@ async fn run_self_maintenance(
     // requires the network for real probes. Fails over if the active node
     // died since the last check. Routes through the local SOCKS5 tunnel when
     // it is up (auto-detected), since direct foreign TCP is severed under NIN.
-    if net_up && now - state.last_node_decay_ts >= crate::node_probe::NODE_DECAY_INTERVAL_SECS {
+    if net_up
+        && now - state.last_node_decay_ts >= crate::probe::node_probe::NODE_DECAY_INTERVAL_SECS
+    {
         state.last_node_decay_ts = now;
-        let use_proxy = crate::node_probe::tunnel_available();
-        let sweep = crate::node_probe::probe_stale(profile, use_proxy);
+        let use_proxy = crate::probe::node_probe::tunnel_available();
+        let sweep = crate::probe::node_probe::probe_stale(profile, use_proxy);
         if sweep.probed > 0 {
             log(&log_line(
                 "INFO",
@@ -1429,8 +1442,8 @@ async fn run_self_maintenance(
     const DEEP_VERIFY_MAX_PER_PASS: usize = 2;
     if net_up && now - state.last_deep_verify_ts >= DEEP_VERIFY_INTERVAL_SECS {
         state.last_deep_verify_ts = now;
-        let store = crate::config_store::load_node_store(profile);
-        let mut candidates: Vec<crate::config_store::V2RayNode> = store
+        let store = crate::artifact::config_store::load_node_store(profile);
+        let mut candidates: Vec<crate::artifact::config_store::V2RayNode> = store
             .nodes
             .iter()
             .filter(|n| n.healthy != Some(false))
@@ -1446,7 +1459,7 @@ async fn run_self_maintenance(
                 ),
             ));
             for node in &mut candidates {
-                let r = crate::tunnel_lifeline::deep_verify_egress(profile, node).await;
+                let r = crate::tunnel::tunnel_lifeline::deep_verify_egress(profile, node).await;
                 if r.ok {
                     log(&log_line(
                         "INFO",
@@ -1483,15 +1496,16 @@ async fn run_self_maintenance(
     // every tick. Routes through the local SOCKS5 tunnel when it is up
     // (auto-detected), since direct foreign TCP is severed under NIN.
     if net_up
-        && crate::node_refill::refill_enabled()
-        && now - state.last_refill_ts >= crate::node_refill::REFILL_COOLDOWN_SECS
+        && crate::probe::node_refill::refill_enabled()
+        && now - state.last_refill_ts >= crate::probe::node_refill::REFILL_COOLDOWN_SECS
     {
-        let needs =
-            crate::node_refill::refill_needed(&crate::config_store::load_node_store(profile));
+        let needs = crate::probe::node_refill::refill_needed(
+            &crate::artifact::config_store::load_node_store(profile),
+        );
         if let Some(reason) = needs {
             state.last_refill_ts = now;
-            let use_proxy = crate::node_probe::tunnel_available();
-            let report = crate::node_refill::run_refill(profile, use_proxy).await;
+            let use_proxy = crate::probe::node_probe::tunnel_available();
+            let report = crate::probe::node_refill::run_refill(profile, use_proxy).await;
             log(&log_line(
                 "INFO",
                 &format!(
@@ -1505,9 +1519,9 @@ async fn run_self_maintenance(
                     report.healthy
                 ),
             ));
-            let _ = crate::journal::append(
+            let _ = crate::mesh::journal::append(
                 profile,
-                crate::journal::JournalKind::NodeRefill,
+                crate::mesh::journal::JournalKind::NodeRefill,
                 &format!(
                     "reason={reason} tg_added={} gh_added={} ct_added={} ns_added={} probed={} healthy={} promoted={:?}",
                     report.telegram_added,
@@ -1531,12 +1545,14 @@ async fn run_self_maintenance(
     // external cron/CLI invokes it (no single point of failure). Requires the
     // network; rate-limited to DISCOVERY_INTERVAL_SECS.
     if net_up
-        && crate::harvest::discovery_enabled()
-        && now - state.last_discovery_ts >= crate::node_refill::DISCOVERY_INTERVAL_SECS
+        && crate::discovery::harvest::discovery_enabled()
+        && now - state.last_discovery_ts >= crate::probe::node_refill::DISCOVERY_INTERVAL_SECS
     {
         state.last_discovery_ts = now;
-        let use_proxy = crate::node_probe::tunnel_available();
-        match crate::harvest::run_multi_hop_discovery(profile, use_proxy, 2, 60, 4, true).await {
+        let use_proxy = crate::probe::node_probe::tunnel_available();
+        match crate::discovery::harvest::run_multi_hop_discovery(profile, use_proxy, 2, 60, 4, true)
+            .await
+        {
             Ok(report) => {
                 log(&log_line(
                     "INFO",
@@ -1550,9 +1566,9 @@ async fn run_self_maintenance(
                         report.persisted_total
                     ),
                 ));
-                let _ = crate::journal::append(
+                let _ = crate::mesh::journal::append(
                     profile,
-                    crate::journal::JournalKind::NodeRefill,
+                    crate::mesh::journal::JournalKind::NodeRefill,
                     &format!(
                         "discovery seeds={} cands={} hops={} winners={} persisted_new={}",
                         report.seeds,
@@ -1569,7 +1585,7 @@ async fn run_self_maintenance(
                 if report.persisted_total > 0 {
                     let home = std::env::var("HOME").unwrap_or_default();
                     let target = format!("{home}/.config/v2rayN/Local/ServersStore.json");
-                    match crate::config_store::export_v2rayn_store(
+                    match crate::artifact::config_store::export_v2rayn_store(
                         profile,
                         std::path::Path::new(&target),
                         true,
@@ -1600,16 +1616,17 @@ async fn run_self_maintenance(
     // The CT-anchor path uses reqwest's *blocking* client, which cannot be
     // built/dropped inside an async runtime — so run it on a blocking thread.
     if net_up
-        && crate::ct_anchors::refresh_enabled()
-        && now - state.last_anchors_refresh_ts >= crate::ct_anchors::ANCHOR_REFRESH_INTERVAL_SECS
+        && crate::discovery::ct_anchors::refresh_enabled()
+        && now - state.last_anchors_refresh_ts
+            >= crate::discovery::ct_anchors::ANCHOR_REFRESH_INTERVAL_SECS
     {
         state.last_anchors_refresh_ts = now;
         let profile_owned = profile.to_string();
         let (added, pruned) = match tokio::task::spawn_blocking(move || {
-            crate::ct_anchors::refresh_and_prune(
+            crate::discovery::ct_anchors::refresh_and_prune(
                 &profile_owned,
                 false,
-                crate::ct_anchors::DEFAULT_QUERIES,
+                crate::discovery::ct_anchors::DEFAULT_QUERIES,
             )
         })
         .await
@@ -1623,16 +1640,16 @@ async fn run_self_maintenance(
                 (0usize, 0usize)
             }
         };
-        let total = crate::ct_anchors::anchor_hosts(profile).len();
+        let total = crate::discovery::ct_anchors::anchor_hosts(profile).len();
         log(&log_line(
             "INFO",
             &format!(
                 "ct anchors: refreshed (+{added} new, pruned {pruned} dead, {total} verified-live)"
             ),
         ));
-        let _ = crate::journal::append(
+        let _ = crate::mesh::journal::append(
             profile,
-            crate::journal::JournalKind::AnchorsRefreshed,
+            crate::mesh::journal::JournalKind::AnchorsRefreshed,
             &format!("added={added} pruned={pruned} total={total}"),
         );
     }
@@ -1646,31 +1663,31 @@ async fn run_self_maintenance(
     // Fully async (UDP raw exchange) so it is awaited directly. Rate-limited.
     if net_up
         && now - state.last_ns_anchors_refresh_ts
-            >= crate::ns_anchors::NS_ANCHOR_REFRESH_INTERVAL_SECS
+            >= crate::discovery::ns_anchors::NS_ANCHOR_REFRESH_INTERVAL_SECS
     {
         state.last_ns_anchors_refresh_ts = now;
         const NS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
-        let resolvers: Vec<String> = crate::resolve_pool::IRANIAN_RESOLVER_CANDIDATES
+        let resolvers: Vec<String> = crate::net::resolve_pool::IRANIAN_RESOLVER_CANDIDATES
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (added, pruned) = crate::ns_anchors::refresh_ns_anchors(
+        let (added, pruned) = crate::discovery::ns_anchors::refresh_ns_anchors(
             profile,
             &resolvers,
-            crate::ns_anchors::DEFAULT_ZONES,
+            crate::discovery::ns_anchors::DEFAULT_ZONES,
             NS_TIMEOUT,
         )
         .await;
-        let total = crate::ns_anchors::anchor_ips(profile).len();
+        let total = crate::discovery::ns_anchors::anchor_ips(profile).len();
         log(&log_line(
             "INFO",
             &format!(
                 "ns anchors: refreshed (+{added} new, pruned {pruned} dead, {total} verified-live)"
             ),
         ));
-        let _ = crate::journal::append(
+        let _ = crate::mesh::journal::append(
             profile,
-            crate::journal::JournalKind::AnchorsRefreshed,
+            crate::mesh::journal::JournalKind::AnchorsRefreshed,
             &format!("ns added={added} pruned={pruned} total={total}"),
         );
     }
@@ -1686,7 +1703,7 @@ async fn run_self_maintenance(
     // needed since `ensure_started` is a no-op after first spawn and
     // `set_uplink` is an atomic store.
     {
-        let host = crate::mesh_host::MeshHost::global();
+        let host = crate::mesh::mesh_host::MeshHost::global();
         host.set_uplink(net_up);
         let peer_id = std::env::var("HOSTNAME").unwrap_or_else(|_| format!("dyb-{profile}"));
         host.ensure_started(&peer_id, &format!("dyb-{profile}"));
@@ -1707,14 +1724,14 @@ async fn run_self_maintenance(
     // anchors into the same node pool as every other source. This runs even
     // when the network is down (local seed file costs nothing — doctrine
     // §6.5.4); a manifest that fails verification is silently discarded.
-    if crate::eob_anchor::verify_enabled()
-        && now - state.last_oob_pull_ts >= crate::eob_anchor::OOB_PULL_INTERVAL_SECS
+    if crate::egress::eob_anchor::verify_enabled()
+        && now - state.last_oob_pull_ts >= crate::egress::eob_anchor::OOB_PULL_INTERVAL_SECS
     {
         state.last_oob_pull_ts = now;
-        let seed_path =
-            crate::store::profiles::profile_dir(profile).join(crate::eob_anchor::SEED_FILENAME);
+        let seed_path = crate::store::profiles::profile_dir(profile)
+            .join(crate::egress::eob_anchor::SEED_FILENAME);
         if seed_path.exists() {
-            match crate::eob_anchor::ingest_signed_from_seed(profile, &seed_path) {
+            match crate::egress::eob_anchor::ingest_signed_from_seed(profile, &seed_path) {
                 Ok(report) => {
                     log(&log_line(
                         "INFO",
@@ -1723,9 +1740,9 @@ async fn run_self_maintenance(
                             report.accepted, report.duplicates, report.rejected
                         ),
                     ));
-                    let _ = crate::journal::append(
+                    let _ = crate::mesh::journal::append(
                         profile,
-                        crate::journal::JournalKind::NodeRefill,
+                        crate::mesh::journal::JournalKind::NodeRefill,
                         &format!(
                             "oob-signed accepted={} dup={} rejected={}",
                             report.accepted, report.duplicates, report.rejected
@@ -1746,24 +1763,25 @@ async fn run_self_maintenance(
 /// critical-artifact drift via the manifest, and restores from the newest
 /// verifying backup. Never heals from an unverified source; always journaled.
 fn run_auto_heal(profile: &str, log: &mut dyn FnMut(&str)) {
-    let verify = crate::manifest::verify_profile(profile);
+    let verify = crate::artifact::manifest::verify_profile(profile);
     if !verify.has_manifest {
         return; // no baseline → nothing to heal against
     }
     // Build candidate list from the backup dir.
-    let candidates: Vec<crate::auto_heal::BackupCandidate> = crate::backup::list_backups()
-        .into_iter()
-        .map(|b| {
-            let path = std::path::PathBuf::from(&b.path);
-            let verifies = crate::doctor::backup_bundle_verifies(&path);
-            crate::auto_heal::BackupCandidate {
-                created_unix: 0, // re-derived from mtime below
-                verifies,
-                path,
-            }
-        })
-        .collect();
-    let candidates: Vec<crate::auto_heal::BackupCandidate> = candidates
+    let candidates: Vec<crate::probe::auto_heal::BackupCandidate> =
+        crate::ops::backup::list_backups()
+            .into_iter()
+            .map(|b| {
+                let path = std::path::PathBuf::from(&b.path);
+                let verifies = crate::probe::doctor::backup_bundle_verifies(&path);
+                crate::probe::auto_heal::BackupCandidate {
+                    created_unix: 0, // re-derived from mtime below
+                    verifies,
+                    path,
+                }
+            })
+            .collect();
+    let candidates: Vec<crate::probe::auto_heal::BackupCandidate> = candidates
         .into_iter()
         .map(|mut c| {
             c.created_unix = std::fs::metadata(&c.path)
@@ -1779,27 +1797,30 @@ fn run_auto_heal(profile: &str, log: &mut dyn FnMut(&str)) {
         })
         .collect();
 
-    let action = crate::auto_heal::plan_heal(
+    let action = crate::probe::auto_heal::plan_heal(
         &verify,
         &candidates,
-        &crate::auto_heal::critical_artifact_kinds(),
+        &crate::probe::auto_heal::critical_artifact_kinds(),
         crate::store::now_ts() as u64,
     );
 
     match action {
-        crate::auto_heal::HealAction::NoAction => {}
-        crate::auto_heal::HealAction::AlertOnly { reason } => {
+        crate::probe::auto_heal::HealAction::NoAction => {}
+        crate::probe::auto_heal::HealAction::AlertOnly { reason } => {
             log(&log_line("WARN", &format!("auto-heal: {reason}")));
-            let _ =
-                crate::journal::append(profile, crate::journal::JournalKind::CycleFailed, &reason);
+            let _ = crate::mesh::journal::append(
+                profile,
+                crate::mesh::journal::JournalKind::CycleFailed,
+                &reason,
+            );
         }
-        crate::auto_heal::HealAction::HealFiles {
+        crate::probe::auto_heal::HealAction::HealFiles {
             backup_path,
             artifacts,
         } => {
             let dir = crate::store::profiles::profile_dir(profile);
-            match crate::auto_heal::execute_heal(
-                &crate::auto_heal::HealAction::HealFiles {
+            match crate::probe::auto_heal::execute_heal(
+                &crate::probe::auto_heal::HealAction::HealFiles {
                     backup_path: backup_path.clone(),
                     artifacts: artifacts.clone(),
                 },
@@ -1809,11 +1830,11 @@ fn run_auto_heal(profile: &str, log: &mut dyn FnMut(&str)) {
                 Ok(report) => {
                     // Refresh the manifest so the single source of truth reflects
                     // the healed content.
-                    let _ = crate::manifest::refresh_manifest_after_write(
+                    let _ = crate::artifact::manifest::refresh_manifest_after_write(
                         &dir,
                         crate::store::now_ts() as u64,
                     );
-                    if crate::auto_heal::heal_is_safe(&report) {
+                    if crate::probe::auto_heal::heal_is_safe(&report) {
                         log(&log_line(
                             "INFO",
                             &format!(
@@ -1822,9 +1843,9 @@ fn run_auto_heal(profile: &str, log: &mut dyn FnMut(&str)) {
                                 backup_path.display()
                             ),
                         ));
-                        let _ = crate::journal::append(
+                        let _ = crate::mesh::journal::append(
                             profile,
-                            crate::journal::JournalKind::AutoHealed,
+                            crate::mesh::journal::JournalKind::AutoHealed,
                             &format!(
                                 "healed={:?} backup={}",
                                 report.healed,
@@ -1858,8 +1879,8 @@ fn run_scheduled_snapshot(
     now: i64,
     log: &mut dyn FnMut(&str),
 ) {
-    use crate::workspace_snapshot::SnapshotKind;
-    use crate::workspace_snapshots::*;
+    use crate::artifact::workspace_snapshot::SnapshotKind;
+    use crate::artifact::workspace_snapshots::*;
     if !is_snapshot_due(state.last_snapshot_ts, now) {
         return;
     }
@@ -1867,9 +1888,9 @@ fn run_scheduled_snapshot(
     let snaps = snapshots_dir();
     match take_scheduled_snapshot(&workspace, &snaps, SnapshotKind::Full, now as u64) {
         Ok(entry) => {
-            let _ = crate::journal::append(
+            let _ = crate::mesh::journal::append(
                 profile,
-                crate::journal::JournalKind::SnapshotWritten,
+                crate::mesh::journal::JournalKind::SnapshotWritten,
                 &entry.path.display().to_string(),
             );
             log(&log_line(
@@ -1909,7 +1930,7 @@ async fn run_scheduled_drill(
     // Hermetic daemon unit tests disable the scheduled drill so a tick never
     // performs a live fallback-ladder probe (real network) just because
     // `last_drill_ts` defaulted to 0. Production default: enabled.
-    if !crate::connectivity::drill_enabled() {
+    if !crate::net::connectivity::drill_enabled() {
         state.last_drill_ts = now;
         return;
     }
@@ -1919,12 +1940,13 @@ async fn run_scheduled_drill(
         return;
     }
 
-    let resolver = crate::doh::DohResolver::new();
-    let report = crate::connectivity::drill_all_tiers(crate::connectivity::RealLadderProbe {
-        profile,
-        resolver: &resolver,
-    })
-    .await;
+    let resolver = crate::net::doh::DohResolver::new();
+    let report =
+        crate::net::connectivity::drill_all_tiers(crate::net::connectivity::RealLadderProbe {
+            profile,
+            resolver: &resolver,
+        })
+        .await;
 
     let mut survivors = 0u8;
     let mut best_tier = "none".to_string();
@@ -1939,9 +1961,9 @@ async fn run_scheduled_drill(
     }
 
     state.last_drill_ts = now;
-    let _ = crate::journal::append(
+    let _ = crate::mesh::journal::append(
         profile,
-        crate::journal::JournalKind::DrillPerformed,
+        crate::mesh::journal::JournalKind::DrillPerformed,
         &format!("{survivors}/4 rungs up (best: {best_tier})"),
     );
     log(&format!(
@@ -1951,18 +1973,18 @@ async fn run_scheduled_drill(
     if survivors < DRILL_DEGRADED_THRESHOLD {
         // Alert + journal. During a blackout the send fails and the alert is
         // queued to the durable outbox, delivered when the network returns.
-        let _ = crate::remote_beacon::maybe_emit(
+        let _ = crate::mesh::remote_beacon::maybe_emit(
             profile,
-            &crate::remote_beacon::BeaconEvent::ResilienceDegraded {
+            &crate::mesh::remote_beacon::BeaconEvent::ResilienceDegraded {
                 survivors,
                 best_tier: best_tier.clone(),
             },
-            crate::diagnose::Locale::En,
+            crate::probe::diagnose::Locale::En,
         )
         .await;
-        let _ = crate::journal::append(
+        let _ = crate::mesh::journal::append(
             profile,
-            crate::journal::JournalKind::DrillPerformed,
+            crate::mesh::journal::JournalKind::DrillPerformed,
             &format!("DEGRADED, {survivors}/4 rungs up (best: {best_tier})"),
         );
     }
@@ -1978,7 +2000,7 @@ async fn try_start_lifeline(profile: &str, state: &mut DaemonState, log: &mut dy
     if state.lifeline_auto_started {
         return;
     }
-    let report = crate::tunnel_lifeline::spawn_lifeline(profile).await;
+    let report = crate::tunnel::tunnel_lifeline::spawn_lifeline(profile).await;
     state.lifeline_auto_started = true;
     if report.up {
         log(&log_line(
@@ -2062,9 +2084,9 @@ pub async fn daemon_tick(
     let max_backoff = crate::store::profiles::effective_max_backoff_secs(&cfg);
     let degraded = status
         .tier
-        .map(|t| t != crate::connectivity::Tier::Direct)
+        .map(|t| t != crate::net::connectivity::Tier::Direct)
         .unwrap_or(false);
-    let timeouts = crate::autopilot::monitor_timeouts_from_config(&cfg, degraded);
+    let timeouts = crate::probe::autopilot::monitor_timeouts_from_config(&cfg, degraded);
 
     // Auto-flush the beacon outbox whenever the network is up. Alerts queued
     // during a blackout (or a blocked channel) are delivered as soon as the
@@ -2075,12 +2097,12 @@ pub async fn daemon_tick(
         let force = state.network_was_down;
         if force || should_flush_outbox(state.last_outbox_flush_ts, now, OUTBOX_FLUSH_INTERVAL_SECS)
         {
-            let n = crate::remote_beacon::flush_outbox(profile).await;
+            let n = crate::mesh::remote_beacon::flush_outbox(profile).await;
             if n > 0 {
                 log(&log_line("INFO", &format!("outbox flushed {} alert(s)", n)));
-                let _ = crate::journal::append(
+                let _ = crate::mesh::journal::append(
                     profile,
-                    crate::journal::JournalKind::OutboxFlushed,
+                    crate::mesh::journal::JournalKind::OutboxFlushed,
                     &format!("{n} alert(s)"),
                 );
             }
@@ -2139,16 +2161,19 @@ pub async fn daemon_tick(
         // presence — so a dead/unreachable VPS reports the honest "no tunnel"
         // ceiling instead of a false "tunnel=yes".
         let branch_start = crate::store::now_ts();
-        let tunnel_ok = match crate::vps_deploy::load_tunnel_client_config(profile) {
+        let tunnel_ok = match crate::egress::vps_deploy::load_tunnel_client_config(profile) {
             Some(cfg) => {
                 // Short timeout: during a blackout we want a quick verdict.
-                crate::dnstunnel::probe_tunnel_live(&cfg, std::time::Duration::from_millis(1500))
-                    .await
+                crate::tunnel::dnstunnel::probe_tunnel_live(
+                    &cfg,
+                    std::time::Duration::from_millis(1500),
+                )
+                .await
             }
             None => false,
         };
-        let plan = crate::blackout_bridge::SurvivalPlan::from_state(
-            crate::blackout::NetworkState::TotalBlackout,
+        let plan = crate::egress::blackout_bridge::SurvivalPlan::from_state(
+            crate::trust::blackout::NetworkState::TotalBlackout,
             tunnel_ok,
         );
         if !state.network_was_down {
@@ -2163,21 +2188,21 @@ pub async fn daemon_tick(
             state.network_was_down = true;
             state.blackout_since_unix = crate::store::now_ts() as i64;
             state.survival_plan = plan.label().to_string();
-            let _ = crate::journal::append(
+            let _ = crate::mesh::journal::append(
                 profile,
-                crate::journal::JournalKind::NetworkDown,
+                crate::mesh::journal::JournalKind::NetworkDown,
                 plan.label(),
             );
             // Notify remotely that the network went dark. During a total
             // blackout this send fails and the alert is queued to the durable
             // outbox, delivered automatically when the network returns — so
             // the user learns about the blackout even if it has already ended.
-            let _ = crate::remote_beacon::maybe_emit(
+            let _ = crate::mesh::remote_beacon::maybe_emit(
                 profile,
-                &crate::remote_beacon::BeaconEvent::NetworkDown {
+                &crate::mesh::remote_beacon::BeaconEvent::NetworkDown {
                     survival: plan.label().to_string(),
                 },
-                crate::diagnose::Locale::En,
+                crate::probe::diagnose::Locale::En,
             )
             .await;
         }
@@ -2214,13 +2239,13 @@ pub async fn daemon_tick(
                 )
                 .elapsed_secs(now),
             );
-            let pool = crate::carrier_pool::open_profile_pool(&cfg_local).ok();
+            let pool = crate::egress::carrier_pool::open_profile_pool(&cfg_local).ok();
             let data_count = pool
                 .as_ref()
                 .and_then(|p| {
                     crate::daemon::escalation::escalated_select(
                         p,
-                        crate::carrier_pool::CarrierKind::WorkerData,
+                        crate::egress::carrier_pool::CarrierKind::WorkerData,
                         1,
                         now,
                     )
@@ -2232,7 +2257,7 @@ pub async fn daemon_tick(
             if data_count > 0 {
                 crate::daemon::exec_reselection(
                     profile,
-                    crate::carrier_pool::CarrierKind::WorkerData,
+                    crate::egress::carrier_pool::CarrierKind::WorkerData,
                     reselect_n,
                     plan.parallel_probes as usize,
                     log,
@@ -2240,7 +2265,7 @@ pub async fn daemon_tick(
             } else {
                 crate::daemon::exec_reselection(
                     profile,
-                    crate::carrier_pool::CarrierKind::WorkerTunnel,
+                    crate::egress::carrier_pool::CarrierKind::WorkerTunnel,
                     reselect_n,
                     plan.parallel_probes as usize,
                     log,
@@ -2292,17 +2317,17 @@ pub async fn daemon_tick(
         // the manual `dastyab token recover` step — protection resumes
         // automatically. Configurable via auto_rotate_on_blocked (default on).
         if let Some((from, to)) = acct.try_rotate(profile).await {
-            state.account_state = crate::account_state::AccountState::Active;
+            state.account_state = crate::trust::account_state::AccountState::Active;
             state.account_rotate_exhausted_notified = false;
             state.last_account_poll_ts = now;
             log(&log_line(
                 "INFO",
                 &format!("account=token-auto-rotated {from}→{to}, resuming cycle"),
             ));
-            let _ = crate::remote_beacon::maybe_emit(
+            let _ = crate::mesh::remote_beacon::maybe_emit(
                 profile,
-                &crate::remote_beacon::BeaconEvent::TokenAutoRotated { from, to },
-                crate::diagnose::Locale::En,
+                &crate::mesh::remote_beacon::BeaconEvent::TokenAutoRotated { from, to },
+                crate::probe::diagnose::Locale::En,
             )
             .await;
         } else {
@@ -2324,18 +2349,18 @@ pub async fn daemon_tick(
                         state.account_state.label()
                     ),
                 ));
-                let _ = crate::remote_beacon::maybe_emit(
+                let _ = crate::mesh::remote_beacon::maybe_emit(
                     profile,
-                    &crate::remote_beacon::BeaconEvent::AccountBlockedRotationExhausted {
+                    &crate::mesh::remote_beacon::BeaconEvent::AccountBlockedRotationExhausted {
                         state: state.account_state.label().to_string(),
                         profile: profile.to_string(),
                         stored_tokens,
                     },
-                    crate::diagnose::Locale::En,
+                    crate::probe::diagnose::Locale::En,
                 )
                 .await;
             }
-            if crate::account_state::should_poll_account(state.last_account_poll_ts, now) {
+            if crate::trust::account_state::should_poll_account(state.last_account_poll_ts, now) {
                 let st = acct.probe_account(profile).await;
                 state.last_account_poll_ts = now;
                 let still_blocked = st.blocks_cycle();
@@ -2346,11 +2371,11 @@ pub async fn daemon_tick(
                         &format!(
                             "account={} still blocked (polling again in {}s)",
                             state.account_state.label(),
-                            crate::account_state::ACCOUNT_POLL_INTERVAL_SECS
+                            crate::trust::account_state::ACCOUNT_POLL_INTERVAL_SECS
                         ),
                     ));
                     try_start_lifeline(profile, state, log).await;
-                    return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
+                    return crate::trust::account_state::ACCOUNT_POLL_INTERVAL_SECS;
                 }
                 log(&log_line(
                     "INFO",
@@ -2371,13 +2396,13 @@ pub async fn daemon_tick(
                         state.account_state.label()
                     ),
                 ));
-                return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
+                return crate::trust::account_state::ACCOUNT_POLL_INTERVAL_SECS;
             }
         }
     } else {
         // Not blocked, but periodically confirm so we notice a suspension even
         // while the token itself still verifies.
-        if crate::account_state::should_poll_account(state.last_account_poll_ts, now) {
+        if crate::trust::account_state::should_poll_account(state.last_account_poll_ts, now) {
             let st = acct.probe_account(profile).await;
             state.last_account_poll_ts = now;
             if st.blocks_cycle() {
@@ -2396,21 +2421,21 @@ pub async fn daemon_tick(
                     let p = crate::store::profiles::load_profile(profile);
                     let stored_tokens = p.tokens.len();
                     let auto_rotate_enabled = p.config.auto_rotate_on_blocked;
-                    let _ = crate::remote_beacon::maybe_emit(
+                    let _ = crate::mesh::remote_beacon::maybe_emit(
                         profile,
-                        &crate::remote_beacon::BeaconEvent::AccountBlocked {
+                        &crate::mesh::remote_beacon::BeaconEvent::AccountBlocked {
                             state: state.account_state.label().to_string(),
                             since: crate::store::now_ts() as i64,
                             profile: profile.to_string(),
                             auto_rotate_enabled,
                             stored_tokens,
                         },
-                        crate::diagnose::Locale::En,
+                        crate::probe::diagnose::Locale::En,
                     )
                     .await;
                 }
                 try_start_lifeline(profile, state, log).await;
-                return crate::account_state::ACCOUNT_POLL_INTERVAL_SECS;
+                return crate::trust::account_state::ACCOUNT_POLL_INTERVAL_SECS;
             }
             state.account_state = st;
         }
@@ -2423,11 +2448,12 @@ pub async fn daemon_tick(
         // current (possibly backed-off) interval for the *next* failure.
         state.network_was_down = false;
         state.blackout_since_unix = 0;
-        let _ = crate::journal::append(profile, crate::journal::JournalKind::NetworkUp, "");
-        let _ = crate::remote_beacon::maybe_emit(
+        let _ =
+            crate::mesh::journal::append(profile, crate::mesh::journal::JournalKind::NetworkUp, "");
+        let _ = crate::mesh::remote_beacon::maybe_emit(
             profile,
-            &crate::remote_beacon::BeaconEvent::NetworkRestored,
-            crate::diagnose::Locale::En,
+            &crate::mesh::remote_beacon::BeaconEvent::NetworkRestored,
+            crate::probe::diagnose::Locale::En,
         )
         .await;
         // Still run a cycle now.
@@ -2509,11 +2535,11 @@ mod tests {
         // Hermetic daemon tests must never trigger a live autonomous refill
         // (Telegram/GitHub harvest) just because the in-memory node pool is
         // empty. Disable the gate; tests that exercise refill re-enable it.
-        crate::node_refill::set_refill_enabled(false);
-        crate::connectivity::set_drill_enabled(false);
-        crate::ct_anchors::set_refresh_enabled(false);
-        crate::eob_anchor::set_verify_enabled(false);
-        crate::harvest::set_discovery_enabled(false);
+        crate::probe::node_refill::set_refill_enabled(false);
+        crate::net::connectivity::set_drill_enabled(false);
+        crate::discovery::ct_anchors::set_refresh_enabled(false);
+        crate::egress::eob_anchor::set_verify_enabled(false);
+        crate::discovery::harvest::set_discovery_enabled(false);
         tmp
     }
 
@@ -2676,7 +2702,7 @@ mod tests {
             "backup timestamp should be recorded"
         );
         assert!(
-            !crate::backup::list_backups().is_empty(),
+            !crate::ops::backup::list_backups().is_empty(),
             "a backup file should exist"
         );
         assert!(
@@ -2698,7 +2724,7 @@ mod tests {
         })
         .await;
         assert_eq!(state.last_backup_ts, 0, "disabled backup must not run");
-        assert!(crate::backup::list_backups().is_empty());
+        assert!(crate::ops::backup::list_backups().is_empty());
     }
 
     /// The daily version-integrity sweep runs when due (state-tracked, like
@@ -2710,7 +2736,13 @@ mod tests {
         let dir = crate::store::profiles::profile_dir(&profile);
         // Seed one real version so the sweep has content to verify.
         std::fs::write(dir.join("config.json"), b"old").unwrap();
-        crate::artifact_versions::snapshot_before_write(&dir, "config.json", b"new", 1000).unwrap();
+        crate::artifact::artifact_versions::snapshot_before_write(
+            &dir,
+            "config.json",
+            b"new",
+            1000,
+        )
+        .unwrap();
 
         let mut state = DaemonState::default();
         state.last_verify_ts = 0; // never verified → due
@@ -2747,7 +2779,7 @@ mod tests {
         let _home = daemon_home();
         let profile = crate::store::profiles::create_profile("discrate", "").unwrap();
         // Re-enable discovery for this test (daemon_home disables it).
-        crate::harvest::set_discovery_enabled(true);
+        crate::discovery::harvest::set_discovery_enabled(true);
 
         let mut state = DaemonState::default();
         let now = crate::store::profiles::now_ts() as i64;
@@ -2884,12 +2916,12 @@ mod tests {
             Self {
                 status: NetStatus {
                     up,
-                    tier: Some(crate::connectivity::Tier::Direct),
+                    tier: Some(crate::net::connectivity::Tier::Direct),
                 },
                 calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
-        fn with_tier(up: bool, tier: crate::connectivity::Tier) -> Self {
+        fn with_tier(up: bool, tier: crate::net::connectivity::Tier) -> Self {
             Self {
                 status: NetStatus {
                     up,
@@ -2924,7 +2956,7 @@ mod tests {
             &self,
             _profile: &str,
             _follow: bool,
-            _timeouts: crate::autopilot::MonitorTimeouts,
+            _timeouts: crate::probe::autopilot::MonitorTimeouts,
         ) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let ok = self.ok;
@@ -2940,14 +2972,14 @@ mod tests {
 
     /// A scripted account probe for daemon_tick tests.
     struct FakeAccountProbe {
-        state: crate::account_state::AccountState,
+        state: crate::trust::account_state::AccountState,
         /// Optional scripted rotation outcome (from, to).
         rotate: Option<(String, String)>,
     }
     impl Default for FakeAccountProbe {
         fn default() -> Self {
             Self {
-                state: crate::account_state::AccountState::Active,
+                state: crate::trust::account_state::AccountState::Active,
                 rotate: None,
             }
         }
@@ -2956,7 +2988,8 @@ mod tests {
         fn probe_account(
             &self,
             _profile: &str,
-        ) -> Pin<Box<dyn Future<Output = crate::account_state::AccountState> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = crate::trust::account_state::AccountState> + Send + '_>>
+        {
             let st = self.state.clone();
             Box::pin(async move { st })
         }
@@ -3044,7 +3077,7 @@ mod tests {
         let profile = "default";
         let mut state = DaemonState::default();
         // Network up via DoH (direct unavailable).
-        let mut probe = FakeProbe::with_tier(true, crate::connectivity::Tier::DoH);
+        let mut probe = FakeProbe::with_tier(true, crate::net::connectivity::Tier::DoH);
         let cycle = FakeCycle::new(true);
         let acct = FakeAccountProbe::default();
 
@@ -3260,11 +3293,11 @@ mod tests {
         let _home = daemon_home();
         let profile = "default";
         let mut state = DaemonState::default();
-        state.account_state = crate::account_state::AccountState::Suspended { since: 1 };
+        state.account_state = crate::trust::account_state::AccountState::Suspended { since: 1 };
         state.last_account_poll_ts = crate::store::now_ts() as i64; // inside window
         let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
-            state: crate::account_state::AccountState::Suspended { since: 1 },
+            state: crate::trust::account_state::AccountState::Suspended { since: 1 },
             rotate: None,
         };
         let cycle = FakeCycle::new(true);
@@ -3273,7 +3306,10 @@ mod tests {
             log_lines.push(l.to_string());
         })
         .await;
-        assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert_eq!(
+            sleep,
+            crate::trust::account_state::ACCOUNT_POLL_INTERVAL_SECS
+        );
         assert_eq!(
             cycle.calls.load(Ordering::SeqCst),
             0,
@@ -3289,12 +3325,12 @@ mod tests {
         let _home = daemon_home();
         let profile = "default";
         let mut state = DaemonState::default();
-        state.account_state = crate::account_state::AccountState::Suspended { since: 1 };
+        state.account_state = crate::trust::account_state::AccountState::Suspended { since: 1 };
         // Stale last-poll → the daemon actually probes and finds it still blocked.
         state.last_account_poll_ts = crate::store::now_ts() as i64 - 10_000;
         let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
-            state: crate::account_state::AccountState::Suspended { since: 1 },
+            state: crate::trust::account_state::AccountState::Suspended { since: 1 },
             rotate: None,
         };
         let cycle = FakeCycle::new(true);
@@ -3303,7 +3339,10 @@ mod tests {
             log_lines.push(l.to_string());
         })
         .await;
-        assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert_eq!(
+            sleep,
+            crate::trust::account_state::ACCOUNT_POLL_INTERVAL_SECS
+        );
         assert!(
             state.lifeline_auto_started,
             "lifeline auto-start flag should be set while blocked"
@@ -3319,12 +3358,12 @@ mod tests {
         let _home = daemon_home();
         let profile = "default";
         let mut state = DaemonState::default();
-        state.account_state = crate::account_state::AccountState::TokenInvalid { since: 1 };
+        state.account_state = crate::trust::account_state::AccountState::TokenInvalid { since: 1 };
         state.last_account_poll_ts = crate::store::now_ts() as i64; // inside window
         let mut probe = FakeProbe::new(true);
         // Scripted rotation: backup token takes over.
         let acct = FakeAccountProbe {
-            state: crate::account_state::AccountState::TokenInvalid { since: 1 },
+            state: crate::trust::account_state::AccountState::TokenInvalid { since: 1 },
             rotate: Some(("primary".to_string(), "backup".to_string())),
         };
         let cycle = FakeCycle::new(true);
@@ -3337,7 +3376,7 @@ mod tests {
         assert_eq!(cycle.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             state.account_state,
-            crate::account_state::AccountState::Active
+            crate::trust::account_state::AccountState::Active
         );
         assert!(log_lines.iter().any(|l| l.contains("token-auto-rotated")));
         assert_eq!(sleep, backoff_reset());
@@ -3358,11 +3397,11 @@ mod tests {
         crate::store::profiles::set_active_token(profile, "a").unwrap();
 
         let mut state = DaemonState::default();
-        state.account_state = crate::account_state::AccountState::TokenInvalid { since: 1 };
+        state.account_state = crate::trust::account_state::AccountState::TokenInvalid { since: 1 };
         state.last_account_poll_ts = crate::store::now_ts() as i64; // inside window
         let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
-            state: crate::account_state::AccountState::TokenInvalid { since: 1 },
+            state: crate::trust::account_state::AccountState::TokenInvalid { since: 1 },
             rotate: None,
         };
         let cycle = FakeCycle::new(true);
@@ -3373,7 +3412,10 @@ mod tests {
         .await;
 
         // Still blocked → no cycle runs, we wait for the next poll.
-        assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert_eq!(
+            sleep,
+            crate::trust::account_state::ACCOUNT_POLL_INTERVAL_SECS
+        );
         assert_eq!(cycle.calls.load(Ordering::SeqCst), 0);
         // The one-shot exhausted notification was recorded.
         assert!(state.account_rotate_exhausted_notified);
@@ -3388,7 +3430,10 @@ mod tests {
             log_lines2.push(l.to_string());
         })
         .await;
-        assert_eq!(sleep2, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert_eq!(
+            sleep2,
+            crate::trust::account_state::ACCOUNT_POLL_INTERVAL_SECS
+        );
         assert!(!log_lines2
             .iter()
             .any(|l| l.contains("auto-rotation exhausted")));
@@ -3401,12 +3446,12 @@ mod tests {
         let _home = daemon_home();
         let profile = "default";
         let mut state = DaemonState::default();
-        state.account_state = crate::account_state::AccountState::Suspended { since: 1 };
+        state.account_state = crate::trust::account_state::AccountState::Suspended { since: 1 };
         // Advance the poll window so a re-probe actually happens.
         state.last_account_poll_ts = (crate::store::now_ts() as i64) - 2000;
         let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
-            state: crate::account_state::AccountState::Active,
+            state: crate::trust::account_state::AccountState::Active,
             rotate: None,
         };
         let cycle = FakeCycle::new(true);
@@ -3419,7 +3464,7 @@ mod tests {
         assert_eq!(cycle.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             state.account_state,
-            crate::account_state::AccountState::Active
+            crate::trust::account_state::AccountState::Active
         );
         assert!(log_lines.iter().any(|l| l.contains("restored")));
         // sleep is the normal reset interval (a cycle succeeded).
@@ -3432,16 +3477,19 @@ mod tests {
         let _home = daemon_home();
         let profile = "default";
         let mut state = DaemonState::default();
-        state.account_state = crate::account_state::AccountState::TokenInvalid { since: 1 };
+        state.account_state = crate::trust::account_state::AccountState::TokenInvalid { since: 1 };
         state.last_account_poll_ts = crate::store::now_ts() as i64;
         let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
-            state: crate::account_state::AccountState::TokenInvalid { since: 1 },
+            state: crate::trust::account_state::AccountState::TokenInvalid { since: 1 },
             rotate: None,
         };
         let cycle = FakeCycle::new(true);
         let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |_| {}).await;
-        assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert_eq!(
+            sleep,
+            crate::trust::account_state::ACCOUNT_POLL_INTERVAL_SECS
+        );
         assert_eq!(cycle.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -3452,16 +3500,19 @@ mod tests {
         let _home = daemon_home();
         let profile = "default";
         let mut state = DaemonState::default();
-        state.account_state = crate::account_state::AccountState::Active;
+        state.account_state = crate::trust::account_state::AccountState::Active;
         state.last_account_poll_ts = (crate::store::now_ts() as i64) - 2000;
         let mut probe = FakeProbe::new(true);
         let acct = FakeAccountProbe {
-            state: crate::account_state::AccountState::Suspended { since: 1 },
+            state: crate::trust::account_state::AccountState::Suspended { since: 1 },
             rotate: None,
         };
         let cycle = FakeCycle::new(true);
         let sleep = daemon_tick(profile, &mut state, &mut probe, &acct, &cycle, &mut |_| {}).await;
-        assert_eq!(sleep, crate::account_state::ACCOUNT_POLL_INTERVAL_SECS);
+        assert_eq!(
+            sleep,
+            crate::trust::account_state::ACCOUNT_POLL_INTERVAL_SECS
+        );
         assert_eq!(cycle.calls.load(Ordering::SeqCst), 0);
         assert!(state.account_state.blocks_cycle());
     }
@@ -3474,7 +3525,7 @@ mod tests {
         let _home = daemon_home();
         let profile = "default";
         let mut state = DaemonState::default();
-        state.account_state = crate::account_state::AccountState::TokenInvalid { since: 1 };
+        state.account_state = crate::trust::account_state::AccountState::TokenInvalid { since: 1 };
         state.last_account_poll_ts = (crate::store::now_ts() as i64) - 100;
         save_daemon_state(profile, &state).unwrap();
 
@@ -3485,7 +3536,7 @@ mod tests {
         assert!(!after.account_state.blocks_cycle());
         assert_eq!(
             after.account_state,
-            crate::account_state::AccountState::Active
+            crate::trust::account_state::AccountState::Active
         );
         assert_eq!(after.last_account_poll_ts, 0, "forces immediate re-probe");
     }

@@ -20,7 +20,7 @@
 //!   alternative to a blind cooldown bypass — a long blackout doesn't starve,
 //!   but it still prefers endpoints most likely to be back soon.
 
-use crate::carrier_pool::{CarrierEndpoint, CarrierKind, CarrierPool, CarrierPoolError};
+use crate::egress::carrier_pool::{CarrierEndpoint, CarrierKind, CarrierPool, CarrierPoolError};
 
 /// Default (baseline, non-escalated) probe cadence, seconds.
 pub const BASELINE_PROBE_INTERVAL_SECS: u64 = 60;
@@ -302,7 +302,7 @@ mod tests {
     }
 
     fn tmp_pool_with(hosts: &[&str]) -> (tempfile::TempDir, CarrierPool) {
-        use crate::carrier_pool::{CarrierProvenance, CarrierSnapshot};
+        use crate::egress::carrier_pool::{CarrierProvenance, CarrierSnapshot};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("carrier_pool.json");
         let pool = CarrierPool::open(&path).unwrap();

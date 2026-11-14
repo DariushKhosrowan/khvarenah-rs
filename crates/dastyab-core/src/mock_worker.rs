@@ -32,7 +32,7 @@ pub struct MockWorkerConfig {
     /// The VLESS WebSocket path the worker "deploys" (default `/api`).
     pub worker_path: String,
     /// Bytes to emit after the 101 upgrade (default 4096). Must exceed
-    /// `crate::health::MIN_WORKER_BYTES` to pass the WS-gate.
+    /// `crate::probe::health::MIN_WORKER_BYTES` to pass the WS-gate.
     pub ws_payload_bytes: usize,
     /// The IP reported in the `/cdn-cgi/trace` body (default a reserved
     /// RFC 5737 test IP, e.g. `198.51.100.1`).

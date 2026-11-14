@@ -159,14 +159,14 @@ fn maybe_snapshot_before_write(path: &Path, bytes: &[u8]) {
     }
     if rel.starts_with(".dyb_tmp_")
         || rel.starts_with('.')
-        || crate::manifest::is_runtime_excluded(&rel)
+        || crate::artifact::manifest::is_runtime_excluded(&rel)
         || rel == "manifest.json"
         || rel == "ledger_hw.json"
     {
         return;
     }
     IN_SNAPSHOT.with(|c| c.set(true));
-    let _ = crate::artifact_versions::snapshot_before_write(
+    let _ = crate::artifact::artifact_versions::snapshot_before_write(
         &profile_dir,
         &rel,
         bytes,

@@ -5,7 +5,7 @@ pub mod ips;
 use reqwest::{multipart, StatusCode};
 
 use crate::error::{explain_response, CFError};
-use crate::stealth::{pre_request_pause, retry_backoff};
+use crate::trust::stealth::{pre_request_pause, retry_backoff};
 
 pub const API: &str = "https://api.cloudflare.com/client/v4";
 pub const DEFAULT_COMPAT_DATE: &str = "2026-07-01";
@@ -411,15 +411,20 @@ impl Client {
         // Cloudflare API, deploy via wrangler (bundles ESM → classic). Local
         // mock-server tests keep the HTTP path.
         if self.is_live() {
-            let wopts = crate::wrangler::WranglerDeployOpts {
+            let wopts = crate::egress::wrangler::WranglerDeployOpts {
                 worker_name: name.to_string(),
                 compat_date: compat_date.to_string(),
                 kv_binding: None,
                 crons: vec![],
                 vars: vec![],
             };
-            crate::wrangler::deploy_worker_via_wrangler(&self.token, account_id, &js, &wopts)
-                .await?;
+            crate::egress::wrangler::deploy_worker_via_wrangler(
+                &self.token,
+                account_id,
+                &js,
+                &wopts,
+            )
+            .await?;
             return Ok(serde_json::json!({ "success": true }));
         }
         let metadata = serde_json::json!({
@@ -546,15 +551,20 @@ impl Client {
                     }
                 }
             }
-            let wopts = crate::wrangler::WranglerDeployOpts {
+            let wopts = crate::egress::wrangler::WranglerDeployOpts {
                 worker_name: name.to_string(),
                 compat_date: compat_date.to_string(),
                 kv_binding,
                 crons: crons.iter().map(|c| c.to_string()).collect(),
                 vars: vec![],
             };
-            crate::wrangler::deploy_worker_via_wrangler(&self.token, account_id, &js, &wopts)
-                .await?;
+            crate::egress::wrangler::deploy_worker_via_wrangler(
+                &self.token,
+                account_id,
+                &js,
+                &wopts,
+            )
+            .await?;
             return Ok(serde_json::json!({ "success": true }));
         }
         let metadata = Self::build_deploy_metadata(compat_date, &bindings, crons);

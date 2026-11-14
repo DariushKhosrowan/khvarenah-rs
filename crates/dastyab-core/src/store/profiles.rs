@@ -147,22 +147,22 @@ pub struct ProfileConfig {
     /// Remote push-notification config (Telegram or webhook). `None` =
     /// disabled (default). Kept as an `Option` so old configs migrate cleanly.
     #[serde(default)]
-    pub beacon: Option<crate::remote_beacon::BeaconConfig>,
+    pub beacon: Option<crate::mesh::remote_beacon::BeaconConfig>,
     /// Scheduled config mutation settings (worker signature rotation).
     #[serde(default)]
-    pub mutation: crate::config_mutation::MutationConfig,
+    pub mutation: crate::artifact::config_mutation::MutationConfig,
     /// Scheduled profile auto-backup settings (crash/blackout resilience).
     #[serde(default)]
-    pub backup_autosync: crate::backup_autosync::BackupAutoSyncConfig,
+    pub backup_autosync: crate::ops::backup_autosync::BackupAutoSyncConfig,
     /// UNIX epoch seconds of the last config mutation.
     #[serde(default)]
     pub last_mutation_ts: i64,
     /// Multi-worker parallel redundancy set (round 19).
     #[serde(default)]
-    pub worker_set: crate::multi_worker::WorkerSet,
+    pub worker_set: crate::probe::multi_worker::WorkerSet,
     /// Anti-DPI TCP desync fragmenter (round 21). Disabled by default.
     #[serde(default)]
-    pub desync: crate::desync::DesyncConfig,
+    pub desync: crate::tunnel::desync::DesyncConfig,
     /// Monitor LIGHT-phase budget in seconds (WS-gate sweep). 0 = system default
     /// (`cycle_guard::MONITOR_TIMEOUT_SECS`, 120). Configurable in-app so a
     /// degraded network can use a tighter budget and fail fast.
@@ -207,7 +207,7 @@ pub struct ProfileConfig {
     /// entry yet (see `worker_tunnel::secret::resolve_worker_secret`).
     #[serde(default)]
     pub worker_secrets:
-        std::collections::HashMap<String, crate::worker_tunnel::secret::WorkerSecret>,
+        std::collections::HashMap<String, crate::egress::worker_tunnel::secret::WorkerSecret>,
     /// The canonical `vless://` base link (worker uuid/path/transport) of the
     /// most recent successful deploy, persisted durably so config-from-IP and
     /// scanning can keep working even if profile history is cleared/trimmed —
@@ -234,7 +234,7 @@ pub fn effective_light_timeout_secs(c: &ProfileConfig) -> u64 {
     if c.light_timeout_secs > 0 {
         c.light_timeout_secs
     } else {
-        crate::cycle_guard::MONITOR_TIMEOUT_SECS
+        crate::probe::cycle_guard::MONITOR_TIMEOUT_SECS
     }
 }
 
@@ -246,7 +246,7 @@ pub fn effective_deep_timeout_secs(c: &ProfileConfig) -> u64 {
     if c.deep_timeout_secs > 0 {
         c.deep_timeout_secs
     } else {
-        crate::cycle_guard::DISCOVERY_TIMEOUT_SECS
+        crate::probe::cycle_guard::DISCOVERY_TIMEOUT_SECS
     }
 }
 
@@ -308,11 +308,11 @@ impl Default for ProfileConfig {
             strategy_cycles_since_rotation: 0,
             strategy_last_rotated_ts: 0,
             beacon: None,
-            mutation: crate::config_mutation::MutationConfig::default(),
-            backup_autosync: crate::backup_autosync::BackupAutoSyncConfig::default(),
+            mutation: crate::artifact::config_mutation::MutationConfig::default(),
+            backup_autosync: crate::ops::backup_autosync::BackupAutoSyncConfig::default(),
             last_mutation_ts: 0,
-            worker_set: crate::multi_worker::WorkerSet::default(),
-            desync: crate::desync::DesyncConfig::default(),
+            worker_set: crate::probe::multi_worker::WorkerSet::default(),
+            desync: crate::tunnel::desync::DesyncConfig::default(),
             light_timeout_secs: 0,
             deep_timeout_secs: 0,
             max_backoff_secs: 0,
@@ -543,7 +543,10 @@ pub fn save_profile(p: &Profile) -> Result<(), CFError> {
     // newer options and the deployed base link. Refreshing on every save makes
     // auto-heal fire only on real corruption (missing/unparseable files).
     // Best-effort: a manifest refresh failure must never fail the save.
-    let _ = crate::manifest::refresh_manifest_after_write(&dir, crate::store::now_ts() as u64);
+    let _ = crate::artifact::manifest::refresh_manifest_after_write(
+        &dir,
+        crate::store::now_ts() as u64,
+    );
     Ok(())
 }
 
@@ -938,9 +941,9 @@ pub fn remember_vless(id: &str, rec: VlessRecord) -> Result<(), CFError> {
     save_profile(&p)?;
     // Track the history ledger's high-water mark so the doctor's append-only
     // guard sees this append (and never flags a later legit growth).
-    let _ = crate::ledger_guard::note_ledger_state(
+    let _ = crate::mesh::ledger_guard::note_ledger_state(
         &dir,
-        crate::ledger_guard::LedgerKind::History,
+        crate::mesh::ledger_guard::LedgerKind::History,
         p.history.len() as u64,
         crate::store::now_ts() as u64,
     );
@@ -959,9 +962,9 @@ pub fn remove_history_record(id: &str, rec_id: &str) -> Result<bool, CFError> {
     if removed {
         // Intentional removal: move the high-water down so the doctor does not
         // flag a deliberate delete as corruption.
-        let _ = crate::ledger_guard::rebase_high_water(
+        let _ = crate::mesh::ledger_guard::rebase_high_water(
             &dir,
-            crate::ledger_guard::LedgerKind::History,
+            crate::mesh::ledger_guard::LedgerKind::History,
             p.history.len() as u64,
             crate::store::now_ts() as u64,
         );
@@ -976,9 +979,9 @@ pub fn clear_history(id: &str) -> Result<(), CFError> {
     let mut p = load_profile(id);
     p.history.clear();
     save_profile(&p)?;
-    let _ = crate::ledger_guard::rebase_high_water(
+    let _ = crate::mesh::ledger_guard::rebase_high_water(
         &dir,
-        crate::ledger_guard::LedgerKind::History,
+        crate::mesh::ledger_guard::LedgerKind::History,
         0,
         crate::store::now_ts() as u64,
     );
@@ -1025,9 +1028,9 @@ pub fn remember_clean_ip_with_source(id: &str, ip: &str, source: &str) -> Result
         }
     }
     save_profile(&p)?;
-    let _ = crate::ledger_guard::note_ledger_state(
+    let _ = crate::mesh::ledger_guard::note_ledger_state(
         &dir,
-        crate::ledger_guard::LedgerKind::CleanIps,
+        crate::mesh::ledger_guard::LedgerKind::CleanIps,
         p.clean_ips.len() as u64,
         crate::store::now_ts() as u64,
     );
@@ -1046,7 +1049,7 @@ fn parse_ip_port(ep: &str) -> u16 {
 fn clean_ip_country(ep: &str) -> Option<String> {
     let ip_part = ep.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(ep);
     let ip: std::net::IpAddr = ip_part.parse().ok()?;
-    crate::geoip::GeoDB::load(None).country_code(&ip)
+    crate::net::geoip::GeoDB::load(None).country_code(&ip)
 }
 
 /// Normalize and validate a clean-IP endpoint string.
@@ -1116,9 +1119,9 @@ pub fn remove_clean_ip(id: &str, ip: &str) -> Result<bool, CFError> {
     let removed = p.clean_ips.len() != before;
     save_profile(&p)?;
     if removed {
-        let _ = crate::ledger_guard::rebase_high_water(
+        let _ = crate::mesh::ledger_guard::rebase_high_water(
             &dir,
-            crate::ledger_guard::LedgerKind::CleanIps,
+            crate::mesh::ledger_guard::LedgerKind::CleanIps,
             p.clean_ips.len() as u64,
             crate::store::now_ts() as u64,
         );
@@ -1134,9 +1137,9 @@ pub fn clear_clean_ips(id: &str) -> Result<(), CFError> {
     p.clean_ips.clear();
     p.clean_ip_meta.clear();
     save_profile(&p)?;
-    let _ = crate::ledger_guard::rebase_high_water(
+    let _ = crate::mesh::ledger_guard::rebase_high_water(
         &dir,
-        crate::ledger_guard::LedgerKind::CleanIps,
+        crate::mesh::ledger_guard::LedgerKind::CleanIps,
         0,
         crate::store::now_ts() as u64,
     );
@@ -1169,9 +1172,9 @@ pub fn record_token_verified(id: &str, label: &str, note: &str) -> Result<(), CF
     let mut p = load_profile(id);
     push_token_event(&mut p, "verified", label, note);
     save_profile(&p)?;
-    let _ = crate::ledger_guard::note_ledger_state(
+    let _ = crate::mesh::ledger_guard::note_ledger_state(
         &dir,
-        crate::ledger_guard::LedgerKind::TokenHistory,
+        crate::mesh::ledger_guard::LedgerKind::TokenHistory,
         p.token_history.len() as u64,
         crate::store::now_ts() as u64,
     );
@@ -1194,9 +1197,9 @@ pub fn clear_token_history(id: &str) -> Result<(), CFError> {
     let mut p = load_profile(id);
     p.token_history.clear();
     save_profile(&p)?;
-    let _ = crate::ledger_guard::rebase_high_water(
+    let _ = crate::mesh::ledger_guard::rebase_high_water(
         &dir,
-        crate::ledger_guard::LedgerKind::TokenHistory,
+        crate::mesh::ledger_guard::LedgerKind::TokenHistory,
         0,
         crate::store::now_ts() as u64,
     );
@@ -1214,9 +1217,9 @@ pub fn remove_token_history_event(id: &str, event_id: &str) -> Result<bool, CFEr
         return Ok(false);
     }
     save_profile(&p)?;
-    let _ = crate::ledger_guard::rebase_high_water(
+    let _ = crate::mesh::ledger_guard::rebase_high_water(
         &dir,
-        crate::ledger_guard::LedgerKind::TokenHistory,
+        crate::mesh::ledger_guard::LedgerKind::TokenHistory,
         p.token_history.len() as u64,
         crate::store::now_ts() as u64,
     );
@@ -1369,16 +1372,16 @@ pub fn save_rescue_meta(
 /// result in plain language). Written by the discovery pipeline each cycle.
 pub fn save_last_diagnostics(
     id: &str,
-    diag: &crate::slipscan::PipelineDiagnostics,
+    diag: &crate::probe::slipscan::PipelineDiagnostics,
 ) -> Result<(), CFError> {
     let p = profile_dir(id).join("last-diagnostics.json");
     write_json(&p, diag)
 }
 
 /// Read the last saved pipeline diagnostics, if any.
-pub fn load_last_diagnostics(id: &str) -> Option<crate::slipscan::PipelineDiagnostics> {
+pub fn load_last_diagnostics(id: &str) -> Option<crate::probe::slipscan::PipelineDiagnostics> {
     let p = profile_dir(id).join("last-diagnostics.json");
-    read_opt::<crate::slipscan::PipelineDiagnostics>(&p)
+    read_opt::<crate::probe::slipscan::PipelineDiagnostics>(&p)
 }
 
 /// The last monitor LIGHT-sweep aggregate (healthy-but-muted signal), so the
@@ -1386,16 +1389,16 @@ pub fn load_last_diagnostics(id: &str) -> Option<crate::slipscan::PipelineDiagno
 /// `monitor_cycle` each ledger probe.
 pub fn save_last_light_sweep(
     id: &str,
-    diag: &crate::slipscan::LightSweepDiag,
+    diag: &crate::probe::slipscan::LightSweepDiag,
 ) -> Result<(), CFError> {
     let p = profile_dir(id).join("last-light-sweep.json");
     write_json(&p, diag)
 }
 
 /// Read the last saved light-sweep aggregate, if any.
-pub fn load_last_light_sweep(id: &str) -> Option<crate::slipscan::LightSweepDiag> {
+pub fn load_last_light_sweep(id: &str) -> Option<crate::probe::slipscan::LightSweepDiag> {
     let p = profile_dir(id).join("last-light-sweep.json");
-    read_opt::<crate::slipscan::LightSweepDiag>(&p)
+    read_opt::<crate::probe::slipscan::LightSweepDiag>(&p)
 }
 
 /// --- Legacy migration ---
@@ -1737,7 +1740,7 @@ mod tests {
             let src = create_profile("src", "").unwrap();
             add_token(&src, "cf-main", "secret-token").unwrap();
             remember_clean_ip(&src, "104.16.1.1:443").unwrap();
-            let bundle = crate::backup::export_profile_to_file(&src, None).unwrap();
+            let bundle = crate::ops::backup::export_profile_to_file(&src, None).unwrap();
 
             let dst = create_profile("dst", "keep me").unwrap();
             add_token(&dst, "other", "other-token").unwrap();
@@ -1819,11 +1822,11 @@ mod tests {
             assert_eq!(p.config.max_backoff_secs, 0);
             assert_eq!(
                 effective_light_timeout_secs(&p.config),
-                crate::cycle_guard::MONITOR_TIMEOUT_SECS
+                crate::probe::cycle_guard::MONITOR_TIMEOUT_SECS
             );
             assert_eq!(
                 effective_deep_timeout_secs(&p.config),
-                crate::cycle_guard::DISCOVERY_TIMEOUT_SECS
+                crate::probe::cycle_guard::DISCOVERY_TIMEOUT_SECS
             );
             assert_eq!(effective_max_backoff_secs(&p.config), 21600);
             // Setting a value persists and is honored.
@@ -2381,17 +2384,18 @@ mod tests {
     fn light_sweep_diag_roundtrip() {
         with_home(|| {
             let id = create_profile("work", "").unwrap();
-            let mut d = crate::slipscan::LightSweepDiag::default();
+            let mut d = crate::probe::slipscan::LightSweepDiag::default();
             d.alive = 6;
             d.total = 7;
             d.histogram
-                .insert(crate::health::WsFailureReason::TlsAlert, 1);
+                .insert(crate::probe::health::WsFailureReason::TlsAlert, 1);
             save_last_light_sweep(&id, &d).unwrap();
             let got = load_last_light_sweep(&id).expect("sweep diag loads back");
             assert_eq!(got.alive, 6);
             assert_eq!(got.total, 7);
             assert_eq!(
-                got.histogram.get(&crate::health::WsFailureReason::TlsAlert),
+                got.histogram
+                    .get(&crate::probe::health::WsFailureReason::TlsAlert),
                 Some(&1)
             );
             // Missing file → None (no panic, no empty default misread).

@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::artifact::vless::VlessProfile;
 use crate::error::CFError;
 use crate::store;
-use crate::vless::VlessProfile;
 
 /// Where the sing-box binary lives (auto-installed, like SenPaiScanner).
 pub fn singbox_bin() -> PathBuf {
@@ -440,7 +440,7 @@ pub async fn verify_tunnel_with(
     };
     profile.address = endpoint_ip.to_string();
     profile.port = endpoint_port;
-    let cfg_json = match crate::export::sing_box_json(&profile) {
+    let cfg_json = match crate::artifact::export::sing_box_json(&profile) {
         Ok(j) => j,
         Err(_) => {
             let mut r = base;
@@ -537,10 +537,10 @@ pub async fn verify_tunnel_with(
 /// Given scanner candidates + E2E results, keep only the ones that actually
 /// tunnel (passed == true), ordered by original order, capped at top_n.
 pub fn select_verified(
-    candidates: &[crate::autopilot::CleanEndpoint],
+    candidates: &[crate::probe::autopilot::CleanEndpoint],
     results: &[E2eResult],
     top_n: usize,
-) -> Vec<crate::autopilot::CleanEndpoint> {
+) -> Vec<crate::probe::autopilot::CleanEndpoint> {
     let passed: std::collections::HashSet<&str> = results
         .iter()
         .filter(|r| r.passed)
@@ -560,7 +560,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_verified_keeps_only_passed() {
-        let mk = |ip: &str, port: u16| crate::autopilot::CleanEndpoint {
+        let mk = |ip: &str, port: u16| crate::probe::autopilot::CleanEndpoint {
             ip: ip.into(),
             port,
             sni: "user.workers.dev".into(),
@@ -629,7 +629,7 @@ mod tests {
         let link = "vless://8274e874-7470-43ee-8018-4bc3baa709a5@amir.dariuskhosrowan.workers.dev:443?encryption=none&security=tls&type=ws&sni=amir.dariuskhosrowan.workers.dev&host=amir.dariuskhosrowan.workers.dev&path=%2F&fp=chrome#live";
 
         // A clean IP from the ledger (must be a working front).
-        let ledger = crate::autopilot::read_ledger("default");
+        let ledger = crate::probe::autopilot::read_ledger("default");
         assert!(!ledger.is_empty(), "no ledger endpoints to verify");
         let ep = &ledger[0];
 

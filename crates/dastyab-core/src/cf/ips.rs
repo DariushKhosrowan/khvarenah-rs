@@ -519,7 +519,7 @@ pub fn weighted_sample_by_cidr(cidrs: &[Cidr], n: usize, rng: &mut impl Rng) -> 
 /// Expand /prefix_len neighbourhoods around known-good clean endpoints.
 /// Returns sibling IPs (network/broadcast excluded), best seeds first.
 pub fn expand_around(
-    clean: &[crate::autopilot::CleanEndpoint],
+    clean: &[crate::probe::autopilot::CleanEndpoint],
     prefix_len: u8,
     per_seed: usize,
 ) -> Vec<String> {
@@ -694,7 +694,7 @@ pub fn load_manual_seeds(profile_id: &str) -> Vec<String> {
 /// This is the "self-improving scanner" hook: whenever the console finds a
 /// working clean IP, it is appended to the manual-seeds list (deduplicated)
 /// so subsequent discovery — both the GUI scanner and autopilot's
-/// [`crate::autopilot`] cycle — is biased toward that IP and its /prefix_len
+/// [`crate::probe::autopilot`] cycle — is biased toward that IP and its /prefix_len
 /// neighbourhood instead of starting from zero. Returns the new seed count.
 pub fn learn_clean_ip(profile_id: &str, ip: &str) -> Result<usize, CFError> {
     let ip = ip.trim().to_string();
@@ -968,7 +968,7 @@ not-an-ip
 
     #[test]
     fn expand_around_generates_neighbors() {
-        let eps = vec![crate::autopilot::CleanEndpoint {
+        let eps = vec![crate::probe::autopilot::CleanEndpoint {
             ip: "104.16.1.5".into(),
             port: 443,
             sni: "worker.workers.dev".into(),

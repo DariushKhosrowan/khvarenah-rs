@@ -29,7 +29,7 @@
 //! [`super::blackout::BlackoutAction::ReselectCarrier`] fires, and on success
 //! binds the winning endpoint as the active tunnel.
 
-use crate::carrier_pool::CarrierEndpoint;
+use crate::egress::carrier_pool::CarrierEndpoint;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
@@ -162,21 +162,24 @@ impl<'a> RealTunnelOpener<'a> {
     }
 
     /// Build a transient probe config for `ep` (does not write to disk).
-    fn probe_config(&self, ep: &CarrierEndpoint) -> Option<crate::vps_deploy::TunnelClientConfig> {
+    fn probe_config(
+        &self,
+        ep: &CarrierEndpoint,
+    ) -> Option<crate::egress::vps_deploy::TunnelClientConfig> {
         let url = ep.worker_url.as_ref()?;
         let upstream = ep.upstream.as_ref()?;
         // Retain the existing shared secret if we have one; otherwise a
         // placeholder is conservative (the real shared secret is set at
         // deploy time).
-        let secret = crate::vps_deploy::load_tunnel_client_config(self.profile)
+        let secret = crate::egress::vps_deploy::load_tunnel_client_config(self.profile)
             .and_then(|c| c.shared_secret)
             .unwrap_or_default();
-        Some(crate::vps_deploy::TunnelClientConfig {
+        Some(crate::egress::vps_deploy::TunnelClientConfig {
             host: url.clone(),
-            base_domain: crate::worker_tunnel::DYB_TUNNEL_BASE.to_string(),
+            base_domain: crate::egress::worker_tunnel::DYB_TUNNEL_BASE.to_string(),
             session: String::new(),
             resolver: "https".into(),
-            mode: crate::vps_deploy::TunnelMode::Worker,
+            mode: crate::egress::vps_deploy::TunnelMode::Worker,
             worker_url: Some(url.clone()),
             worker_name: None,
             shared_secret: Some(secret),
@@ -189,17 +192,17 @@ impl<'a> RealTunnelOpener<'a> {
 impl TunnelOpener for RealTunnelOpener<'_> {
     fn open(&self, ep: &CarrierEndpoint) -> Result<OpenedTunnel, OpenError> {
         let ok = match ep.kind {
-            crate::carrier_pool::CarrierKind::WorkerData
-            | crate::carrier_pool::CarrierKind::WorkerTunnel => {
+            crate::egress::carrier_pool::CarrierKind::WorkerData
+            | crate::egress::carrier_pool::CarrierKind::WorkerTunnel => {
                 let Some(cfg) = self.probe_config(ep) else {
                     return Err(OpenError::Other(
                         "endpoint missing worker_url/upstream".into(),
                     ));
                 };
-                crate::connectivity::probe_worker_tunnel_live(&cfg, self.timeout).ok
+                crate::net::connectivity::probe_worker_tunnel_live(&cfg, self.timeout).ok
             }
-            crate::carrier_pool::CarrierKind::VpsTunnel => {
-                crate::vps_deploy::probe_vps_reachable(&ep.host, ep.port)
+            crate::egress::carrier_pool::CarrierKind::VpsTunnel => {
+                crate::egress::vps_deploy::probe_vps_reachable(&ep.host, ep.port)
             }
         };
         if ok {
@@ -220,8 +223,8 @@ impl TunnelOpener for RealTunnelOpener<'_> {
 pub fn bind_winner(profile: &str, ep: &CarrierEndpoint) -> bool {
     if !matches!(
         ep.kind,
-        crate::carrier_pool::CarrierKind::WorkerData
-            | crate::carrier_pool::CarrierKind::WorkerTunnel
+        crate::egress::carrier_pool::CarrierKind::WorkerData
+            | crate::egress::carrier_pool::CarrierKind::WorkerTunnel
     ) {
         return false;
     }
@@ -231,28 +234,28 @@ pub fn bind_winner(profile: &str, ep: &CarrierEndpoint) -> bool {
     let Some(upstream) = &ep.upstream else {
         return false;
     };
-    let secret = crate::vps_deploy::load_tunnel_client_config(profile)
+    let secret = crate::egress::vps_deploy::load_tunnel_client_config(profile)
         .and_then(|c| c.shared_secret)
         .unwrap_or_default();
-    let cfg = crate::vps_deploy::TunnelClientConfig {
+    let cfg = crate::egress::vps_deploy::TunnelClientConfig {
         host: url.clone(),
-        base_domain: crate::worker_tunnel::DYB_TUNNEL_BASE.to_string(),
+        base_domain: crate::egress::worker_tunnel::DYB_TUNNEL_BASE.to_string(),
         session: String::new(),
         resolver: "https".into(),
-        mode: crate::vps_deploy::TunnelMode::Worker,
+        mode: crate::egress::vps_deploy::TunnelMode::Worker,
         worker_url: Some(url.clone()),
         worker_name: None,
         shared_secret: Some(secret),
         worker_vless_upstream: Some(upstream.clone()),
         resolver_pool: None,
     };
-    crate::vps_deploy::write_tunnel_client_config(profile, &cfg).is_ok()
+    crate::egress::vps_deploy::write_tunnel_client_config(profile, &cfg).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::carrier_pool::{CarrierKind, CarrierProvenance};
+    use crate::egress::carrier_pool::{CarrierKind, CarrierProvenance};
     use std::sync::Mutex;
 
     fn ep(host: &str) -> CarrierEndpoint {

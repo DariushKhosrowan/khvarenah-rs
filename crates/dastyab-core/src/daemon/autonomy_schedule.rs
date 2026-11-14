@@ -1,6 +1,6 @@
 //! Scheduled Autonomy Audit with Auto-Execute.
 //!
-//! The daemon runs a readiness audit (`crate::autonomy::run_audit`) on a
+//! The daemon runs a readiness audit (`crate::trust::autonomy::run_audit`) on a
 //! schedule; any `CheckStatus::Action` item whose preconditions are met is
 //! auto-executed on that tick — no human click. The GUI buttons become
 //! retry-now surfaces; the automatic path is the primary path. This closes the
@@ -126,7 +126,7 @@ pub fn auto_executable(code: &str, cfg: &ProfileConfig, net_up: bool, now_unix: 
                 let due = now_unix.saturating_sub(ws.rotated_unix) >= ROTATION_MAX_AGE_SECS;
                 let inflight = ws.pending_secret.is_some()
                     && now_unix.saturating_sub(ws.pending_since_unix)
-                        < crate::worker_tunnel::secret::MAX_PENDING_AGE_SECS;
+                        < crate::egress::worker_tunnel::secret::MAX_PENDING_AGE_SECS;
                 due && !inflight
             })
         }
@@ -254,7 +254,7 @@ mod tests {
         // seed an old secret so rotation is due
         cfg.worker_secrets.insert(
             "http://w".into(),
-            crate::worker_tunnel::secret::WorkerSecret {
+            crate::egress::worker_tunnel::secret::WorkerSecret {
                 worker_url: "http://w".into(),
                 secret: "s".into(),
                 rotated_unix: 1,
@@ -280,7 +280,7 @@ mod tests {
         let mut cfg = ProfileConfig::default();
         cfg.worker_secrets.insert(
             "http://w".into(),
-            crate::worker_tunnel::secret::WorkerSecret {
+            crate::egress::worker_tunnel::secret::WorkerSecret {
                 worker_url: "http://w".into(),
                 secret: "s".into(),
                 rotated_unix: 1,

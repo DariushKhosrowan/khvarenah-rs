@@ -53,7 +53,7 @@ impl ScriptedProbe {
         Self {
             status: NetStatus {
                 up: true,
-                tier: Some(crate::connectivity::Tier::Direct),
+                tier: Some(crate::net::connectivity::Tier::Direct),
             },
             calls: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -69,7 +69,7 @@ impl ScriptedProbe {
         }
     }
 
-    pub fn with_status(up: bool, tier: Option<crate::connectivity::Tier>) -> Self {
+    pub fn with_status(up: bool, tier: Option<crate::net::connectivity::Tier>) -> Self {
         Self {
             status: NetStatus { up, tier },
             calls: std::sync::atomic::AtomicUsize::new(0),
@@ -92,8 +92,8 @@ impl AccountProbe for NoopAccountProbe {
     fn probe_account(
         &self,
         _profile: &str,
-    ) -> Pin<Box<dyn Future<Output = crate::account_state::AccountState> + Send + '_>> {
-        Box::pin(async move { crate::account_state::AccountState::Active })
+    ) -> Pin<Box<dyn Future<Output = crate::trust::account_state::AccountState> + Send + '_>> {
+        Box::pin(async move { crate::trust::account_state::AccountState::Active })
     }
 }
 
@@ -105,7 +105,7 @@ impl CycleRunner for NoopCycleRunner {
         &self,
         _profile: &str,
         _follow: bool,
-        _timeouts: crate::autopilot::MonitorTimeouts,
+        _timeouts: crate::probe::autopilot::MonitorTimeouts,
     ) -> Pin<Box<dyn Future<Output = Result<(), CFError>> + Send + '_>> {
         Box::pin(async move { Ok(()) })
     }
@@ -251,26 +251,28 @@ mod tests {
         // escalation escalation_plan and backoff_secs cooperate.
         let dir = tempfile::tempdir().unwrap();
         let pool =
-            crate::carrier_pool::CarrierPool::open(dir.path().join("drill_pool.json")).unwrap();
-        let mut snap = crate::carrier_pool::CarrierSnapshot::new_empty(1000);
-        snap.endpoints.push(crate::carrier_pool::CarrierEndpoint {
-            kind: crate::carrier_pool::CarrierKind::WorkerData,
-            host: "dead.example.com".into(),
-            port: 443,
-            sni: None,
-            worker_url: Some("https://dead.example.com".into()),
-            upstream: Some("dead.example.com:443".into()),
-            weight: 0.9,
-            last_probe_ok_unix: None,
-            last_probe_rtt_ms: None,
-            provenance: crate::carrier_pool::CarrierProvenance::Deployed,
-            desync_strategy: None,
-        });
+            crate::egress::carrier_pool::CarrierPool::open(dir.path().join("drill_pool.json"))
+                .unwrap();
+        let mut snap = crate::egress::carrier_pool::CarrierSnapshot::new_empty(1000);
+        snap.endpoints
+            .push(crate::egress::carrier_pool::CarrierEndpoint {
+                kind: crate::egress::carrier_pool::CarrierKind::WorkerData,
+                host: "dead.example.com".into(),
+                port: 443,
+                sni: None,
+                worker_url: Some("https://dead.example.com".into()),
+                upstream: Some("dead.example.com:443".into()),
+                weight: 0.9,
+                last_probe_ok_unix: None,
+                last_probe_rtt_ms: None,
+                provenance: crate::egress::carrier_pool::CarrierProvenance::Deployed,
+                desync_strategy: None,
+            });
         snap.sign().unwrap();
         pool.store_atomic(&snap).unwrap();
         let e = &snap.endpoints[0];
         let _ = pool.record_failure(e, 1000).unwrap();
-        let backoff = crate::carrier_pool::backoff_secs(1);
+        let backoff = crate::egress::carrier_pool::backoff_secs(1);
         assert_eq!(backoff, 120);
         // At now=1001 the single endpoint is cooling. select_at falls back to
         // including it (never returns empty while any endpoint exists), but the
@@ -278,7 +280,11 @@ mod tests {
         // re-dialing it every tick. Assert the fallback is non-empty and the
         // cooldown is recorded.
         let sel = pool
-            .select_at(crate::carrier_pool::CarrierKind::WorkerData, 8, 1001)
+            .select_at(
+                crate::egress::carrier_pool::CarrierKind::WorkerData,
+                8,
+                1001,
+            )
             .unwrap();
         assert_eq!(
             sel.len(),
@@ -286,7 +292,7 @@ mod tests {
             "single cooling endpoint must fall back (never empty)"
         );
         let loaded = pool.load().unwrap();
-        let id = crate::carrier_pool::CarrierPool::endpoint_id_hex(e);
+        let id = crate::egress::carrier_pool::CarrierPool::endpoint_id_hex(e);
         assert!(
             loaded.penalties.contains_key(&id),
             "cooldown penalty must be recorded"
@@ -297,22 +303,24 @@ mod tests {
     async fn drill_escalated_select_fills_from_cooling_when_all_cooled() {
         let dir = tempfile::tempdir().unwrap();
         let pool =
-            crate::carrier_pool::CarrierPool::open(dir.path().join("drill_pool2.json")).unwrap();
-        let mut snap = crate::carrier_pool::CarrierSnapshot::new_empty(1000);
+            crate::egress::carrier_pool::CarrierPool::open(dir.path().join("drill_pool2.json"))
+                .unwrap();
+        let mut snap = crate::egress::carrier_pool::CarrierSnapshot::new_empty(1000);
         for (i, h) in ["a", "b"].iter().enumerate() {
-            snap.endpoints.push(crate::carrier_pool::CarrierEndpoint {
-                kind: crate::carrier_pool::CarrierKind::WorkerData,
-                host: format!("{h}.example.com"),
-                port: 443,
-                sni: None,
-                worker_url: Some(format!("https://{h}.example.com")),
-                upstream: Some(format!("{h}.example.com:443")),
-                weight: 0.8,
-                last_probe_ok_unix: None,
-                last_probe_rtt_ms: None,
-                provenance: crate::carrier_pool::CarrierProvenance::Deployed,
-                desync_strategy: None,
-            });
+            snap.endpoints
+                .push(crate::egress::carrier_pool::CarrierEndpoint {
+                    kind: crate::egress::carrier_pool::CarrierKind::WorkerData,
+                    host: format!("{h}.example.com"),
+                    port: 443,
+                    sni: None,
+                    worker_url: Some(format!("https://{h}.example.com")),
+                    upstream: Some(format!("{h}.example.com:443")),
+                    weight: 0.8,
+                    last_probe_ok_unix: None,
+                    last_probe_rtt_ms: None,
+                    provenance: crate::egress::carrier_pool::CarrierProvenance::Deployed,
+                    desync_strategy: None,
+                });
             let _ = i;
         }
         snap.sign().unwrap();
@@ -324,7 +332,7 @@ mod tests {
         // All cooling → escalated_select must still yield candidates (fill).
         let sel = crate::daemon::escalation::escalated_select(
             &pool,
-            crate::carrier_pool::CarrierKind::WorkerData,
+            crate::egress::carrier_pool::CarrierKind::WorkerData,
             8,
             1001,
         )
@@ -424,7 +432,7 @@ mod tests {
         // The parallel wrapper is bounded by max_concurrent; verify it never
         // exceeds the requested concurrency via the pool test above. Here we
         // just confirm the wrapper dispatches to serial for max_concurrent=1.
-        let eps = Vec::<crate::carrier_pool::CarrierEndpoint>::new();
+        let eps = Vec::<crate::egress::carrier_pool::CarrierEndpoint>::new();
         let opener = crate::daemon::reselect::RealTunnelOpener::new("drill_test");
         let winner = crate::daemon::reselect::exec_reselection_wrapper(&eps, &opener, 1);
         assert!(winner.is_none()); // empty → none, serial path
