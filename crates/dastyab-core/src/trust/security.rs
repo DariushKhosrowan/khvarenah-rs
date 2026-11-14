@@ -93,12 +93,13 @@ impl AuditReport {
 
 /// Check permissions on the base dirs.
 fn check_dir_permissions(report: &mut AuditReport) {
-    let dirs = [mem_dir(), profiles_dir()];
-    for d in dirs {
-        if let Ok(meta) = std::fs::metadata(&d) {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
+    // POSIX mode bits do not exist on Windows (access is ACL based), so this
+    // check reports nothing there instead of a false positive.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for d in [mem_dir(), profiles_dir()] {
+            if let Ok(meta) = std::fs::metadata(&d) {
                 let mode = meta.permissions().mode() & 0o777;
                 if mode & 0o077 != 0 {
                     report.add(
@@ -110,6 +111,10 @@ fn check_dir_permissions(report: &mut AuditReport) {
                 }
             }
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = report;
     }
 }
 

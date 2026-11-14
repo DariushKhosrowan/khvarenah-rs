@@ -236,10 +236,20 @@ fn read_pid(profile: &str) -> Option<u32> {
 }
 
 /// Whether a PID refers to a live process.
+///
+/// On Unix this is `kill(pid, 0)` — an existence check that delivers nothing.
+/// Elsewhere the process model has no equivalent, so a recorded pid is assumed
+/// stale rather than claimed live.
 fn pid_alive(pid: u32) -> bool {
-    // Signal 0: existence check only, no signal delivered.
-    let r = unsafe { libc::kill(pid as i32, 0) };
-    r == 0
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// Result of a lifeline spawn attempt.
@@ -803,14 +813,21 @@ pub fn stop_lifeline(profile: &str) -> bool {
     };
     if pid_alive(pid) {
         // Send SIGTERM, then SIGKILL after a short grace if it does not exit.
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
-        std::thread::sleep(Duration::from_millis(600));
-        if pid_alive(pid) {
+        #[cfg(unix)]
+        {
             unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
+                libc::kill(pid as i32, libc::SIGTERM);
             }
+            std::thread::sleep(Duration::from_millis(600));
+            if pid_alive(pid) {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
         }
     }
     let _ = std::fs::remove_file(pidfile(profile));

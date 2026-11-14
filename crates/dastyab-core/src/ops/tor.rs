@@ -338,14 +338,23 @@ pub fn is_running(profile: &str) -> bool {
 pub fn stop(profile: &str) -> Result<(), CFError> {
     match read_pid(profile) {
         Some(pid) if pid_alive(pid) => {
-            // SIGTERM for a graceful shutdown.
-            let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-            if rc != 0 {
-                return Err(CFError::new(
-                    "Tor",
-                    format!("failed to signal tor pid {pid} (errno {rc})"),
-                    "Try `dastyab tor status` then kill the pid manually.",
-                ));
+            // SIGTERM for a graceful shutdown. Signal delivery is Unix-only;
+            // elsewhere `pid_alive` already reports false so this arm is
+            // unreachable, but the code must still compile.
+            #[cfg(unix)]
+            {
+                let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                if rc != 0 {
+                    return Err(CFError::new(
+                        "Tor",
+                        format!("failed to signal tor pid {pid} (errno {rc})"),
+                        "Try `dastyab tor status` then kill the pid manually.",
+                    ));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pid;
             }
             // Wait for it to exit.
             let deadline = Instant::now() + Duration::from_secs(10);

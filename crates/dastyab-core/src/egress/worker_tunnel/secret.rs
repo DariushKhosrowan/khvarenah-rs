@@ -647,9 +647,14 @@ fn lock_profile_desync(profile_id: &str) -> std::io::Result<std::fs::File> {
         .open(&path)?;
     // Best-effort write a pid marker for debuggability (ignored on failure).
     let _ = writeln!(&file, "{}", std::process::id());
-    let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
+    // Cross-process exclusive lock. `flock` is Unix-only; on other platforms
+    // the in-process mutex remains the guard and the pid marker is advisory.
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
     Ok(file)
 }
