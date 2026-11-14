@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.1.5 — 2026-11-14
+
+### Fixed
+- `dastyab aistudio <action>` works on installed binaries. It had a
+  compile-time absolute path to the Python bridge, which only existed on the
+  build machine, so every user got `can't open file .../dastyab-aistudio.py`.
+  The script is now located at run time (`$DASTYAB_AISTUDIO`, beside the
+  executable, `~/.dastyab/bin/`, then the working directory), and a missing
+  script produces an actionable message instead of "tunnel" failure.
+- A test could disable the network paths of tests running beside it: the new
+  air-gap switch is per-thread over a process default.
+
+### Added
+- `DASTYAB_OFFLINE=1` runs with all outbound work skipped — a real air-gapped
+  mode for isolated machines or traffic-free inspection.
+
+### Changed
+- Core test suite is roughly twice as fast (194s → 97s): daemon drills no
+  longer wait on live DNS and Cloudflare timeouts.
+
 ## v0.1.4 — 2026-11-14
 
 The first release built from the renamed tree. Earlier 0.1.x artefacts were
