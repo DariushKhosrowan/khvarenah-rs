@@ -1,41 +1,69 @@
-# Contributing
+# Contributing to DastYab
 
-Thanks for helping improve DastYab!
+DastYab is a Rust workspace. One core crate holds all logic; the CLI, TUI and
+GUI are thin front-ends over it. If a behaviour is not in `dastyab-core`, it
+probably belongs there.
 
-## Getting started
-
-1. Fork and clone the repo.
-2. `cargo build --workspace`.
-3. `cargo test --workspace`.
-
-## Before you commit
+## Getting set up
 
 ```bash
-cargo fmt --all
-cargo clippy --workspace    # must be warning-free
-cargo test --workspace       # must pass
+git clone git@github.com:DastYab/dastyab.git
+cd dastyab
+cargo build --workspace
+cargo test  -p dastyab-core --lib
 ```
 
-## Conventions
+Rust 1.99+ is required (the workspace tracks recent stable). The CLI is a
+single static binary with no runtime dependencies.
 
-- All logic goes in `dastyab-core`. Frontends are thin shells.
-- New public functions get doc comments; new modules get a `//!` header.
-- Use `CFError::new(title, detail, fix)` for errors — never `unwrap()` where
-  a graceful error is possible.
-- Add tests for new behavior.
-- Keep `docs/` in sync.
+## Before you open a pull request
 
-## Testing
+Run the same gate CI runs:
 
-- Core unit tests cover pure logic (VLESS, export, parsing, storage).
-- No live Cloudflare calls in tests; mock or isolate network paths.
+```bash
+scripts/verify.sh
+```
 
-## Code review
+That is `cargo fmt --all --check`, a workspace build, `cargo clippy
+--workspace --all-targets -- -D warnings`, and the core test suite. A PR that
+does not pass it will not be merged.
 
-- Keep PRs focused and small.
-- Reference the module docs in your PR description.
+## Where things live
 
-## Security
+`crates/dastyab-core/src` is organised into nine domain layers:
 
-Do not commit real tokens or account IDs. If you find a security issue, open
-a private/security issue and do not include real secrets.
+| Layer | Responsibility |
+|---|---|
+| `net` | transport, resolvers, TLS, DNS shaping, TUN |
+| `trust` | security audit, stealth, SNI, tokens, blackout, bootstrap |
+| `tunnel` | DNS tunnels, ARQ, IBLT, bonding, chaining |
+| `egress` | workers, wrangler, VPS deploy, carrier pool |
+| `probe` | scanning, clean-IP, node health, autopilot |
+| `mesh` | LAN mesh, DTN gossip, beacons, trust ledger |
+| `discovery` | harvesting, GitHub/CT/NS anchors, Telegram export |
+| `artifact` | VLESS, exporters, presets, inventory, snapshots |
+| `ops` | backup, self-update, platform, tor, status, i18n |
+
+`docs/MODULES.md` describes the layers in reading order.
+
+## House rules
+
+- **Errors are user-facing.** Return `CFError { title, detail, fix }`; the
+  `fix` field is what the user actually reads when something breaks.
+- **State writes are atomic.** Go through `store::atomic_write`; never write a
+  config file in place.
+- **No new runtime dependencies in the CLI.** The single-binary property is a
+  feature, not an accident.
+- **Test what you fix.** A bug fix without a test that fails before it is not
+  finished.
+- **Do not put network calls in unit tests.** Use the mock worker / injectable
+  probes that already exist.
+
+## Commit messages
+
+Short imperative subject line, then a body explaining *why* rather than *what*
+— the diff already shows the what. Reference the layer or crate you touched.
+
+## Reporting a security issue
+
+Do not open a public issue. See `SECURITY.md`.

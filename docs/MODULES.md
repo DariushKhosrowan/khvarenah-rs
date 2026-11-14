@@ -1,7 +1,36 @@
 # Module Guide
 
-How to read the `dastyab-core` source, in dependency order. Each module is
-self-contained and documented at the top of its file.
+How to read the `dastyab-core` source. The crate is organised into nine
+domain layers plus a handful of root modules; each module is documented at the
+top of its file.
+
+---
+
+## 0. Layered map
+
+Read the layers roughly bottom-up: `net` and `trust` are foundations, `tunnel`
+and `egress` build on them, `probe` decides what works, `mesh` and `discovery`
+find peers and nodes, `artifact` turns a working path into a usable config,
+and `ops` keeps the whole thing alive.
+
+| Layer | Owns | Example modules |
+|---|---|---|
+| `net` | transport, resolvers, TLS, DNS shaping, TUN | `connectivity`, `doh`, `dot`, `tls`, `resolve_pool`, `dns_shaper`, `tun_mtu` |
+| `trust` | audit, stealth, SNI, tokens, blackout, bootstrap | `security`, `stealth`, `sni_spoof`, `token_rotate`, `blackout`, `bootstrap` |
+| `tunnel` | DNS tunnels, ARQ, IBLT, bonding, chaining | `dnstunnel`, `dnstunnel_arq`, `arq`, `iblt`, `multipath_bond`, `chain_mixer` |
+| `egress` | workers, wrangler, VPS, carrier pool | `worker`, `worker_tunnel`, `wrangler`, `vps_deploy`, `carrier_pool` |
+| `probe` | scanning, clean-IP, health, autopilot | `scanner`, `cleanip`, `health`, `autopilot`, `auto_heal`, `doctor` |
+| `mesh` | LAN mesh, DTN gossip, beacons, ledger | `lan_mesh`, `mesh_host`, `mesh_relay`, `dtn_gossip`, `ledger_guard` |
+| `discovery` | harvesting and anchors | `harvest`, `gh_sources`, `ct_anchors`, `ns_anchors`, `tg_export` |
+| `artifact` | configs, exporters, inventory, snapshots | `vless`, `export`, `presets`, `config_store`, `manifest`, `workspace_snapshot` |
+| `ops` | backup, self-update, platform, i18n | `backup`, `selfupdate`, `platform_linux`, `tor`, `status`, `i18n` |
+
+Root modules: `daemon/` (the supervisor loop), `store/` (atomic per-profile
+persistence), `cf/` (Cloudflare API client), `e2e.rs` (end-to-end gates),
+`error.rs` (the `CFError` taxonomy).
+
+The crate root re-exports every module, so `dastyab_core::<module>` works
+regardless of which layer the module lives in.
 
 ---
 
