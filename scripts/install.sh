@@ -7,7 +7,7 @@
 #  PATH setup so `dastyab` just works afterwards.
 #
 #  Usage:
-#      curl -fsSL https://raw.githubusercontent.com/DariushKhosrowan/dastyab/main/scripts/install.sh | sh
+#      curl -fsSL https://raw.githubusercontent.com/DastYab/dastyab/main/scripts/install.sh | sh
 #
 #  Options (env vars):
 #      INSTALL_DIR=/path      install into /path instead of ~/.local/bin
@@ -16,7 +16,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -eu
 
-REPO_OWNER="DariushKhosrowan"
+REPO_OWNER="DastYab"
 REPO_NAME="dastyab"
 GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
 

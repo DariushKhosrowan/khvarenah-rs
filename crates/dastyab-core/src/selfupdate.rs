@@ -8,7 +8,7 @@
 use crate::error::CFError;
 
 /// GitHub repo owner.
-pub const OWNER: &str = "DariushKhosrowan";
+pub const OWNER: &str = "DastYab";
 /// GitHub repo name.
 pub const REPO: &str = "dastyab";
 /// GitHub API base.
@@ -17,8 +17,7 @@ pub const GITHUB_API: &str = "https://api.github.com";
 /// How often the daemon checks for an auto-update (seconds). 24h.
 pub const AUTO_UPDATE_INTERVAL_SECS: u64 = 86400;
 
-const RELEASE_LATEST: &str =
-    "https://api.github.com/repos/DariushKhosrowan/dastyab/releases/latest";
+const RELEASE_LATEST: &str = "https://api.github.com/repos/DastYab/dastyab/releases/latest";
 
 /// Version metadata parsed from a release tag.
 #[derive(Debug, Clone)]
